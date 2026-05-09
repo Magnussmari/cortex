@@ -13,6 +13,8 @@ import type {
   OutboundFile,
   ContextMessage,
 } from "./types";
+import type { Envelope } from "../bus/myelin/envelope-validator";
+import type { SurfaceAdapter } from "../bus/surface-router";
 
 const ALLOW_ALL: AccessDecision = {
   allowed: true,
@@ -33,11 +35,16 @@ export class MockAdapter implements PlatformAdapter {
   threadsCreated: Array<{ msg: InboundMessage; name: string }> = [];
   /** Recorded notifyOperator calls */
   operatorNotifications: string[] = [];
+  /** MIG-3b: Recorded envelopes received via surfaceConfig.render() */
+  envelopesRendered: Envelope[] = [];
 
   /** Configurable return value for resolveAccess */
   accessDecision: AccessDecision = ALLOW_ALL;
   /** Configurable return value for fetchContext */
   contextMessages: ContextMessage[] = [];
+  /** MIG-3b: Configurable subject patterns the surface face listens for. Default `mock.>`
+   *  matches anything under `mock.*` for surface-router integration tests. */
+  surfaceSubjects: string[] = ["mock.>"];
 
   private onMessage?: (msg: InboundMessage) => Promise<void>;
   private started = false;
@@ -45,6 +52,24 @@ export class MockAdapter implements PlatformAdapter {
 
   constructor(instanceId: string = "mock-instance") {
     this.instanceId = instanceId;
+  }
+
+  /**
+   * MIG-3b — Surface-adapter face for surface-router integration tests.
+   *
+   * Records every rendered envelope into `envelopesRendered` so tests can
+   * assert on the dispatch path. Tests that need a different subject set
+   * can mutate `surfaceSubjects` before registering, or wrap this in a
+   * custom SurfaceAdapter literal — registration is the consumer's choice.
+   */
+  get surfaceConfig(): SurfaceAdapter {
+    return {
+      id: this.instanceId,
+      subjects: this.surfaceSubjects,
+      render: async (envelope) => {
+        this.envelopesRendered.push(envelope);
+      },
+    };
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
@@ -113,6 +138,7 @@ export class MockAdapter implements PlatformAdapter {
     this.progressSent = [];
     this.threadsCreated = [];
     this.operatorNotifications = [];
+    this.envelopesRendered = [];
     this.threadCounter = 0;
   }
 }
