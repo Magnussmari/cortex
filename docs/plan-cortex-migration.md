@@ -471,12 +471,12 @@ Each phase = one umbrella issue with a task-list checklist + one or more PRs. Pi
 
 **Steps:**
 
-- [ ] **6.1** Copy from grove-v2: `src/cli/discord.ts` + `src/cli/lib/` + `src/cli/skill/` → `cortex/src/cli/discord/`.
-- [ ] **6.2** Copy from grove-v2: `src/cli/cldyo-live` (single bash script) → `cortex/src/cli/cldyo-live` (no trailing slash; single file). Verify with `file cortex/src/cli/cldyo-live` returning "Bourne-Again shell script". Do NOT create `cortex/src/cli/cldyo-live/` as a directory.
-- [ ] **6.3** Update `arc-manifest.yaml` `provides:` block to install `~/bin/discord` and `~/bin/cldyo-live` from cortex.
-- [ ] **6.4** Update `~/.claude/skills/Discord/` source path to cortex.
-- [ ] **6.5** Manual smoke: `discord post --channel cortex "MIG-6 sanity"` works.
-- [ ] **6.6** Tests moved + green.
+- [x] **6.1** Copy from grove-v2: `src/cli/discord.ts` + `src/cli/lib/` + `src/cli/skill/` → `cortex/src/cli/discord/`. *(cortex#15, merged 2026-05-09 as 81aa0ce; 5 byte-identical lifts)*
+- [x] **6.2** Copy from grove-v2: `src/cli/cldyo-live` (single bash script) → `cortex/src/cli/cldyo-live` (no trailing slash; single file). Verify with `file cortex/src/cli/cldyo-live` returning "Bourne-Again shell script". Do NOT create `cortex/src/cli/cldyo-live/` as a directory. *(verified live; Echo round-1 also caught architecture.md §8 line 586 trailing-slash inconsistency, fixed in same PR)*
+- [x] **6.3** Update `arc-manifest.yaml` `provides:` block to install `~/bin/discord` and `~/bin/cldyo-live` from cortex. *(cortex#15; provides.files block + hooks.postupgrade pointing at scripts/postupgrade.sh; explicitly scoped to MIG-6 deliverables, MIG-7 expands)*
+- [x] **6.4** Update `~/.claude/skills/Discord/` source path to cortex. *(cortex#15 scripts/postupgrade.sh — `ln -sf "${CORTEX_DIR}/src/cli/discord/skill" "${PAI_DIR}/skills/Discord"`; idempotent on every arc upgrade)*
+- [x] **6.5** Manual smoke: `discord post --channel cortex "MIG-6 sanity"` works. *(cortex#15 — `bun src/cli/discord/discord.ts post --channel cortex "MIG-6 sanity smoke from cortex worktree HEAD ~55ec0ac"` returned "Posted to #cortex"; live message visible at 03:18 PM in #cortex; reading from existing ~/.config/grove/cli.yaml per plan §1.3 parity)*
+- [ ] **6.6** Tests moved + green. *(deferred-with-justification — no CLI tests exist in grove-v2 either; tsc green + `--help` smoke + live channel post are the parity baseline; new test work is post-migration follow-up, not migration scope)*
 
 **Acceptance:**
 - `discord` and `cldyo-live` work post-`arc upgrade Cortex` (which becomes real in MIG-7).
