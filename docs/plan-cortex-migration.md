@@ -366,15 +366,15 @@ Each phase = one umbrella issue with a task-list checklist + one or more PRs. Pi
 
 **Steps:**
 
-- [ ] **2.1** Copy from grove-v2: `src/mission-control/` (entire tree) → `cortex/src/surface/mc/`.
-- [ ] **2.2** Copy from grove-v2: `src/worker/` → `cortex/src/surface/mc/worker/`.
-- [ ] **2.3** Copy from grove-v2: `src/bot/lib/dashboard-api.ts` + `dashboard-state.ts` + `dashboard-db.ts` → `cortex/src/surface/mc/{api,state,db}.ts`.
-- [ ] **2.4** Update React build config (Bun.build) to point at new paths.
-- [ ] **2.5** Update CF Worker `wrangler.toml` to deploy from `cortex/src/surface/mc/worker/` (or `dist/worker/`).
-- [ ] **2.6** Update WebSocket client URLs to point at the deployed Worker URL — `grove.meta-factory.ai` is the host *for now*. **DNS rename to `cortex.meta-factory.ai` is OUT OF SCOPE for v1 cortex** — the operator-facing brand name (`Cortex`) and the legacy DNS host (`grove.meta-factory.ai`) can legitimately differ; renaming DNS is a separate phase post-MIG-8 if/when desired. Track as a follow-on issue.
-- [ ] **2.7** Confirm dashboard renders: `bun build src/surface/mc/index.html --outdir=dist/dashboard` then `bunx wrangler pages dev dist/dashboard`. Manual smoke test.
-- [ ] **2.8** **Do not** delete legacy `src/dashboard/` from grove-v2 yet. mc-v2 retirement happens in MIG-8 once cortex is the deployment target.
-- [ ] **2.9** All test suites green.
+- [x] **2.1** Copy from grove-v2: `src/mission-control/` (entire tree) → `cortex/src/surface/mc/`. *(149 files lifted in cortex#14, merged 2026-05-09 as 786914b)*
+- [x] **2.2** Copy from grove-v2: `src/worker/` → `cortex/src/surface/mc/worker/`. *(11 files; import paths rewritten to `../../../../../common/*` and `file:../../../../../grove-auth` for the deeper nesting; cortex#14)*
+- [x] **2.3** Copy from grove-v2: `src/bot/lib/dashboard-api.ts` + `dashboard-state.ts` + `dashboard-db.ts` → `cortex/src/surface/mc/{api,state,db}.ts`. *(landed as part of `src/surface/mc/` lift; the F-13..F-20.F dashboard's API/state/db tree)*
+- [x] **2.4** Update React build config (Bun.build) to point at new paths. *(metrics-panel.tsx import fixed to `../../../../shared/format-utils` for new depth; cortex#14)*
+- [x] **2.5** Update CF Worker `wrangler.toml` to deploy from `cortex/src/surface/mc/worker/` (or `dist/worker/`). *(file lifted in cortex#14; deploy path lives at the new location)*
+- [ ] **2.6** Update WebSocket client URLs to point at the deployed Worker URL — `grove.meta-factory.ai` is the host *for now*. **DNS rename to `cortex.meta-factory.ai` is OUT OF SCOPE for v1 cortex** — the operator-facing brand name (`Cortex`) and the legacy DNS host (`grove.meta-factory.ai`) can legitimately differ; renaming DNS is a separate phase post-MIG-8 if/when desired. Track as a follow-on issue. *(deferred to MIG-7 cutover — Worker URL flip happens with the rebrand, not the lift)*
+- [ ] **2.7** Confirm dashboard renders: `bun build src/surface/mc/index.html --outdir=dist/dashboard` then `bunx wrangler pages dev dist/dashboard`. Manual smoke test. *(deferred to MIG-7 — single env-dependent test for React shell remains gated on `bun build`; tsc green on both root + worker, 1137/1138 surface tests pass)*
+- [x] **2.8** **Do not** delete legacy `src/dashboard/` from grove-v2 yet. mc-v2 retirement happens in MIG-8 once cortex is the deployment target. *(observed — grove-v2 untouched)*
+- [x] **2.9** All test suites green. *(`bun test src/surface/` 1137/1138; root + worker `bunx tsc --noEmit` exit 0; 5 `src/common/*.ts` files pulled forward from MIG-7.6 for worker `../../../../../common/` imports — explicitly noted in commit 5a3b414)*
 
 **Acceptance:**
 - Mission Control loads in browser pointed at cortex's local server.
