@@ -338,7 +338,7 @@ Each phase = one umbrella issue with a task-list checklist + one or more PRs. Pi
 - [ ] **1.2** Copy from grove-v2: `src/bot/lib/nats-subscription.ts` → `cortex/src/bus/nats/subscription.ts`. Tests alongside.
 - [ ] **1.3** Copy from grove-v2: `src/bot/lib/myelin/` (vendored schema) → `cortex/src/bus/myelin/vendor/`.
 - [ ] **1.4** Copy from grove-v2: `src/bot/lib/myelin-subscriber.ts` → `cortex/src/bus/myelin/subscriber.ts`. Tests alongside.
-- [ ] **1.5** Copy from grove-v2: `src/bot/lib/myelin-runtime.ts` → `cortex/src/bus/myelin/runtime.ts`. Tests alongside.
+- [x] **1.5** Copy from grove-v2: `src/bot/lib/myelin-runtime.ts` → `cortex/src/bus/myelin/runtime.ts`. Tests alongside. *(cortex#22, merged 2026-05-09 — closes cortex#13. 4 import rewrites + 7/7 tests forward. The keystone unlock — releases MIG-3b/4b/5b/MIG-7.1 from the strict-block deferrals.)*
 - [ ] **1.6** Copy from grove-v2: `src/bot/lib/message-router.ts` → `cortex/src/bus/dispatch-handler.ts`. **Rename** internal class `MessageRouter` → `DispatchHandler`.
 - [ ] **1.7** *(no copy — `inbound-queue.ts` is legacy-grove-only per §2.2.1, not in grove-v2; cortex relies on JetStream durability per design-cortex.md §3.3 "lost event ≠ lost state". Falsifiable re-evaluation trigger: if any post-MIG-7 incident's RCA cites lost events crossing a cortex restart boundary, file a follow-on issue to port `inbound-queue.ts` from legacy.)*
 - [ ] **1.8** Copy from grove-v2: `src/bot/lib/network-resolver.ts` → `cortex/src/bus/network-resolver.ts`.
