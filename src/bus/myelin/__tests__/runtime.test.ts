@@ -216,7 +216,7 @@ describe("MyelinRuntime", () => {
     });
     expect(runtime.enabled).toBe(true);
     const connectLog = logs.find(
-      (l) => l.kind === "log" && l.msg.includes("myelin runtime connected"),
+      (l) => l.kind === "log" && l.msg.includes("myelin-runtime: connected"),
     );
     expect(connectLog).toBeDefined();
     expect(connectLog!.msg).not.toContain("secret-token");
@@ -236,7 +236,7 @@ describe("MyelinRuntime", () => {
     });
     expect(runtime.enabled).toBe(true);
     const connectLog = logs.find(
-      (l) => l.kind === "log" && l.msg.includes("myelin runtime connected"),
+      (l) => l.kind === "log" && l.msg.includes("myelin-runtime: connected"),
     );
     expect(connectLog).toBeDefined();
     // Both user and password redacted.
@@ -263,7 +263,7 @@ describe("MyelinRuntime", () => {
     // invocations, not twice — proves the `stopped` flag in the
     // closure actually short-circuits.
     const stoppedLines = logs.filter(
-      (l) => l.kind === "log" && l.msg.includes("myelin runtime stopped"),
+      (l) => l.kind === "log" && l.msg.includes("myelin-runtime: stopped"),
     );
     expect(stoppedLines.length).toBe(1);
   });
@@ -347,6 +347,11 @@ describe("MyelinRuntime", () => {
     });
 
     test("publish after stop() is a no-op (no late publishes after drain)", async () => {
+      // Pins the post-stop semantic documented on `publishEnabled` in
+      // runtime.ts: once `stop()` returns, calls to `runtime.publish(...)`
+      // must short-circuit before reaching `link.publish`. The underlying
+      // nats client is drain-safe, but the runtime contract is explicit:
+      // post-stop publish is a no-op the caller can rely on.
       const fake = makeFakeNatsConnection();
       const runtime = await startMyelinRuntime(
         makeConfig({
