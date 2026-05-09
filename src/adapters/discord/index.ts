@@ -20,6 +20,10 @@ import { fetchContext } from "./context-fetcher";
 import { postToDiscord } from "./response-poster";
 import { resolveRole } from "./role-resolver";
 import { isRetryableError } from "./retry";
+import type { Envelope } from "../../bus/myelin/envelope-validator";
+import type { SurfaceAdapter } from "../../bus/surface-router";
+import type { PayloadFilter } from "../../bus/payload-filter";
+import { formatEnvelopeAsMarkdown } from "../envelope-renderer";
 
 export interface DiscordAdapterConfig {
   instanceId: string;
@@ -34,6 +38,17 @@ export interface DiscordAdapterConfig {
   defaultRole?: string;
   /** G-300: DM privilege configuration */
   dm?: DMConfig;
+  /** MIG-3b: NATS subject patterns this adapter renders to Discord. Empty/undefined → adapter
+   * never matches in the surface-router (still subscribes for messages, just doesn't render
+   * envelopes). */
+  surfaceSubjects?: string[];
+  /** MIG-3b: optional payload filter applied AFTER subject match. */
+  surfaceFilter?: PayloadFilter;
+  /** MIG-3b: fallback Discord channel ID for envelope rendering when no per-envelope routing
+   * rule applies. Channel ID, NOT name — the adapter needs the discord.js channel-fetch key.
+   * Per-envelope routing (e.g. payload.repo → repo-specific channel) is handled by the
+   * Renderer model in MIG-7.2d. */
+  surfaceFallbackChannelId?: string;
 }
 
 interface PendingResult {
@@ -56,6 +71,17 @@ export class DiscordAdapter implements PlatformAdapter {
     this.instanceId = adapterConfig.instanceId;
     this.adapterConfig = adapterConfig;
     this.botConfig = botConfig;
+
+    // MIG-3b: warn once at construction if surfaceSubjects is explicitly empty.
+    // `undefined` is silent (adapter opted out of bus rendering entirely);
+    // `[]` is a config-typo signal — the surface-router will never match this
+    // adapter, so any envelopes intended for it are silently dropped. Catching
+    // it here avoids the "why is nothing rendering?" diagnostic dance.
+    if (adapterConfig.surfaceSubjects?.length === 0) {
+      console.warn(
+        `grove-bot: discord-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
+      );
+    }
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
@@ -607,5 +633,86 @@ export class DiscordAdapter implements PlatformAdapter {
   /** Get the underlying discord.js client (for outbound JSONL tailing) */
   getClient(): Client | null {
     return this.client;
+  }
+
+  // ---------------------------------------------------------------------------
+  // MIG-3b: Surface-router integration
+  // ---------------------------------------------------------------------------
+
+  /**
+   * MIG-3b — Surface-adapter face for the surface-router (G-1111.A).
+   *
+   * Returns a fresh `SurfaceAdapter` describing the bus-envelope-rendering
+   * side of this Discord adapter:
+   *
+   *   - `id`        — the adapter instance ID (matches `this.instanceId`)
+   *   - `subjects`  — NATS subject patterns from `surfaceSubjects` (empty if unset → never matches)
+   *   - `filter`    — optional payload filter from `surfaceFilter`
+   *   - `render`    — bound to `renderEnvelope` so `this` is preserved
+   *
+   * Wiring: the bot's startup composer calls `router.register(adapter.surfaceConfig)`
+   * once per adapter, after MyelinRuntime has started. The router never opens
+   * a NATS subscription — that's MyelinRuntime's job (per spec §5.1) — so this
+   * face is purely the rendering hook.
+   */
+  get surfaceConfig(): SurfaceAdapter {
+    return {
+      id: this.instanceId,
+      subjects: this.adapterConfig.surfaceSubjects ?? [],
+      ...(this.adapterConfig.surfaceFilter ? { filter: this.adapterConfig.surfaceFilter } : {}),
+      render: (envelope) => this.renderEnvelope(envelope),
+    };
+  }
+
+  /**
+   * MIG-3b — Render a bus envelope as a Discord message.
+   *
+   * v1 strategy: post the envelope to the adapter's configured fallback
+   * channel as a markdown code block via `postResponse`. This re-uses the
+   * existing pending-result + connection-health buffering from the chat
+   * post path, so envelopes that arrive during a Discord disconnect get
+   * the same retry behaviour as chat replies.
+   *
+   * v2 (MIG-7.2d Renderer model): per-event-type templates with channel
+   * routing based on `envelope.payload` (e.g. `payload.repo` → repo-specific
+   * channel) and sovereignty-aware redaction. This method stays as the
+   * default fallback for envelopes that don't match a registered template.
+   *
+   * Failure modes: this method never throws — `postResponse` already swallows
+   * delivery errors and buffers when disconnected. The router's
+   * `renderWithIsolation` wraps us in a timeout regardless.
+   */
+  private async renderEnvelope(envelope: Envelope): Promise<void> {
+    // Buffering at the adapter level would duplicate `postResponse`'s
+    // existing pending-result mechanism; instead we drop here and rely
+    // on JetStream replay (per design-cortex.md §3.3 "lost event ≠ lost
+    // state") to redeliver after reconnect. Future refinement at MIG-3b-ii.
+    //
+    // We split null-client (adapter never started) from not-ready-client
+    // (started but shard reconnecting) so operators can tell a config bug
+    // from a transient gateway blip in the logs.
+    if (this.client === null) {
+      console.warn(
+        `grove-bot: discord-${this.instanceId} renderEnvelope called before start() — dropping envelope ${envelope.id}`,
+      );
+      return;
+    }
+    if (!this.client.isReady()) {
+      console.warn(
+        `grove-bot: discord-${this.instanceId} renderEnvelope called while shard reconnecting — dropping envelope ${envelope.id}`,
+      );
+      return;
+    }
+    const channelId = this.adapterConfig.surfaceFallbackChannelId;
+    if (!channelId) {
+      console.warn(
+        `grove-bot: discord-${this.instanceId} has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
+      );
+      return;
+    }
+    await this.postResponse(
+      { instanceId: this.instanceId, channelId },
+      formatEnvelopeAsMarkdown(envelope),
+    );
   }
 }

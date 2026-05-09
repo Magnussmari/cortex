@@ -23,6 +23,10 @@ import {
 } from "./poller";
 import { fetchMattermostContext } from "./context";
 import { resolveRole } from "../discord/role-resolver";
+import type { Envelope } from "../../bus/myelin/envelope-validator";
+import type { SurfaceAdapter } from "../../bus/surface-router";
+import type { PayloadFilter } from "../../bus/payload-filter";
+import { formatEnvelopeAsMarkdown } from "../envelope-renderer";
 
 export interface MattermostAdapterConfig {
   instanceId: string;
@@ -34,6 +38,15 @@ export interface MattermostAdapterConfig {
   operatorMattermostId?: string;
   roles?: DiscordRole[];
   defaultRole?: string;
+  /** MIG-3b: NATS subject patterns this adapter renders to Mattermost. Empty/undefined →
+   * adapter never matches in the surface-router. */
+  surfaceSubjects?: string[];
+  /** MIG-3b: optional payload filter applied AFTER subject match. */
+  surfaceFilter?: PayloadFilter;
+  /** MIG-3b: fallback Mattermost channel ID for envelope rendering when no per-envelope
+   * routing rule applies. Mattermost channel ID (the 26-char string), NOT a channel name.
+   * Per-envelope routing handled by the Renderer model (MIG-7.2d). */
+  surfaceFallbackChannelId?: string;
 }
 
 export class MattermostAdapter implements PlatformAdapter {
@@ -57,6 +70,15 @@ export class MattermostAdapter implements PlatformAdapter {
         enabled: true,
       }],
     } as BotConfig;
+
+    // MIG-3b: warn once at construction if surfaceSubjects is explicitly empty.
+    // Mirrors DiscordAdapter — `undefined` is silent (opted out), `[]` is a
+    // config-typo signal worth surfacing.
+    if (adapterConfig.surfaceSubjects?.length === 0) {
+      console.warn(
+        `grove-bot: mattermost-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
+      );
+    }
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
@@ -274,5 +296,64 @@ export class MattermostAdapter implements PlatformAdapter {
       contentType: i.contentType,
       size: i.size,
     }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // MIG-3b: Surface-router integration
+  // ---------------------------------------------------------------------------
+
+  /**
+   * MIG-3b — Surface-adapter face for the surface-router (G-1111.A).
+   *
+   * Mirror of `DiscordAdapter.surfaceConfig` — see that doc for the shape +
+   * wiring pattern. Mattermost-specific note: the adapter has no equivalent
+   * of Discord's pending-result buffer (Mattermost's reconnect story is
+   * different — the poller pulls; it doesn't push), so renderEnvelope's
+   * failure mode is "log + drop" rather than "buffer for retry". JetStream
+   * replay covers the recovery path per design-cortex.md §3.3.
+   */
+  get surfaceConfig(): SurfaceAdapter {
+    return {
+      id: this.instanceId,
+      subjects: this.adapterConfig.surfaceSubjects ?? [],
+      ...(this.adapterConfig.surfaceFilter ? { filter: this.adapterConfig.surfaceFilter } : {}),
+      render: (envelope) => this.renderEnvelope(envelope),
+    };
+  }
+
+  /**
+   * MIG-3b — Render a bus envelope as a Mattermost post.
+   *
+   * v1: post the formatted envelope to the configured fallback channel via
+   * `postReply` (no rootId — top-level post in the channel). v2 routing
+   * lives in the Renderer model (MIG-7.2d).
+   *
+   * Failure mode: `postReply` may throw on HTTP error; we catch + log
+   * here so the surface-router's `renderWithIsolation` doesn't have to
+   * be the only safety net. Dropping is acceptable because JetStream
+   * replay handles redelivery.
+   */
+  private async renderEnvelope(envelope: Envelope): Promise<void> {
+    const channelId = this.adapterConfig.surfaceFallbackChannelId;
+    if (!channelId) {
+      console.warn(
+        `grove-bot: mattermost-${this.instanceId} has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
+      );
+      return;
+    }
+    try {
+      await postReply(
+        channelId,
+        formatEnvelopeAsMarkdown(envelope),
+        undefined,
+        this.adapterConfig.apiUrl,
+        this.adapterConfig.apiToken,
+      );
+    } catch (err) {
+      console.warn(
+        `grove-bot: mattermost-${this.instanceId} renderEnvelope failed for envelope ${envelope.id}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 }
