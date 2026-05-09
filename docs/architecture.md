@@ -185,16 +185,16 @@ inbound from a surface ─→ presence adapter ─→ tap (publish dispatch.* en
 
 The **surface-router** (G-1111.A target) is the single in-process fan-out point. Adapters and renderers do not subscribe to NATS directly; they register with the surface-router and the surface-router owns the JetStream consumer. Per `docs/design-event-taxonomy.md` §7.6 anti-pattern: "DO NOT subscribe surfaces directly to NATS."
 
-### 3.5 Open question — namespace reconciliation
+### 3.5 Namespace reconciliation — RESOLVED
 
-The metafactory ecosystem currently has two NATS subject conventions in use:
+**Decision (2026-05-09):** The federated namespace `local.{org}.{domain}.{entity}.{action}` (per `myelin/specs/namespace.md`) is the canonical subject convention. The earlier `mf.net-{operator}.*` convention was a first iteration that appeared in documentation diagrams but was never adopted in implementation — cortex's runtime already publishes exclusively on `local.{org}.*` subjects.
 
-- **`local.{org}.{domain}.{entity}.{action}`** (per `myelin/specs/namespace.md`) — semantic events, sovereignty-bearing, three prefixes (local / federated / public).
-- **`mf.net-{operator}.events.>` / `.trace.>` / `.metric.>` / `.log.>`** (per the event architecture diagram in design-collaboration-surface, and per signal repo) — operator-scoped, class-prefixed for transport routing.
+The three-prefix model from myelin's namespace spec applies:
+- **`local.{org}.*`** — intra-operator semantic events (current scope)
+- **`federated.*`** — cross-operator task markets (requires sovereignty enforcement, [myelin#11](https://github.com/the-metafactory/myelin/issues/11))
+- **`public.*`** — open discovery (future)
 
-The two overlap rather than contradict: the diagram's `mf.net-{op}.events.>` carries envelopes whose `subject` field is `local.{org}.>`-shaped per myelin's grammar. But it's not yet documented anywhere whether they are alternative subject hierarchies, nested (one-of carries the other), or a transport-level convention vs. an envelope-level convention.
-
-**Action**: this is on the path to resolution as part of myelin#7's still-pending acceptance criterion ("Seven-layer model documented in myelin"). Cortex's MIG-1 (bus runtime move) tracks both as input subjects and tolerates both; the doc convergence happens upstream in myelin. Tracked in the migration plan's open-questions section.
+**Migration:** Diagrams and tables in §3.1–§3.4 of this document still reference `mf.net-{op}.*` as a visual convention. These will be updated to `local.{org}.*` as part of [myelin#7](https://github.com/the-metafactory/myelin/issues/7) documentation convergence. The runtime requires no changes — it already uses the correct convention. See also: myelin task routing design doc, Decision #6.
 
 ### 3.6 Operator visibility — three tiers
 
