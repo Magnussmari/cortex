@@ -453,7 +453,7 @@ Within cortex, the **internal modules** (§8 below) are sub-domains of the corte
 
 ## 7. Agent task routing — capability-driven dispatch
 
-Reference: `~/Developer/myelin/docs/design-agent-task-routing.md` (currently myelin PR #36 — three distribution modes + M7 stratification + event lifecycle, in flight). Cortex's M7 dispatch handler is the canonical first consumer of this pattern, and serves as the worked example for §6's M7 application principles.
+Reference: `~/Developer/myelin/docs/design-agent-task-routing.md` (myelin PR #36 — three distribution modes + M7 stratification + event lifecycle; **Pattern 4 accepted 2026-05-09**). Cortex's M7 dispatch handler is the canonical first consumer of this pattern, and serves as the worked example for §6's M7 application principles.
 
 ### 7.1 Three distribution modes — what gets routed how
 
@@ -544,7 +544,7 @@ This shifts cortex's dispatch from hardcoded routing (`if message in #grove → 
 - **M2 (Transport)** provides JetStream consumer groups + KV bucket primitives + dead-letter subjects.
 - **M3 (Envelope)** carries task payload (`requirements`, `sovereignty_required`, `target_principal` for Direct/Delegate).
 - **M4 (Identity)** signs the publishing source so consumers can verify task origin; signed KV writes for the capability registry.
-- **M5 (Discovery)** is the capability registry — currently this design IS the seed of M5; future myelin#9 spec will formalise.
+- **M5 (Discovery)** is the capability registry — the `AGENT_CAPABILITIES` KV bucket defined in this design IS the M5 seed. myelin#9 spec will formalise the KV schema, watcher contract, capability taxonomy, and signed registration envelope format.
 - **M6 (Composition)** provides the bidding-mode request/reply pattern.
 - **M7 (this layer, cortex)** owns capability declaration, orchestrator translation, compliance attestation, surface routing, and sub-agent trust per §7.5.
 
