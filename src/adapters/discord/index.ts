@@ -672,13 +672,23 @@ export class DiscordAdapter implements PlatformAdapter {
    * `renderWithIsolation` wraps us in a timeout regardless.
    */
   private async renderEnvelope(envelope: Envelope): Promise<void> {
-    if (!this.client?.isReady()) {
-      // Buffering at the adapter level would duplicate `postResponse`'s
-      // existing pending-result mechanism; instead we drop here and rely
-      // on JetStream replay (per design-cortex.md §3.3 "lost event ≠ lost
-      // state") to redeliver after reconnect. Future refinement at MIG-3b-ii.
+    // Buffering at the adapter level would duplicate `postResponse`'s
+    // existing pending-result mechanism; instead we drop here and rely
+    // on JetStream replay (per design-cortex.md §3.3 "lost event ≠ lost
+    // state") to redeliver after reconnect. Future refinement at MIG-3b-ii.
+    //
+    // We split null-client (adapter never started) from not-ready-client
+    // (started but shard reconnecting) so operators can tell a config bug
+    // from a transient gateway blip in the logs.
+    if (this.client === null) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} renderEnvelope called but client not ready — dropping envelope ${envelope.id}`,
+        `grove-bot: discord-${this.instanceId} renderEnvelope called before start() — dropping envelope ${envelope.id}`,
+      );
+      return;
+    }
+    if (!this.client.isReady()) {
+      console.warn(
+        `grove-bot: discord-${this.instanceId} renderEnvelope called while shard reconnecting — dropping envelope ${envelope.id}`,
       );
       return;
     }

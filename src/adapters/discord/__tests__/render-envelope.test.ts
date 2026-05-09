@@ -253,24 +253,28 @@ describe("DiscordAdapter.renderEnvelope — happy path", () => {
 // ---------------------------------------------------------------------------
 
 describe("DiscordAdapter.renderEnvelope — failure modes", () => {
-  test("drops + warns when client is not ready", async () => {
+  test("drops + warns 'shard reconnecting' when client started but not ready", async () => {
     const { adapter, sends } = makeAdapter({
       surfaceFallbackChannelId: "channel-A",
       ready: false,
     });
     await adapter.surfaceConfig.render(makeEnvelope());
     expect(sends).toHaveLength(0);
-    expect(warnings.some((w) => w.includes("client not ready"))).toBe(true);
+    expect(warnings.some((w) => w.includes("shard reconnecting"))).toBe(true);
+    // Distinguishes from the pre-start case — must NOT log "before start()".
+    expect(warnings.some((w) => w.includes("before start()"))).toBe(false);
   });
 
-  test("drops + warns when client is null (adapter not started)", async () => {
+  test("drops + warns 'before start()' when client is null (adapter not started)", async () => {
     const { adapter, sends } = makeAdapter({
       surfaceFallbackChannelId: "channel-A",
       withClient: false,
     });
     await adapter.surfaceConfig.render(makeEnvelope());
     expect(sends).toHaveLength(0);
-    expect(warnings.some((w) => w.includes("client not ready"))).toBe(true);
+    expect(warnings.some((w) => w.includes("before start()"))).toBe(true);
+    // Distinguishes from the reconnecting case — must NOT log "shard reconnecting".
+    expect(warnings.some((w) => w.includes("shard reconnecting"))).toBe(false);
   });
 
   test("drops + warns when no surfaceFallbackChannelId is configured", async () => {
