@@ -420,15 +420,15 @@ Each phase = one umbrella issue with a task-list checklist + one or more PRs. Pi
 
 **Steps:**
 
-- [ ] **4.1** Copy from grove-v2: `src/bot/lib/cc-session.ts` + `session-manager.ts` + `stream-parser.ts` + `claude-invoker.ts` + `agent-team.ts` + `task-tracker.ts` + `execution-backend.ts` + `worklog-manager.ts` + `learning-store.ts` + `security-preamble.ts` → `cortex/src/runner/`.
+- [x] **4.1** Copy from grove-v2: `src/bot/lib/cc-session.ts` + `session-manager.ts` + `stream-parser.ts` + `claude-invoker.ts` + `agent-team.ts` + `task-tracker.ts` + `execution-backend.ts` + `worklog-manager.ts` + `learning-store.ts` + `security-preamble.ts` → `cortex/src/runner/`. *(cortex#19, merged 2026-05-09 — MIG-4a)*
 - [ ] **4.2** *(deleted — `src/hooks/lib/event-taxonomy.ts` moves with the rest of `src/hooks/` in MIG-5.2; was double-counted in earlier draft)*
-- [ ] **4.3** Copy from grove-v2: `src/bot/hooks/` → `cortex/src/runner/hooks/`.
-- [ ] **4.4** Copy from grove-v2: `src/bot/commands/` → `cortex/src/cli/cortex/commands/` (these are CLI subcommands, not runner code; placement reflects that).
-- [ ] **4.5** Refactor: runner subscribes to `local.{org}.dispatch.task.received` via the surface-router (same registration mechanism as adapters). On envelope, spawns CC.
-- [ ] **4.6** Runner emits lifecycle envelopes per G-1111 §3.4 (`dispatch.task.{started,completed,failed,aborted}`).
-- [ ] **4.7** Worklog manager subscribes to `dispatch.task.*` envelopes and projects to the worklog Discord thread. (No longer called directly from message-router — it's a sibling consumer of the bus.)
-- [ ] **4.8** Retire `claude-invoker.ts:invokeClaudeCode()` dead code per existing v1-to-v2-cutover doc §7.
-- [ ] **4.9** Tests moved + green.
+- [x] **4.3** Copy from grove-v2: `src/bot/hooks/` → `cortex/src/runner/hooks/`. *(cortex#19 — bash-guard.hook.ts)*
+- [x] **4.4** Copy from grove-v2: `src/bot/commands/` → `cortex/src/cli/cortex/commands/` (these are CLI subcommands, not runner code; placement reflects that). *(cortex#19 — cloud.ts + tests)*
+- [ ] **4.5** Refactor: runner subscribes to `local.{org}.dispatch.task.received` via the surface-router (same registration mechanism as adapters). On envelope, spawns CC. *(MIG-4b — strict block on MIG-1.5 myelin-runtime port per cortex#13)*
+- [ ] **4.6** Runner emits lifecycle envelopes per G-1111 §3.4 (`dispatch.task.{started,completed,failed,aborted}`). *(MIG-4b — same MyelinRuntime dependency)*
+- [ ] **4.7** Worklog manager subscribes to `dispatch.task.*` envelopes and projects to the worklog Discord thread. (No longer called directly from message-router — it's a sibling consumer of the bus.) *(MIG-4b — same MyelinRuntime dependency)*
+- [ ] **4.8** Retire `claude-invoker.ts:invokeClaudeCode()` dead code per existing v1-to-v2-cutover doc §7. *(deferred to MIG-4b for atomicity with the surface-router refactor; verified production-orphan in both repos — only `tests/bot/lib/claude-invoker{,-resume}.test.ts` exercise it)*
+- [x] **4.9** Tests moved + green. *(cortex#19 — 118/118 src/runner/ + 19/19 src/cli/cortex/commands/; round-1 review caught 9 missed tests in tests/bot/lib/, all lifted in same PR; +64 tests added)*
 
 **Acceptance:**
 - A manual dispatch via Discord adapter → dispatch-handler emits `dispatch.task.received` → runner picks up → spawns CC → emits lifecycle events → worklog thread renders.
