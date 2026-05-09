@@ -71,6 +71,17 @@ export class DiscordAdapter implements PlatformAdapter {
     this.instanceId = adapterConfig.instanceId;
     this.adapterConfig = adapterConfig;
     this.botConfig = botConfig;
+
+    // MIG-3b: warn once at construction if surfaceSubjects is explicitly empty.
+    // `undefined` is silent (adapter opted out of bus rendering entirely);
+    // `[]` is a config-typo signal — the surface-router will never match this
+    // adapter, so any envelopes intended for it are silently dropped. Catching
+    // it here avoids the "why is nothing rendering?" diagnostic dance.
+    if (adapterConfig.surfaceSubjects?.length === 0) {
+      console.warn(
+        `grove-bot: discord-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
+      );
+    }
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {

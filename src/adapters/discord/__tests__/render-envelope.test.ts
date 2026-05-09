@@ -294,3 +294,28 @@ describe("DiscordAdapter.renderEnvelope — failure modes", () => {
     await expect(adapter.surfaceConfig.render(makeEnvelope())).resolves.toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Empty-surfaceSubjects construction warning
+// ---------------------------------------------------------------------------
+
+describe("DiscordAdapter — empty surfaceSubjects warning", () => {
+  test("warns at construction when surfaceSubjects is explicitly []", () => {
+    makeAdapter({ surfaceSubjects: [] });
+    expect(
+      warnings.some((w) =>
+        w.includes("surfaceSubjects is empty") && w.includes("never render bus envelopes"),
+      ),
+    ).toBe(true);
+  });
+
+  test("does NOT warn when surfaceSubjects is undefined (opted out)", () => {
+    makeAdapter({ /* surfaceSubjects: undefined */ });
+    expect(warnings.some((w) => w.includes("surfaceSubjects is empty"))).toBe(false);
+  });
+
+  test("does NOT warn when surfaceSubjects has entries", () => {
+    makeAdapter({ surfaceSubjects: ["local.metafactory.review.>"] });
+    expect(warnings.some((w) => w.includes("surfaceSubjects is empty"))).toBe(false);
+  });
+});

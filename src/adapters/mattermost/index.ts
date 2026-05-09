@@ -70,6 +70,15 @@ export class MattermostAdapter implements PlatformAdapter {
         enabled: true,
       }],
     } as BotConfig;
+
+    // MIG-3b: warn once at construction if surfaceSubjects is explicitly empty.
+    // Mirrors DiscordAdapter — `undefined` is silent (opted out), `[]` is a
+    // config-typo signal worth surfacing.
+    if (adapterConfig.surfaceSubjects?.length === 0) {
+      console.warn(
+        `grove-bot: mattermost-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
+      );
+    }
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
