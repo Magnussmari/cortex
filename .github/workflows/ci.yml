@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validators:
+    name: Compass governance validators
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cortex
+        uses: actions/checkout@v4
+        with:
+          path: cortex
+
+      - name: Checkout compass
+        uses: actions/checkout@v4
+        with:
+          repository: the-metafactory/compass
+          path: compass
+          token: ${{ secrets.GH_PAT_COMPASS_RO || github.token }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run compass validators
+        working-directory: cortex
+        run: |
+          bun ../compass/engine/ci/run-all.ts \
+            --owner the-metafactory \
+            --repo cortex
