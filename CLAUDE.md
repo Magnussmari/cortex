@@ -120,6 +120,17 @@ Each PR is small (one or a few related checklist items). The migration plan IS t
 
 After MIG-8 the migration plan retires. cortex switches to normal feature-work mode (use blueprint.yaml for cross-repo dependency tracking; SOPs as above).
 
+## Generated images
+
+All AI-generated images (architecture diagrams, infographics, etc.) for cortex follow the ecosystem rule:
+
+- **Source of truth** lives in **`~/Documents/andreas_brain/assets/`** following the naming convention `YYYY-MM-DD-{topic}/YYYY-MM-DD-{descriptive-name}.{ext}`.
+- **Repo copy** at `cortex/docs/diagrams/` is for inline rendering in `docs/architecture.md`, README, and design specs. Treat the repo copy as a render artifact; the andreas_brain copy is the source.
+- The art skill outputs to `~/Downloads/` first for preview; once approved, move to andreas_brain (not directly into the repo).
+- Existing example: `cortex/docs/diagrams/cortex-architecture.jpg` + source at `~/Documents/andreas_brain/assets/2026-05-09-cortex-architecture/2026-05-09-cortex-architecture.jpg`.
+
+When updating or regenerating a diagram, update both the andreas_brain canonical copy and the in-repo render copy.
+
 ## Bun
 
 Default to using Bun instead of Node.js.
