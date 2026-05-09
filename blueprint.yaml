@@ -1,0 +1,119 @@
+schema: blueprint/v1
+repo: cortex
+features:
+  C-100:
+    name: Cortex platform — migration from grove-v2 (umbrella)
+    status: in-progress
+    description: >
+      Umbrella feature for the cortex spawn — moving from grove-v2 (and abandoning
+      legacy grove) into the M7-application home for the metafactory ecosystem.
+      See docs/plan-cortex-migration.md for the full per-phase plan.
+    children:
+      - C-101
+      - C-102
+      - C-103
+      - C-104
+      - C-105
+      - C-106
+      - C-107
+      - C-108
+      - C-109
+
+  C-101:
+    name: MIG-0 — Cortex repo bootstrap
+    status: in-progress
+    description: >
+      Compass-core 7-step new-repo bootstrap. Creates the cortex repo, applies
+      labels, lifts design + migration plan, files umbrella issue + per-phase
+      issues. THIS phase is what's happening right now in cortex#2.
+    parent: C-100
+    issue: 2
+
+  C-102:
+    name: MIG-1 — Bus runtime (NATS + myelin + dispatch-handler + surface-router)
+    status: planned
+    description: >
+      Lift the G-1100 ladder out of grove-v2's src/bot/lib/ into cortex/src/bus/.
+      Includes new code for the surface-router (G-1111.A target).
+    parent: C-100
+    issue: 3
+    depends_on: [C-101]
+
+  C-103:
+    name: MIG-2 — Surface (Mission Control v3 lifted)
+    status: planned
+    description: >
+      Move src/mission-control/ + src/worker/ + dashboard-{api,state,db}.ts
+      into cortex/src/surface/mc/. Retire legacy src/dashboard/ (mc-v2).
+    parent: C-100
+    issue: 4
+    depends_on: [C-101]
+    parallelizable: true
+
+  C-104:
+    name: MIG-3 — Adapters (Discord, Mattermost via surface-router)
+    status: planned
+    description: >
+      Move src/bot/lib/adapters/ + Discord client + response-poster into
+      cortex/src/adapters/. Refactor to register with surface-router instead
+      of subscribing to NATS directly. Wire system.adapter.* + system.dispatch.*
+      events.
+    parent: C-100
+    issue: 5
+    depends_on: [C-102]
+
+  C-105:
+    name: MIG-4 — Runner (CC orchestration via bus)
+    status: planned
+    description: >
+      Move cc-session + session-manager + stream-parser + agent-team +
+      worklog-manager etc. into cortex/src/runner/. Refactor to subscribe
+      to dispatch.task.received via surface-router; emit lifecycle envelopes.
+    parent: C-100
+    issue: 6
+    depends_on: [C-102, C-104]
+
+  C-106:
+    name: MIG-5 — Taps (GH webhook + CC events)
+    status: planned
+    description: >
+      Move src/relay/ + src/hooks/ + src/webhook-proxy/ + cloud-publisher
+      into cortex/src/taps/. Update CC hooks to publish CloudEvents to NATS
+      via MyelinRuntime.
+    parent: C-100
+    issue: 7
+    depends_on: [C-102]
+    parallelizable: true
+
+  C-107:
+    name: MIG-6 — Operator CLIs (discord, cldyo-live)
+    status: planned
+    description: >
+      Move src/cli/discord.ts + src/cli/cldyo-live (single bash script)
+      into cortex/src/cli/. Update arc-manifest provides:.
+    parent: C-100
+    issue: 8
+    depends_on: [C-101]
+
+  C-108:
+    name: MIG-7 — Top-level wiring + arc package switchover
+    status: planned
+    description: >
+      Create cortex/src/cortex.ts entrypoint. Refactor config schema to first-class
+      agents[] + renderers[] (agent-bundle flip per design §9). Migration helper
+      for grove-v2 bot.yaml → cortex.yaml. Rename launchd plist + config path.
+      Bump version to v1.0.0 (per §6.3 lean) at cutover.
+    parent: C-100
+    issue: 9
+    depends_on: [C-103, C-104, C-105, C-106, C-107]
+
+  C-109:
+    name: MIG-8 — Retire grove + grove-v2
+    status: planned
+    description: >
+      Verify cortex in production ≥1 week. Archive legacy grove + grove-v2.
+      Remove deprecation shims. Update sibling-repo references from grove:G-NNN
+      to cortex:C-NNN. Final cleanup.
+    parent: C-100
+    issue: 10
+    depends_on: [C-108]
