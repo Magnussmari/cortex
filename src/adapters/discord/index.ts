@@ -101,6 +101,12 @@ export class DiscordAdapter implements PlatformAdapter {
   private adapterConfig: DiscordAdapterConfig;
   private runtime: MyelinRuntime | undefined;
   private systemEventSource: SystemEventSource | undefined;
+  /**
+   * Latches once we've warned about the runtime-without-source case so a
+   * busy adapter doesn't flood the log with the same diagnostic on every
+   * shard event. Cleared only when the adapter is reconstructed.
+   */
+  private warnedMissingSource = false;
 
   constructor(
     adapterConfig: DiscordAdapterConfig,
@@ -120,7 +126,7 @@ export class DiscordAdapter implements PlatformAdapter {
     // it here avoids the "why is nothing rendering?" diagnostic dance.
     if (adapterConfig.surfaceSubjects?.length === 0) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
+        `discord-${this.instanceId}: surfaceSubjects is empty — adapter will never render bus envelopes`,
       );
     }
   }
@@ -151,9 +157,19 @@ export class DiscordAdapter implements PlatformAdapter {
         shardId,
         closeCode: closeEvent.code,
         closeReason: closeEvent.reason,
-        // discord.js wsCloseCode convention: 1000 / 1001 are clean shutdowns,
-        // anything else is unclean. Keep this conservative — surfaces filter
-        // on this for incident vs flap classification.
+        // `was_clean` follows RFC 6455 close-frame semantics: codes 1000/1001
+        // are clean; everything else is unclean.
+        //
+        // Discord layers gateway-specific 4xxx codes on top of the WebSocket
+        // standard set (see https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway):
+        //   - 4004 (auth failed)         — permanent; was_clean: false
+        //   - 4014 (disallowed intents)  — permanent; was_clean: false
+        //   - 4000 (unknown error)       — retryable; was_clean: false
+        // All currently classify as unclean; a surface that wants
+        // transient-vs-permanent must inspect `code` itself. Keep this
+        // conservative — surfaces filter on `was_clean` for incident vs
+        // flap classification, and an "unknown 4xxx" being flagged unclean
+        // is the right default during an outage.
         wasClean: closeEvent.code === 1000 || closeEvent.code === 1001,
       });
     });
@@ -202,7 +218,7 @@ export class DiscordAdapter implements PlatformAdapter {
           const res = await fetch(messageTxt.url);
           if (res.ok) finalContent = (await res.text()).trim();
         } catch (err) {
-          console.warn("grove-bot: discord: failed to fetch message.txt attachment:", err instanceof Error ? err.message : err);
+          console.warn(`discord-${this.instanceId}: failed to fetch message.txt attachment:`, err instanceof Error ? err.message : err);
         }
       }
 
@@ -229,7 +245,7 @@ export class DiscordAdapter implements PlatformAdapter {
             try {
               parent = (await this.client.channels.fetch(thread.parentId)) as TextChannel | null;
             } catch (err) {
-              console.warn("grove-bot: discord: failed to fetch parent channel:", err instanceof Error ? err.message : err);
+              console.warn(`discord-${this.instanceId}: failed to fetch parent channel:`, err instanceof Error ? err.message : err);
             }
           }
           channelName = parent?.name ?? undefined;
@@ -238,7 +254,7 @@ export class DiscordAdapter implements PlatformAdapter {
           channelName = (channel as TextChannel).name ?? undefined;
         }
         if (channelName) {
-          console.log(`grove-bot: channel="${channelName}"${threadName ? ` thread="${threadName}"` : ""}`);
+          console.log(`discord-${this.instanceId}: channel="${channelName}"${threadName ? ` thread="${threadName}"` : ""}`);
         }
       }
 
@@ -428,9 +444,9 @@ export class DiscordAdapter implements PlatformAdapter {
           if (oldest) this.pendingResults.delete(oldest);
         }
         this.pendingResults.set(key, { target, text, files, createdAt: Date.now() });
-        console.warn(`grove-bot: discord: buffered result for ${key} (Discord disconnected, ${this.pendingResults.size} pending)`);
+        console.warn(`discord-${this.instanceId}: buffered result for ${key} (Discord disconnected, ${this.pendingResults.size} pending)`);
       } else {
-        console.error("grove-bot: discord: postResponse failed while connected:", err instanceof Error ? err.message : err);
+        console.error(`discord-${this.instanceId}: postResponse failed while connected:`, err instanceof Error ? err.message : err);
       }
     }
   }
@@ -486,7 +502,7 @@ export class DiscordAdapter implements PlatformAdapter {
     this.progressMessages.delete(key);
     this.progressSending.delete(key);
     try { await msg?.delete(); } catch (err) {
-      console.warn("grove-bot: discord: failed to delete progress message:", err instanceof Error ? err.message : err);
+      console.warn(`discord-${this.instanceId}: failed to delete progress message:`, err instanceof Error ? err.message : err);
     }
   }
 
@@ -509,7 +525,7 @@ export class DiscordAdapter implements PlatformAdapter {
         _native: thread,
       };
     } catch (err) {
-      console.warn("grove-bot: discord: thread creation failed, falling back to channel:", err instanceof Error ? err.message : err);
+      console.warn(`discord-${this.instanceId}: thread creation failed, falling back to channel:`, err instanceof Error ? err.message : err);
       return { instanceId: this.instanceId, channelId: msg.channelId, _native: nativeMsg.channel };
     }
   }
@@ -536,7 +552,7 @@ export class DiscordAdapter implements PlatformAdapter {
       //     the same failure forever and crowd out genuinely transient DMs.
       if (DiscordAdapter.isPermanentlyUndeliverableDMError(err)) {
         console.warn(
-          "grove-bot: discord: dropping operator DM, permanently undeliverable:",
+          `discord-${this.instanceId}: dropping operator DM, permanently undeliverable:`,
           err instanceof Error ? err.message : err,
         );
         return;
@@ -544,7 +560,7 @@ export class DiscordAdapter implements PlatformAdapter {
       if (!this.connectionHealth?.currentlyConnected && isRetryableError(err)) {
         this.bufferOperatorDM(text);
       } else {
-        console.warn("grove-bot: discord: failed to notify operator:", err instanceof Error ? err.message : err);
+        console.warn(`discord-${this.instanceId}: failed to notify operator:`, err instanceof Error ? err.message : err);
       }
     }
   }
@@ -581,7 +597,7 @@ export class DiscordAdapter implements PlatformAdapter {
     }
     this.pendingOperatorDMs.push({ text, createdAt: Date.now() });
     console.warn(
-      `grove-bot: discord: buffered operator DM (Discord disconnected, ${this.pendingOperatorDMs.length} pending)`
+      `discord-${this.instanceId}: buffered operator DM (Discord disconnected, ${this.pendingOperatorDMs.length} pending)`
     );
   }
 
@@ -594,7 +610,7 @@ export class DiscordAdapter implements PlatformAdapter {
     );
     const expired = before - this.pendingOperatorDMs.length;
     if (expired > 0) {
-      console.warn(`grove-bot: discord: expired ${expired} pending operator DM(s)`);
+      console.warn(`discord-${this.instanceId}: expired ${expired} pending operator DM(s)`);
     }
   }
 
@@ -611,7 +627,7 @@ export class DiscordAdapter implements PlatformAdapter {
     const toDeliver = this.pendingOperatorDMs;
     this.pendingOperatorDMs = [];
 
-    console.log(`grove-bot: discord: draining ${toDeliver.length} pending operator DM(s)`);
+    console.log(`discord-${this.instanceId}: draining ${toDeliver.length} pending operator DM(s)`);
     try {
       const operator = await this.client.users.fetch(operatorId);
       for (const pending of toDeliver) {
@@ -619,14 +635,14 @@ export class DiscordAdapter implements PlatformAdapter {
           await operator.send(pending.text);
         } catch (err) {
           console.error(
-            "grove-bot: discord: failed to deliver buffered operator DM:",
+            `discord-${this.instanceId}: failed to deliver buffered operator DM:`,
             err instanceof Error ? err.message : err,
           );
         }
       }
     } catch (err) {
       console.error(
-        "grove-bot: discord: could not fetch operator user to drain DMs:",
+        `discord-${this.instanceId}: could not fetch operator user to drain DMs:`,
         err instanceof Error ? err.message : err,
       );
     }
@@ -635,23 +651,23 @@ export class DiscordAdapter implements PlatformAdapter {
   private async deliverPendingResult(key: string, pending: PendingResult): Promise<boolean> {
     const channel = await this.resolveChannel(pending.target, true);
     if (!channel) {
-      console.warn(`grove-bot: discord: could not resolve channel ${key} for pending result, dropping`);
+      console.warn(`discord-${this.instanceId}: could not resolve channel ${key} for pending result, dropping`);
       return false;
     }
     await postToDiscord(channel, pending.text, DiscordAdapter.toDiscordFiles(pending.files));
-    console.log(`grove-bot: discord: delivered pending result to ${key}`);
+    console.log(`discord-${this.instanceId}: delivered pending result to ${key}`);
     return true;
   }
 
   private async drainPendingResults(): Promise<void> {
     if (this.pendingResults.size === 0) return;
-    console.log(`grove-bot: discord: draining ${this.pendingResults.size} pending result(s) after reconnect`);
+    console.log(`discord-${this.instanceId}: draining ${this.pendingResults.size} pending result(s) after reconnect`);
 
     for (const [key, pending] of this.pendingResults) {
       try {
         await this.deliverPendingResult(key, pending);
       } catch (err) {
-        console.error(`grove-bot: discord: failed to deliver pending result to ${key}:`, err instanceof Error ? err.message : err);
+        console.error(`discord-${this.instanceId}: failed to deliver pending result to ${key}:`, err instanceof Error ? err.message : err);
       }
     }
     this.pendingResults.clear();
@@ -661,7 +677,7 @@ export class DiscordAdapter implements PlatformAdapter {
     const now = Date.now();
     for (const [key, pending] of this.pendingResults) {
       if (now - pending.createdAt > DiscordAdapter.PENDING_TTL_MS) {
-        console.warn(`grove-bot: discord: expired pending result for ${key} (age: ${((now - pending.createdAt) / 1000).toFixed(0)}s)`);
+        console.warn(`discord-${this.instanceId}: expired pending result for ${key} (age: ${((now - pending.createdAt) / 1000).toFixed(0)}s)`);
         this.pendingResults.delete(key);
       }
     }
@@ -727,7 +743,7 @@ export class DiscordAdapter implements PlatformAdapter {
       id: this.instanceId,
       subjects: this.adapterConfig.surfaceSubjects ?? [],
       ...(this.adapterConfig.surfaceFilter ? { filter: this.adapterConfig.surfaceFilter } : {}),
-      render: (envelope) => this.renderEnvelope(envelope),
+      render: (envelope, signal) => this.renderEnvelope(envelope, signal),
     };
   }
 
@@ -745,11 +761,18 @@ export class DiscordAdapter implements PlatformAdapter {
    * channel) and sovereignty-aware redaction. This method stays as the
    * default fallback for envelopes that don't match a registered template.
    *
+   * `signal` is the surface-router's per-render abort signal. We accept it
+   * for contract symmetry but don't currently forward it into discord.js —
+   * the underlying client doesn't accept an AbortSignal and `postResponse`
+   * already buffers on disconnect, so the timeout-cancellation benefit is
+   * marginal. Future refinement: thread the signal into a fetch-based
+   * Discord REST client (a follow-on iteration when v2 templates land).
+   *
    * Failure modes: this method never throws — `postResponse` already swallows
    * delivery errors and buffers when disconnected. The router's
    * `renderWithIsolation` wraps us in a timeout regardless.
    */
-  private async renderEnvelope(envelope: Envelope): Promise<void> {
+  private async renderEnvelope(envelope: Envelope, _signal?: AbortSignal): Promise<void> {
     // Buffering at the adapter level would duplicate `postResponse`'s
     // existing pending-result mechanism; instead we drop here and rely
     // on JetStream replay (per design-cortex.md §3.3 "lost event ≠ lost
@@ -760,20 +783,20 @@ export class DiscordAdapter implements PlatformAdapter {
     // from a transient gateway blip in the logs.
     if (this.client === null) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} renderEnvelope called before start() — dropping envelope ${envelope.id}`,
+        `discord-${this.instanceId}: renderEnvelope called before start() — dropping envelope ${envelope.id}`,
       );
       return;
     }
     if (!this.client.isReady()) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} renderEnvelope called while shard reconnecting — dropping envelope ${envelope.id}`,
+        `discord-${this.instanceId}: renderEnvelope called while shard reconnecting — dropping envelope ${envelope.id}`,
       );
       return;
     }
     const channelId = this.adapterConfig.surfaceFallbackChannelId;
     if (!channelId) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
+        `discord-${this.instanceId}: has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
       );
       return;
     }
@@ -788,25 +811,35 @@ export class DiscordAdapter implements PlatformAdapter {
   // ---------------------------------------------------------------------------
 
   /**
-   * Common gate for `system.adapter.*` emission. Splits the "no runtime
-   * configured" case (silent — bot was started without NATS) from the "no
-   * source configured but runtime present" case (warn once — operator wired
-   * NATS but forgot to pass `systemEventSource`, which is a config bug worth
-   * surfacing).
+   * Common gate for `system.adapter.*` emission. Returns the bound runtime +
+   * source pair when both are configured, or `null` otherwise. Splits the "no
+   * runtime configured" case (silent — bot was started without NATS) from the
+   * "no source configured but runtime present" case (warn once — operator
+   * wired NATS but forgot to pass `systemEventSource`, which is a config bug
+   * worth surfacing).
+   *
+   * Returning the pair (rather than a boolean) lets callers publish without
+   * any non-null assertions on `this.runtime` / `this.systemEventSource` —
+   * the discriminated shape carries the type evidence the compiler needs.
    */
-  private canPublishSystemEvent(): boolean {
-    if (!this.runtime) return false;
-    if (!this.systemEventSource) {
-      // Warn once per missing-source occurrence — without the source, we'd
-      // emit envelopes that fail schema validation on the receiver side. The
-      // operator needs this signal at start time, not buried in error logs
-      // after a real outage.
-      console.warn(
-        `grove-bot: discord-${this.instanceId} runtime is configured but systemEventSource is missing — system.* events will not be emitted`,
-      );
-      return false;
+  private canPublishSystemEvent(): { runtime: MyelinRuntime; source: SystemEventSource } | null {
+    const runtime = this.runtime;
+    if (!runtime) return null;
+    const source = this.systemEventSource;
+    if (!source) {
+      if (!this.warnedMissingSource) {
+        // Warn once per process — without the source, we'd emit envelopes
+        // that fail schema validation on the receiver side. The operator
+        // needs this signal at start time, not flooded across every shard
+        // disconnect during a real outage.
+        console.warn(
+          `discord-${this.instanceId}: runtime is configured but systemEventSource is missing — system.* events will not be emitted`,
+        );
+        this.warnedMissingSource = true;
+      }
+      return null;
     }
-    return true;
+    return { runtime, source };
   }
 
   private publishAdapterDegraded(opts: {
@@ -814,9 +847,10 @@ export class DiscordAdapter implements PlatformAdapter {
     thresholdMs: number;
     since: Date;
   }): void {
-    if (!this.canPublishSystemEvent()) return;
+    const wiring = this.canPublishSystemEvent();
+    if (!wiring) return;
     const env = createSystemAdapterDegradedEvent({
-      source: this.systemEventSource!,
+      source: wiring.source,
       adapterId: opts.instanceId,
       platform: "discord",
       disconnectedSince: opts.since,
@@ -825,22 +859,23 @@ export class DiscordAdapter implements PlatformAdapter {
     });
     // Fire-and-forget — `MyelinRuntime.publish` swallows + logs errors so we
     // never crash the bot just because a degraded notification couldn't ship.
-    void this.runtime!.publish(env);
+    void wiring.runtime.publish(env);
   }
 
   private publishAdapterRecovered(opts: {
     instanceId: string;
     degradedForMs: number;
   }): void {
-    if (!this.canPublishSystemEvent()) return;
+    const wiring = this.canPublishSystemEvent();
+    if (!wiring) return;
     const env = createSystemAdapterRecoveredEvent({
-      source: this.systemEventSource!,
+      source: wiring.source,
       adapterId: opts.instanceId,
       platform: "discord",
       degradedForMs: opts.degradedForMs,
       reconnectAttempts: this.connectionHealth?.reconnectCount,
     });
-    void this.runtime!.publish(env);
+    void wiring.runtime.publish(env);
   }
 
   private publishAdapterDisconnected(opts: {
@@ -849,7 +884,8 @@ export class DiscordAdapter implements PlatformAdapter {
     closeReason?: string;
     wasClean: boolean;
   }): void {
-    if (!this.canPublishSystemEvent()) return;
+    const wiring = this.canPublishSystemEvent();
+    if (!wiring) return;
     // The disconnect timestamp lives on the connection-health snapshot; if
     // discord.js fired shardDisconnect before connection-health updated (or
     // the field was cleared between event and publish), fall back to "now"
@@ -857,7 +893,7 @@ export class DiscordAdapter implements PlatformAdapter {
     const disconnectedSince =
       this.connectionHealth?.lastDisconnectedAt ?? new Date();
     const env = createSystemAdapterDisconnectedEvent({
-      source: this.systemEventSource!,
+      source: wiring.source,
       adapterId: this.instanceId,
       platform: "discord",
       disconnectedSince,
@@ -868,6 +904,6 @@ export class DiscordAdapter implements PlatformAdapter {
       }),
       wasClean: opts.wasClean,
     });
-    void this.runtime!.publish(env);
+    void wiring.runtime.publish(env);
   }
 }

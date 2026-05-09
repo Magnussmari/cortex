@@ -48,6 +48,7 @@
  */
 
 import type { Envelope } from "../../bus/myelin/envelope-validator";
+import { buildBaseEnvelope } from "../../bus/envelope-builder";
 import type { NatsLink } from "../../bus/nats/connection";
 import type { PublishedEvent } from "./hooks/lib/event-types";
 
@@ -69,6 +70,14 @@ export interface CcEventSource {
   agent?: string;
   /** Stable instance name. Defaults to `"relay"`. */
   instance?: string;
+  /**
+   * Operator residency code stamped into `envelope.sovereignty.data_residency`.
+   * Defaults to `"NZ"` when omitted — matches the original cortex deployment.
+   * Operators in other jurisdictions pass their own ISO-3166-style code so
+   * envelopes accurately reflect data residency. Mirrors the parameterisation
+   * pattern in `bus/system-events.ts` and `bus/dispatch-events.ts`.
+   */
+  dataResidency?: string;
 }
 
 function buildSource(src: CcEventSource | undefined): string {
@@ -80,14 +89,15 @@ function buildSource(src: CcEventSource | undefined): string {
 /**
  * Default sovereignty for `cc.*` envelopes. Same posture as `system.*`:
  * operator-only, local residency, no federation, no frontier-model
- * processing. Returned as a fresh literal per call so a downstream
- * mutation on one envelope's sovereignty cannot leak into a sibling
- * envelope.
+ * processing. `data_residency` reads from `source.dataResidency`
+ * (defaulting to `"NZ"`). Returned as a fresh literal per call so a
+ * downstream mutation on one envelope's sovereignty cannot leak into
+ * a sibling envelope.
  */
-function defaultCcSovereignty(): Envelope["sovereignty"] {
+function defaultCcSovereignty(source: CcEventSource | undefined): Envelope["sovereignty"] {
   return {
     classification: "local",
-    data_residency: "NZ",
+    data_residency: source?.dataResidency ?? "NZ",
     max_hop: 0,
     frontier_ok: false,
     model_class: "local-only",
@@ -137,15 +147,19 @@ export function createCcEventEnvelope(
   opts: CreateCcEventEnvelopeOpts,
 ): Envelope {
   const { event } = opts;
-  const envelope: Envelope = {
-    id: crypto.randomUUID(),
-    source: buildSource(opts.source),
+  // Use the shared envelope builder for the skeleton, then override
+  // `timestamp` with the PublishedEvent's hook timestamp so envelope ts ==
+  // hook ts (the relay may batch-process; using `now()` from the shared
+  // helper would smear chronology across batched events). The override is
+  // a single line and preserves the rule-of-three extraction for the rest
+  // of the skeleton.
+  const envelope = buildBaseEnvelope({
     type: event.event_type,
-    // Mirror the published event's timestamp so envelope ts == hook ts.
-    // The relay may batch-process; using `now()` would smear chronology
-    // across batched events.
-    timestamp: event.timestamp,
-    sovereignty: defaultCcSovereignty(),
+    source: buildSource(opts.source),
+    sovereignty: defaultCcSovereignty(opts.source),
+    // Only set correlation_id when session_id has the UUID shape the schema
+    // requires. Non-UUID session ids fall through to payload.session_id only.
+    ...(isUuid(event.session_id) && { correlationId: event.session_id }),
     payload: {
       // Flatten the PublishedEvent into the envelope payload. Downstream
       // consumers who want the legacy taxonomy can read these fields
@@ -162,14 +176,8 @@ export function createCcEventEnvelope(
       // live at top-level on the PublishedEvent, not inside payload.
       ...event.payload,
     },
-  };
-
-  // Only set correlation_id when session_id has the UUID shape the schema
-  // requires. Non-UUID session ids fall through to payload.session_id only.
-  if (isUuid(event.session_id)) {
-    envelope.correlation_id = event.session_id;
-  }
-
+  });
+  envelope.timestamp = event.timestamp;
   return envelope;
 }
 
@@ -194,6 +202,10 @@ export interface CreateCcEventPublisherOpts {
    * Override the envelope `source.instance` segment. Defaults to `"relay"`.
    */
   instance?: string;
+  /**
+   * Operator residency stamped into envelope sovereignty. Defaults to `"NZ"`.
+   */
+  dataResidency?: string;
   /**
    * Override the envelope-construction helper. Lets tests assert on the
    * envelope shape without needing a real NATS connection. Defaults to
@@ -224,6 +236,7 @@ export function createCcEventPublisher(
     org,
     agent: opts.agent ?? "cortex",
     instance: opts.instance ?? "relay",
+    ...(opts.dataResidency !== undefined && { dataResidency: opts.dataResidency }),
   };
   const buildEnvelope =
     opts.buildEnvelope ??

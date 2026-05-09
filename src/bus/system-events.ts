@@ -52,6 +52,7 @@
  */
 
 import type { Envelope } from "./myelin/envelope-validator";
+import { buildBaseEnvelope } from "./envelope-builder";
 
 /**
  * Source identifier used by every `system.*` event. Three dotted segments
@@ -70,6 +71,15 @@ export interface SystemEventSource {
   agent: string;
   /** Stable instance name — usually `local` for in-process emission. */
   instance: string;
+  /**
+   * Operator residency code stamped into `envelope.sovereignty.data_residency`.
+   * Defaults to `"NZ"` when omitted — matches the original cortex deployment.
+   * Operators in other jurisdictions (AU, EU, US) pass their own ISO-3166-style
+   * code so envelopes accurately reflect data residency for compliance audits.
+   * The field is only used when constructing the default sovereignty object;
+   * callers that override `sovereignty` directly bypass it entirely.
+   */
+  dataResidency?: string;
 }
 
 function buildSource(src: SystemEventSource): string {
@@ -83,13 +93,14 @@ function buildSource(src: SystemEventSource): string {
  *
  * `system.*` events expose internal grove state — operator-only, never
  * federated outside the org, never sent to frontier models. The `data_residency`
- * default of "NZ" matches the operator's residency for andreas's deployment;
- * downstream consumers that re-publish for a different operator must override.
+ * field is sourced from `source.dataResidency` (defaulting to `"NZ"`) so a
+ * non-NZ operator gets envelopes stamped with their actual residency without
+ * having to override the entire sovereignty object at every call site.
  */
-function defaultSystemSovereignty(): Envelope["sovereignty"] {
+function defaultSystemSovereignty(source: SystemEventSource): Envelope["sovereignty"] {
   return {
     classification: "local",
-    data_residency: "NZ",
+    data_residency: source.dataResidency ?? "NZ",
     max_hop: 0,
     frontier_ok: false,
     model_class: "local-only",
@@ -151,12 +162,10 @@ export interface SystemAdapterDegradedOpts {
 export function createSystemAdapterDegradedEvent(
   opts: SystemAdapterDegradedOpts,
 ): Envelope {
-  return {
-    id: crypto.randomUUID(),
-    source: buildSource(opts.source),
+  return buildBaseEnvelope({
     type: "system.adapter.degraded",
-    timestamp: new Date().toISOString(),
-    sovereignty: defaultSystemSovereignty(),
+    source: buildSource(opts.source),
+    sovereignty: defaultSystemSovereignty(opts.source),
     payload: {
       adapter_id: opts.adapterId,
       platform: opts.platform,
@@ -170,7 +179,7 @@ export function createSystemAdapterDegradedEvent(
       }),
       ...(opts.shardId !== undefined && { shard_id: opts.shardId }),
     },
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -205,12 +214,10 @@ export interface SystemAdapterRecoveredOpts {
 export function createSystemAdapterRecoveredEvent(
   opts: SystemAdapterRecoveredOpts,
 ): Envelope {
-  return {
-    id: crypto.randomUUID(),
-    source: buildSource(opts.source),
+  return buildBaseEnvelope({
     type: "system.adapter.recovered",
-    timestamp: new Date().toISOString(),
-    sovereignty: defaultSystemSovereignty(),
+    source: buildSource(opts.source),
+    sovereignty: defaultSystemSovereignty(opts.source),
     payload: {
       adapter_id: opts.adapterId,
       platform: opts.platform,
@@ -222,7 +229,7 @@ export function createSystemAdapterRecoveredEvent(
         reconnect_attempts: opts.reconnectAttempts,
       }),
     },
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -255,12 +262,10 @@ export interface SystemAdapterDisconnectedOpts {
 export function createSystemAdapterDisconnectedEvent(
   opts: SystemAdapterDisconnectedOpts,
 ): Envelope {
-  return {
-    id: crypto.randomUUID(),
-    source: buildSource(opts.source),
+  return buildBaseEnvelope({
     type: "system.adapter.disconnected",
-    timestamp: new Date().toISOString(),
-    sovereignty: defaultSystemSovereignty(),
+    source: buildSource(opts.source),
+    sovereignty: defaultSystemSovereignty(opts.source),
     payload: {
       adapter_id: opts.adapterId,
       platform: opts.platform,
@@ -270,7 +275,7 @@ export function createSystemAdapterDisconnectedEvent(
       ...(opts.closeCode !== undefined && { close_code: opts.closeCode }),
       ...(opts.closeReason !== undefined && { close_reason: opts.closeReason }),
     },
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -335,12 +340,11 @@ export interface SystemInboundAbortedOpts {
 export function createSystemInboundAbortedEvent(
   opts: SystemInboundAbortedOpts,
 ): Envelope {
-  const envelope: Envelope = {
-    id: crypto.randomUUID(),
-    source: buildSource(opts.source),
+  return buildBaseEnvelope({
     type: "system.inbound.aborted",
-    timestamp: new Date().toISOString(),
-    sovereignty: defaultSystemSovereignty(),
+    source: buildSource(opts.source),
+    sovereignty: defaultSystemSovereignty(opts.source),
+    ...(opts.correlationId !== undefined && { correlationId: opts.correlationId }),
     payload: {
       adapter_id: opts.adapterId,
       inbound_message_id: opts.inboundMessageId,
@@ -349,9 +353,5 @@ export function createSystemInboundAbortedEvent(
       elapsed_ms: opts.elapsedMs,
       phase: opts.phase,
     },
-  };
-  if (opts.correlationId !== undefined) {
-    envelope.correlation_id = opts.correlationId;
-  }
-  return envelope;
+  });
 }
