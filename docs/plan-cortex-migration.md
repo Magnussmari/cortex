@@ -445,13 +445,13 @@ Each phase = one umbrella issue with a task-list checklist + one or more PRs. Pi
 
 **Steps:**
 
-- [ ] **5.1** Copy from grove-v2: `src/relay/` → `cortex/src/taps/cc-events/`.
-- [ ] **5.2** Copy from grove-v2: `src/hooks/` → `cortex/src/taps/cc-events/hooks/`.
-- [ ] **5.3** Copy from grove-v2: `src/bot/lib/cloud-publisher.ts` → `cortex/src/taps/cc-events/cloud-publisher.ts`.
-- [ ] **5.4** Copy from grove-v2: `src/webhook-proxy/` → `cortex/src/taps/gh-webhook/`.
-- [ ] **5.5** Update CC hook publishing path: hooks publish CloudEvents to NATS via `MyelinRuntime`, not just to JSONL files.
-- [ ] **5.6** Update GitHub webhook proxy: HMAC-validated webhook → publishes `local.{org}.github.{event}.{action}` envelopes onto the bus.
-- [ ] **5.7** Tests moved + green.
+- [x] **5.1** Copy from grove-v2: `src/relay/` → `cortex/src/taps/cc-events/`. *(cortex#17, merged 2026-05-09 — MIG-5a)*
+- [x] **5.2** Copy from grove-v2: `src/hooks/` → `cortex/src/taps/cc-events/hooks/`. *(cortex#17 — hooks subtree placed INSIDE cc-events/; 5 import-path rewrites mechanical)*
+- [ ] **5.3** Copy from grove-v2: `src/bot/lib/cloud-publisher.ts` → `cortex/src/taps/cc-events/cloud-publisher.ts`. *(MIG-5b — scope-management deferral; lands with `src/common/config/` at MIG-7.6)*
+- [x] **5.4** Copy from grove-v2: `src/webhook-proxy/` → `cortex/src/taps/gh-webhook/`. *(cortex#17 — own package preserved; bun.lock regenerated, forward-compatible)*
+- [ ] **5.5** Update CC hook publishing path: hooks publish CloudEvents to NATS via `MyelinRuntime`, not just to JSONL files. *(MIG-5b — strict block on MIG-1.5 myelin-runtime port, deferred to post-MIG-7 per cortex#13)*
+- [ ] **5.6** Update GitHub webhook proxy: HMAC-validated webhook → publishes `local.{org}.github.{event}.{action}` envelopes onto the bus. *(MIG-5b — same MyelinRuntime dependency)*
+- [x] **5.7** Tests moved + green. *(cortex#17 — 84/84 cc-events + 15/15 gh-webhook = 99 tests; bus-publish behaviour tests added with MIG-5b)*
 
 **Acceptance:**
 - A simulated PR-merged GitHub webhook → tap publishes `local.{org}.github.pr.merged` → dashboard renderer renders the event.
