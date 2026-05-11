@@ -4,7 +4,7 @@
 **Date:** 2026-05-11
 **Driver:** Ivy (for Jens-Christian Fischer)
 **Related docs:**
-- `docs/design-pi-dev-review-agent.md` — substrate/presence decoupling that motivates this (committed in this same PR; previously untracked)
+- `docs/design-pi-dev-review-agent.md` — substrate/presence decoupling that motivates this
 - `docs/architecture.md` §6 (bus contracts: subjects + envelopes) and §9 (agent + presence/renderer model)
 - `src/common/agents/registry.ts` — `AgentRegistry` rules §9.3 (trust must resolve at construction)
 - `arc-manifest.yaml` (cortex root) — current arc package shape for cortex itself
@@ -56,10 +56,13 @@ Cortex's runner (after MIG-7.1 lands `src/cortex.ts`) spawns Claude Code subproc
 arc install foo-review-bot
   → drops persona.md   → ~/.config/cortex/personas/foo.md
   → drops fragment     → ~/.config/cortex/agents.d/foo.yaml
-  → mints NATS creds   → cortex creds issue foo
-                         (cortex daemon mints, writes ~/.config/nats/creds/foo.creds)
   → signals cortex     → SIGHUP or `cortex agents reload`
-                         (loader+watcher, extended per §6.1, pick up the fragment)
+                         (loader+watcher, extended per §6.1, pick up the fragment;
+                          daemon registers foo BEFORE creds issue so it can scope
+                          the credential to foo's runtime.capabilities)
+  → mints NATS creds   → cortex creds issue foo
+                         (cortex daemon mints with foo's capability scope,
+                          writes ~/.config/nats/creds/foo.creds)
 ```
 
 **No new process. No new launchd plist.** The watcher (`src/common/config/watcher.ts`) hot-reloads `cortex.yaml` today and is extended in §6.1 to also watch `~/.config/cortex/agents.d/`. Cortex's runner spawns CC for foo on the next dispatch matching foo's capability.
@@ -70,18 +73,38 @@ Use this shape for: simple persona-based agents on the cortex's Claude-Code subs
 
 Substrate-flexibility lives here. Codex / pi.dev / custom-binary bots run as their own daemons, connect directly to the same NATS bus cortex is on, and self-register capabilities.
 
-```
-arc install foo-codex-review-bot
-  → drops persona.md   → ~/.config/cortex/personas/foo.md
-  → drops fragment     → ~/.config/cortex/agents.d/foo.yaml
-  → mints NATS creds   → ~/.config/nats/creds/foo.creds
-  → installs binary    → ~/bin/foo-bot   (symlink to package)
-  → installs plist     → ~/Library/LaunchAgents/ai.meta-factory.foo.plist
-  → launchctl load     → daemon starts, connects bus, registers capability
-  → signals cortex     → cortex sees new fragment, agent appears in registry
+**Standalone bots install into multiple arc targets** (per arc#117's HostAdapter pattern): the `cortex` host receives the identity fragment + persona + NATS creds; the OS supervision host (`darwin-launchd` or `linux-systemd`) receives the daemon binary + service unit. Both targets land in a single `arc install` transaction.
+
+```yaml
+# foo-codex-review-bot/arc-manifest.yaml — standalone shape
+targets: [cortex, darwin-launchd]   # arc#117 multi-target install
+type: agent
+runtime:
+  substrate: codex
+  mode: standalone
+  capabilities: [code-review]
 ```
 
-The bot daemon is wholly owned by arc's lifecycle (its own pre/post install scripts). Cortex sees the agent only via:
+```
+arc install foo-codex-review-bot
+  → cortex target:
+      drops persona.md   → ~/.config/cortex/personas/foo.md
+      drops fragment     → ~/.config/cortex/agents.d/foo.yaml
+      signals cortex     → SIGHUP or `cortex agents reload`
+                            (daemon registers foo from agents.d/ before creds issue)
+      mints NATS creds   → cortex creds issue foo
+                            (now scoped to foo's runtime.capabilities)
+                            → ~/.config/nats/creds/foo.creds (cortex daemon-signed)
+  → darwin-launchd target:
+      installs binary    → ~/bin/foo-bot   (symlink to package)
+      installs plist     → ~/Library/LaunchAgents/ai.meta-factory.foo.plist
+      launchctl load     → daemon starts LAST — connects bus with the creds,
+                            publishes capability registration to NATS KV
+```
+
+**Daemon-down resilience:** if cortex is briefly unreachable when `arc install` runs the signal step, the install can fail fast OR proceed (arc-side flag). When cortex comes back, the watcher (§6.1) picks up `agents.d/` on next poll cycle. Standalone daemons retry their NATS connect with backoff. No bespoke retry logic needed in `installArtifact` — the eventual-consistency guarantee from the watcher + the NATS reconnect both already cover this. Implementers should NOT add their own retry loops here.
+
+The bot daemon is wholly owned by the OS supervision target's lifecycle (its own pre/post install scripts within that HostAdapter). Cortex sees the agent only via:
 1. The fragment file in `agents.d/` (identity + trust + presence)
 2. The NATS capability registry (`local.{org}.agents.capabilities.foo`)
 3. Envelopes published by the bot on the bus
@@ -106,14 +129,14 @@ Default to in-process when substrate is `claude-code` and the bot doesn't need a
 
 ## 4. Bot Arc-Manifest Schema
 
-Extends arc's existing manifest schema with an `agent` type. Cortex itself stays `type: component` (per the current `arc-manifest.yaml` at the cortex root).
+Extends arc's existing manifest schema with an `agent` type. Cortex itself stays `type: component` (per the current `arc-manifest.yaml` at the cortex root). The install destination is declared via arc#117's `targets:` field — cortex registers as a `HostAdapter` (see §14 for the relationship to arc#117's multi-backend work).
 
 ```yaml
 # foo-review-bot/arc-manifest.yaml
 name: foo-review-bot
 version: 0.1.0
-type: agent                       # NEW — arc enforces parent-installed-first
-parent: cortex                    # NEW — dependency on cortex package
+type: agent                       # NEW — arc artifact type for bus-participating agents
+targets: [cortex]                 # arc#117 — bot installs into cortex's HostAdapter
 description: Code review bot for TypeScript repos
 
 runtime:
@@ -146,13 +169,13 @@ provides:
 
 lifecycle:
   preinstall:
-    - scripts/check-cortex-version.sh    # require parent at compatible version
+    - scripts/check-cortex-version.sh    # CortexHostAdapter.detect() + version range check
   postinstall:
-    - scripts/issue-nats-creds.sh        # mints per-agent NATS user (Q2 answer)
-    - scripts/signal-cortex-reload.sh    # SIGHUP cortex or call `cortex agents reload`
+    - scripts/signal-cortex-reload.sh    # FIRST — daemon learns about agent from agents.d/
+    - scripts/issue-nats-creds.sh        # THEN — mints per-agent NATS user (Q2; daemon scopes creds to capabilities)
   preuninstall:
-    - scripts/drain-tasks.sh             # OPEN Q4 — stop accepting, wait, then remove
-    - scripts/signal-cortex-reload.sh    # cortex drops the agent from registry
+    - scripts/drain-tasks.sh             # D1 (was Q4) — stop accepting, wait, then remove
+    - scripts/signal-cortex-reload.sh    # cortex drops the agent from registry (creds revoked in removeArtifact per D7)
 ```
 
 **Schema decisions (locked):**
@@ -218,17 +241,73 @@ These are the prerequisites for `arc install <bot>` to work end-to-end. None of 
 
 Estimated ~150 LOC + tests. Lands as a `feat(common/config)` PR.
 
-### 6.2 Arc — `type: agent` + `parent:` dependency
+### 6.2 Arc — ship a `CortexHostAdapter` (per arc#117)
 
-**Scope:** arc's manifest schema + install order.
+**Scope:** new `CortexHostAdapter` implementing arc#117's `HostAdapter` interface. Lands alongside the `ClaudeCodeHostAdapter`, `CodexHostAdapter`, `CursorHostAdapter`, etc. that arc#117 introduces.
 
-- Schema extension: `type: agent` is a distinct kind from `type: component` (cortex's kind). Arc validates `parent` is installed (or being installed in the same transaction) and at a compatible version range.
-- Install order: agents install after their parent. Lifecycle scripts can reference parent's installation root (`PAI_PARENT_INSTALL_PATH`).
-- Uninstall order: agents uninstall before their parent.
-- `arc list --type agent` filters to agents.
-- `arc agents` subcommand (optional): groups agents by parent for legibility.
+This supersedes the earlier draft's "extend arc with `type: agent` + `parent:` schema" proposal — cortex doesn't need a parent-dependency mechanism specific to itself. Arc#117's `targets:` field + HostAdapter detection covers the same surface: a bot declares `targets: [cortex]`, arc detects whether cortex is installed (via its `CortexHostAdapter.detect()`), and refuses the install if the target isn't available.
 
-Estimated ~200 LOC in arc + schema doc + a couple integration tests. Lands in arc repo, not cortex.
+```ts
+// arc/src/hosts/cortex.ts (proposed)
+export class CortexHostAdapter implements HostAdapter {
+  id = "cortex" as const;
+
+  detect(): boolean {
+    // cortex daemon reachable via NATS request/reply on local.{org}.cortex.health
+    // OR cortex binary on PATH + cortex.yaml at expected location
+  }
+
+  paths: HostPaths & CortexPaths = {
+    skillsDir:    "",                                  // n/a — cortex isn't a skills host
+    agentsDir:    "~/.config/cortex/agents.d/",        // arc#117 HostPaths field — identity fragments
+    binDir:       "~/bin/",                            // arc#117 HostPaths field — standalone bot binaries
+    settingsPath: "~/.config/cortex/cortex.yaml",      // arc#117 HostPaths field — operator-edited core config
+    hooksFormat:  "none",                              // arc#117 HostPaths field — no claude-code-style hooks
+    // Cortex-internal extensions (not in arc#117 HostPaths today):
+    personasDir:  "~/.config/cortex/personas/",        // persona markdown files
+    credsDir:     "~/.config/nats/creds/",             // per-agent NATS creds (daemon-written)
+  };
+
+  supports(type: ArtifactType): boolean {
+    return type === "agent";                           // cortex hosts agents; skills go elsewhere
+  }
+
+  installArtifact(pkg, type): void {
+    // ORDER MATTERS — fragment must be visible to daemon BEFORE creds issue
+    // (daemon scopes the credential to the agent's capabilities, which it
+    // reads from the fragment).
+    // 1. Drop persona.md into paths.personasDir
+    // 2. Render + drop agent.yaml fragment into paths.agentsDir
+    // 3. Signal cortex via SIGHUP or `cortex agents reload`
+    //      → daemon re-reads agents.d/ and adds the new agent to registry
+    // 4. Invoke `cortex creds issue <agent-id>` (daemon-mediated; see §6.3)
+    //      → daemon now knows about the agent, scopes creds to its capabilities
+  }
+
+  removeArtifact(pkg): void {
+    // Reverse order per §8.3 — revoke creds BEFORE removing files
+    // 1. Drain (per D1) if standalone — emit agents.{id}.draining, wait
+    // 2. cortex creds revoke <agent-id>   (server-side first, then local file)
+    //      → abort uninstall on revoke failure (D7)
+    // 3. Remove fragment + persona
+    // 4. Signal cortex reload (registry rebuilt without the agent)
+  }
+}
+```
+
+**Note on `HostPaths` extension:** arc#117's current `HostPaths` interface (per the issue body) defines `skillsDir`, `agentsDir`, `promptsDir`, `binDir`, `settingsPath`, `hooksFormat`. Cortex's adapter introduces two additional fields (`personasDir`, `credsDir`) shown above as a `HostPaths & CortexPaths` intersection — these are cortex-internal extensions, not modifications to arc#117's interface. Two arc-side paths forward:
+1. **Cortex-internal (preferred for v1):** `personasDir` and `credsDir` live only on `CortexHostAdapter.paths`. Arc#117's generic `arc list --target cortex` doesn't know about them; cortex's own diagnostics do.
+2. **Promote to `HostPaths` (deferrable):** if another future host adapter wants the same paths (unlikely — personas are cortex-specific; creds are NATS-specific), propose `HostPaths` extension on arc#117.
+
+Either way, no contract break on arc#117. Carry-forward to §14 intersection points.
+
+**Multi-target install ordering** (per arc#117 §3): a standalone bot with `targets: [cortex, darwin-launchd]` MUST install to `cortex` FIRST (fragment + creds — daemon needs to know about the agent before it shows up on the bus) then `darwin-launchd` (binary + plist + load). Uninstall reverses (unload daemon first, then revoke creds + remove fragment). **How arc#117 expresses this ordering is an open coordination item** — proposed shape: cortex declares `installOrder: "before"` for the `agent` artifact type on its `CortexHostAdapter`. Whether arc#117 adopts that field name or a different mechanism is tracked in §14 open intersection points; the invariant (cortex-target-first, reverse on uninstall) is non-negotiable regardless of how it's spelled in the adapter API.
+
+**`arc list --target cortex`** (per arc#117 §3 CLI) lists all installed cortex agents — replaces the earlier draft's proposed cortex-specific `arc agents` subcommand. Reuses arc's generic per-target listing.
+
+Estimated ~250 LOC (`CortexHostAdapter` + tests) + ~50 LOC in cortex (the `cortex agents reload` CLI subcommand for adapter postinstall to call). Lands as two PRs: arc-side `feat(hosts): CortexHostAdapter` and cortex-side `feat(cli/cortex): agents reload command`.
+
+**Phasing note:** this depends on arc#117 Phase 1 (the `PaiPaths` → `ArcPaths` + `HostAdapter` legacy cut) being merged. arc#117 sits at "future" priority today; cortex#58's Phase A.3 (`CortexHostAdapter` itself) unblocks once arc#117 Phase 1 lands. Phase A.1 (cortex `agents.d/`) and Phase A.2 (cortex `cortex creds` CLI) are independent of arc#117 and can land first.
 
 ### 6.3 Cortex — `cortex creds issue` CLI (Q2)
 
@@ -262,7 +341,7 @@ Estimated ~300 LOC + tests + NATS account scaffolding doc. Lands as a `feat(cli/
 name: claude-review-bot
 version: 0.1.0
 type: agent
-parent: cortex
+targets: [cortex]                  # arc#117 single-target install
 runtime:
   substrate: claude-code
   mode: in-process
@@ -278,8 +357,8 @@ provides:
     agent.yaml: ~/.config/cortex/agents.d/rev.yaml
 lifecycle:
   postinstall:
-    - scripts/issue-nats-creds.sh
-    - scripts/signal-cortex-reload.sh
+    - scripts/signal-cortex-reload.sh    # FIRST — daemon registers rev
+    - scripts/issue-nats-creds.sh        # THEN — daemon scopes creds to rev's capabilities
 ```
 
 `arc install claude-review-bot` → 4 files dropped, cortex hot-reloads, rev appears in dashboard as `rev (in-process / claude-code)`. First `tasks.code-review.*` task on the bus is claimed by rev's CC subprocess. No restart, no manual config edits.
@@ -291,7 +370,7 @@ lifecycle:
 name: codex-review-bot
 version: 0.1.0
 type: agent
-parent: cortex
+targets: [cortex, darwin-launchd]  # arc#117 multi-target install
 runtime:
   substrate: codex
   mode: standalone
@@ -309,9 +388,9 @@ provides:
   plist: services/ai.meta-factory.codex-rev.plist
 lifecycle:
   postinstall:
-    - scripts/issue-nats-creds.sh
-    - scripts/signal-cortex-reload.sh
-    - scripts/launchctl-load.sh
+    - scripts/signal-cortex-reload.sh    # 1. daemon registers codex-rev
+    - scripts/issue-nats-creds.sh        # 2. daemon scopes creds (capabilities visible now)
+    - scripts/launchctl-load.sh          # 3. daemon starts last — needs creds + registry
 ```
 
 `arc install codex-review-bot` → fragment + persona drop, plist rendered + loaded, daemon connects bus, registers `code-review` capability. Cortex sees codex-rev in fragments and on the capability KV — same agent identity (just on a different substrate). On the bus, codex-rev and rev are competing consumers for `tasks.code-review.*` per pull-consumer-group semantics.
@@ -343,17 +422,19 @@ Operator interacts with Scout indirectly: another agent (Luna) dispatches a rese
 
 ```
 operator: arc install foo-review-bot
-arc:      preinstall: scripts/check-cortex-version.sh        [verify parent compat]
+arc:      preinstall: scripts/check-cortex-version.sh        [verify cortex target compat via CortexHostAdapter.detect()]
 arc:      drop persona.md   → ~/.config/cortex/personas/foo.md
 arc:      drop agent.yaml   → ~/.config/cortex/agents.d/foo.yaml
-arc:      postinstall: scripts/issue-nats-creds.sh
-            → cortex creds issue foo
-            → ~/.config/nats/creds/foo.creds written
-arc:      postinstall: scripts/signal-cortex-reload.sh
+arc:      postinstall: scripts/signal-cortex-reload.sh        [signal BEFORE creds]
             → SIGHUP cortex bot pid (or `cortex agents reload`)
             → config-watcher.ts re-reads agents.d/
             → agents[] now includes foo
-            → AgentRegistry rebuilt
+            → AgentRegistry rebuilt — daemon now knows foo + its capabilities
+arc:      postinstall: scripts/issue-nats-creds.sh
+            → cortex creds issue foo
+            → daemon scopes the cred to foo's runtime.capabilities (which it
+              just loaded from the fragment)
+            → ~/.config/nats/creds/foo.creds written
 operator: foo appears in dashboard, can take tasks
 ```
 
@@ -361,18 +442,22 @@ operator: foo appears in dashboard, can take tasks
 
 ```
 operator: arc install codex-review-bot
-arc:      preinstall: scripts/check-cortex-version.sh
+arc:      preinstall: scripts/check-cortex-version.sh         [via CortexHostAdapter.detect()]
 arc:      drop persona, agent.yaml, binary (~/bin/codex-rev-bot)
 arc:      drop plist → ~/Library/LaunchAgents/ai.meta-factory.codex-rev.plist
-arc:      postinstall: scripts/issue-nats-creds.sh
-arc:      postinstall: scripts/launchctl-load.sh
+arc:      postinstall: scripts/signal-cortex-reload.sh        [signal FIRST so daemon learns about agent]
+            → cortex re-reads agents.d/, registers codex-rev
+arc:      postinstall: scripts/issue-nats-creds.sh            [now daemon can scope creds]
+            → cortex creds issue codex-rev
+            → ~/.config/nats/creds/codex-rev.creds written
+arc:      postinstall: scripts/launchctl-load.sh              [start daemon LAST — needs creds + registry]
             → daemon starts
             → connects NATS with codex-rev.creds
             → publishes capabilities to local.{org}.agents.capabilities.codex-rev
-arc:      postinstall: scripts/signal-cortex-reload.sh
-            → cortex sees agent.yaml fragment in agents.d/
 operator: codex-rev appears in dashboard alongside cortex-hosted agents
 ```
+
+**Ordering invariant across both shapes (matches §6.2 `installArtifact` and §6.3 chicken-and-egg sequencing):** drop fragment → signal reload → issue creds → (standalone only) start daemon. The daemon needs the fragment loaded before it can scope the credential; the daemon (standalone shape) needs the credential before it can connect.
 
 ### 8.3 Uninstall
 
@@ -436,6 +521,7 @@ The strict contract is the right v1 default because it surfaces config errors at
 | D6 | **Trust contract:** strict — `AgentRegistry` `UnknownAgentReferenceError` on unresolved trust at construction. Multi-bot install with cross-trust requires arc transaction (Q2). | Holly review feedback + alignment with `registry.ts` §9.3 |
 | D7 | **Uninstall ordering:** revoke creds (server-side first, then local file) BEFORE removing fragment + persona + binary + plist. Arc aborts on revoke failure rather than continuing. | Holly review feedback (major #3) |
 | D8 | **Signing model:** daemon-mediated (CLI is thin client; operator account key lives in cortex daemon memory; CLI talks via NATS or UNIX socket). | Holly review feedback (major #5) |
+| D9 | **Arc integration shape:** cortex registers as a `HostAdapter` per arc#117's multi-backend pattern; bots declare `targets: [cortex]` (multi-target for standalone shape: `targets: [cortex, darwin-launchd]`). Supersedes the earlier draft's `type: agent` + `parent: cortex` schema extension proposal. | arc#117 alignment |
 
 ### 10.2 Open Questions (need decision before Phase A starts)
 
@@ -453,28 +539,27 @@ The strict contract is the right v1 default because it surfaces config errors at
 
 ### Phase A — Plumbing (no bots installable yet)
 
-- [ ] **A.1** Cortex `agents.d/` fragment support (§6.1) — `feat(common/config)` PR
-- [ ] **A.2** `cortex creds issue/revoke/rotate` CLI (§6.3) — `feat(cli/cortex)` PR
-- [ ] **A.3** Arc `type: agent` + `parent:` schema extension (§6.2) — arc-repo PR
-- [ ] **A.4** Persona format spec doc — `docs/persona-format.md`
+- [ ] **A.1** Cortex `agents.d/` fragment support (§6.1) — `feat(common/config)` PR. Independent of arc#117.
+- [ ] **A.2** `cortex creds issue/revoke/rotate` CLI (§6.3) — `feat(cli/cortex)` PR. Independent of arc#117.
+- [ ] **A.3** `CortexHostAdapter` in arc (§6.2) — arc-repo `feat(hosts): CortexHostAdapter` PR. **Blocked on arc#117 Phase 1** (the `PaiPaths` → `ArcPaths` + `HostAdapter` legacy cut). Lands after arc#117 Phase 1 merges.
+- [ ] **A.4** `cortex agents reload` CLI subcommand — `feat(cli/cortex)` PR. Called by `CortexHostAdapter.installArtifact` postinstall step + by SIGHUP signal handler.
+- [ ] **A.5** Persona format spec doc — `docs/persona-format.md`
 
 ### Phase B — First bot package + lifecycle scripts
 
-- [ ] **B.1** `claude-review-bot` repo with arc-manifest + persona + lifecycle scripts (in-process pattern)
-- [ ] **B.2** `cortex agents reload` CLI command
-- [ ] **B.3** Operator runbook: `docs/operator-installing-bots.md`
+- [ ] **B.1** `claude-review-bot` repo with arc-manifest (`targets: [cortex]`) + persona + lifecycle scripts (in-process pattern)
+- [ ] **B.2** Operator runbook: `docs/operator-installing-bots.md`
 
 ### Phase C — First standalone bot
 
-- [ ] **C.1** `pi-dev-review-bot` repo — packages the pi.dev design's bus-bridge + review-agent as an arc package
-- [ ] **C.2** Plist template + lifecycle scripts for standalone bots
-- [ ] **C.3** Verify dashboard renders in-process vs standalone correctly
+- [ ] **C.1** `pi-dev-review-bot` repo — packages the pi.dev design's bus-bridge + review-agent as an arc package with `targets: [cortex, darwin-launchd]`
+- [ ] **C.2** Verify dashboard renders in-process vs standalone correctly
+- [ ] **C.3** `linux-systemd` HostAdapter in arc (once first Linux host enters deployment topology — arc#117 Phase 3 timing)
 
 ### Phase D — Operator polish
 
-- [ ] **D.1** `arc agents` subcommand for grouped listing
-- [ ] **D.2** Drain-on-uninstall semantics + timeout config
-- [ ] **D.3** Creds rotation scheduler
+- [ ] **D.1** Drain-on-uninstall semantics + timeout config (D1)
+- [ ] **D.2** Creds rotation scheduler (D2)
 
 ---
 
@@ -490,13 +575,38 @@ The strict contract is the right v1 default because it surfaces config errors at
 
 ## 13. References
 
-- `docs/design-pi-dev-review-agent.md` — substrate decoupling that this builds on (committed in this same PR)
+- `docs/design-pi-dev-review-agent.md` — substrate decoupling that this builds on
 - `docs/architecture.md` §6 (bus contracts: subjects + envelope shape), §9 (agent + presence/renderer model), §9.2 (renderer interface), §9.3 (trust rules)
 - `arc-manifest.yaml` (cortex root) — current arc manifest example
+- `the-metafactory/arc#117` — multi-backend `HostAdapter` + `targets:` field. cortex registers as a host via this pattern (see §14).
 - `src/common/agents/registry.ts` — `AgentRegistry` rules §9.3 (trust must resolve at construction; `UnknownAgentReferenceError` thrown otherwise)
 - `src/common/agents/trust-resolver.ts` — `TrustResolver` (platformId ↔ agentId)
 - `src/common/config/loader.ts` + `watcher.ts` — config hot-reload surface (`agents.d/` support lands per §6.1)
 
 ---
 
-*This document is the design specification for arc-installable sub-bots. Implementation follows the phased plan in §11. Review owners: Luna (architecture), Andreas (ecosystem fit + arc schema impact).*
+## 14. Relationship to arc#117 (multi-backend `HostAdapter`)
+
+[arc#117](https://github.com/the-metafactory/arc/issues/117) reshapes arc from `~/.claude/`-pinned to a multi-backend tool that installs into Claude Code, Codex CLI, Cursor, Continue, Zed, Roo Code, and other agentic backends via a `HostAdapter` abstraction. Each adapter declares per-host paths (`skillsDir`, `agentsDir`, `binDir`, `settingsPath`, `hooksFormat`) and an `installArtifact()` / `removeArtifact()` lifecycle. Manifests gain an optional `targets:` field that pins an artifact to specific hosts; default is "every detected host that supports the artifact type."
+
+**Cortex's place in arc#117's model:** cortex is a host. Not a *peer* of Claude Code / Codex / Cursor (those are claude-code-style hosts where users write `*.md` skills); cortex is a runtime host for bus-participating agents. It registers via a `CortexHostAdapter` whose `supports(type)` returns true only for `type: agent`. Skills, slash-commands, and rules go elsewhere; bots go to cortex.
+
+**How the two designs compose:**
+
+1. **arc#117 invents the abstraction.** Before arc#117, arc had no concept of "install into multiple distinct backends with different paths." `PaiPaths` was a single global path table. arc#117 unifies this around `HostAdapter`.
+
+2. **cortex#58 plugs into the abstraction.** Instead of cortex#58 inventing cortex-specific arc schema (`type: agent` + `parent: cortex` as proposed in the v1 draft of this doc), cortex ships a `CortexHostAdapter` that fits arc#117's interface. `targets: [cortex]` replaces `parent: cortex`. Multi-target installs (`targets: [cortex, darwin-launchd]`) cleanly express the standalone shape's split-install.
+
+3. **Independence of decisions.** D1–D8 are unaffected — the substrate/presence decoupling, persona ownership, per-agent NATS keys, daemon-mediated signing, strict trust, revoke-before-remove, all hold regardless of arc#117's interface. arc#117 changes HOW arc routes the install to cortex (HostAdapter dispatch vs hard-coded paths); D1–D8 describe WHAT happens once it lands.
+
+4. **Sequencing.** Cortex#58 Phase A.1 (`agents.d/` support) and A.2 (`cortex creds issue` CLI) are independent of arc#117 — they land in cortex first and can be exercised manually (without arc) for testing. Phase A.3 (`CortexHostAdapter`) is blocked on arc#117 Phase 1 (the `PaiPaths` → `ArcPaths` + first `HostAdapter` legacy cut) merging. Until then, operators run a thin shell wrapper (`cortex install-bot <path>`) that does what `arc install` will eventually do.
+
+**Open intersection points (carry-forward for arc#117 review):**
+
+- **`hooksFormat: "none"` for cortex** — arc#117's `HostPaths` includes a `hooksFormat` field (`"json"` for claude-code, `"toml"` for codex). Cortex doesn't have settings hooks in the claude-code sense. Declaring `"none"` is the natural fit but the precise semantics ("attempts to install hooks into cortex error out cleanly") should be confirmed with arc#117's spec.
+- **Multi-target install order** — arc#117 §3 sketches `targets:` but doesn't yet specify install-order semantics across targets in a single transaction. cortex#58 §6.2 names a need (cortex target FIRST, then OS-supervision target) — coordinate with arc#117 to ensure the HostAdapter scheduler exposes this.
+- **Detect impl for `CortexHostAdapter.detect()`** — preferred path: NATS request/reply on `local.{org}.cortex.health` (returns daemon version). Fallback: cortex binary on PATH + valid `cortex.yaml`. Both are testable.
+
+---
+
+*This document is the design specification for arc-installable sub-bots. Implementation follows the phased plan in §11. Review owners: Holly (cortex#58 + cortex#60 reviewer), Andreas (ecosystem fit + arc schema impact). This follow-up updates the design against [arc#117](https://github.com/the-metafactory/arc/issues/117) — multi-backend `HostAdapter` pattern.*
