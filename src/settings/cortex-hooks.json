@@ -1,27 +1,39 @@
 {
+  "_comment": "Reference / operator-facing fallback for ~/.claude/settings.json. arc auto-registers these hooks from arc-manifest.yaml's provides.hooks during `arc install/upgrade Cortex` — do NOT manually merge this file into settings.json or hooks will double-fire. Paths here point at the INSTALLED symlinks (created by arc under ~/.claude/hooks/), matching what arc itself writes. Holly cortex#52 round 1 architecture findings #4 + #5.",
   "hooks": {
     "SessionStart": [
       {
         "type": "command",
-        "command": "bun $GROVE_DIR/src/hooks/GroveContext.hook.ts"
+        "command": "${CLAUDE_DIR}/hooks/CortexContext.hook.ts"
       }
     ],
     "PostToolUse": [
       {
         "type": "command",
-        "command": "bun $GROVE_DIR/src/hooks/EventLogger.hook.ts"
+        "command": "${CLAUDE_DIR}/hooks/CortexEventLogger.hook.ts"
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "bun $GROVE_DIR/src/hooks/EventLogger.hook.ts"
+        "command": "${CLAUDE_DIR}/hooks/CortexEventLogger.hook.ts"
       }
     ],
     "UserPromptSubmit": [
       {
         "type": "command",
-        "command": "bun $GROVE_DIR/src/hooks/EventLogger.hook.ts"
+        "command": "${CLAUDE_DIR}/hooks/CortexEventLogger.hook.ts"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_DIR}/hooks/CortexBashGuard.hook.ts"
+          }
+        ]
       }
     ]
   }
