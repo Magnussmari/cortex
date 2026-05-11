@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.cortex.relay</string>
+    <string>ai.meta-factory.cortex.relay</string>
     <key>ProgramArguments</key>
     <array>
         <string>__BUN_PATH__</string>
-        <string>__GROVE_DIR__/src/taps/cc-events/relay.ts</string>
+        <string>__CORTEX_DIR__/src/taps/cc-events/relay.ts</string>
         <string>start</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>__GROVE_DIR__</string>
+    <string>__CORTEX_DIR__</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
