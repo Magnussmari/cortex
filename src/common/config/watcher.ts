@@ -4,8 +4,9 @@
  */
 
 import { watch, type FSWatcher, existsSync } from "fs";
-import { loadConfig } from "./loader";
+import { loadConfig, loadAgentsDirectory, FragmentLoadError, expandTilde } from "./loader";
 import type { BotConfig } from "../types/config";
+import type { Agent } from "../types/cortex-config";
 
 export interface ConfigChangeEvent {
   /** Fields that were applied without requiring restart */
@@ -324,4 +325,263 @@ export class ConfigWatcher {
   getConfig(): BotConfig {
     return this.config;
   }
+}
+
+// =============================================================================
+// F-2 — AgentsDirectoryWatcher (cortex#60 §6.1)
+// =============================================================================
+
+/**
+ * Event emitted by `AgentsDirectoryWatcher` when fragments under
+ * `~/.config/cortex/agents.d/` change. Separate shape from `ConfigChangeEvent`
+ * because the agents-d surface is independent of the bot.yaml loader (today)
+ * and will stay separable when the loader migrates to cortex.yaml.
+ */
+export interface AgentsChangeEvent {
+  /** Source that triggered the reload. */
+  source: "watcher" | "sighup" | "cli";
+  /**
+   * `true` if the reload threw `FragmentLoadError`. When true, `agents` is
+   * the PRIOR valid set (not the failed one) — caller keeps using it.
+   */
+  failed: boolean;
+  /** Populated only when `failed: true`. */
+  error?: { file: string; reason: string };
+  /** Currently active agent set. On success: the fresh load. On failure:
+   *  the last-known-good set. */
+  agents: Agent[];
+  /** Agent ids in the new set that were not in the prior set. */
+  agentsAdded: string[];
+  /** Agent ids in the prior set that are no longer in the new set. */
+  agentsRemoved: string[];
+  /** Agent ids whose definition (JSON-stringified shape) changed. */
+  agentsChanged: string[];
+}
+
+export type AgentsChangeHandler = (event: AgentsChangeEvent) => void;
+
+/**
+ * Watches an `agents.d/` directory for fragment file changes and reloads
+ * via `loadAgentsDirectory()` on a 200ms debounce. Emits `AgentsChangeEvent`
+ * to the handler.
+ *
+ * Mid-run failure handling (cortex#60 spec §FR-5): when a reload throws
+ * `FragmentLoadError`, the watcher retains the prior `Agent[]` and emits a
+ * `failed: true` event. The handler can render a "reload failed" badge but
+ * the in-memory state stays consistent.
+ *
+ * The watcher does NOT enforce boot-time strictness — that's the loader's
+ * job at startup (caller invokes `loadAgentsDirectory()` directly + lets
+ * `FragmentLoadError` propagate; the watcher only starts AFTER a successful
+ * initial load).
+ */
+export class AgentsDirectoryWatcher {
+  private agentsDir: string;
+  private agents: Agent[];
+  private handler: AgentsChangeHandler;
+  private debounceMs: number;
+  private watcher: FSWatcher | null = null;
+  private reloadTimeout: NodeJS.Timeout | null = null;
+
+  constructor(
+    agentsDir: string,
+    initialAgents: Agent[],
+    handler: AgentsChangeHandler,
+    options: { debounceMs?: number } = {},
+  ) {
+    // Echo M1 — single source-of-truth tilde expansion shared with the loader.
+    this.agentsDir = expandTilde(agentsDir);
+    this.agents = initialAgents;
+    this.handler = handler;
+    this.debounceMs = options.debounceMs ?? 200;
+  }
+
+  /**
+   * Registration grace window in ms. macOS FSEvents subscribes asynchronously;
+   * if a test (or production code) writes a file immediately after `start()`
+   * returns, the event may be lost. `waitForReady()` waits this long for the
+   * watcher to fully bind before resolving. Tests should `await` it after
+   * `start()` to eliminate the race (Echo M4 on cortex#62).
+   */
+  private readonly registrationGraceMs = 30;
+  private readyPromise: Promise<void> | null = null;
+
+  start(): void {
+    if (!existsSync(this.agentsDir)) {
+      // Operator hasn't created agents.d/ yet. The watcher noops — when arc
+      // first drops a fragment, fs.watch on the parent dir would catch it
+      // but that widens scope. For v1: log + return. Operator restarts cortex
+      // after creating the dir, or invokes `cortex agents reload` (F-3).
+      console.warn(`agents-watcher: agents.d directory not found at ${this.agentsDir} — watcher idle`);
+      this.readyPromise = Promise.resolve();
+      return;
+    }
+
+    console.log(`agents-watcher: watching ${this.agentsDir} for fragment changes`);
+
+    const triggerReload = (source: "watcher" | "sighup" | "cli" = "watcher") => {
+      if (this.reloadTimeout) clearTimeout(this.reloadTimeout);
+      this.reloadTimeout = setTimeout(() => this.reload(source), this.debounceMs);
+    };
+
+    this.watcher = watch(this.agentsDir, { persistent: false }, (eventType: string, filename: string | null) => {
+      // Only react to YAML file events. Don't fire on dotfile flutter.
+      if (!filename) return;
+      if (filename.startsWith(".")) return;
+      if (!filename.endsWith(".yaml") && !filename.endsWith(".yml")) return;
+      // eventType is "rename" (create/delete) or "change" — both warrant a reload.
+      if (eventType === "rename" || eventType === "change") {
+        triggerReload("watcher");
+      }
+    });
+
+    // Register a small grace promise — tests await this before writing
+    // fixtures to ensure the fs.watch subscription is fully bound.
+    this.readyPromise = new Promise((resolve) =>
+      setTimeout(resolve, this.registrationGraceMs),
+    );
+  }
+
+  /**
+   * Resolves once the underlying fs.watch is bound (or immediately if the
+   * watcher is idle because agents.d/ doesn't exist). Useful for tests that
+   * want to write a fragment file right after `start()` without racing the
+   * macOS FSEvents subscription. Production code typically doesn't need it —
+   * the registration grace is short (30ms).
+   */
+  waitForReady(): Promise<void> {
+    return this.readyPromise ?? Promise.resolve();
+  }
+
+  stop(): void {
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+    if (this.reloadTimeout) {
+      clearTimeout(this.reloadTimeout);
+      this.reloadTimeout = null;
+    }
+  }
+
+  /**
+   * Public entry point for non-watcher-triggered reloads. F-3's CLI
+   * (`cortex agents reload`) and the SIGHUP handler will call this with
+   * the appropriate `source` value.
+   */
+  triggerReload(source: "sighup" | "cli"): void {
+    if (this.reloadTimeout) clearTimeout(this.reloadTimeout);
+    // Skip debounce for explicit triggers — operator wants the reload now.
+    this.reload(source);
+  }
+
+  /** Get the current agent set (reflects last successful reload). */
+  getAgents(): Agent[] {
+    return this.agents;
+  }
+
+  private reload(source: "watcher" | "sighup" | "cli"): void {
+    try {
+      const fresh = loadAgentsDirectory(this.agentsDir);
+      const diff = diffAgents(this.agents, fresh);
+      this.agents = fresh;
+      this.handler({
+        source,
+        failed: false,
+        agents: fresh,
+        agentsAdded: diff.added,
+        agentsRemoved: diff.removed,
+        agentsChanged: diff.changed,
+      });
+    } catch (err) {
+      if (err instanceof FragmentLoadError) {
+        // Mid-run failure: keep prior agents alive, surface the error.
+        this.handler({
+          source,
+          failed: true,
+          error: { file: err.file, reason: err.reason },
+          agents: this.agents,
+          agentsAdded: [],
+          agentsRemoved: [],
+          agentsChanged: [],
+        });
+      } else {
+        // Unexpected error — log + emit a failed event with a synthetic file
+        // path. Doesn't crash the watcher.
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(`agents-watcher: unexpected reload error: ${reason}`);
+        this.handler({
+          source,
+          failed: true,
+          error: { file: this.agentsDir, reason },
+          agents: this.agents,
+          agentsAdded: [],
+          agentsRemoved: [],
+          agentsChanged: [],
+        });
+      }
+    }
+  }
+}
+
+/** Compute the agent-id diff between two Agent arrays. */
+function diffAgents(
+  prior: Agent[],
+  next: Agent[],
+): { added: string[]; removed: string[]; changed: string[] } {
+  const priorById = new Map(prior.map((a) => [a.id, a]));
+  const nextById = new Map(next.map((a) => [a.id, a]));
+
+  const added: string[] = [];
+  const removed: string[] = [];
+  const changed: string[] = [];
+
+  for (const id of nextById.keys()) {
+    if (!priorById.has(id)) {
+      added.push(id);
+    } else if (!deepEqual(priorById.get(id), nextById.get(id))) {
+      // Echo N4 on cortex#62 — was JSON.stringify which depends on field
+      // ordering. `deepEqual` is order-independent.
+      changed.push(id);
+    }
+  }
+  for (const id of priorById.keys()) {
+    if (!nextById.has(id)) {
+      removed.push(id);
+    }
+  }
+
+  return { added: added.sort(), removed: removed.sort(), changed: changed.sort() };
+}
+
+/**
+ * Order-independent structural equality. Handles plain objects, arrays, and
+ * scalars — the shapes Agent values actually inhabit. Doesn't try to be a
+ * general deep-equal (no Date/RegExp/Map/Set support); kept narrow on
+ * purpose so it stays auditable.
+ */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return a === b;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== "object") return false;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  if (Array.isArray(b)) return false;
+  const aKeys = Object.keys(a as object);
+  const bKeys = Object.keys(b as object);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    if (!deepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) {
+      return false;
+    }
+  }
+  return true;
 }
