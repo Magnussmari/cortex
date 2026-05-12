@@ -27,10 +27,12 @@ import { existsSync, lstatSync, readdirSync } from "fs";
 import { join } from "path";
 
 import { expandTilde } from "../../../common/config/loader";
-import { CliArgsError } from "./_shared/arg-error";
+import { CliArgsError, MissingPositionalError } from "./_shared/arg-error";
 import { envelopeError, envelopeOk, renderJson } from "./_shared/envelope";
 import { assertExhaustive } from "./_shared/assert-exhaustive";
 import { type ExitResult } from "./_shared/exit-result";
+import { parseSubcommandArgs, type SubcommandSpec } from "./_shared/parser";
+import { boolFlag, valueFlag } from "./_shared/hydrate";
 
 // =============================================================================
 // Types
@@ -100,127 +102,83 @@ const MAX_CREDS_DIR_ENTRIES = 10_000;
 // =============================================================================
 
 /**
- * Per-subcommand flag allowlist (Echo M3 on cortex#64). Parser rejects
- * flags that don't apply to the active subcommand — e.g.
- * `cortex creds issue echo --creds-dir /tmp` is now an error, not a silent
- * ignore.
+ * Grammar spec for `cortex creds`. Consumed by `parseSubcommandArgs`
+ * (cortex#66 generic parser extract). Per-subcommand flag scoping +
+ * positionals enforced via the spec.
  */
-const SUBCOMMAND_FLAGS: Record<"list" | "issue" | "revoke" | "rotate", Set<string>> = {
-  list: new Set(["--creds-dir", "--json", "--help", "-h"]),
-  issue: new Set(["--config", "--json", "--help", "-h"]),
-  revoke: new Set(["--config", "--json", "--help", "-h"]),
-  rotate: new Set(["--config", "--json", "--help", "-h"]),
+const CREDS_SPEC: SubcommandSpec<"list" | "issue" | "revoke" | "rotate"> = {
+  cliName: "creds",
+  subcommands: {
+    list: { flags: { "--creds-dir": "value" } },
+    issue: { positionals: ["agent-id"], flags: { "--config": "value" } },
+    revoke: { positionals: ["agent-id"], flags: { "--config": "value" } },
+    rotate: { positionals: ["agent-id"], flags: { "--config": "value" } },
+  },
+  universal: { "--help": "bool", "-h": "bool", "--json": "bool" },
 };
 
+/**
+ * Parses `cortex creds` CLI arguments via the generic `parseSubcommandArgs`
+ * helper. The deferred subcommands (issue/revoke/rotate) need a required
+ * `<agent-id>` positional — declared via the spec's `positionals: [...]`
+ * array. Missing positional surfaces as a `CliArgsError` ("missing
+ * required positional argument: <agent-id>") which the deferred-subcommand
+ * handler maps to a user-friendly message.
+ *
+ * Note: the helper enforces required positionals; the legacy parser
+ * special-cased missing-id in `runDeferredSubcommand`. That handler still
+ * has a defensive missing-id check for `args.agentId` for the case where
+ * callers construct ParsedCredsArgs by hand (existing test pattern).
+ */
 export function parseCredsArgs(argv: string[]): ParsedCredsArgs {
-  const out: ParsedCredsArgs = {
-    subcommand: "unknown",
-    rawSubcommand: "",
-    agentId: undefined,
-    credsDir: undefined,
-    config: undefined,
-    json: false,
-    help: false,
-  };
-
-  if (argv.length === 0) return out;
-
-  // First pass: identify subcommand from the first positional (so we know
-  // the flag allowlist before reading subsequent flags).
-  const firstPositional = argv.find((a) => !a.startsWith("-"));
-  if (firstPositional) {
-    out.rawSubcommand = firstPositional;
+  let parsed;
+  try {
+    parsed = parseSubcommandArgs(CREDS_SPEC, argv);
+  } catch (err) {
+    // Echo cortex#66 round-1 M1 — was regex-matching the error message;
+    // now `instanceof MissingPositionalError` and a strict
+    // `positionalName === "agent-id"` check. Decoupled from internal phrasing.
+    //
+    // Missing-required-positional for issue/revoke/rotate used to be
+    // handled inside `runDeferredSubcommand` (it checks `!args.agentId`
+    // and renders a friendly envelope). The generic parser now throws on
+    // the missing positional. Catch that specific subclass and return a
+    // degenerate args object so the handler emits its own message;
+    // re-throw everything else.
     if (
-      firstPositional === "list" ||
-      firstPositional === "issue" ||
-      firstPositional === "revoke" ||
-      firstPositional === "rotate"
+      err instanceof MissingPositionalError &&
+      err.positionalName === "agent-id"
     ) {
-      out.subcommand = firstPositional;
+      // Echo cortex#66 round-1 warning — use the parser-supplied
+      // `rawSubcommand` rather than naively re-scanning argv. The parser
+      // already walked argv skipping flag-value pairs; trust its answer.
+      const sub = err.rawSubcommand;
+      const known =
+        sub === "list" || sub === "issue" || sub === "revoke" || sub === "rotate"
+          ? sub
+          : "unknown";
+      return {
+        subcommand: known,
+        rawSubcommand: sub,
+        agentId: undefined,
+        credsDir: undefined,
+        config: undefined,
+        json: false,
+        help: false,
+      };
     }
-  } else if (argv.includes("--help") || argv.includes("-h")) {
-    out.subcommand = "help";
+    throw err;
   }
 
-  let i = 0;
-  let positionalsSeen = 0;
-  while (i < argv.length) {
-    const arg = argv[i]!;
-
-    if (arg === "--help" || arg === "-h") {
-      if (out.subcommand !== "help") {
-        out.help = true;
-      }
-      i++;
-      continue;
-    }
-    if (arg === "--json") {
-      assertFlagAllowed(out.subcommand, "--json");
-      out.json = true;
-      i++;
-      continue;
-    }
-    if (arg === "--creds-dir") {
-      assertFlagAllowed(out.subcommand, "--creds-dir");
-      if (i + 1 >= argv.length || argv[i + 1]!.startsWith("-")) {
-        throw new CliArgsError("creds", "--creds-dir requires a path argument");
-      }
-      out.credsDir = argv[i + 1];
-      i += 2;
-      continue;
-    }
-    if (arg === "--config") {
-      assertFlagAllowed(out.subcommand, "--config");
-      if (i + 1 >= argv.length || argv[i + 1]!.startsWith("-")) {
-        throw new CliArgsError("creds", "--config requires a path argument");
-      }
-      out.config = argv[i + 1];
-      i += 2;
-      continue;
-    }
-    if (arg.startsWith("-")) {
-      throw new CliArgsError("creds", `unknown flag: ${arg}`);
-    }
-
-    // Positionals
-    positionalsSeen++;
-    if (positionalsSeen === 1) {
-      // Already captured above as rawSubcommand. No-op.
-      i++;
-      continue;
-    }
-    if (positionalsSeen === 2) {
-      if (
-        out.subcommand === "issue" ||
-        out.subcommand === "revoke" ||
-        out.subcommand === "rotate"
-      ) {
-        out.agentId = arg;
-        i++;
-        continue;
-      }
-      throw new CliArgsError("creds", `unexpected extra positional argument: "${arg}"`);
-    }
-    throw new CliArgsError("creds", `unexpected extra positional argument: "${arg}"`);
-  }
-
-  return out;
-}
-
-function assertFlagAllowed(
-  subcommand: ParsedCredsArgs["subcommand"],
-  flag: string,
-): void {
-  // Flags before a subcommand is determined are accepted (the subcommand
-  // resolves at the end). Help is universal; --json is universal.
-  if (subcommand === "unknown" || subcommand === "help") return;
-  const allowed = SUBCOMMAND_FLAGS[subcommand];
-  if (!allowed.has(flag)) {
-    throw new CliArgsError(
-      "creds",
-      `flag ${flag} is not valid for subcommand "${subcommand}"`,
-    );
-  }
+  return {
+    subcommand: parsed.subcommand,
+    rawSubcommand: parsed.rawSubcommand,
+    agentId: parsed.positionals["agent-id"],
+    credsDir: valueFlag(parsed.flags, "--creds-dir"),
+    config: valueFlag(parsed.flags, "--config"),
+    json: boolFlag(parsed.flags, "--json"),
+    help: parsed.help,
+  };
 }
 
 // =============================================================================
