@@ -13,22 +13,67 @@
  * (G-1100.E wires that up).
  */
 
+import { readFile } from "fs/promises";
 import {
   connect as natsConnect,
+  credsAuthenticator,
   Events,
   type ConnectionOptions,
   type NatsConnection,
 } from "nats";
+import { enforceChmod600 } from "../../common/config/file-permissions";
+import { expandTilde } from "../../common/config/loader";
 
 export interface NatsLinkOptions {
   /** NATS server URL (e.g. nats://localhost:4222). */
   url: string;
   /** Bearer token for the connect-time auth. Optional. */
   token?: string;
+  /**
+   * Path to a NATS user `.creds` file for operator-mode auth (cortex#86).
+   * The loader expands a leading `~/` to `$HOME`, enforces chmod 600 on
+   * POSIX (file MUST NOT be group- or world-readable — `.creds` carries
+   * an NKey seed + signed JWT), reads the bytes, and passes them to
+   * `credsAuthenticator(...)` as `ConnectionOptions.authenticator`.
+   * When both `token` and `credsPath` are set, `credsPath` wins and a
+   * warn log explains the precedence so operators notice a duplicated
+   * config rather than silently picking one.
+   */
+  credsPath?: string;
   /** Connection name surfaced on the server's `varz` endpoint. */
   name?: string;
   /** Override the underlying nats `connect` function (test seam). */
   connectImpl?: (opts: ConnectionOptions) => Promise<NatsConnection>;
+}
+
+/**
+ * Read a NATS user `.creds` file from disk and return its bytes for
+ * `credsAuthenticator(...)`. `.creds` files carry the user's NKey seed
+ * and a signed JWT — both sensitive enough to refuse loading from a
+ * group- or world-readable file.
+ *
+ * Uses the canonical `expandTilde` from `common/config/loader.ts` (so
+ * the no-`$HOME` failure surfaces consistently with cortex.yaml load)
+ * and the shared `enforceChmod600` permission gate from
+ * `common/config/file-permissions.ts` (same policy as the operator
+ * account signing-key loader — Echo cortex#87 round-1 extraction).
+ *
+ * Throws with an operator-readable message when:
+ *   - `expandTilde` rejects (no `$HOME` set).
+ *   - The file is missing / unreadable (ENOENT / EACCES propagate).
+ *   - The file mode is not exactly `0o600` on POSIX.
+ */
+async function loadCredsBytes(rawPath: string): Promise<Uint8Array> {
+  const path = expandTilde(rawPath);
+  // `enforceChmod600` is sync (statSync) — that's intentional in the
+  // sibling loader to keep the stat-then-read TOCTOU window minimal.
+  // The subsequent async `readFile` widens that window slightly, but
+  // the daemon owns `~/.config/nats/` entirely so the practical risk
+  // is near zero — an attacker who can swap files in the daemon's
+  // home has already won.
+  enforceChmod600(path);
+  const buf = await readFile(path);
+  return new Uint8Array(buf);
 }
 
 /**
@@ -63,13 +108,31 @@ export class NatsLink {
     const connectImpl = opts.connectImpl ?? natsConnect;
     const name = opts.name ?? "grove-bot";
 
-    const raw = await connectImpl({
+    // Build base connect options. We branch on auth mode separately so that
+    // an operator-mode `.creds` connection never leaks a bearer token into
+    // the wire — `credsAuthenticator` and `token` are mutually exclusive
+    // server-side, and the warn log calls out the precedence explicitly.
+    const connectOpts: ConnectionOptions = {
       servers: [opts.url],
-      token: opts.token,
       name,
       // Defer reconnect to the underlying client; we just log status.
       reconnect: true,
-    });
+    };
+
+    if (opts.credsPath) {
+      if (opts.token) {
+        console.warn(
+          `nats-connection: "${name}" — both 'token' and 'credsPath' set; ` +
+            `'credsPath' takes precedence (operator-mode auth wins).`,
+        );
+      }
+      const credsBytes = await loadCredsBytes(opts.credsPath);
+      connectOpts.authenticator = credsAuthenticator(credsBytes);
+    } else if (opts.token) {
+      connectOpts.token = opts.token;
+    }
+
+    const raw = await connectImpl(connectOpts);
 
     return new NatsLink(raw, name);
   }
