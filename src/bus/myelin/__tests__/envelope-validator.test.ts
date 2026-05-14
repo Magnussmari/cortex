@@ -293,8 +293,6 @@ describe("envelope-validator — F-021 task envelope fields (IAW Phase A.2)", ()
   // (visible on the typed Envelope) but not yet acted on for routing or
   // trust — that's IAW Phase B / cortex#102 territory.
 
-  const ED25519_SIG = "A".repeat(88);
-
   test("accepts an envelope with all F-021 task fields populated (direct)", () => {
     const env = {
       ...(validEnvelope as object),
@@ -484,11 +482,29 @@ describe("envelope-validator — chain helpers (IAW Phase A.2)", () => {
     expect(getLastStampPrincipal(env as Envelope)).toBeUndefined();
   });
 
-  test("schema source commit points at the post-F-021 myelin pin", () => {
+  test("schema source commit points at the post-myelin#115 stack-aware pin", () => {
     // Lock the pin so future bumps surface in a code review.
     expect(SCHEMA_SOURCE_COMMIT).toBe(
-      "4578ae1e9bc595e667fbb356ea2c12c8c2c3cc8a",
+      "b69c877e23a2696040561c2d832fdc75aa83f73e",
     );
+  });
+
+  test("SCHEMA_SOURCE_COMMIT matches the @the-metafactory/myelin pin in package.json (Sage R2 drift guard)", async () => {
+    // The schema is vendored at `SCHEMA_SOURCE_COMMIT` AND the runtime
+    // `deriveSubject` implementation is pulled from the same myelin commit
+    // via the npm dep. If a future bump updates one but forgets the other,
+    // cortex would run new grammar against an old schema (or vice versa).
+    // This test reads package.json's myelin dep ref and asserts equality.
+    const pkgPath = new URL("../../../../package.json", import.meta.url);
+    const pkg = (await import(pkgPath.pathname, { with: { type: "json" } })) as {
+      default: { dependencies?: Record<string, string> };
+    };
+    const myelinDep = pkg.default.dependencies?.["@the-metafactory/myelin"];
+    expect(myelinDep).toBeDefined();
+    // Format: "github:the-metafactory/myelin#<40-char-sha>"
+    const match = myelinDep!.match(/#([0-9a-f]{40})$/);
+    expect(match).not.toBeNull();
+    expect(match![1]).toBe(SCHEMA_SOURCE_COMMIT);
   });
 });
 
@@ -539,6 +555,36 @@ describe("deriveNatsSubject (IAW A.3)", () => {
     expect(deriveNatsSubject(env)).toBe(
       "local.acme.system.adapter.degraded",
     );
+  });
+
+  // IAW Phase A.5 — stack-aware subject emission (myelin#113 grammar).
+  test("local + stack → local.{org}.{stack}.{type}", () => {
+    const env = envWithClassification("local");
+    expect(deriveNatsSubject(env, "research")).toBe(
+      "local.metafactory.research.system.adapter.degraded",
+    );
+  });
+
+  test("federated + stack → federated.{org}.{stack}.{type}", () => {
+    const env = envWithClassification("federated");
+    expect(deriveNatsSubject(env, "security")).toBe(
+      "federated.metafactory.security.system.adapter.degraded",
+    );
+  });
+
+  test("public + stack → stack is dropped (public is global)", () => {
+    // `public.` subjects never carry an org or stack segment, regardless of
+    // what the caller supplies — matches myelin#113 grammar.
+    const env = envWithClassification("public");
+    expect(deriveNatsSubject(env, "devops")).toBe(
+      "public.system.adapter.degraded",
+    );
+  });
+
+  test("invalid stack segment is rejected by myelin grammar", () => {
+    // STACK_SEGMENT_REGEX = /^[a-z][a-z0-9-]{0,62}$/ — uppercase rejected.
+    const env = envWithClassification("local");
+    expect(() => deriveNatsSubject(env, "BadStack")).toThrow(/stack segment/i);
   });
 });
 
@@ -607,5 +653,61 @@ describe("validateSubjectEnvelopeAlignment (IAW A.3)", () => {
     expect(result.aligned).toBe(false);
     expect(result.expected).toBe("local");
     expect(result.actual).toBe("public");
+  });
+
+  // -------------------------------------------------------------------------
+  // Behavior-pinning tests (Sage R1 — PR #151 important finding).
+  //
+  // The shim delegates entirely to `subjectPrefixAligns` from
+  // `@the-metafactory/myelin/subjects`. These tests assert concrete
+  // alignment semantics that a future myelin behavior change (e.g.,
+  // case-folding, partial-prefix matching, whitespace tolerance) would
+  // silently inherit. Pin them here so cortex's bus invariants fail
+  // fast at vendor-bump time rather than at production publish time.
+  // -------------------------------------------------------------------------
+
+  test("alignment is case-sensitive — uppercase classification does NOT match", () => {
+    // If myelin ever case-folds, `LOCAL.metafactory.*` would start to
+    // count as aligned with a `local`-classified envelope and this
+    // assertion would fail, surfacing the semantic drift.
+    const env = envWithClassification("local");
+    const result = validateSubjectEnvelopeAlignment(
+      "LOCAL.metafactory.system.adapter.degraded",
+      env,
+    );
+    expect(result.aligned).toBe(false);
+    expect(result.actual).toBe("LOCAL");
+  });
+
+  test("alignment requires a dot boundary after the prefix — no partial matches", () => {
+    // Pin: `local-host.something.*` MUST NOT count as aligned with a
+    // `local`-classified envelope. Catches a future regression where a
+    // pure `startsWith` check without dot-boundary enforcement creeps
+    // back in.
+    const env = envWithClassification("local");
+    const result = validateSubjectEnvelopeAlignment(
+      "local-host.metafactory.system.adapter.degraded",
+      env,
+    );
+    expect(result.aligned).toBe(false);
+    expect(result.expected).toBe("local");
+    expect(result.actual).toBe("local-host");
+  });
+
+  test("bare classification subject (no payload segments) is aligned", () => {
+    // Pin: subject === classification exactly should count as aligned.
+    // Edge case where the dot-boundary check would naively fail.
+    const env = envWithClassification("local");
+    const result = validateSubjectEnvelopeAlignment("local", env);
+    expect(result.aligned).toBe(true);
+    expect(result.actual).toBe("local");
+  });
+
+  test("empty subject is misaligned (no prefix at all)", () => {
+    const env = envWithClassification("local");
+    const result = validateSubjectEnvelopeAlignment("", env);
+    expect(result.aligned).toBe(false);
+    expect(result.expected).toBe("local");
+    expect(result.actual).toBe("");
   });
 });
