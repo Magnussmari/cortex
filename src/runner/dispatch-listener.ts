@@ -57,6 +57,7 @@
  */
 
 import type { Envelope } from "../bus/myelin/envelope-validator";
+import { getSignedByChain } from "../bus/myelin/envelope-validator";
 import type { MyelinRuntime } from "../bus/myelin/runtime";
 import type {
   SurfaceAdapter,
@@ -67,6 +68,14 @@ import type {
   DispatchRequest,
   SessionHarness,
 } from "../common/substrates/types";
+import type { PolicyEngine } from "../common/policy/engine";
+import { extractAgentIdFromDid } from "../common/policy/did";
+import type {
+  Intent,
+  PolicyDenyReason,
+  Principal,
+} from "../common/policy/types";
+import { createDispatchTaskFailedEvent } from "../bus/dispatch-events";
 import {
   ClaudeCodeHarness,
   type CCSessionFactory as ClaudeCodeFactory,
@@ -152,6 +161,21 @@ export interface DispatchListenerOptions {
    * (a future operator-controlled fleet) can disambiguate.
    */
   adapterId?: string;
+  /**
+   * IAW Phase C.3.1 — optional PolicyEngine gate. When present, every
+   * inbound `dispatch.task.received` envelope passes through
+   * `engine.check(principalId, intent)` before reaching a substrate
+   * harness. A deny short-circuits the dispatch (`harness.dispatch`
+   * is never called) and logs to stderr; C.4 will additionally emit
+   * a `system.access.denied` audit envelope here.
+   *
+   * When the option is `undefined` the listener falls back to the
+   * pre-C.3 path: every envelope reaches a harness. This preserves
+   * the legacy single-operator/dev-mode boot (no `policy:` block in
+   * cortex.yaml → `policyEngineFromConfig` returns `undefined` →
+   * passed through verbatim here).
+   */
+  policyEngine?: PolicyEngine;
 }
 
 export interface DispatchListener {
@@ -191,6 +215,7 @@ export function createDispatchListener(
     router,
     source,
     ccSessionFactory,
+    policyEngine,
     adapterId = "runner-dispatch-listener",
   } = opts;
   const subjects = opts.subjects ?? defaultSubjects(source.org);
@@ -210,7 +235,8 @@ export function createDispatchListener(
     // iteration can wire `signal.aborted` to `harness.shutdown({ graceful:
     // false })` so surface-router timeouts end the CC process eagerly
     // rather than waiting for cc-session's internal timer to fire.
-    render: (envelope, _signal) => handleDispatchEnvelope(envelope, runtime, source, ccSessionFactory),
+    render: (envelope, _signal) =>
+      handleDispatchEnvelope(envelope, runtime, source, ccSessionFactory, policyEngine),
   };
 
   return {
@@ -294,7 +320,10 @@ function parsePayload(envelope: Envelope): DispatchTaskReceivedPayload | null {
  * from the request — the harness handles `persona === undefined` per
  * the A.1b spec (optional field).
  */
-function buildDispatchRequest(payload: DispatchTaskReceivedPayload): DispatchRequest {
+function buildDispatchRequest(
+  payload: DispatchTaskReceivedPayload,
+  principal?: Principal,
+): DispatchRequest {
   const tools: DispatchRequest["tools"] = {
     allow: payload.allowed_tools ?? [],
     ...(payload.disallowed_tools !== undefined && { deny: payload.disallowed_tools }),
@@ -332,6 +361,7 @@ function buildDispatchRequest(payload: DispatchTaskReceivedPayload): DispatchReq
     requestId: payload.task_id,
     ...(hasRuntime && { runtime }),
     ...(payload.timeout_ms !== undefined && { timeoutMs: payload.timeout_ms }),
+    ...(principal !== undefined && { principal }),
   };
 
   return req;
@@ -356,6 +386,7 @@ async function handleDispatchEnvelope(
   runtime: MyelinRuntime,
   source: SystemEventSource,
   ccSessionFactory: CCSessionFactory | undefined,
+  policyEngine: PolicyEngine | undefined,
 ): Promise<void> {
   const payload = parsePayload(envelope);
   if (!payload) {
@@ -363,6 +394,56 @@ async function handleDispatchEnvelope(
       `cortex-runner: dispatch-listener: malformed dispatch.task.received envelope id=${envelope.id} — required fields missing`,
     );
     return;
+  }
+
+  // IAW Phase C.3.1 — policy gate. When the engine is configured we
+  // resolve the originating principal from `envelope.signed_by[0]`
+  // (the first stamp is the originator per myelin#31 chain ordering;
+  // hub-stamps later in the chain re-attest but don't replace
+  // origin). The capability claim is a placeholder
+  // `dispatch.<agent_id>` derived from the dispatch target — until
+  // C.2b carries an explicit capability tag on the payload, the
+  // dispatch surface is "may principal X invoke agent Y on this
+  // stack?". Sovereignty flows through verbatim so audit envelopes
+  // (C.4) carry the same constraints the engine saw.
+  //
+  // When the engine is undefined the listener falls back to the
+  // legacy unauthenticated path — the runner is booted without a
+  // `policy:` block. C.2b removes the legacy path entirely.
+  let gatedPrincipal: Principal | undefined;
+  if (policyEngine !== undefined) {
+    const decision = checkDispatchPolicy(policyEngine, envelope, payload);
+    if (!decision.allow) {
+      console.error(
+        `cortex-runner: dispatch-listener: denied envelope id=${envelope.id} task_id=${payload.task_id} agent=${payload.agent_id} — reason=${decision.reason.kind}`,
+      );
+      // Echo cortex#220 round 2 M-1: synthesise a `dispatch.task.failed`
+      // terminal envelope on the same correlation_id so subscribers
+      // correlating on task_id (worklog-manager.ts, agent-team.ts) see
+      // a terminal lifecycle event and don't hang waiting on a
+      // completion that will never arrive. The structured `reason`
+      // field lets them branch on the policy_denied case distinctly
+      // from substrate-side errors; C.4's `system.access.denied`
+      // audit envelope lives on a different subject and serves
+      // different consumers (audit pipeline, dashboard) — both
+      // envelopes are emitted for a denied dispatch.
+      const now = new Date();
+      const failed = createDispatchTaskFailedEvent({
+        source,
+        taskId: payload.task_id,
+        agentId: payload.agent_id,
+        startedAt: now,
+        failedAt: now,
+        errorSummary: `policy gate denied dispatch: ${decision.reason.kind}`,
+        reason: {
+          kind: "policy_denied",
+          deny: { ...decision.reason },
+        },
+      });
+      await runtime.publish(failed);
+      return;
+    }
+    gatedPrincipal = decision.principal;
   }
 
   // Per-dispatch harness — see fn-doc above for rationale. `source` is
@@ -373,7 +454,7 @@ async function handleDispatchEnvelope(
     ...(ccSessionFactory !== undefined && { ccSessionFactory }),
   });
 
-  const req = buildDispatchRequest(payload);
+  const req = buildDispatchRequest(payload, gatedPrincipal);
 
   // Drain the harness's lifecycle stream onto the bus. The harness
   // guarantees at least one terminal envelope; we publish whatever it
@@ -384,5 +465,114 @@ async function handleDispatchEnvelope(
   for await (const env of harness.dispatch(req)) {
     await runtime.publish(env);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Policy gating helpers (C.3.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of the policy gate: an `allow` carries the authenticated
+ * principal forward to the harness; a `deny` carries the structured
+ * reason for the stderr log (and the future C.4 audit envelope).
+ */
+type DispatchPolicyResult =
+  | { allow: true; principal: Principal | undefined }
+  | { allow: false; reason: PolicyDenyReason };
+
+/**
+ * Build an `Intent` from the envelope + payload and ask the engine.
+ *
+ * **⚠ SECURITY — pre-Phase-B authorization-without-authentication.**
+ * The principal claim read here (`signed_by[0].principal`) is
+ * **not yet cryptographically verified at the envelope-validator
+ * layer**. Per `src/bus/myelin/envelope-validator.ts:125-126`:
+ * *"IAW Phase A.2: `signed_by` is surfaced but not yet consumed
+ * for trust decisions."* That means a publisher to the bus can
+ * fabricate `signed_by[0].principal = "did:mf:operator"` and
+ * acquire the operator role's capabilities until Phase B's
+ * signature verification is mandatory at the validator. Echo
+ * cortex#220 round 1.
+ *
+ * **What this gate IS safe for (today):**
+ *   - Single-operator / dev-mode deployments where the bus is a
+ *     local leaf node with no untrusted publishers.
+ *   - Multi-operator deployments where every adapter+harness on
+ *     the bus is operated by the same trust boundary.
+ *
+ * **What this gate is NOT safe for (today):**
+ *   - Multi-principal trust in a deployment where untrusted
+ *     processes can publish onto the bus.
+ *   - Federation across operators (Phase D) — verification is
+ *     mandatory there.
+ *
+ * The `CORTEX_POLICY_REQUIRE_UNVERIFIED_ACK=1` opt-in below makes
+ * this trade-off explicit at boot. Phase B (cortex#114) wires the
+ * verifier into the validator and closes the gap.
+ *
+ * **Principal resolution.** Read `envelope.signed_by[0].principal`
+ * (originator stamp per myelin#31 chain semantics). Strip the
+ * `did:mf:` prefix to match `Principal.id`. If no chain is present
+ * (legacy unsigned envelope), fall back to `payload.agent_id` —
+ * the engine will reject with `unknown_principal` unless the
+ * agent is also a declared principal in the policy block. Both
+ * paths are equally unverified today (Echo cortex#220 round 1).
+ *
+ * **Capability claim.** `dispatch.<agent_id>` — the dispatch surface
+ * is "may principal X invoke agent Y on this stack?". C.2b will let
+ * envelopes carry an explicit `capability` claim on the payload; for
+ * now the implicit form keeps the gate operative without a payload
+ * schema change.
+ */
+function checkDispatchPolicy(
+  engine: PolicyEngine,
+  envelope: Envelope,
+  payload: DispatchTaskReceivedPayload,
+): DispatchPolicyResult {
+  const principalId = resolvePrincipalId(envelope, payload);
+
+  const intent: Intent = {
+    capability: `dispatch.${payload.agent_id}`,
+    sovereignty: {
+      classification: envelope.sovereignty.classification,
+      data_residency: envelope.sovereignty.data_residency,
+      max_hop: envelope.sovereignty.max_hop,
+      frontier_ok: envelope.sovereignty.frontier_ok,
+      model_class: envelope.sovereignty.model_class,
+    },
+    payload_summary: `dispatch agent=${payload.agent_id} task_id=${payload.task_id}`,
+  };
+
+  const decision = engine.check(principalId, intent);
+  if (!decision.allow) {
+    return { allow: false, reason: decision.reason };
+  }
+  // The engine doesn't return a Principal — only the decision +
+  // effective capabilities. The dispatch-listener doesn't need the
+  // full Principal object on the request *yet* (C.3.2 substrate-side
+  // consumers haven't shipped); we forward `undefined` for now so
+  // the contract is in place but no harness branches on the value.
+  // C.3b adds engine.getPrincipal(id) and threads it through.
+  return { allow: true, principal: undefined };
+}
+
+/**
+ * Strip the `did:mf:` prefix from the originator stamp's principal
+ * via the shared `extractAgentIdFromDid` helper (also used by
+ * `verify-signed-by-chain.ts` — Echo cortex#220 round 2 S-1). Falls
+ * back to `payload.agent_id` when the envelope has no chain, AND
+ * surfaces the raw DID string when the parser rejects it (malformed
+ * DID method, empty tail, multi-segment colon) so the engine
+ * receives a deterministic `unknown_principal` rather than silent
+ * coercion.
+ */
+function resolvePrincipalId(
+  envelope: Envelope,
+  payload: DispatchTaskReceivedPayload,
+): string {
+  const chain = getSignedByChain(envelope);
+  const origin = chain[0];
+  if (origin === undefined) return payload.agent_id;
+  return extractAgentIdFromDid(origin.principal) ?? origin.principal;
 }
 
