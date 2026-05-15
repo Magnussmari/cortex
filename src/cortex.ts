@@ -482,8 +482,17 @@ export async function startCortex(
   // Receives `systemEventSource` so visibility-config drops produce
   // `system.access.filtered` envelopes operators can subscribe to — see
   // `evaluateVisibility()` in surface-router.ts.
+  //
+  // IAW Phase D.2 (refs cortex#116) — also receives `policy.federated`
+  // so inbound `federated.*` envelopes get gated against the operator's
+  // declared accept/deny/max_hop config before adapter fan-out. When
+  // `policy.federated` is absent or `networks[]` is empty, the gate is
+  // fully inert — `federated.*` envelopes pass through unchanged
+  // (mirrors the C.3.1 policy-engine contract: no policy → no gating).
+  // Federation enforcement is opt-in.
   const router: SurfaceRouter = createSurfaceRouter(runtime, {
     systemEventSource,
+    ...(options.policy?.federated !== undefined && { federated: options.policy.federated }),
     onAdapterError: (adapterId, err) => {
       console.error(`cortex: surface adapter "${adapterId}" render error:`, err.message);
     },
