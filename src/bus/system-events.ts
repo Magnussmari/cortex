@@ -457,3 +457,68 @@ export function createSystemAccessFilteredEvent(
     },
   });
 }
+
+// ---------------------------------------------------------------------------
+// system.bus.peer_dispatch_received — IAW Phase B.2a visibility event
+// ---------------------------------------------------------------------------
+
+export interface SystemBusPeerDispatchReceivedOpts {
+  /** Standard source attribution — who emitted this visibility event. */
+  source: SystemEventSource;
+  /**
+   * Source field from the peer's dispatch envelope (the `{operator}.
+   * {agent}.{instance}` triple that identifies which peer just
+   * dispatched a task to us). Different from `opts.source.org` —
+   * that's US, this is THEM.
+   */
+  peerSource: string;
+  /**
+   * Envelope id of the peer's dispatch envelope. Lets operators join
+   * the visibility event to the underlying dispatch on the dashboard
+   * and in audit pipelines.
+   */
+  dispatchEnvelopeId: string;
+  /**
+   * Correlation id from the peer's dispatch envelope, if present.
+   * Threads the visibility event to any reply chain that follows.
+   */
+  correlationId?: string;
+  /** Wall-clock time the listener observed the inbound. */
+  receivedAt: Date;
+  /**
+   * IAW Phase A.3 — classification on the emitted visibility event.
+   * Defaults to `"local"` because peer-dispatch-received is bookkeeping
+   * about our own stack; the underlying peer dispatch may itself be
+   * federated, but the visibility annotation stays local-only.
+   */
+  classification?: Classification;
+}
+
+/**
+ * IAW Phase B.2a (cortex#114) — visibility event emitted whenever
+ * `BusDispatchListener` receives a valid peer dispatch envelope on the
+ * bus. Surfaces "peer X dispatched a task to us at <time>" without
+ * routing through the dispatch path itself (that's a follow-up; see
+ * `BusDispatchListener` file header for the deferred-scope rationale).
+ *
+ * Sovereignty defaults to local; the visibility event is bookkeeping
+ * about our own stack regardless of the underlying peer dispatch's
+ * classification.
+ */
+export function createSystemBusPeerDispatchReceivedEvent(
+  opts: SystemBusPeerDispatchReceivedOpts,
+): Envelope {
+  return buildBaseEnvelope({
+    type: "system.bus.peer_dispatch_received",
+    source: buildSource(opts.source),
+    sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
+    payload: {
+      peer_source: opts.peerSource,
+      dispatch_envelope_id: opts.dispatchEnvelopeId,
+      received_at: opts.receivedAt.toISOString(),
+      ...(opts.correlationId !== undefined && {
+        correlation_id: opts.correlationId,
+      }),
+    },
+  });
+}
