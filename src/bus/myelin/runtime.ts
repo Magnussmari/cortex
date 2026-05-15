@@ -311,8 +311,11 @@ export async function startMyelinRuntime(
 
   let stopped = false;
 
-  // Signature stays Promise<void> for symmetry with `publishDisabled` and
-  // the MyelinRuntime contract; the body is sync-by-design today (NatsLink
+  // `publishEnabled` is async because we await `signEnvelope` when a
+  // signer is configured (B.3). `NatsLink.publish` itself is fire-and-
+  // forget at the Core NATS client layer; the awaitable surface is
+  // preserved for symmetry with `publishDisabled` and the
+  // `MyelinRuntime.publish: (env) => Promise<void>` contract.
   const signer = options?.signer;
   const signFailureMode = options?.signFailureMode ?? "fallback";
   // Pre-encode the seed to the base64 shape myelin's `signEnvelope`
