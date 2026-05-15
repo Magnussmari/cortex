@@ -39,6 +39,7 @@ import {
 } from "./bus/myelin/runtime";
 import { loadStackSigningKey } from "./common/config/stack-signing-key";
 import { BusDispatchListener } from "./bus/bus-dispatch-listener";
+import { DID_RE } from "@the-metafactory/myelin/identity";
 import { createSurfaceRouter, type SurfaceRouter } from "./bus/surface-router";
 import { createNetworkResolver } from "./bus/network-resolver";
 import type { SystemEventSource } from "./bus/system-events";
@@ -240,16 +241,62 @@ export async function startCortex(
   let signer: BusEnvelopeSigner | undefined;
   if (options.stack?.nkey_seed_path) {
     try {
-      const kp = await loadStackSigningKey(options.stack.nkey_seed_path);
+      // `expandTilde` matches `NatsLink.connect`'s treatment of
+      // `credsPath` + the agents.d/ fallback below — operators writing
+      // `~/.config/cortex/stack.nk` should not silently ENOENT into
+      // the unsigned-publish fallback (Echo cortex#211 round 1).
+      const seedPath = expandTilde(options.stack.nkey_seed_path);
+      const kp = await loadStackSigningKey(seedPath);
+
+      // Consistency check: if `stack.nkey_pub` is also declared, the
+      // loaded keypair's public key MUST match. A mismatch is the
+      // operator-rotation split-brain hazard — peers' `trust:`
+      // lookups would reject every signature without explaining why.
+      // Throw and let the existing catch surface the failure (Echo
+      // cortex#211 round 1).
+      if (
+        options.stack.nkey_pub !== undefined &&
+        kp.getPublicKey() !== options.stack.nkey_pub
+      ) {
+        throw new Error(
+          `seed file pubkey ${kp.getPublicKey()} does not match declared ` +
+            `stack.nkey_pub ${options.stack.nkey_pub} — rotation split-brain hazard`,
+        );
+      }
+
       // KP class exposes getRawSeed() returning the 32-byte ed25519
       // seed; that's the shape myelin's signEnvelope consumes (after
       // base64-encoding, done inside MyelinRuntime). See B.3 PR #209.
       const rawSeedBytes = (
         kp as unknown as { getRawSeed(): Uint8Array }
       ).getRawSeed();
-      const principal = `did:mf:${derivedStack.id.replace("/", "-")}`;
+
+      // Derive the principal DID. `stack.id` shape is `{op}/{stack}`
+      // (Phase A.5 lock-in); myelin's DID_RE rejects slashes but
+      // accepts hyphens, so we canonicalize. The schema regex allows
+      // trailing hyphens in each segment (`my-op-/foo`) which after
+      // replacement becomes `my-op--foo`, breaking DID_RE's
+      // consecutive-hyphen guard. Collapse `--` runs to avoid the
+      // silent per-publish sign failure that would otherwise downgrade
+      // every outbound envelope to unsigned (Echo cortex#211 round 1).
+      const principal = `did:mf:${derivedStack.id
+        .replace("/", "-")
+        .replace(/-+/g, "-")}`;
+      if (!DID_RE.test(principal)) {
+        throw new Error(
+          `derived DID "${principal}" does not match myelin DID_RE — ` +
+            `check stack.id segments for trailing-hyphen edge cases`,
+        );
+      }
+
       signer = { rawSeedBytes, principal };
-      console.log(`cortex: stack signing key loaded — principal=${principal}`);
+      // Soften wording: the runtime may still fail to start; the
+      // signer is only "active" once `startMyelinRuntime` returns an
+      // enabled runtime. Boot-log clarity matters more than terseness
+      // here (Echo cortex#211 round 1).
+      console.log(
+        `cortex: stack signing key staged — principal=${principal} (active once myelin runtime starts)`,
+      );
     } catch (err) {
       console.error(
         "cortex: stack signing key load failed (non-fatal — publish will be unsigned):",
