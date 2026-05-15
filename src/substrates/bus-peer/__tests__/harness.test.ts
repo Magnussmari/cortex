@@ -8,8 +8,10 @@
  *      structural check is dropped at the boundary (not yielded) and the
  *      stderr line carries the rejection reason discriminator.
  *   3. Consumer-break — when the iterator is broken before a peer terminal
- *      arrives, the harness synthesises a `dispatch.task.aborted` envelope
- *      and unregisters from the runtime fan-out.
+ *      arrives, the harness unregisters from the runtime fan-out. No
+ *      synthetic terminal is yielded (async-generator semantics drop
+ *      yields-in-finally after iterator return); the runner records the
+ *      abort from its outside view. Matches `ClaudeCodeHarness`'s contract.
  */
 
 import { describe, test, expect } from "bun:test";

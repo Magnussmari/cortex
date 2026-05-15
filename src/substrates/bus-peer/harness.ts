@@ -15,8 +15,12 @@
  *     pattern keyed on `correlation_id`. The harness yields a local
  *     `dispatch.task.started` envelope on entry, then every verified
  *     inbound envelope tagged with the same `correlation_id`, then a
- *     terminal envelope (yielded by the peer OR a synthetic
- *     `aborted` if the consumer breaks early).
+ *     terminal envelope yielded by the peer (`dispatch.task.completed`
+ *     / `failed` / `aborted`). Consumer-break causes the runtime
+ *     subscription to unregister via the try/finally; the runner is
+ *     responsible for recording an aborted lifecycle envelope from its
+ *     outside view (matches `ClaudeCodeHarness`'s contract — see the
+ *     `dispatch()` JSDoc for the spec rationale).
  *   - **Verification gate on every inbound** via `verifySignedByChain`
  *     (Phase B.1a). Envelopes that fail the structural trust check
  *     are dropped at the boundary with a single-line `process.stderr`
@@ -155,10 +159,19 @@ export class BusPeerHarness implements SessionHarness {
    *     `ClaudeCodeHarness`'s contract (runner / dispatch-listener
    *     observes iterator close + records an aborted lifecycle
    *     envelope from its outside view).
-   *   - Runtime publish fails: error propagates synchronously to
-   *     the caller (matches `MyelinRuntime.publish`'s fire-and-forget
-   *     contract — internal log + swallow inside the runtime; the
-   *     promise still resolves so we don't `await` on a rejection).
+   *   - Runtime publish errors: swallowed. The harness uses
+   *     `void this.runtime.publish(...)` per `MyelinRuntime.publish`'s
+   *     fire-and-forget contract — the runtime itself logs and
+   *     swallows publish errors (so a misconfigured NATS section
+   *     can't crash the bot), and this harness deliberately doesn't
+   *     `await` the returned promise. The only observable failure
+   *     mode of a publish failure here is "the receiving peer never
+   *     sees the outbound request"; no synthetic terminal is emitted
+   *     locally before the started yield. A future B.1c+ refinement
+   *     could opt into the `await + synthetic failed-terminal`
+   *     pattern (Echo's option B on cortex#195) if operators want
+   *     a louder failure surface, but at this slice we mirror the
+   *     existing runtime contract.
    */
   // eslint-disable-next-line @typescript-eslint/require-await
   async *dispatch(
@@ -292,9 +305,11 @@ export class BusPeerHarness implements SessionHarness {
     //    path — including a consumer break at the FIRST yield.
     // ----------------------------------------------------------------
     try {
-      // Fire-and-forget per MyelinRuntime.publish's documented contract
-      // (Core NATS is fire-and-forget at the client layer; the promise
-      // resolves synchronously even on failures — runtime logs+swallows).
+      // Fire-and-forget per MyelinRuntime.publish's documented contract:
+      // the runtime logs and swallows publish errors internally, so the
+      // returned promise resolves rather than rejects. We `void` it so
+      // ESLint's no-floating-promises rule is satisfied without an
+      // `await` that would block on the runtime's own swallow path.
       void this.runtime.publish(requestEnvelope);
 
       // ----------------------------------------------------------------
