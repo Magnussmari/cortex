@@ -245,6 +245,37 @@ export class AgentRegistry {
     if (!trusterAgent) return false;
     return trusterAgent.trust.includes(trusted);
   }
+
+  /**
+   * IAW Phase B.1 (cortex#114) — reverse-lookup an agent by its declared
+   * NKey public key. Returns `undefined` when no registered agent declares
+   * `nkey_pub === pubkey`, OR when more than one does (ambiguous — refuse
+   * to silently pick one). The ambiguity case is a config bug; the caller
+   * surfaces it as a verification failure rather than an exception so the
+   * bus path can log + reject without throwing into an event handler.
+   *
+   * Linear scan is intentional: the registry holds O(small) agents and
+   * the call site is per-stamp during inbound verification, not per-byte.
+   * If profiling shows this matters, build an `nkey_pub → agentId` index
+   * once at registry construction.
+   */
+  tryGetByNkeyPub(pubkey: string): Agent | undefined {
+    let match: Agent | undefined;
+    for (const agent of this.agents) {
+      if (agent.nkey_pub === pubkey) {
+        if (match) {
+          // Two agents claim the same NKey — refuse to disambiguate at
+          // read time. fromAgents should reject this at construction once
+          // Phase C tightens the principal model, but until then a config
+          // with duplicate keys gets a structural-trust failure rather
+          // than a silently-wrong agent resolution.
+          return undefined;
+        }
+        match = agent;
+      }
+    }
+    return match;
+  }
 }
 
 // =============================================================================
