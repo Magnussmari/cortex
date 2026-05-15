@@ -105,6 +105,30 @@ export const StackConfigSchema = z.object({
     /^U[A-Z2-7]{55}$/,
     "stack.nkey_pub must be a base32 NKey public key (U-prefixed, 56 chars total)",
   ).optional(),
+  /**
+   * IAW Phase B.3 (cortex#114) — path to the stack's private signing
+   * seed file. NATS NKey seed (`SU` + 57 base32 chars) — same shape
+   * `nsc generate nkey -u` produces. The file MUST be chmod 600 on
+   * POSIX; the loader (`src/common/config/stack-signing-key.ts`)
+   * enforces that gate before reading.
+   *
+   * Optional at config schema level so operators can stage `nkey_pub`
+   * without immediately wiring the seed (e.g. on a dry run, or when
+   * the bot is structurally configured but not yet expected to sign
+   * outbound envelopes). When BOTH `nkey_pub` and `nkey_seed_path`
+   * are set, `MyelinRuntime.publish()` signs every outbound envelope
+   * with this stack's NKey; when only `nkey_pub` is set, the bot
+   * publishes unsigned (B.1a / B.1b consume the `signed_by[]` only
+   * structurally so unsigned envelopes still flow).
+   *
+   * Threat model: the seed is the most sensitive key material the
+   * stack holds — possessing it lets an attacker mint signed
+   * envelopes claiming this stack's identity. The chmod 600 gate is
+   * the operator-laptop / server-filesystem mitigation; hardware-
+   * backed signing (yubikey / TPM) is future work tracked by the
+   * `loadStackSigningKey` seam.
+   */
+  nkey_seed_path: z.string().optional(),
 });
 
 export type StackConfig = z.infer<typeof StackConfigSchema>;
