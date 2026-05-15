@@ -30,7 +30,7 @@ The Internet of Agentic Work is the composition model where stacks (`{operator_i
 | Phase | Scope | Effort | Sibling issues consumed | Schema flip? |
 |---|---|---|---|---|
 | **A** Foundation | Substrate harness + visibility consumption (4 emit sites parameterised + envelope upgrade + stack: block) | 2–3 weeks | cortex#91 + cortex#109 (§A+B+C) | No (stack: is additive with default) |
-| **B** Identity | NKey-signed envelopes for bot↔bot (chain-of-stamps consumption) | 1–2 weeks | cortex#102 | No |
+| **B** Identity | NKey-signed envelopes for bot↔bot (chain-of-stamps consumption) — ✅ almost complete (B.4 integration tests 🟡 in flight) | 1–2 weeks | cortex#102 | No |
 | **C** Policy + schema flip | PolicyEngine at M6 + cortex.yaml flips ONCE (stack block, principal table, role table) | 2–3 weeks | cortex#107 | **Yes — the only one** |
 | **D** Federation | Peer registry + accept rules + network membership declaration + cloud-side network registry service | 3–4 weeks | cortex#107 (Step H) + cortex#109 (§E) | No (additive) |
 | **E** Multi-network bridges + delegation | A stack participating in N networks; cross-network delegation patterns | 4–6 weeks | new sibling issue (Phase E sub-issue, this plan) | No (additive) |
@@ -172,73 +172,100 @@ The `{operator_id}` and `{stack_id}` segments are embedded in NATS subjects afte
 - Phase A complete EXCLUDING A.1.3 (envelope schema upgraded; chain-of-stamps parses structurally; substrate harness interface + `ClaudeCodeHarness` exist; classification parameterised at all 4 emit sites; visibility filter on surface-router; stack-aware namespace cutover shipped; capabilities schema landed). A.1.3 (`BusPeerHarness` scaffold) is rolled into B.1b below — it was speculatively ticked in PR #192 but never shipped.
 - Q1 lock-in confirmed (`{operator_id}/{stack_id}` identity, 3-tier NKey chain) — DONE 2026-05-13.
 
-### B.1a Verification primitives (no bus integration yet)
+### B.1a Verification primitives (no bus integration yet) — ✅ done (PR #194)
 
 Standalone, testable in isolation. Lands ahead of `BusPeerHarness` so the verification helpers are reusable by any caller (CLI tooling, tests, future harnesses).
 
-- [ ] **B.1a.1** `AgentSchema.nkey_pub` (optional, 56-char U-prefixed base32) so agents can declare their stack's signing key inline. Mirrors `StackConfigSchema.nkey_pub`. Phase C migrates this onto `policy.principals[]`.
-- [ ] **B.1a.2** `AgentRegistry.tryGetByNkeyPub(pubkey) → Agent | undefined` — reverse lookup, returns `undefined` for unknown or ambiguous (two agents claiming the same key).
-- [ ] **B.1a.3** `TrustResolver.trustsByNKey(receivingAgentId, signerPubKey) → boolean` — composes `tryGetByNkeyPub` + `AgentRegistry.trusts`. Mirrors the existing `trustsByPlatformId` pattern.
-- [ ] **B.1a.4** `verifySignedByChain(envelope, opts) → { valid: boolean; rejectedAt?: number; reason?: string }` — walks `getSignedByChain(envelope)`; for each ed25519 stamp, extracts `did:mf:<name>` → `trustsByNKey` lookup; rejects on first failure with index + reason. Hub-stamp variants pass through structurally (Phase D wires hub verification).
-- [ ] **B.1a.5** Tests: valid single-hop chain, valid multi-hop chain, unknown-signer stamp (rejected), wrong-key-for-known-signer (rejected), tampered chain (rejected). Ed25519 *cryptographic* verification is stubbed at this slice — the helper validates structural trust (principal exists, claims this NKey, we trust them). B.1c adds the bytes check.
+- [x] **B.1a.1** `AgentSchema.nkey_pub` (optional, 56-char U-prefixed base32) so agents can declare their stack's signing key inline. Mirrors `StackConfigSchema.nkey_pub`. Phase C migrates this onto `policy.principals[]`. — PR #194
+- [x] **B.1a.2** `AgentRegistry.tryGetByNkeyPub(pubkey) → Agent | undefined` — reverse lookup, returns `undefined` for unknown or ambiguous (two agents claiming the same key). — PR #194
+- [x] **B.1a.3** `TrustResolver.trustsByNKey(receivingAgentId, signerPubKey) → boolean` — composes `tryGetByNkeyPub` + `AgentRegistry.trusts`. Mirrors the existing `trustsByPlatformId` pattern. — PR #194
+- [x] **B.1a.4** `verifySignedByChain(envelope, opts) → { valid: boolean; rejectedAt?: number; reason?: string }` — walks `getSignedByChain(envelope)`; for each ed25519 stamp, extracts `did:mf:<name>` → `trustsByNKey` lookup; rejects on first failure with index + reason. Hub-stamp variants pass through structurally (Phase D wires hub verification). — PR #194
+- [x] **B.1a.5** Tests: valid single-hop chain, valid multi-hop chain, unknown-signer stamp (rejected), wrong-key-for-known-signer (rejected), tampered chain (rejected). Ed25519 *cryptographic* verification is stubbed at this slice — the helper validates structural trust (principal exists, claims this NKey, we trust them). B.1c adds the bytes check. — PR #194
 
-### B.1b `BusPeerHarness` scaffold + wiring (was A.1.3)
+### B.1b `BusPeerHarness` scaffold + wiring (was A.1.3) — ✅ done (PR #195)
 
 Carries over from A.1.3 — the class that should have shipped in Phase A.
 
-- [ ] **B.1b.1** `BusPeerHarness` implementing `SessionHarness` — publishes the inbound dispatch envelope onto the local bus, subscribes to the reply subject, streams replies back as `AsyncIterable<MyelinEnvelope>`. Pattern matches sage's existing peer behaviour.
-- [ ] **B.1b.2** On every inbound envelope, calls `verifySignedByChain` (from B.1a) BEFORE handing to the consumer. Failed verification logs to stderr + rejects dispatch with structured reason; no dispatch event emitted to the application path.
-- [ ] **B.1b.3** Tests: scaffold round-trips a valid envelope; invalid chain is rejected at the boundary; sage-pattern parity test.
+- [x] **B.1b.1** `BusPeerHarness` implementing `SessionHarness` — publishes the inbound dispatch envelope onto the local bus, subscribes to the reply subject, streams replies back as `AsyncIterable<MyelinEnvelope>`. Pattern matches sage's existing peer behaviour. — PR #195
+- [x] **B.1b.2** On every inbound envelope, calls `verifySignedByChain` (from B.1a) BEFORE handing to the consumer. Failed verification logs to stderr + rejects dispatch with structured reason; no dispatch event emitted to the application path. — PR #195
+- [x] **B.1b.3** Tests: scaffold round-trips a valid envelope; invalid chain is rejected at the boundary; sage-pattern parity test. — PR #195
 
-### B.1c Ed25519 signature verification
+### B.1c Ed25519 signature verification — ✅ done (PR #200)
 
-- [ ] **B.1c.1** JCS canonicalization helper (per `myelin/src/identity/`) — input bytes for verification (and Phase B.3 signing).
-- [ ] **B.1c.2** `verifySignedByChain` extended to do the ed25519 verify step (was stubbed at B.1a).
-- [ ] **B.1c.3** Forged-signature regression test (tampered byte → fails crypto check, not just structural).
+- [x] **B.1c.1** JCS canonicalization helper (per `myelin/src/identity/`) — input bytes for verification (and Phase B.3 signing). — PR #200
+- [x] **B.1c.2** `verifySignedByChain` extended to do the ed25519 verify step (was stubbed at B.1a). — PR #200
+- [x] **B.1c.3** Forged-signature regression test (tampered byte → fails crypto check, not just structural). — PR #200
 
 ### B.2 ClaudeCodeHarness uses bus for bot↔bot calls
 
-- [ ] **B.2.1** Replace "post in #cortex with @mention" pattern with `MyelinRuntime.publish()` for bot↔bot dispatch.
-- [ ] **B.2.2** Discord adapter `mentionsAgent()` keeps working for human-to-bot DMs; bot↔bot path no longer consults Discord platform IDs.
-- [ ] **B.2.3** cortex#98 `trustedAgentBots` stays as Discord-side fallback for human-to-bot DMs (per `cortex/docs/architecture.md` §9.3); bot↔bot path now uses NKey trust.
+#### B.2a `BusDispatchListener` inbound — ✅ done (PR #203)
 
-### B.3 Outbound envelope signing
+- [x] **B.2a.1** `BusDispatchListener` consumes inbound bot↔bot dispatch envelopes from the bus, applies `verifySignedByChain`, and routes accepted dispatches into the dispatch-handler path. — PR #203
+- [x] **B.2a.2** Discord adapter `mentionsAgent()` keeps working for human-to-bot DMs; bot↔bot inbound path no longer consults Discord platform IDs. — PR #203
+- [x] **B.2a.3** cortex#98 `trustedAgentBots` stays as Discord-side fallback for human-to-bot DMs (per `cortex/docs/architecture.md` §9.3); bot↔bot inbound path now uses NKey trust. — PR #203
 
-- [ ] **B.3.1** `MyelinRuntime.publish()` signs every outbound envelope with the stack's NKey (loaded from `cortex.yaml.stack.nkey_pub` + sibling private key path).
-- [ ] **B.3.2** Multi-hop envelopes (forwarded across stacks) append a new `signed_by[]` entry per hop, preserving the prior chain.
-- [ ] **B.3.3** JCS canonicalization (per `myelin/src/identity/`) used for signature input.
+#### B.2b agent-team bus-peer participant routing (outbound) — ✅ done (PR #213)
 
-### B.4 Tests
+- [x] **B.2b.1** agent-team participant invocation prefers `BusPeerHarness` over Discord @mention when the participant declares a bus-peer NKey; replaces "post in #cortex with @mention" pattern with `MyelinRuntime.publish()` for bot↔bot outbound dispatch. — PR #213
+- [x] **B.2b.2** Tests: agent-team participants route through the bus end-to-end; legacy Discord-mention path still works as fallback for participants without an NKey. — PR #213
+
+### B.3 Outbound envelope signing — ✅ done (PR #209)
+
+- [x] **B.3.1** `MyelinRuntime.publish()` signs every outbound envelope with the stack's NKey (loaded from `cortex.yaml.stack.nkey_pub` + sibling private key path). — PR #209
+- [x] **B.3.2** Multi-hop envelopes (forwarded across stacks) append a new `signed_by[]` entry per hop, preserving the prior chain. — PR #209
+- [x] **B.3.3** JCS canonicalization (per `myelin/src/identity/`) used for signature input. — PR #209
+
+### B.3.E Entrypoint wiring (B.2a + B.3 deferred plumbing) — ✅ done (PR #211)
+
+- [x] **B.3.E.1** `cortex.ts` entrypoint wires `BusDispatchListener` (B.2a) and the signing publisher (B.3) at boot — the deferred plumbing that B.2a and B.3 left out so each PR stayed reviewable. — PR #211
+
+### B.4 Tests — 🟡 in flight (PR not yet open as of 2026-05-16)
+
+Round-trip + adversarial integration tests are the last remaining Phase B slice. Work is underway in worktree `Cortex-c114-b4`; no PR open yet.
 
 - [ ] **B.4.1** Round-trip test: agent A (operator alpha) emits a dispatch; agent B (operator beta) verifies the signature; B's reply chain stamps both stacks.
 - [ ] **B.4.2** Forged-signature test: a tampered envelope is rejected by BusPeerHarness.
 - [ ] **B.4.3** Cross-trust test: a stack not in the local trust registry is rejected.
 
-### Phase B acceptance criteria
+### Phase B acceptance criteria — ✅ almost complete (B.4 🟡 integration-test gate remaining)
 
-- BusPeerHarness verifies `signed_by[]` against TrustResolver on every inbound dispatch.
-- ClaudeCodeHarness uses MyelinRuntime.publish for bot-bot calls.
-- TrustResolver gains `trustsByNKey()` method.
-- Round-trip bot↔bot test green with two stacks signing each other's envelopes.
+- [x] BusPeerHarness verifies `signed_by[]` against TrustResolver on every inbound dispatch. — PR #195 (scaffold + structural) + PR #200 (ed25519)
+- [x] ClaudeCodeHarness uses MyelinRuntime.publish for bot-bot calls. — PR #203 (inbound listener) + PR #213 (outbound agent-team routing) + PR #211 (entrypoint wiring)
+- [x] TrustResolver gains `trustsByNKey()` method. — PR #194
+- [ ] Round-trip bot↔bot test green with two stacks signing each other's envelopes. — 🟡 B.4 in flight
+
+### Phase B follow-ups (tracked)
+
+Issues filed during Phase B that defer items per Echo's review rounds. Each represents a deferred-but-tracked item; none block Phase B closure (gated on B.4) but most should resolve before Phase C entry.
+
+- **cortex#196** — isUuid shield extract (B.1a follow-up).
+- **cortex#197** — BusPeerHarness test coverage gaps (B.1b follow-up).
+- **cortex#201** — B.1c deferred findings: discriminator granularity, nkeys internal subpath dep, `rejectedAt` semantics, test fragility, stderr-after-unregister, chain growth.
+- **cortex#204** — B.2a test coverage + DRY (BusDispatchListener follow-up).
+- **cortex#210** — signFailureMode flip to `'drop'` (when subscribe-side enforces).
+- **cortex#212** — entrypoint wiring deferred items: first-agent fail-loud, cryptoVerify flag, smoke test.
+- **cortex#214** — Echo review pipeline routing bug (`tasks.code-review.generic` envelope dropped).
 
 ### Phase B parallelism map
 
-| Slice | Depends on | Can parallel with |
-|---|---|---|
-| **B.1a** verification primitives | Phase A (envelope chain parse) | Phase C design (paper-only RFCs); Phase A tail issues (#142, #143, #147, #148); cortex#97 observability |
-| **B.1b** BusPeerHarness scaffold | B.1a primitives merged | B.3 outbound signing (B.3 only writes the publish side; doesn't touch the new harness file); Phase C design work |
-| **B.1c** ed25519 + JCS verification | B.1a primitives merged | B.1b (different file surfaces — runtime vs registry); B.3 (shared JCS helper — coordinate one of them lands it first); Phase C design work |
-| **B.2** ClaudeCodeHarness uses bus | B.1b scaffold merged | B.3 (different files); Phase C design work |
-| **B.3** outbound signing | B.1a (Agent.nkey_pub) merged | B.1b, B.1c, B.2 (all touch different surfaces); Phase C design work |
-| **B.4** round-trip + adversarial tests | B.1b + B.1c + B.2 + B.3 all merged | Phase C implementation kick-off if the principal-model RFC has landed |
+| Slice | Depends on | Can parallel with | State |
+|---|---|---|---|
+| **B.1a** verification primitives | Phase A (envelope chain parse) | Phase C design (paper-only RFCs); Phase A tail issues (#142, #143, #147, #148); cortex#97 observability | ✅ PR #194 |
+| **B.1b** BusPeerHarness scaffold | B.1a primitives merged | B.3 outbound signing (B.3 only writes the publish side; doesn't touch the new harness file); Phase C design work | ✅ PR #195 |
+| **B.1c** ed25519 + JCS verification | B.1a primitives merged | B.1b (different file surfaces — runtime vs registry); B.3 (shared JCS helper — coordinate one of them lands it first); Phase C design work | ✅ PR #200 |
+| **B.2a** BusDispatchListener inbound | B.1b scaffold merged | B.3 (different files); Phase C design work | ✅ PR #203 |
+| **B.2b** agent-team bus-peer outbound | B.2a + B.3 merged | Phase C design work | ✅ PR #213 |
+| **B.3** outbound signing | B.1a (Agent.nkey_pub) merged | B.1b, B.1c, B.2a (all touch different surfaces); Phase C design work | ✅ PR #209 |
+| **B.3.E** entrypoint wiring | B.2a + B.3 merged | — | ✅ PR #211 |
+| **B.4** round-trip + adversarial tests | B.1b + B.1c + B.2a + B.2b + B.3 + B.3.E all merged | Phase C design + Phase C implementation kick-off if the principal-model RFC has landed | 🟡 in flight |
 
-**Single-developer ordering** (one PR in flight at a time): B.1a → B.1b → B.1c (or B.3 first if you want signing before crypto verify) → B.2 → B.3 (whichever didn't go first) → B.4.
+**Single-developer ordering** (one PR in flight at a time, as actually executed): B.1a → B.1b → B.1c → B.3 → B.2a → B.3.E (entrypoint wiring) → B.2b → B.4.
 
-**Two-developer ordering**: developer-A does B.1a → B.1b → B.2 → B.4; developer-B does B.3 → B.1c (joint JCS helper merge gate). Both wait on B.1a.
+**Status as of 2026-05-16:** every wire-side primitive, harness, listener, signing path, and entrypoint plumbing has shipped. Only B.4 (round-trip + adversarial integration tests) remains in flight. Phase C design + design-paper work can start in parallel with B.4.
 
 ### Cross-phase parallelism during Phase B
 
-Most of Phase C is paper until B.4 ships, but the paper can be drafted now:
+With B.1–B.3 + entrypoint wiring all shipped and only B.4 in flight, Phase C design + design-paper work is the natural next lift to run in parallel with B.4:
 
 | Activity | Surface | Independent of B implementation? |
 |---|---|---|
