@@ -51,8 +51,10 @@ import type {
   Agent,
   DiscordPresence,
   MattermostPresence,
+  Policy,
   StackConfig,
 } from "./common/types/cortex-config";
+import { policyEngineFromConfig } from "./common/policy/factory";
 import { MattermostAdapter } from "./adapters/mattermost";
 import type { PlatformAdapter } from "./adapters/types";
 
@@ -177,6 +179,22 @@ export interface StartCortexOptions {
    * @internal — not part of the public API; semver does not apply.
    */
   stack?: StackConfig;
+  /**
+   * IAW Phase C.3.1 (refs cortex#115) — optional `policy:` block from
+   * `CortexConfig`, threaded through from the loader so the boot path
+   * can build the PolicyEngine once and pass it to the dispatch-
+   * listener. Undefined for legacy `bot.yaml` input (the block lives
+   * on `CortexConfigSchema` only) AND for cortex-shape input where
+   * the operator hasn't declared a `policy:` block — the engine
+   * factory returns `undefined` for both, and the dispatch-listener
+   * falls back to the legacy unauthenticated path.
+   *
+   * C.2b removes the legacy path; until then, this seam keeps the
+   * existing dev-mode bots booting unchanged.
+   *
+   * @internal — not part of the public API; semver does not apply.
+   */
+  policy?: Policy;
 }
 
 /**
@@ -841,8 +859,56 @@ export async function startCortex(
     }
   }
 
+  // IAW Phase C.3.1 — build the PolicyEngine from the optional
+  // `policy:` block on cortex.yaml. `policyEngineFromConfig` returns
+  // `undefined` when no block was declared or it has no principals;
+  // the dispatch-listener falls back to the legacy unauthenticated
+  // path in that case (C.2b removes the legacy path).
+  //
+  // SECURITY GATE (Echo cortex#220 round 1): until Phase B (cortex#114)
+  // makes signature verification mandatory at the envelope-validator
+  // layer, the dispatch-listener's policy gate authorises on an
+  // unverified `signed_by[0].principal` claim. Acceptable for
+  // single-operator / dev-mode deployments where the bus is local
+  // and every publisher is trusted; NOT acceptable for multi-
+  // principal trust over a federated bus. We refuse to build the
+  // engine unless the operator explicitly acknowledges this trade-
+  // off via the env var below — making the limitation impossible to
+  // adopt accidentally. The variable can be retired together with
+  // C.2b once Phase B verification is wired.
+  // Echo cortex#220 round 2 S-2 — surface the silent-degradation case
+  // (policy: block present but principals[] empty → factory returns
+  // undefined → legacy unauthenticated path) so operators editing
+  // cortex.yaml see it in the boot log rather than guessing why the
+  // gate didn't engage.
+  if (options.policy?.principals.length === 0) {
+    console.warn(
+      `cortex: policy: block declared with empty principals[] — no authorisation gate engages; the dispatch-listener stays on the legacy path.`,
+    );
+  }
+  const UNVERIFIED_ACK = "CORTEX_POLICY_REQUIRE_UNVERIFIED_ACK";
+  let policyEngine = policyEngineFromConfig(options.policy);
+  if (policyEngine !== undefined && process.env[UNVERIFIED_ACK] !== "1") {
+    console.warn(
+      `cortex: policy: block declared in cortex.yaml but ${UNVERIFIED_ACK}=1 not set — ignoring the block.\n` +
+        `        Pre-Phase-B verification (cortex#114) the gate authorises on an unverified signed_by[0].principal claim;\n` +
+        `        any bus publisher can fabricate principal identity. Set ${UNVERIFIED_ACK}=1 in the cortex env\n` +
+        `        to acknowledge the trade-off and enable the engine. See dispatch-listener.ts checkDispatchPolicy() docs.`,
+    );
+    policyEngine = undefined;
+  } else if (policyEngine !== undefined) {
+    console.log(
+      `cortex: policy-engine active — principals=${policyEngine.principalCount} roles=${policyEngine.roleCount} (${UNVERIFIED_ACK}=1; pre-Phase-B unverified-principal mode)`,
+    );
+  }
+
   // Dispatch-listener — bus envelope → CC spawn.
-  const dispatchListener: DispatchListener = createDispatchListener({ runtime, router, source: systemEventSource });
+  const dispatchListener: DispatchListener = createDispatchListener({
+    runtime,
+    router,
+    source: systemEventSource,
+    ...(policyEngine !== undefined && { policyEngine }),
+  });
   await dispatchListener.start();
 
   // Start router AFTER all surfaces register so the first envelope
@@ -1382,11 +1448,12 @@ if (import.meta.main) {
       // block when the operator declared one — `startCortex` calls
       // `deriveStackId` and logs the resolved stack id. Today this is
       // observational only; emit subjects are unchanged.
-      const { config, inlineAgents, stack } = loadConfigWithAgents(options.config);
+      const { config, inlineAgents, stack, policy } = loadConfigWithAgents(options.config);
       const handle = await startCortex(config, {
         configPath: options.config,
         ...(inlineAgents.length > 0 && { inlineAgents }),
         ...(stack !== undefined && { stack }),
+        ...(policy !== undefined && { policy }),
       });
 
       const shutdown = async () => {
