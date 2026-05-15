@@ -18,6 +18,10 @@ import type { BotConfig } from "../../common/types/config";
 import { NatsLink } from "../nats/connection";
 import { MyelinSubscriber } from "./subscriber";
 import { deriveNatsSubject, type Envelope } from "./envelope-validator";
+// IAW Phase B.3 — sign outbound envelopes via myelin's chain-aware
+// signer. Import discipline matches B.1c: the constrained `/identity`
+// subpath keeps tsc out of myelin's full source tree.
+import { signEnvelope } from "@the-metafactory/myelin/identity";
 
 /**
  * Per-envelope handler. Receives validated envelopes from any active
@@ -99,6 +103,68 @@ export interface MyelinRuntime {
  */
 export interface MyelinRuntimeOptions {
   connectImpl?: (opts: ConnectionOptions) => Promise<NatsConnection>;
+  /**
+   * IAW Phase B.3 (cortex#114) — outbound envelope signer. When set,
+   * `publish()` signs every outbound envelope via myelin's
+   * `signEnvelope` before NATS publish; the envelope's `signed_by[]`
+   * gains a fresh ed25519 stamp committed to the JCS-canonical bytes
+   * of `{...envelope, signed_by: [...prior, newStamp]}`. Multi-hop
+   * envelopes (forwarded across stacks) append rather than replace —
+   * the prior chain is preserved.
+   *
+   * When undefined, `publish()` emits envelopes verbatim — same shape
+   * as today, unchanged for callers that haven't opted in. Operators
+   * stage the keypair via `cortex.yaml.stack.nkey_seed_path` + the
+   * `loadStackSigningKey` loader (chmod 600 gated; `SU` prefix
+   * required); the entrypoint wires the loaded keypair + the stack's
+   * DID-shaped principal into this option.
+   */
+  signer?: BusEnvelopeSigner;
+  /**
+   * IAW Phase B.3 (cortex#114) — behaviour when the signer is
+   * configured but `signEnvelope` itself throws (malformed seed,
+   * unsupported principal DID format, etc.).
+   *
+   * - `'fallback'` (default) — log the error, publish the envelope
+   *   UNSIGNED. Acceptable while the receive side
+   *   (`verifyEnvelopeIdentity`) is not yet enforcing on the
+   *   subscribe path (B.3 ships in that window). The bus tolerates
+   *   unsigned envelopes today; a transient sign failure doesn't
+   *   crash the publish path or drop the operational signal.
+   *
+   * - `'drop'` — log the error and SKIP the publish entirely. The
+   *   envelope never reaches the wire. Use this once the receive
+   *   side becomes enforcing — at that point publishing unsigned is
+   *   a silent downgrade attack surface (an attacker who can fault-
+   *   inject the signer would otherwise get the daemon to emit
+   *   unsigned envelopes; peers in a rollout window that tolerate
+   *   unsigned would accept the bypass). Flip to `'drop'` is
+   *   tracked at cortex#210.
+   *
+   * Ignored when `signer` is undefined (no signer means no failure
+   * mode to choose).
+   */
+  signFailureMode?: "fallback" | "drop";
+}
+
+/**
+ * Outbound envelope signer surface — what `MyelinRuntime` needs to
+ * sign a single envelope. Kept narrow so test doubles + future
+ * hardware-backed signers (yubikey / TPM) can implement without
+ * leaking the `nkeys.js` KeyPair shape across module boundaries.
+ *
+ * `rawSeedBytes` is the 32-byte ed25519 seed — what myelin's
+ * `signEnvelope` consumes after base64-encoding. Production callers
+ * pass `keyPair.getRawSeed()` directly; tests construct from a
+ * generated keypair.
+ *
+ * `principal` is the DID-shaped string that lands on the new stamp's
+ * `signed_by[].principal` field. Convention: `did:mf:<name>` per
+ * myelin spec.
+ */
+export interface BusEnvelopeSigner {
+  rawSeedBytes: Uint8Array;
+  principal: string;
 }
 
 export async function startMyelinRuntime(
@@ -245,10 +311,22 @@ export async function startMyelinRuntime(
 
   let stopped = false;
 
-  // Signature stays Promise<void> for symmetry with `publishDisabled` and
-  // the MyelinRuntime contract; the body is sync-by-design today (NatsLink
-  // .publish is fire-and-forget). Future implementations may await.
-  // eslint-disable-next-line @typescript-eslint/require-await
+  // `publishEnabled` is async because we await `signEnvelope` when a
+  // signer is configured (B.3). `NatsLink.publish` itself is fire-and-
+  // forget at the Core NATS client layer; the awaitable surface is
+  // preserved for symmetry with `publishDisabled` and the
+  // `MyelinRuntime.publish: (env) => Promise<void>` contract.
+  const signer = options?.signer;
+  const signFailureMode = options?.signFailureMode ?? "fallback";
+  // Pre-encode the seed to the base64 shape myelin's `signEnvelope`
+  // consumes — done once at runtime init rather than per-publish so
+  // every call doesn't reallocate the encoding. Tests can pass a
+  // synthetic seed via `MyelinRuntimeOptions.signer.rawSeedBytes`
+  // without going through the file loader.
+  const signerSeedBase64 = signer
+    ? Buffer.from(signer.rawSeedBytes).toString("base64")
+    : undefined;
+
   const publishEnabled = async (envelope: Envelope): Promise<void> => {
     if (stopped) {
       // Post-stop publish: short-circuit. The runtime's `link.drain()`
@@ -274,8 +352,66 @@ export async function startMyelinRuntime(
     // same value `agent.operatorId` produces when emit-site helpers
     // assemble it, so subscribe-side `{org}` substitution stays symmetric.
     const subject = deriveNatsSubject(envelope);
+
+    // IAW Phase B.3: sign before publish if the runtime was started
+    // with a signer. The chain-aware `signEnvelope` appends to any
+    // existing `signed_by[]` rather than overwriting — so a multi-hop
+    // envelope forwarded through this stack picks up an additional
+    // stamp committed to the prior chain. Failure to sign falls back
+    // to the original envelope plus a log — we don't want a transient
+    // crypto failure (extremely rare; bad seed bytes typically fail
+    // at `loadStackSigningKey` time) to crash the publish path.
+    let envelopeToPublish: Envelope = envelope;
+    if (signer !== undefined && signerSeedBase64 !== undefined) {
+      try {
+        // Normalize signed_by to the array shape myelin's
+        // `signEnvelope` expects (MyelinEnvelope tightens
+        // `signed_by` to `SignedBy[] | undefined` whereas cortex's
+        // back-compat Envelope still allows a single stamp). The
+        // signer appends to the existing chain when present.
+        const priorChain =
+          envelope.signed_by === undefined
+            ? undefined
+            : Array.isArray(envelope.signed_by)
+              ? envelope.signed_by
+              : [envelope.signed_by];
+        const envelopeForSigner = {
+          ...envelope,
+          ...(priorChain !== undefined && { signed_by: priorChain }),
+        };
+        envelopeToPublish = await signEnvelope(
+          envelopeForSigner as Parameters<typeof signEnvelope>[0],
+          signerSeedBase64,
+          signer.principal,
+        );
+      } catch (err) {
+        // Sign failure handling — see `MyelinRuntimeOptions.signFailureMode`
+        // for the full rationale. `fallback` publishes unsigned (safe
+        // while subscribe side is non-enforcing); `drop` skips publish
+        // entirely (safe once subscribe side enforces verification).
+        //
+        // Log message deliberately omits `err.message` interpolation
+        // when the error origin is myelin's `signEnvelope` — that
+        // function constructs error strings from inputs (e.g.
+        // "Invalid private key: expected 32-byte Ed25519 seed, got N
+        // bytes") and we don't want even partial seed-shape facts
+        // landing in operator logs. The error class + envelope id
+        // gives operators enough to triage.
+        const reason = err instanceof Error ? err.name : "unknown";
+        if (signFailureMode === "drop") {
+          console.error(
+            `myelin-runtime: sign failed for id=${envelope.id} type=${envelope.type} reason=${reason} — DROPPING (signFailureMode=drop)`,
+          );
+          return;
+        }
+        console.error(
+          `myelin-runtime: sign failed for id=${envelope.id} type=${envelope.type} reason=${reason} — publishing unsigned (signFailureMode=fallback)`,
+        );
+      }
+    }
+
     try {
-      link.publish(subject, JSON.stringify(envelope));
+      link.publish(subject, JSON.stringify(envelopeToPublish));
     } catch (err) {
       // Swallow + log per the contract on `MyelinRuntime.publish`. A failing
       // operational event must NOT escalate into a crash, particularly since
