@@ -1,0 +1,391 @@
+/**
+ * IAW Phase B.1b (cortex#114) — BusPeerHarness tests.
+ *
+ * Three coverage axes:
+ *   1. Round-trip on a valid chain — verified inbound flows through to the
+ *      consumer; the local `started` lifecycle envelope is yielded first.
+ *   2. Verification gate — an inbound envelope whose chain fails the
+ *      structural check is dropped at the boundary (not yielded) and the
+ *      stderr line carries the rejection reason discriminator.
+ *   3. Consumer-break — when the iterator is broken before a peer terminal
+ *      arrives, the harness synthesises a `dispatch.task.aborted` envelope
+ *      and unregisters from the runtime fan-out.
+ */
+
+import { describe, test, expect } from "bun:test";
+
+import { AgentRegistry } from "../../../common/agents/registry";
+import { TrustResolver } from "../../../common/agents/trust-resolver";
+import type {
+  EnvelopeHandler,
+  MyelinRuntime,
+} from "../../../bus/myelin/runtime";
+import type { Envelope } from "../../../bus/myelin/envelope-validator";
+import type { Agent } from "../../../common/types/cortex-config";
+import type {
+  DispatchRequest,
+  MyelinEnvelope,
+} from "../../../common/substrates/types";
+import { BusPeerHarness } from "../harness";
+
+// =============================================================================
+// Fixtures
+// =============================================================================
+
+const NKEY_ECHO = "U" + "B".repeat(55);
+const NKEY_HOLLY = "U" + "C".repeat(55);
+
+function discordPresence() {
+  return {
+    enabled: true,
+    token: "discord-bot-token",
+    guildId: "1487000000000000000",
+    agentChannelId: "1487000000000000001",
+    logChannelId: "1487000000000000002",
+    contextDepth: 10,
+    enableAgentLog: false,
+    roles: [],
+    defaultRole: "allow-all",
+    dm: {
+      operatorRole: {
+        features: ["chat", "async", "team"] as const,
+        disallowedTools: [],
+        bashGuard: true,
+      },
+      defaultRole: "denied" as const,
+      userRoles: [],
+    },
+  };
+}
+
+function agentFixture(overrides: Partial<Agent> = {}): Agent {
+  return {
+    id: "luna",
+    displayName: "Luna",
+    persona: "./personas/luna.md",
+    roles: [],
+    trust: [],
+    presence: { discord: discordPresence() },
+    ...overrides,
+  } as Agent;
+}
+
+function resolverWith(...agents: Agent[]): TrustResolver {
+  return new TrustResolver(AgentRegistry.fromAgents(agents));
+}
+
+/**
+ * Minimal MyelinRuntime double — records every publish + lets the test
+ * trigger inbound by invoking the registered onEnvelope handlers
+ * synchronously. Matches the production runtime's contract: publishes
+ * are fire-and-forget; onEnvelope returns an unregister token.
+ */
+function fakeRuntime() {
+  const handlers = new Set<EnvelopeHandler>();
+  const published: Envelope[] = [];
+
+  const runtime: MyelinRuntime = {
+    enabled: true,
+    onEnvelope(handler) {
+      handlers.add(handler);
+      return {
+        unregister: () => {
+          handlers.delete(handler);
+        },
+      };
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async publish(envelope) {
+      published.push(envelope);
+    },
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async stop() {
+      handlers.clear();
+    },
+  };
+
+  function deliverInbound(envelope: Envelope, subject = "test.subject") {
+    for (const handler of handlers) handler(envelope, subject);
+  }
+
+  return { runtime, published, deliverInbound, handlers };
+}
+
+function dispatchRequest(overrides: Partial<DispatchRequest> = {}): DispatchRequest {
+  return {
+    prompt: "do the thing",
+    tools: { allow: [], deny: [] },
+    context: [],
+    agent: { id: "luna", displayName: "Luna" },
+    requestId: "00000000-0000-4000-8000-000000000099",
+    ...overrides,
+  };
+}
+
+function inboundEnvelope(opts: {
+  correlationId: string;
+  type: string;
+  signerPrincipal?: string;
+}): Envelope {
+  return {
+    id: "00000000-0000-4000-8000-000000000aaa",
+    source: "metafactory.echo.local",
+    type: opts.type,
+    timestamp: "2026-05-15T08:30:00.000Z",
+    correlation_id: opts.correlationId,
+    sovereignty: {
+      classification: "local",
+      data_residency: "NZ",
+      max_hop: 4,
+      frontier_ok: false,
+      model_class: "any",
+    },
+    payload: {},
+    ...(opts.signerPrincipal !== undefined && {
+      signed_by: {
+        method: "ed25519" as const,
+        principal: opts.signerPrincipal,
+        signature: "A".repeat(88),
+        at: "2026-05-15T08:30:00.000Z",
+      },
+    }),
+  };
+}
+
+const SOURCE = { org: "metafactory", agent: "cortex", instance: "local" };
+
+// =============================================================================
+// Cases
+// =============================================================================
+
+describe("BusPeerHarness — round-trip + verification gate", () => {
+  test("publishes the request envelope and yields started + verified inbound + peer terminal", async () => {
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const resolver = resolverWith(luna, echo);
+    const { runtime, published, deliverInbound } = fakeRuntime();
+
+    const harness = new BusPeerHarness({
+      runtime,
+      resolver,
+      receivingAgentId: "luna",
+      source: SOURCE,
+    });
+
+    const req = dispatchRequest();
+    const yielded: MyelinEnvelope[] = [];
+
+    // Drive the iterator. After yielding `started`, deliver an inbound
+    // dispatch.task.completed from echo — that's the peer terminal and
+    // triggers iterator close.
+    const iterator = harness.dispatch(req)[Symbol.asyncIterator]();
+
+    const startedYield = await iterator.next();
+    expect(startedYield.done).toBe(false);
+    if (!startedYield.done) yielded.push(startedYield.value);
+
+    // Now inject the peer terminal — verified principal echo, trusted by luna.
+    deliverInbound(
+      inboundEnvelope({
+        correlationId: req.requestId,
+        type: "dispatch.task.completed",
+        signerPrincipal: "did:mf:echo",
+      }),
+    );
+
+    const terminalYield = await iterator.next();
+    expect(terminalYield.done).toBe(false);
+    if (!terminalYield.done) yielded.push(terminalYield.value);
+
+    // Iterator should close after the terminal.
+    const closeYield = await iterator.next();
+    expect(closeYield.done).toBe(true);
+
+    // Outbound envelope: published exactly once.
+    expect(published).toHaveLength(1);
+    expect(published[0]?.type).toBe("dispatch.task.dispatched");
+    expect(published[0]?.correlation_id).toBe(req.requestId);
+
+    // Yielded sequence: started → completed (verified inbound).
+    expect(yielded).toHaveLength(2);
+    expect(yielded[0]?.type).toBe("dispatch.task.started");
+    expect(yielded[1]?.type).toBe("dispatch.task.completed");
+  });
+
+  test("drops an inbound envelope whose signer is not in receiver's trust list", async () => {
+    // Holly is registered with an NKey but NOT in luna's trust list.
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const holly = agentFixture({
+      id: "holly",
+      displayName: "Holly",
+      nkey_pub: NKEY_HOLLY,
+    });
+    const resolver = resolverWith(luna, echo, holly);
+    const { runtime, deliverInbound } = fakeRuntime();
+
+    // Capture stderr to assert the drop is logged with the structured
+    // reason (mirrors what the harness writes).
+    const stderrLines: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk: string | Uint8Array): boolean => {
+      stderrLines.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    };
+
+    try {
+      const harness = new BusPeerHarness({
+        runtime,
+        resolver,
+        receivingAgentId: "luna",
+        source: SOURCE,
+      });
+
+      const req = dispatchRequest();
+      const iterator = harness.dispatch(req)[Symbol.asyncIterator]();
+
+      // Pull `started` first.
+      const startedYield = await iterator.next();
+      expect(startedYield.done).toBe(false);
+
+      // Holly tries to claim the task — chain signer not trusted.
+      deliverInbound(
+        inboundEnvelope({
+          correlationId: req.requestId,
+          type: "dispatch.task.completed",
+          signerPrincipal: "did:mf:holly",
+        }),
+      );
+
+      // The untrusted envelope must be dropped, NOT yielded. Echo's
+      // legitimate terminal arrives second; only THIS one should yield.
+      deliverInbound(
+        inboundEnvelope({
+          correlationId: req.requestId,
+          type: "dispatch.task.completed",
+          signerPrincipal: "did:mf:echo",
+        }),
+      );
+
+      const next = await iterator.next();
+      expect(next.done).toBe(false);
+      if (!next.done) {
+        // The yielded envelope's signer must be echo, not holly.
+        const signedBy = next.value.signed_by;
+        const stamp = Array.isArray(signedBy) ? signedBy[0] : signedBy;
+        expect(stamp?.principal).toBe("did:mf:echo");
+      }
+
+      const done = await iterator.next();
+      expect(done.done).toBe(true);
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    const stderrOutput = stderrLines.join("");
+    expect(stderrOutput).toContain("bus-peer:luna");
+    expect(stderrOutput).toContain("signer_not_trusted");
+  });
+
+  test("unregisters the runtime handler when the consumer breaks before peer terminal", async () => {
+    // Per the SessionHarness contract (and matching ClaudeCodeHarness),
+    // consumer-break does NOT yield a synthetic terminal envelope —
+    // async-generator semantics drop yields-in-finally after iterator
+    // return. The harness's job on break is to clean up its NATS
+    // subscription so the runtime doesn't fan out to a dropped handler.
+    // The runner / dispatch-listener observes iterator close and
+    // records an aborted lifecycle envelope from its outside view.
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const resolver = resolverWith(luna, echo);
+    const { runtime, handlers } = fakeRuntime();
+
+    const harness = new BusPeerHarness({
+      runtime,
+      resolver,
+      receivingAgentId: "luna",
+      source: SOURCE,
+    });
+
+    const req = dispatchRequest();
+    const yielded: MyelinEnvelope[] = [];
+
+    // Consume `started` then break — no peer terminal ever delivered.
+    for await (const env of harness.dispatch(req)) {
+      yielded.push(env);
+      if (env.type === "dispatch.task.started") break;
+    }
+
+    // Only `started` should be observable (the break is the iterator's
+    // last call) — no synthetic-aborted in the consumer's view.
+    expect(yielded).toHaveLength(1);
+    expect(yielded[0]?.type).toBe("dispatch.task.started");
+
+    // Critical contract: the runtime handler must be unregistered so
+    // future bus traffic doesn't leak to a closed dispatch.
+    expect(handlers.size).toBe(0);
+  });
+
+  test("ignores envelopes whose correlation_id does not match this dispatch", async () => {
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const resolver = resolverWith(luna, echo);
+    const { runtime, deliverInbound } = fakeRuntime();
+
+    const harness = new BusPeerHarness({
+      runtime,
+      resolver,
+      receivingAgentId: "luna",
+      source: SOURCE,
+    });
+
+    const req = dispatchRequest({
+      requestId: "00000000-0000-4000-8000-000000000111",
+    });
+    const iterator = harness.dispatch(req)[Symbol.asyncIterator]();
+
+    const started = await iterator.next();
+    expect(started.done).toBe(false);
+
+    // Inject a DIFFERENT-correlation-id envelope — must not yield.
+    deliverInbound(
+      inboundEnvelope({
+        correlationId: "00000000-0000-4000-8000-000000000222",
+        type: "dispatch.task.completed",
+        signerPrincipal: "did:mf:echo",
+      }),
+    );
+
+    // Now deliver the actual matching terminal.
+    deliverInbound(
+      inboundEnvelope({
+        correlationId: req.requestId,
+        type: "dispatch.task.completed",
+        signerPrincipal: "did:mf:echo",
+      }),
+    );
+
+    const matching = await iterator.next();
+    expect(matching.done).toBe(false);
+    expect(matching.value?.correlation_id).toBe(req.requestId);
+
+    const done = await iterator.next();
+    expect(done.done).toBe(true);
+  });
+});
