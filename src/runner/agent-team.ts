@@ -11,13 +11,45 @@
 import { EventEmitter } from "events";
 import { CCSession, type CCSessionOpts } from "./cc-session";
 import { randomUUID } from "crypto";
+import type { MyelinRuntime } from "../bus/myelin/runtime";
+import type { TrustResolver } from "../common/agents/trust-resolver";
+import type { DispatchEventSource } from "../bus/dispatch-events";
+import { BusPeerHarness } from "../substrates/bus-peer/harness";
+import type {
+  DispatchRequest,
+  MyelinEnvelope,
+} from "../common/substrates/types";
 
 export interface TeamMember {
   name: string;
-  session: CCSession;
+  /**
+   * Local participants (default `kind: "local"`) drive a CCSession in
+   * the runner's process. Bus-peer participants (B.2b — `kind:
+   * "bus-peer"`) delegate to a remote cortex over the bus via
+   * `BusPeerHarness`; the local member tracks the harness handle as
+   * an abort point + the AsyncIterable's underlying state. The
+   * runtime exposes only the parts the synthesis path cares about.
+   */
+  session: CCSession | BusPeerHandle;
   role: "moderator" | "participant";
   status: "idle" | "thinking" | "done";
   result?: string;
+}
+
+/**
+ * IAW Phase B.2b (cortex#114, refs cortex#202) — abstraction over an
+ * in-flight `BusPeerHarness.dispatch()` iterator. The agent-team
+ * runner needs `start()` (kicks the iterator) and a way to abort if
+ * the team is torn down before the peer's terminal envelope arrives.
+ */
+export interface BusPeerHandle {
+  /** Begin pulling envelopes from `harness.dispatch(req)`. */
+  start(): void;
+  /**
+   * Abort the in-flight dispatch — breaks the iterator, runs
+   * `BusPeerHarness`'s cleanup (unregister handler on runtime).
+   */
+  abort(): void;
 }
 
 export interface TeamParticipantConfig {
@@ -30,6 +62,34 @@ export interface TeamParticipantConfig {
   allowedTools?: string[];
   /** Override disallowed tools for this participant */
   disallowedTools?: string[];
+  /**
+   * IAW Phase B.2b (cortex#114) — participant substrate kind.
+   *
+   * - `"local"` (default) — drives a `CCSession` in this runner's
+   *   process. Today's behaviour; unchanged for callers that don't
+   *   opt in.
+   * - `"bus-peer"` — dispatches the participant prompt to a remote
+   *   cortex via `BusPeerHarness`. Requires
+   *   `AgentTeamOpts.runtime` + `resolver` + `receivingAgentId` +
+   *   `operatorId` + `source` to be set. The terminal envelope's
+   *   `payload.result_summary` (set by the peer) becomes the
+   *   member's `result`; absence becomes an empty result string.
+   *
+   * The mode flips per-participant so a team can mix local CC
+   * sessions with bus-peer delegations in one moderator run — useful
+   * when only one capability (e.g. `security-review`) lives off-stack
+   * and the rest stay local.
+   */
+  kind?: "local" | "bus-peer";
+  /**
+   * Required when `kind === "bus-peer"`. The remote agent id the
+   * dispatch envelope targets — surfaces on
+   * `DispatchRequest.agent.id` so the peer's substrate sees it as
+   * the recipient. Today's wire format is sender-agnostic; this
+   * field is for forward compatibility with cortex#107
+   * principal-based routing.
+   */
+  peerAgentId?: string;
 }
 
 export interface AgentTeamOpts {
@@ -53,6 +113,166 @@ export interface AgentTeamOpts {
   project?: string;
   entity?: string;
   operator?: string;
+  /**
+   * IAW Phase B.2b (cortex#114) — bus-peer dependencies. Required
+   * when ANY participant has `kind: "bus-peer"`; the constructor
+   * throws if a participant declares bus-peer routing without these
+   * dependencies wired in (load-bearing — silent fallback to local
+   * would defeat the purpose of declaring bus-peer in the first
+   * place).
+   */
+  busPeer?: {
+    runtime: MyelinRuntime;
+    resolver: TrustResolver;
+    receivingAgentId: string;
+    operatorId: string;
+    source: DispatchEventSource;
+  };
+  /**
+   * IAW Phase B.2b (cortex#114) — test-injectable factory for the
+   * bus-peer handle. Production callers omit; tests pass a fake
+   * that captures the dispatch request + lets the test inject the
+   * terminal envelope synchronously.
+   *
+   * @internal — not part of the public API.
+   */
+  busPeerHandleFactory?: BusPeerHandleFactory;
+}
+
+/**
+ * IAW Phase B.2b (cortex#114) — factory that builds a `BusPeerHandle`
+ * for a single bus-peer participant. Production wiring uses the
+ * `defaultBusPeerHandleFactory` below which constructs a real
+ * `BusPeerHarness` + iterates `dispatch()`; tests pass a fake.
+ */
+export type BusPeerHandleFactory = (
+  config: BusPeerHandleConfig,
+) => BusPeerHandle;
+
+export interface BusPeerHandleConfig {
+  /** Remote agent id (`TeamParticipantConfig.peerAgentId`). */
+  peerAgentId: string;
+  /** Display name on the local member record. */
+  participantName: string;
+  /** Prompt to send the remote substrate. */
+  prompt: string;
+  /** Bus deps from `AgentTeamOpts.busPeer`. */
+  runtime: MyelinRuntime;
+  resolver: TrustResolver;
+  receivingAgentId: string;
+  operatorId: string;
+  source: DispatchEventSource;
+  /** Callback when the remote returns its terminal envelope. */
+  onResult: (resultSummary: string) => void;
+  /** Callback when dispatch errors before terminal. */
+  onError: (err: Error) => void;
+  /** Soft timeout in ms; abort if no terminal arrives. */
+  timeoutMs: number;
+}
+
+/**
+ * IAW Phase B.2b (cortex#114) — default production factory for
+ * bus-peer participant handles. Constructs a `BusPeerHarness`,
+ * builds a `DispatchRequest`, and iterates `harness.dispatch(req)`
+ * in an async generator. Terminal envelopes flip the handle into
+ * the result callback; non-terminal progress envelopes flow into
+ * `onProgress`-style callbacks once those land (today the team
+ * only consumes terminal results).
+ *
+ * Abort semantics: `BusPeerHarness.dispatch()` is an async generator
+ * that exits cleanly when the consumer breaks. The handle wraps the
+ * iterator; `abort()` calls `.return()` on the iterator which
+ * triggers the harness's try/finally cleanup (unregister handler
+ * on runtime).
+ */
+export function defaultBusPeerHandleFactory(
+  config: BusPeerHandleConfig,
+): BusPeerHandle {
+  const harness = new BusPeerHarness({
+    runtime: config.runtime,
+    resolver: config.resolver,
+    receivingAgentId: config.receivingAgentId,
+    source: config.source,
+  });
+
+  const dispatchRequest: DispatchRequest = {
+    prompt: config.prompt,
+    tools: { allow: [], deny: [] },
+    context: [],
+    agent: {
+      id: config.peerAgentId,
+      displayName: config.participantName,
+    },
+    requestId: randomUUID(),
+  };
+
+  let iterator: AsyncIterator<MyelinEnvelope> | undefined;
+  let aborted = false;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+  return {
+    start(): void {
+      timeoutHandle = setTimeout(() => {
+        if (!aborted) {
+          aborted = true;
+          void iterator?.return?.(undefined);
+          config.onError(
+            new Error(
+              `bus-peer dispatch timed out after ${config.timeoutMs}ms for peerAgentId=${config.peerAgentId}`,
+            ),
+          );
+        }
+      }, config.timeoutMs);
+
+      // Async loop pulls envelopes until terminal arrives or abort
+      // breaks the iterator. The harness yields started → progress*
+      // → terminal; we discard non-terminal envelopes (today's
+      // synthesis path consumes only the final result_summary).
+      const drain = async (): Promise<void> => {
+        try {
+          const iterable = harness.dispatch(dispatchRequest);
+          iterator = iterable[Symbol.asyncIterator]();
+          for (;;) {
+            const next = await iterator.next();
+            if (next.done === true) break;
+            const envelope = next.value;
+            if (
+              envelope.type === "dispatch.task.completed" ||
+              envelope.type === "dispatch.task.failed" ||
+              envelope.type === "dispatch.task.aborted"
+            ) {
+              if (aborted) return;
+              // Result extraction: the peer cortex emits a
+              // `dispatch.task.completed` with `payload.result_summary`
+              // carrying its synthesized response. Absence becomes an
+              // empty string so the team's synthesis still runs (the
+              // missing payload is a peer-side bug worth surfacing on
+              // the dashboard, not a reason to fail the whole team).
+              const summary =
+                typeof envelope.payload.result_summary === "string"
+                  ? envelope.payload.result_summary
+                  : "";
+              config.onResult(summary);
+              return;
+            }
+          }
+        } catch (err) {
+          if (aborted) return;
+          config.onError(err instanceof Error ? err : new Error(String(err)));
+        } finally {
+          if (timeoutHandle !== undefined) {
+            clearTimeout(timeoutHandle);
+          }
+        }
+      };
+      void drain();
+    },
+    abort(): void {
+      aborted = true;
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+      void iterator?.return?.(undefined);
+    },
+  };
 }
 
 /**
@@ -133,6 +353,30 @@ export class AgentTeam extends EventEmitter {
     super();
     this.traceId = randomUUID();
     this.teamId = `team-${randomUUID().slice(0, 8)}`;
+
+    // IAW Phase B.2b — fail loud at construction time when a
+    // participant declares `kind: "bus-peer"` but the team wasn't
+    // wired with the bus dependencies. Silent fallback to local
+    // would defeat the explicit per-participant routing choice.
+    const busPeers = opts.participants.filter((p) => p.kind === "bus-peer");
+    if (busPeers.length > 0) {
+      if (opts.busPeer === undefined) {
+        throw new Error(
+          `AgentTeam: ${busPeers.length} bus-peer participant(s) declared ` +
+            `(${busPeers.map((p) => p.name).join(", ")}) but opts.busPeer is missing — ` +
+            "wire runtime + resolver + receivingAgentId + operatorId + source",
+        );
+      }
+      const missingPeerAgentId = busPeers.find(
+        (p) => p.peerAgentId === undefined || p.peerAgentId === "",
+      );
+      if (missingPeerAgentId !== undefined) {
+        throw new Error(
+          `AgentTeam: bus-peer participant "${missingPeerAgentId.name}" is missing peerAgentId — ` +
+            "the remote agent id is required for outbound dispatch",
+        );
+      }
+    }
   }
 
   /** Start the team: spawn moderator, which triggers participant dispatch. */
@@ -213,6 +457,16 @@ export class AgentTeam extends EventEmitter {
     const config = this.opts.participants.find((p) => p.name === name);
     if (!config) return;
 
+    // IAW Phase B.2b — bus-peer participants delegate to a remote
+    // cortex via `BusPeerHarness` instead of spawning a local
+    // CCSession. The constructor already validated that `busPeer`
+    // dependencies + `peerAgentId` are set when any participant
+    // declared `kind: "bus-peer"`; this branch can trust them.
+    if (config.kind === "bus-peer") {
+      this.spawnBusPeerParticipant(name, config);
+      return;
+    }
+
     const participantPrompt = [
       `You are "${name}", a specialist participant in a team working on a task.`,
       `Your role: ${config.prompt}`,
@@ -281,6 +535,102 @@ export class AgentTeam extends EventEmitter {
     });
 
     session.start();
+  }
+
+  /**
+   * IAW Phase B.2b (cortex#114) — spawn a participant that delegates
+   * its work to a remote cortex over the bus rather than running
+   * locally. The remote substrate (peer cortex's BusDispatchListener)
+   * receives our `dispatch.task.dispatched` envelope, the peer's
+   * own runner does the work, and emits a terminal envelope with
+   * the synthesized result back over the bus.
+   *
+   * Result extraction: the peer's `dispatch.task.completed` envelope
+   * carries `payload.result_summary`; absence becomes an empty
+   * string so the synthesis step still runs (a missing payload is
+   * a peer-side bug, not a reason to fail this team).
+   *
+   * Timeout: the team's overall `timeoutMs` (default 15 min) bounds
+   * the peer wait. On timeout, the harness's iterator is broken
+   * (clean unregister via the try/finally inside `BusPeerHarness`)
+   * and the member is marked failed.
+   */
+  private spawnBusPeerParticipant(
+    name: string,
+    config: TeamParticipantConfig,
+  ): void {
+    // Validated at construction time; the non-null assertions here
+    // are documentation that the precondition holds.
+    const busPeer = this.opts.busPeer;
+    const peerAgentId = config.peerAgentId;
+    if (busPeer === undefined || peerAgentId === undefined) {
+      this.emit(
+        "error",
+        new Error(
+          `AgentTeam: bus-peer participant "${name}" missing dependencies at spawn — ` +
+            "constructor validation should have caught this",
+        ),
+      );
+      return;
+    }
+
+    const participantPrompt = [
+      `You are "${name}", a specialist participant in a team working on a task.`,
+      `Your role: ${config.prompt}`,
+      "",
+      `The team is working on: ${this.opts.prompt}`,
+      "",
+      "Provide your specialist analysis or work. Be thorough but focused on your area.",
+      "Start with a 1-3 sentence plain-text overview, then provide details.",
+    ].join("\n");
+
+    const factory =
+      this.opts.busPeerHandleFactory ?? defaultBusPeerHandleFactory;
+
+    const handle = factory({
+      peerAgentId,
+      participantName: name,
+      prompt: participantPrompt,
+      runtime: busPeer.runtime,
+      resolver: busPeer.resolver,
+      receivingAgentId: busPeer.receivingAgentId,
+      operatorId: busPeer.operatorId,
+      source: busPeer.source,
+      timeoutMs: this.opts.timeoutMs ?? 900_000,
+      onResult: (resultSummary) => {
+        const member = this.members.get(name);
+        if (member) {
+          member.status = "done";
+          member.result = resultSummary;
+        }
+        this.emit("progress", name, resultSummary.slice(0, 200));
+        this.pendingParticipants.delete(name);
+        if (this.pendingParticipants.size === 0) {
+          this.triggerSynthesis();
+        }
+      },
+      onError: (err) => {
+        const member = this.members.get(name);
+        if (member) {
+          member.status = "done";
+          member.result = `Error: ${err.message}`;
+        }
+        this.pendingParticipants.delete(name);
+        this.emit("progress", name, `Failed: ${err.message}`);
+        if (this.pendingParticipants.size === 0) {
+          this.triggerSynthesis();
+        }
+      },
+    });
+
+    this.members.set(name, {
+      name,
+      session: handle,
+      role: "participant",
+      status: "thinking",
+    });
+
+    handle.start();
   }
 
   private triggerSynthesis(): void {
