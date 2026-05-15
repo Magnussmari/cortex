@@ -1,31 +1,62 @@
 /**
- * IAW Phase B.1a (cortex#114) — structural verification of an envelope's
- * `signed_by[]` chain against the local trust registry.
+ * IAW Phase B.1a/B.1c (cortex#114) — verification of an envelope's
+ * `signed_by[]` chain against the local trust registry, optionally
+ * including cryptographic verification of each stamp's ed25519 signature.
  *
- * "Structural" because this slice does NOT verify the ed25519 signature
- * bytes. It checks that every stamp's claimed principal:
- *   1. Resolves to a known agent in the local registry
- *   2. Has an `nkey_pub` declared (the agent intends to sign on the bus)
- *   3. Passes `TrustResolver.trustsByNKey(receivingAgentId, agent.nkey_pub)`
- *      — i.e. the receiving agent's `trust:` list includes this signer
+ * Two layered checks:
  *
- * Phase B.1c extends this helper to also verify the signature bytes via
- * ed25519 + JCS canonicalization. The structural rejection paths in this
- * slice catch the failure modes that don't require the crypto check:
- * unknown signer, signer-not-configured-for-bus, peer-not-in-trust-list.
- * Adding the bytes check in B.1c collapses the "signer claims X but
- * controls a different key" attack surface; until then a stamp can lie
- * about its principal and a sloppy operator who copy-pasted an unknown
- * agent's NKey into their own agent's `trust:` list would accept it.
- * That's why B.1c is part of Phase B — the structural check alone is
- * not safe to wire into a production inbound path.
+ *   1. **Structural trust** (B.1a, always on). For every ed25519 stamp,
+ *      checks that the claimed principal:
+ *        a. Resolves to a known agent in the local registry
+ *        b. Has an `nkey_pub` declared (the agent intends to sign on bus)
+ *        c. Passes `TrustResolver.trustsByNKey(receivingAgentId, nkey_pub)`
+ *           — i.e. the receiving agent's `trust:` list includes this signer
  *
- * Hub-stamp variants (`method === "hub-stamp"`) pass through this slice
- * structurally — they're a Phase D concern (federation hub trust). B.1a
- * neither rejects nor verifies them; they're surfaced as "unverified" in
- * the result so a strict caller can opt to reject all non-bare-ed25519
- * chains.
+ *   2. **Cryptographic verification** (B.1c, opt-in via `cryptoVerify: true`).
+ *      After structural pass, calls myelin's `verifyEnvelopeIdentity` which:
+ *        a. Canonicalizes the envelope per JCS (RFC 8785)
+ *        b. Verifies every stamp's ed25519 signature over the canonical bytes
+ *        c. Checks timestamp freshness (clock-skew window)
+ *      Failure surfaces as `crypto_verify_failed` with the underlying
+ *      myelin rejection reason carried through.
+ *
+ * **Why two layers, both gated by trust:** the structural check alone is
+ * not safe to wire into a production inbound path — a stamp can lie
+ * about its principal, and a sloppy operator copying an unknown agent's
+ * NKey into their own `trust:` list would accept the forgery. The crypto
+ * check alone is not enough either — a verified signer the receiver
+ * doesn't trust shouldn't be admitted. The two checks compose: structural
+ * fails closed on unknown/untrusted; crypto fails closed on forged bytes.
+ *
+ * Hub-stamp variants (`method === "hub-stamp"`) pass through this helper
+ * structurally — they're a Phase D concern (federation hub trust).
+ * They're surfaced as `skipped` indices so a strict caller can opt to
+ * reject all non-bare-ed25519 chains.
+ *
+ * **Import discipline.** Crypto helpers come from
+ * `@the-metafactory/myelin/identity` — the constrained subpath added by
+ * myelin#146 (closes myelin#145), tightened to strict-null safety by
+ * myelin#148 (closes myelin#147). Importing from the top-level
+ * `@the-metafactory/myelin` package pulls myelin's full source tree into
+ * tsc analysis and surfaces strict-null violations in modules cortex
+ * doesn't consume; the `./identity` subpath limits resolution to
+ * myelin's identity submodule + its transitive deps.
  */
+
+import {
+  verifyEnvelopeIdentity,
+  createInMemoryRegistry,
+  type PrincipalRegistry,
+} from "@the-metafactory/myelin/identity";
+import { Prefix } from "@nats-io/nkeys";
+// `Codec` is the internal NKey base32 + CRC + prefix-byte decoder.
+// Marked `@ignore` in @nats-io/nkeys but stable; the public `fromPublic`
+// helper stores only the ASCII bytes of the NKey string on its returned
+// `PublicKey.publicKey` field, not the raw 32-byte ed25519 pubkey. We
+// need the raw bytes to bridge to myelin's `Principal.public_key`
+// (base64-encoded raw ed25519), so this subpath import is the narrow
+// way in without re-implementing crockford base32 + CRC16 inline.
+import { Codec } from "@nats-io/nkeys/lib/codec";
 
 import {
   getSignedByChain,
@@ -33,6 +64,7 @@ import {
   type SignedBy,
 } from "./myelin/envelope-validator";
 import { TrustResolver } from "../common/agents/trust-resolver";
+import type { AgentRegistry } from "../common/agents/registry";
 
 // =============================================================================
 // Result types
@@ -68,7 +100,22 @@ export type ChainRejectionReason =
   | { kind: "malformed_principal"; principal: string }
   | { kind: "unknown_agent"; principal: string; agentId: string }
   | { kind: "principal_has_no_nkey_pub"; principal: string; agentId: string }
-  | { kind: "signer_not_trusted"; principal: string; agentId: string };
+  | { kind: "signer_not_trusted"; principal: string; agentId: string }
+  | {
+      /**
+       * Cryptographic verification failed — the bytes don't match the
+       * claimed signature, OR the timestamp is outside the freshness
+       * window, OR myelin's principal-registry lookup failed for the
+       * stamp's DID (when the structural check accepted the agent but
+       * the per-stamp Principal lookup inside myelin's verify did not).
+       *
+       * `myelinReason` carries myelin's own rejection text verbatim so
+       * audit envelopes (Phase C) can surface "ed25519 verify failed"
+       * vs. "timestamp outside freshness window" without recomputing.
+       */
+      kind: "crypto_verify_failed";
+      myelinReason: string;
+    };
 
 /**
  * Discriminated outcome of `verifySignedByChain`.
@@ -119,6 +166,33 @@ export interface VerifySignedByChainOptions {
    * tooling that legitimately accept unsigned envelopes pass `false`.
    */
   rejectEmpty?: boolean;
+  /**
+   * When true (B.1c), runs myelin's `verifyEnvelopeIdentity` after the
+   * structural pass to verify each stamp's ed25519 signature over the
+   * JCS-canonical envelope bytes. Default `false` for back-compat: the
+   * structural check alone is the B.1a contract and existing B.1b
+   * call sites keep their behaviour unchanged until they opt in.
+   *
+   * When `cryptoVerify: true`, the caller must also pass `operatorId`
+   * so the helper can build a myelin `PrincipalRegistry` from the
+   * `TrustResolver`'s underlying `AgentRegistry`. Each agent with an
+   * `nkey_pub` becomes a Principal whose `public_key` is the
+   * base64-encoded raw ed25519 pubkey derived from the NATS NKey.
+   */
+  cryptoVerify?: boolean;
+  /**
+   * Operator id (e.g. `andreas`). Required when `cryptoVerify: true` —
+   * threaded into each constructed Principal so myelin's verification
+   * has the operator field populated. Ignored when `cryptoVerify` is
+   * false / undefined.
+   */
+  operatorId?: string;
+  /**
+   * Optional clock-skew tolerance for myelin's timestamp-freshness
+   * check (passed through to `verifyEnvelopeIdentity`). Default per
+   * myelin: 5 minutes.
+   */
+  clockSkewMs?: number;
 }
 
 // =============================================================================
@@ -127,20 +201,26 @@ export interface VerifySignedByChainOptions {
 
 /**
  * Walk `envelope.signed_by` chain (normalised via `getSignedByChain`) and
- * structurally verify each ed25519 stamp against the local trust registry.
+ * verify each ed25519 stamp against the local trust registry.
  *
- * **Cryptographic signature verification is NOT performed at this slice.**
- * See file header for rationale. Phase B.1c extends this helper.
+ * Two layered checks: structural trust (always), then cryptographic
+ * verification (when `opts.cryptoVerify === true`). See file header.
  *
- * Iteration short-circuits on the first failure (terminal rejection). Chain
- * length is bounded by myelin's envelope schema (max_hop cap) so a linear
- * scan is cheap; no early-exit optimisation needed beyond the natural
- * `return` on rejection.
+ * Iteration short-circuits on the first structural failure. The crypto
+ * check is invoked once at the end, on the full chain, because myelin's
+ * `verifyEnvelopeIdentity` itself walks the chain and threads canonical-
+ * bytes commitment from one stamp to the next (myelin#31).
+ *
+ * `verifySignedByChain` is async because `verifyEnvelopeIdentity` is
+ * async (@noble/ed25519's `verifyAsync`). When `cryptoVerify: false`
+ * (default), the helper still returns a Promise to keep one signature
+ * for both modes — a sync/async split based on an option flag would
+ * force every call site to handle both branches.
  */
-export function verifySignedByChain(
+export async function verifySignedByChain(
   envelope: Envelope,
   opts: VerifySignedByChainOptions,
-): ChainVerificationResult {
+): Promise<ChainVerificationResult> {
   const chain = getSignedByChain(envelope);
   const rejectEmpty = opts.rejectEmpty ?? true;
 
@@ -173,6 +253,51 @@ export function verifySignedByChain(
       };
     }
     // stampResult.kind === "accept" — continue to next stamp
+  }
+
+  // Crypto layer (B.1c) — opt-in. Structural check has already passed
+  // for every ed25519 stamp at this point; myelin's verifier runs the
+  // canonical-bytes + signature + freshness check on top.
+  if (opts.cryptoVerify === true) {
+    if (opts.operatorId === undefined) {
+      throw new Error(
+        "verifySignedByChain: cryptoVerify requires opts.operatorId — " +
+          "myelin's Principal shape needs the operator field populated.",
+      );
+    }
+    const registry = buildPrincipalRegistry(
+      opts.resolver.getRegistry(),
+      opts.operatorId,
+    );
+    // Myelin's verifier expects `signed_by` normalised to array form;
+    // cortex's `Envelope` keeps the back-compat shim of single-stamp
+    // OR array. Normalise here before handing off.
+    const myelinEnvelope = {
+      ...envelope,
+      signed_by: chain,
+    };
+    const myelinResult = await verifyEnvelopeIdentity(
+      myelinEnvelope,
+      registry,
+      opts.clockSkewMs !== undefined
+        ? { clockSkewMs: opts.clockSkewMs }
+        : undefined,
+    );
+    if (myelinResult.status !== "verified") {
+      return {
+        valid: false,
+        // The structural walk accepted every stamp; the crypto failure
+        // is a chain-level rejection rather than a per-stamp index.
+        // Surface as rejectedAt: 0 (the first stamp) with the myelin
+        // reason carried verbatim.
+        rejectedAt: 0,
+        reason: {
+          kind: "crypto_verify_failed",
+          myelinReason: myelinResult.reason,
+        },
+        skipped: [...skipped],
+      };
+    }
   }
 
   return { valid: true, skipped };
@@ -261,4 +386,86 @@ function extractAgentIdFromDid(principal: string): string | undefined {
   // a colon in the tail signals an unsupported DID variant.
   if (tail.includes(":")) return undefined;
   return tail;
+}
+
+// =============================================================================
+// Principal-registry bridge (B.1c)
+// =============================================================================
+
+/**
+ * Bridge cortex's `AgentRegistry` to myelin's `PrincipalRegistry` for the
+ * crypto-verification step. Every agent with a declared `nkey_pub` becomes
+ * a Principal whose `public_key` is the base64-encoded raw ed25519 pubkey
+ * extracted from the NATS NKey via `@nats-io/nkeys`'s `fromPublic`.
+ *
+ * Why the decode is needed: cortex stores agent signing keys in NATS NKey
+ * format (`U` + 55 base32 chars) for parity with `StackConfigSchema.nkey_pub`.
+ * Myelin's verify pipeline consumes raw ed25519 pubkeys encoded as base64.
+ * The two encodings cover the same 32-byte ed25519 pubkey underneath —
+ * `fromPublic` gives us a `KeyPair` whose underlying concrete class
+ * stores the raw `Uint8Array` which we base64-encode for myelin.
+ *
+ * Agents without `nkey_pub` are skipped — the structural check will have
+ * already rejected stamps claiming those principals before crypto verify
+ * runs.
+ *
+ * Exported so callers (tests, future tooling) can construct a registry
+ * independently and pass it through; this also keeps the
+ * verifySignedByChain hot path from rebuilding a registry per call when
+ * the caller has a stable agent set (future caching is a separate
+ * concern — at B.1c, every cryptoVerify call rebuilds).
+ */
+export function buildPrincipalRegistry(
+  agentRegistry: AgentRegistry,
+  operatorId: string,
+): PrincipalRegistry {
+  const registry = createInMemoryRegistry();
+  const createdAt = new Date(0).toISOString();
+  for (const agent of agentRegistry.getAll()) {
+    if (agent.nkey_pub === undefined) continue;
+    const publicKey = nkeyToBase64Pubkey(agent.nkey_pub);
+    if (publicKey === undefined) {
+      // Malformed NKey at this point would already have failed the
+      // AgentSchema regex on config load — defensive only.
+      continue;
+    }
+    registry.add({
+      id: `did:mf:${agent.id}`,
+      display_name: agent.displayName,
+      operator: operatorId,
+      public_key: publicKey,
+      type: "agent",
+      created_at: createdAt,
+    });
+  }
+  return registry;
+}
+
+/**
+ * Convert a NATS NKey public-key (e.g. `UA...`, 56 chars) to the
+ * base64-encoded 32-byte raw ed25519 pubkey shape myelin expects on
+ * `Principal.public_key`. Returns `undefined` if `@nats-io/nkeys`
+ * rejects the input — defensive against drift between AgentSchema's
+ * regex and the on-the-wire decode.
+ *
+ * `Codec.decode(Prefix.User, asciiBytes)` from `@nats-io/nkeys`:
+ *   1. Base32-decodes the NKey ASCII (`UA...` 56 chars → 35 raw bytes)
+ *   2. Validates the leading prefix byte matches `Prefix.User` (0xa0)
+ *   3. Strips the prefix + trailing 2-byte CRC
+ *   4. Returns the 32-byte raw ed25519 pubkey
+ *
+ * The public `fromPublic` helper does the same decode internally for
+ * validation, but stores only the ASCII bytes of the NKey string on
+ * its returned `PublicKey.publicKey` field — not the raw 32 bytes we
+ * want. The `Codec` subpath import is the narrow way to the decoded
+ * payload without re-implementing crockford base32 + CRC16 inline.
+ */
+function nkeyToBase64Pubkey(nkey: string): string | undefined {
+  try {
+    const asciiBytes = new TextEncoder().encode(nkey);
+    const raw = Codec.decode(Prefix.User, asciiBytes);
+    return Buffer.from(raw).toString("base64");
+  } catch {
+    return undefined;
+  }
 }

@@ -66,7 +66,7 @@ import {
 import schema from "./vendor/envelope.schema.json" with { type: "json" };
 
 /** Pin so future maintainers know which myelin commit the schema was lifted from. */
-export const SCHEMA_SOURCE_COMMIT = "b69c877e23a2696040561c2d832fdc75aa83f73e";
+export const SCHEMA_SOURCE_COMMIT = "5a0e2619a4af5c91c78f552b88fafd3ad40a227f";
 
 /**
  * Hand-typed Envelope shape matching the JSON Schema. We hand-write rather

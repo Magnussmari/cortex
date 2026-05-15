@@ -63,10 +63,7 @@ import { randomUUID } from "crypto";
 import type { Envelope } from "../../bus/myelin/envelope-validator";
 import type { MyelinRuntime } from "../../bus/myelin/runtime";
 import type { TrustResolver } from "../../common/agents/trust-resolver";
-import {
-  verifySignedByChain,
-  type ChainVerificationResult,
-} from "../../bus/verify-signed-by-chain";
+import { verifySignedByChain } from "../../bus/verify-signed-by-chain";
 import type {
   Capability,
   DispatchRequest,
@@ -262,44 +259,50 @@ export class BusPeerHarness implements SessionHarness {
       // this harness just published.
       if (envelope.id === requestEnvelope.id) return;
 
-      const verification: ChainVerificationResult = verifySignedByChain(
-        envelope,
-        {
+      // verifySignedByChain is async (B.1c) but onEnvelope's handler
+      // is sync. Run the verify in a separate microtask; when it
+      // resolves, decide whether to admit the envelope to the queue.
+      // The IIFE return is `void`-ed so an unhandled rejection here
+      // would surface via the process unhandled-rejection handler —
+      // verifySignedByChain returns structured results rather than
+      // throwing, so this is belt-and-braces for future-me.
+      void (async (): Promise<void> => {
+        const verification = await verifySignedByChain(envelope, {
           resolver: this.resolver,
           receivingAgentId: this.receivingAgentId,
           // Peers always sign at least the bare ed25519 stamp; an
           // unsigned envelope on the bus-peer path is a misconfig
           // we want surfaced.
           rejectEmpty: true,
-        },
-      );
+        });
 
-      if (!verification.valid) {
-        // Phase C wires audit envelopes; for now stderr is the
-        // visibility surface. Format the reason discriminator inline
-        // so an operator grepping stderr gets the structural class
-        // without consulting code.
-        const reason = verification.reason;
-        process.stderr.write(
-          `[bus-peer:${this.receivingAgentId}] dropped inbound envelope ` +
-            `${envelope.id} (correlation_id=${correlationId}): ` +
-            `${reason.kind} at chain index ${verification.rejectedAt}\n`,
-        );
-        return;
-      }
+        if (!verification.valid) {
+          // Phase C wires audit envelopes; for now stderr is the
+          // visibility surface. Format the reason discriminator
+          // inline so an operator grepping stderr gets the structural
+          // class without consulting code.
+          const reason = verification.reason;
+          process.stderr.write(
+            `[bus-peer:${this.receivingAgentId}] dropped inbound envelope ` +
+              `${envelope.id} (correlation_id=${correlationId}): ` +
+              `${reason.kind} at chain index ${verification.rejectedAt}\n`,
+          );
+          return;
+        }
 
-      pushInbound(envelope);
+        pushInbound(envelope);
 
-      // Terminal-envelope detection — when the peer signals end of
-      // the dispatch, close the inbound queue so the generator can
-      // exit cleanly. Conventional terminal types per G-1111 §3.4.
-      if (
-        envelope.type === "dispatch.task.completed" ||
-        envelope.type === "dispatch.task.failed" ||
-        envelope.type === "dispatch.task.aborted"
-      ) {
-        signalClosed();
-      }
+        // Terminal-envelope detection — when the peer signals end of
+        // the dispatch, close the inbound queue so the generator can
+        // exit cleanly. Conventional terminal types per G-1111 §3.4.
+        if (
+          envelope.type === "dispatch.task.completed" ||
+          envelope.type === "dispatch.task.failed" ||
+          envelope.type === "dispatch.task.aborted"
+        ) {
+          signalClosed();
+        }
+      })();
     });
 
     // ----------------------------------------------------------------
