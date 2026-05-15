@@ -161,6 +161,16 @@ export const DiscordInstanceSchema = z.object({
    * since the resolver only sees adapters started in its own process.
    */
   trustedBotIds: z.array(z.coerce.string()).default([]),
+
+  /**
+   * MIG-3b / cortex#205: NATS subject patterns this Discord adapter renders
+   * to chat. Mirror of the cortex-shape field — `flattenDiscordPresences`
+   * threads it through verbatim.
+   *
+   * @see DiscordPresenceSchema.surfaceSubjects in `cortex-config.ts` for the
+   * canonical operator-facing description, IoAW examples, and contract.
+   */
+  surfaceSubjects: z.array(z.string().min(1)).default([]),
 });
 
 export type DiscordInstance = z.infer<typeof DiscordInstanceSchema>;

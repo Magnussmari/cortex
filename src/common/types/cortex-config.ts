@@ -198,6 +198,24 @@ export const DiscordPresenceSchema = z.object({
    * guard in `DiscordAdapter` is unchanged).
    */
   trustedBotIds: z.array(z.coerce.string()).default([]),
+  /**
+   * MIG-3b / cortex#205: NATS subject patterns this Discord adapter renders
+   * to chat. Threaded into `DiscordAdapterInfra.surfaceSubjects` at
+   * construction time and registered with the surface-router as the
+   * adapter's match set. Empty/undefined → the adapter never matches any
+   * envelope and `DiscordAdapter` logs a one-shot warning at startup (the
+   * v0 behaviour preserved for back-compat with operators on legacy
+   * configs).
+   *
+   * Common values:
+   *   - `local.{org}.tasks.code-review.>` — pilot review-requests (IoAW
+   *     Broadcast grammar per myelin/specs/namespace.md §Tasks Domain).
+   *   - `local.{org}.code.pr.review.>`    — sage review outcomes.
+   *
+   * Moves to per-renderer config at MIG-7.2d; for v1 the whole-adapter
+   * subscription list is enough to unblock the bus→Discord render path.
+   */
+  surfaceSubjects: z.array(z.string().min(1)).default([]),
 });
 
 export type DiscordPresence = z.infer<typeof DiscordPresenceSchema>;
@@ -207,6 +225,11 @@ export type DiscordPresence = z.infer<typeof DiscordPresenceSchema>;
  * grove-v2's `MattermostInstanceSchema` minus the operator/role-override fields
  * that move to the parent agent.
  */
+// TODO(cortex#205-followup): add `surfaceSubjects` mirror —
+// `MattermostAdapter` already accepts it in its infra type
+// (`src/adapters/mattermost/index.ts:57`), so today the bus→chat render
+// path is operator-configurable via cortex.yaml for Discord but silently
+// unreachable for Mattermost.
 export const MattermostPresenceSchema = z.object({
   /** Whether this presence is active. Default: true. */
   enabled: z.boolean().default(true),
