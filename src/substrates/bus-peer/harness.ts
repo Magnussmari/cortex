@@ -242,12 +242,15 @@ export class BusPeerHarness implements SessionHarness {
       }
     }
 
-    // Register the handler INSIDE the try/finally so the unregister
-    // runs even if the consumer breaks at the `started` yield (or
-    // earlier, before entering the pull loop). Async generators only
-    // run finally blocks that wrap the suspended yield point — a
-    // try/finally placed after `yield startedEnvelope` would be
-    // skipped by a break-at-started call to iter.return().
+    // Register the handler BEFORE the try block so envelopes arriving
+    // between registration and the first yield are captured; the
+    // unregister in `finally` (which wraps the publish + every yield
+    // below) covers every exit path — including a consumer break at
+    // the `started` yield. Async-generator semantics: only finally
+    // blocks that *wrap* the suspended yield point run on
+    // `iterator.return()`, so the try must enclose every yield this
+    // method emits, but the registration itself must precede the try
+    // to avoid a registration-vs-yield race.
     const handlerRegistration = this.runtime.onEnvelope((envelope) => {
       // Filter: only envelopes tagged with our correlation_id are
       // relevant to this dispatch. Bus traffic for other dispatches
