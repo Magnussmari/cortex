@@ -32,7 +32,14 @@ import type { UsageStats } from "./runner/stream-parser";
 
 import { buildSecurityPreamble } from "./runner/security-preamble";
 import { DispatchHandler } from "./bus/dispatch-handler";
-import { startMyelinRuntime, type MyelinRuntime } from "./bus/myelin/runtime";
+import {
+  startMyelinRuntime,
+  type BusEnvelopeSigner,
+  type MyelinRuntime,
+} from "./bus/myelin/runtime";
+import { loadStackSigningKey } from "./common/config/stack-signing-key";
+import { BusDispatchListener } from "./bus/bus-dispatch-listener";
+import { DID_RE } from "@the-metafactory/myelin/identity";
 import { createSurfaceRouter, type SurfaceRouter } from "./bus/surface-router";
 import { createNetworkResolver } from "./bus/network-resolver";
 import type { SystemEventSource } from "./bus/system-events";
@@ -216,6 +223,88 @@ export async function startCortex(
     `  Stack: ${derivedStack.id}${options.stack === undefined ? " (default-derived)" : ""}`,
   );
 
+  // IAW Phase B.3 (refs cortex#114) — load the stack signing keypair
+  // if the operator has declared `stack.nkey_seed_path`. The signer is
+  // optional; when absent, MyelinRuntime publishes envelopes unsigned
+  // (same shape as today). When present, MyelinRuntime.publish signs
+  // every outbound envelope via myelin's chain-aware signEnvelope.
+  //
+  // Principal derivation: `did:mf:${stack.id.replace("/", "-")}`. The
+  // `stack.id` shape is `{operator_id}/{stack_id}` (Phase A.5 lock-in);
+  // myelin's DID_RE rejects slashes but accepts hyphens, so we
+  // canonicalize the slash. Operators see `did:mf:andreas-research`
+  // on the wire for `stack.id = "andreas/research"`.
+  //
+  // Load failures are non-fatal — the daemon keeps starting and the
+  // runtime publishes unsigned. The error surfaces to operator logs
+  // so they can fix the seed file and restart.
+  let signer: BusEnvelopeSigner | undefined;
+  if (options.stack?.nkey_seed_path) {
+    try {
+      // `expandTilde` matches `NatsLink.connect`'s treatment of
+      // `credsPath` + the agents.d/ fallback below — operators writing
+      // `~/.config/cortex/stack.nk` should not silently ENOENT into
+      // the unsigned-publish fallback (Echo cortex#211 round 1).
+      const seedPath = expandTilde(options.stack.nkey_seed_path);
+      const kp = await loadStackSigningKey(seedPath);
+
+      // Consistency check: if `stack.nkey_pub` is also declared, the
+      // loaded keypair's public key MUST match. A mismatch is the
+      // operator-rotation split-brain hazard — peers' `trust:`
+      // lookups would reject every signature without explaining why.
+      // Throw and let the existing catch surface the failure (Echo
+      // cortex#211 round 1).
+      if (
+        options.stack.nkey_pub !== undefined &&
+        kp.getPublicKey() !== options.stack.nkey_pub
+      ) {
+        throw new Error(
+          `seed file pubkey ${kp.getPublicKey()} does not match declared ` +
+            `stack.nkey_pub ${options.stack.nkey_pub} — rotation split-brain hazard`,
+        );
+      }
+
+      // KP class exposes getRawSeed() returning the 32-byte ed25519
+      // seed; that's the shape myelin's signEnvelope consumes (after
+      // base64-encoding, done inside MyelinRuntime). See B.3 PR #209.
+      const rawSeedBytes = (
+        kp as unknown as { getRawSeed(): Uint8Array }
+      ).getRawSeed();
+
+      // Derive the principal DID. `stack.id` shape is `{op}/{stack}`
+      // (Phase A.5 lock-in); myelin's DID_RE rejects slashes but
+      // accepts hyphens, so we canonicalize. The schema regex allows
+      // trailing hyphens in each segment (`my-op-/foo`) which after
+      // replacement becomes `my-op--foo`, breaking DID_RE's
+      // consecutive-hyphen guard. Collapse `--` runs to avoid the
+      // silent per-publish sign failure that would otherwise downgrade
+      // every outbound envelope to unsigned (Echo cortex#211 round 1).
+      const principal = `did:mf:${derivedStack.id
+        .replace("/", "-")
+        .replace(/-+/g, "-")}`;
+      if (!DID_RE.test(principal)) {
+        throw new Error(
+          `derived DID "${principal}" does not match myelin DID_RE — ` +
+            `check stack.id segments for trailing-hyphen edge cases`,
+        );
+      }
+
+      signer = { rawSeedBytes, principal };
+      // Soften wording: the runtime may still fail to start; the
+      // signer is only "active" once `startMyelinRuntime` returns an
+      // enabled runtime. Boot-log clarity matters more than terseness
+      // here (Echo cortex#211 round 1).
+      console.log(
+        `cortex: stack signing key staged — principal=${principal} (active once myelin runtime starts)`,
+      );
+    } catch (err) {
+      console.error(
+        "cortex: stack signing key load failed (non-fatal — publish will be unsigned):",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
   // Bus runtime (M2-M6) — no-op when `config.nats?` is absent. Tests inject
   // a recording fake via `options.injectRuntime` to assert observable
   // wire-up side-effects without standing up a real NATS server.
@@ -234,7 +323,10 @@ export async function startCortex(
     runtime = options.injectRuntime;
   } else {
     try {
-      runtime = await startMyelinRuntime(config);
+      runtime = await startMyelinRuntime(
+        config,
+        signer !== undefined ? { signer } : undefined,
+      );
     } catch (err) {
       console.error("cortex: myelin runtime startup error (non-fatal):", err instanceof Error ? err.message : err);
     }
@@ -330,6 +422,43 @@ export async function startCortex(
       dataResidency: config.agent.dataResidency,
     }),
   };
+
+  // IAW Phase B.2a (refs cortex#114) — inbound peer-dispatch listener.
+  // Subscribes via the runtime's onEnvelope fan-out, filters for
+  // `dispatch.task.dispatched` envelopes from non-self sources, runs
+  // verifySignedByChain, emits `system.bus.peer_dispatch_received`
+  // visibility envelopes on valid arrivals. Listener is bound to the
+  // FIRST registered agent today — multi-agent stacks may eventually
+  // want one listener per agent (each receiver's `trust:` list is
+  // distinct), but at this slice a single binding is sufficient for
+  // the inbound visibility surface. When the registry is empty (no
+  // inline agents AND no fragments — e.g. legacy bot.yaml with
+  // `trust: []`), the listener is skipped entirely.
+  //
+  // `cryptoVerify` is hard-coded off at this slice — the structural
+  // check alone is the B.1a contract and operators flip to crypto
+  // verify once every trusted peer has an `nkey_pub` declared. The
+  // flag is a small follow-up plumbing (cortex.yaml flag → option) once
+  // the rollout window closes.
+  let busDispatchListener: BusDispatchListener | undefined;
+  const firstAgent = mergedAgents[0];
+  if (firstAgent !== undefined) {
+    busDispatchListener = new BusDispatchListener({
+      runtime,
+      resolver: trustResolver,
+      receivingAgentId: firstAgent.id,
+      operatorId: config.agent.operatorId ?? "default",
+      source: systemEventSource,
+    });
+    busDispatchListener.start();
+    console.log(
+      `cortex: bus-dispatch-listener started — receivingAgentId=${firstAgent.id}`,
+    );
+  } else {
+    console.log(
+      "cortex: bus-dispatch-listener skipped — no agents in registry",
+    );
+  }
 
   // Surface router (in-process fan-out).
   // Receives `systemEventSource` so visibility-config drops produce
@@ -852,6 +981,17 @@ export async function startCortex(
         if (cleanup) completeSync(`outbound poller stop[${i}]`, cleanup);
       }
       await completeAsync("dispatch-listener stop", dispatchListener.stop());
+      // IAW B.2a — bus-dispatch-listener drain runs after the dispatch
+      // listener (which feeds dispatch-handler) but before the
+      // surface-router stop. The listener's `stop()` awaits its
+      // in-flight verify chain so late stderr / publish side-effects
+      // don't land after the runtime closes.
+      if (busDispatchListener !== undefined) {
+        await completeAsync(
+          "bus-dispatch-listener stop",
+          busDispatchListener.stop(),
+        );
+      }
       await completeAsync("surface-router stop", router.stop());
       await completeAsync("dispatch-handler shutdown", dispatchHandler.shutdown());
       for (let i = 0; i < adapters.length; i++) {
