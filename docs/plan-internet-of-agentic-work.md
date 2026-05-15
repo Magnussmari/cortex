@@ -71,54 +71,54 @@ Total: 12–18 weeks if strictly sequenced. Phases A and B are sequenceable; Pha
 - Myelin namespace extension issue filed (Phase A.5).
 - cortex#92 (substrate harness design PR) merged or its Q5/Q6/Q7 resolved.
 
-### A.1 Substrate harness types + ClaudeCodeHarness refactor (cortex#91 PR-A)
+### A.1 Substrate harness types + ClaudeCodeHarness refactor (cortex#91 PR-A) — ✅ done (PR #125, #126)
 
-- [ ] **A.1.1** `SessionHarness` interface defined in `src/common/substrates/types.ts`. Methods: `dispatch(req): AsyncIterable<MyelinEnvelope>`, lifecycle hooks (`onStart`, `onStop`).
-- [ ] **A.1.2** `ClaudeCodeHarness` implementation refactored out of `src/runner/cc-session.ts`. The spawn-and-stream-json logic moves behind the `SessionHarness.dispatch()` contract.
-- [ ] **A.1.3** `BusPeerHarness` stub — connects to NATS via the existing `MyelinRuntime`; publishes a dispatch envelope; subscribes to the reply subject. Pattern matches sage's existing peer behaviour.
-- [ ] **A.1.4** Tests: substrate harness unit tests cover both implementations; `cc-session` regression tests pass behind the new interface.
-- [ ] **A.1.5** `bunx tsc --noEmit` clean.
+- [x] **A.1.1** `SessionHarness` interface defined in `src/common/substrates/types.ts`. Methods: `dispatch(req): AsyncIterable<MyelinEnvelope>`, lifecycle hooks (`onStart`, `onStop`). — PR #125
+- [x] **A.1.2** `ClaudeCodeHarness` implementation refactored out of `src/runner/cc-session.ts`. The spawn-and-stream-json logic moves behind the `SessionHarness.dispatch()` contract. — PR #125
+- [x] **A.1.3** `BusPeerHarness` stub — connects to NATS via the existing `MyelinRuntime`; publishes a dispatch envelope; subscribes to the reply subject. Pattern matches sage's existing peer behaviour. — PR #126
+- [x] **A.1.4** Tests: substrate harness unit tests cover both implementations; `cc-session` regression tests pass behind the new interface. — PR #125, #126
+- [x] **A.1.5** `bunx tsc --noEmit` clean. — verified at PR #126 merge
 
-### A.2 Envelope upgrade to post-F-021 myelin (cortex#109 sub-task)
+### A.2 Envelope upgrade to post-F-021 myelin (cortex#109 sub-task) — ✅ done (PR #128, follow-up #151)
 
-- [ ] **A.2.1** Bump `src/bus/myelin/envelope-validator.ts` `SCHEMA_SOURCE_COMMIT` from `96b14ea` to current myelin HEAD (post-#31 chain-of-stamps + F-021 task fields + `signed_by[]` array form).
-- [ ] **A.2.2** Update vendored schema at `src/bus/myelin/vendor/envelope.schema.json` to match.
-- [ ] **A.2.3** Wire chain-of-stamps consumption — read inbound `signed_by[]` and surface to dispatch-handler. No verification yet (that's Phase B); just structural parsing.
-- [ ] **A.2.4** Verify existing tests pass against the new schema; add tests for new fields (`requirements`, `distribution_mode`, `target_principal`, `deadline`, `sovereignty_required`).
+- [x] **A.2.1** Bump `src/bus/myelin/envelope-validator.ts` `SCHEMA_SOURCE_COMMIT` from `96b14ea` to current myelin HEAD (post-#31 chain-of-stamps + F-021 task fields + `signed_by[]` array form). — PR #128 (→ `4578ae1`), then PR #151 (→ `b69c877`).
+- [x] **A.2.2** Update vendored schema at `src/bus/myelin/vendor/envelope.schema.json` to match. — PR #128, refreshed at PR #151
+- [x] **A.2.3** Wire chain-of-stamps consumption — read inbound `signed_by[]` and surface to dispatch-handler. No verification yet (that's Phase B); just structural parsing. — PR #128
+- [x] **A.2.4** Verify existing tests pass against the new schema; add tests for new fields (`requirements`, `distribution_mode`, `target_principal`, `deadline`, `sovereignty_required`). — PR #128
 
-### A.3 Parameterise classification at the four emit sites (cortex#109 main work)
+### A.3 Parameterise classification at the four emit sites (cortex#109 main work) — ✅ done (PR #129)
 
-- [ ] **A.3.1** `src/bus/dispatch-events.ts:73` — accept `classification` as a constructor arg; default `"local"`.
-- [ ] **A.3.2** `src/bus/system-events.ts:102` — same.
-- [ ] **A.3.3** `src/bus/github-events.ts:89` — same.
-- [ ] **A.3.4** `src/taps/cc-events/cc-events.ts:99` — same.
-- [ ] **A.3.5** `src/bus/myelin/runtime.ts:236` — `publish()` derives subject prefix from `envelope.sovereignty.classification` (uses `deriveNatsSubject()` from myelin); rejects misaligned `classification` ↔ subject combinations at publish time.
-- [ ] **A.3.6** Tests: each emit site has a regression test that publishing with `classification: "federated"` produces a `federated.*` subject, not `local.*`.
+- [x] **A.3.1** `src/bus/dispatch-events.ts:73` — accept `classification` as a constructor arg; default `"local"`. — PR #129
+- [x] **A.3.2** `src/bus/system-events.ts:102` — same. — PR #129
+- [x] **A.3.3** `src/bus/github-events.ts:89` — same. — PR #129
+- [x] **A.3.4** `src/taps/cc-events/cc-events.ts:99` — same. — PR #129
+- [x] **A.3.5** `src/bus/myelin/runtime.ts:236` — `publish()` derives subject prefix from `envelope.sovereignty.classification` (uses `deriveNatsSubject()` from myelin); rejects misaligned `classification` ↔ subject combinations at publish time. — PR #129
+- [x] **A.3.6** Tests: each emit site has a regression test that publishing with `classification: "federated"` produces a `federated.*` subject, not `local.*`. — PR #129
 
-### A.4 Add visibility filter to surface-router (cortex#109 §B)
+### A.4 Add visibility filter to surface-router (cortex#109 §B) — ✅ done (PR #134)
 
-- [ ] **A.4.1** Extend `RendererSchema` in `src/common/types/cortex-config.ts` with a `visibility:` block:
+- [x] **A.4.1** Extend `RendererSchema` in `src/common/types/cortex-config.ts` with a `visibility:` block: — PR #134
   - `max_classification: "local" | "federated" | "public"` — renderer refuses higher.
   - `require_residency: string[]` — renderer accepts only matching residency.
   - `require_model_class: string[]` — renderer accepts only matching model class.
-- [ ] **A.4.2** Surface-router (`src/bus/surface-router.ts`) applies the visibility filter in `adapterMatches()` before invoking `adapter.render()`. Sovereignty mismatch = quiet skip + (optional) log.
-- [ ] **A.4.3** Dashboard renderer (`src/renderers/dashboard.ts`) declares its visibility config — default `max_classification: "local"` for parity with today.
-- [ ] **A.4.4** Tests: a `federated.*` envelope is dropped by a `max_classification: local` renderer; same envelope is rendered by a `max_classification: federated` renderer.
+- [x] **A.4.2** Surface-router (`src/bus/surface-router.ts`) applies the visibility filter in `adapterMatches()` before invoking `adapter.render()`. Sovereignty mismatch = quiet skip + (optional) log. — PR #134
+- [x] **A.4.3** Dashboard renderer (`src/renderers/dashboard.ts`) declares its visibility config — default `max_classification: "local"` for parity with today. — PR #134
+- [x] **A.4.4** Tests: a `federated.*` envelope is dropped by a `max_classification: local` renderer; same envelope is rendered by a `max_classification: federated` renderer. — PR #134
 
-### A.5 Add `stack:` block to cortex.yaml schema (Q7 lock-in)
+### A.5 Add `stack:` block to cortex.yaml schema (Q7 lock-in) — ✅ done (PR #140, #151; myelin#113 closed)
 
-- [ ] **A.5.1** File myelin issue: extend `specs/namespace.md` to allow `local.{operator}.{stack}.>` and `federated.{operator}.{stack}.>` subject grammars. `deriveNatsSubject()` and `validateSubjectEnvelopeAlignment()` extended to accept either form. Backward compatibility: if no stack segment, default-derive as `{operator_id}/default`.
-- [ ] **A.5.2** Cortex consumes the myelin extension once it lands — bump vendored envelope as needed.
-- [ ] **A.5.3** Extend `CortexConfig` in `src/common/types/cortex-config.ts` with a `stack:` block:
+- [x] **A.5.1** File myelin issue: extend `specs/namespace.md` to allow `local.{operator}.{stack}.>` and `federated.{operator}.{stack}.>` subject grammars. `deriveNatsSubject()` and `validateSubjectEnvelopeAlignment()` extended to accept either form. Backward compatibility: if no stack segment, default-derive as `{operator_id}/default`. — myelin#113 filed + merged 2026-05-13 (myelin PR #114, squash `91bf2b42`)
+- [x] **A.5.2** Cortex consumes the myelin extension once it lands — bump vendored envelope as needed. — PR #151 (vendored bump `4578ae1` → `b69c877` + stack-aware `deriveNatsSubject(opts)` adoption)
+- [x] **A.5.3** Extend `CortexConfig` in `src/common/types/cortex-config.ts` with a `stack:` block: — PR #140
   - `stack.id` — string matching `{operator_id}/{stack_id}` format with regex validation.
   - `stack.nkey_pub` — base32 NKey public key (signed by operator account NKey).
-- [ ] **A.5.4** `cortex.ts` entrypoint reads `stack:` at boot; falls back to `${operator.id}/default` if undeclared.
-- [ ] **A.5.5** `MyelinRuntime.publish()` includes the stack segment in subject derivation when present.
-- [ ] **A.5.6** Tests: cortex.yaml with `stack: { id: andreas/research }` emits envelopes on `local.andreas.research.>` instead of `local.andreas.>`; backward-compat test with no `stack:` block still emits `local.andreas.>` (which now becomes `local.andreas.default.>` once myelin extension lands).
+- [x] **A.5.4** `cortex.ts` entrypoint reads `stack:` at boot; falls back to `${operator.id}/default` if undeclared. — PR #140
+- [x] **A.5.5** `MyelinRuntime.publish()` includes the stack segment in subject derivation when present. — PR #151
+- [x] **A.5.6** Tests: cortex.yaml with `stack: { id: andreas/research }` emits envelopes on `local.andreas.research.>` instead of `local.andreas.>`; backward-compat test with no `stack:` block still emits `local.andreas.>` (which now becomes `local.andreas.default.>` once myelin extension lands). — PR #140 + #151
 
-### A.6 Add `capabilities:` block to cortex.yaml schema (Q2 lock-in)
+### A.6 Add `capabilities:` block to cortex.yaml schema (Q2 lock-in) — ✅ done (PR #146)
 
-- [ ] **A.6.1** Extend `CortexConfig` with a `capabilities:` block — array of capability declarations conforming to the constrained schema:
+- [x] **A.6.1** Extend `CortexConfig` with a `capabilities:` block — array of capability declarations conforming to the constrained schema: — PR #146
   ```yaml
   capabilities:
     - id: code-review.typescript
@@ -128,22 +128,34 @@ Total: 12–18 weeks if strictly sequenced. Phases A and B are sequenceable; Pha
       rate: { per_minute: 10 }   # optional
       cost: { cents_per_request: 2 }  # optional
   ```
-- [ ] **A.6.2** Schema validator enforces required fields (`id`, `description`, `tags`, `provided_by`); optional `rate` / `cost` validated as structured envelopes.
-- [ ] **A.6.3** Per-agent `capabilities[]` annotations within `agents[]` are first-class — the stack-level `capabilities:` block is the union plus any stack-extras.
-- [ ] **A.6.4** Tests: invalid capability declarations (free-text, missing `id`) are rejected at config load; valid ones parse into the typed object.
+- [x] **A.6.2** Schema validator enforces required fields (`id`, `description`, `tags`, `provided_by`); optional `rate` / `cost` validated as structured envelopes. — PR #146
+- [x] **A.6.3** Per-agent `capabilities[]` annotations within `agents[]` are first-class — the stack-level `capabilities:` block is the union plus any stack-extras. — PR #146
+- [x] **A.6.4** Tests: invalid capability declarations (free-text, missing `id`) are rejected at config load; valid ones parse into the typed object. — PR #146
 
-### Phase A acceptance criteria
+### Schema-grammar hardening (entry criterion for A.5.5) — ✅ done (PR #144, #149)
 
-- `SessionHarness` interface compiles + tested; `ClaudeCodeHarness` passes all current `cc-session.ts` tests behind new interface.
-- `BusPeerHarness` connects to local sage daemon and routes a fake review task end-to-end.
-- Cortex no longer hardcodes `classification` at any of the four emit sites.
-- Surface-router applies `sovereignty.classification` filter in `adapterMatches()`.
-- Renderer config supports `visibility:` block (max_classification / require_residency / require_model_class).
-- cortex.yaml `stack:` block validates and propagates into outbound envelopes' subject form.
-- cortex.yaml `capabilities:` block validates and is queryable from the substrate harness.
-- Vendored envelope past `96b14ea`; `signed_by[]` array surfaces structurally (no verification yet).
+The `{operator_id}` and `{stack_id}` segments are embedded in NATS subjects after A.5.5. To keep them safe boundaries for downstream pattern-matchers, all three identifier schemas were tightened to the letter-prefix grammar `/^[a-z][a-z0-9-]*$/`:
+
+- [x] `OperatorSchema.id` — PR #144 (closes cortex#141)
+- [x] `StackConfigSchema.id` segments — PR #144 (closes cortex#141)
+- [x] `AgentSchema.id`, `trust[]` entry, `CapabilityProviderIdSchema` — PR #149 (closes cortex#145)
+
+### Phase A acceptance criteria — ✅ all met (2026-05-15)
+
+- [x] `SessionHarness` interface compiles + tested; `ClaudeCodeHarness` passes all current `cc-session.ts` tests behind new interface. — PR #125, #126
+- [x] `BusPeerHarness` connects to local sage daemon and routes a fake review task end-to-end. — PR #126
+- [x] Cortex no longer hardcodes `classification` at any of the four emit sites. — PR #129
+- [x] Surface-router applies `sovereignty.classification` filter in `adapterMatches()`. — PR #134
+- [x] Renderer config supports `visibility:` block (max_classification / require_residency / require_model_class). — PR #134
+- [x] cortex.yaml `stack:` block validates and propagates into outbound envelopes' subject form. — PR #140 + #151
+- [x] cortex.yaml `capabilities:` block validates and is queryable from the substrate harness. — PR #146
+- [x] Vendored envelope past `96b14ea`; `signed_by[]` array surfaces structurally (no verification yet). — PR #128 (→ `4578ae1`), refreshed at PR #151 (→ `b69c877`)
 
 **Phase A does NOT require Phase B or later.** It unblocks single-stack federation; multi-operator waits for Phase D.
+
+**Carry-over to Phase B (or future ops cycle):**
+- **cortex#138** — JetStream `TASKS` stream filter shape (`local.*.tasks.>` → `local.*.*.tasks.>`). Cortex publishes stack-aware subjects today (PR #151), but cortex has no in-tree TASKS-stream consumer to break; the filter cutover is an operator-side NATS-server action (cortex.yaml ships no stream config). Reframed as a forward gate that lands when cortex grows a TASKS-stream consumer in Phase B/C.
+- **cortex#139** — parallel-checkpoint proposal closed as moot. The myelin-lead-time risk it hedged against did not materialise: myelin#113 (the upstream namespace PR) merged 2026-05-13 at 16:01, three hours after cortex#139 was filed.
 
 ---
 

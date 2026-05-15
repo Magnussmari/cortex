@@ -5,10 +5,8 @@
  * one operator can run multiple cortex stacks side-by-side
  * (`andreas/research`, `andreas/production`, `andreas/code`, …). The
  * subject-grammar extension that lets `local.{operator}.{stack}.…` envelopes
- * coexist with the current `local.{operator}.…` form is filed as a
- * **myelin** issue (myelin#113) and lands separately; this primitive ships
- * cortex-side ahead of that PR so the config surface is in place when the
- * envelope namespace lands.
+ * coexist with the legacy `local.{operator}.…` form lives in myelin
+ * (myelin#113 — closed by myelin PR #114, squash `91bf2b42`, 2026-05-13).
  *
  * What this file delivers (A.5.3 + A.5.4):
  *   - `StackConfigSchema` — Zod schema for the optional top-level `stack:`
@@ -20,17 +18,25 @@
  *     omitted, it default-derives `${operator.id}/default` so existing
  *     deployments preserve their identity verbatim (no behaviour change).
  *
- * What this file does NOT do:
- *   - **No subject derivation.** A.5.5 — `MyelinRuntime.publish()`
- *     consuming the stack segment — is blocked on myelin#113 and lands in
- *     a follow-up PR. Today `deriveStackId` is observed at boot and exposed
- *     on `LoadedConfig`/`StartCortexOptions` so call-sites can read it
- *     ahead of the namespace cutover, but no emit subject changes.
- *   - **No JetStream filter change.** The TASKS stream filter rewrite
- *     (`local.*.tasks.>` → `local.*.*.tasks.>`) is cortex#138 and ships
- *     separately.
- *   - **No envelope bump.** The vendored myelin envelope upgrade (A.5.2)
- *     waits on myelin#113.
+ * Cutover state (post-PR #151, A.5.5 shipped):
+ *   - **Subject derivation flips on the wire.** `MyelinRuntime.publish()`
+ *     now derives subjects via the stack-aware `deriveNatsSubject({ stack })`
+ *     ported from myelin (`b69c877`). Emitted envelopes carry the stack
+ *     segment in `local.{operator}.{stack}.>` form. Operators with no
+ *     `stack:` block fall through to the namespace spec's default-derived
+ *     `${operator.id}/default` for backward compatibility (myelin
+ *     `specs/namespace.md` §Backward-compat).
+ *   - **Vendored envelope past `96b14ea`.** PR #128 bumped to `4578ae1`;
+ *     PR #151 refreshed to `b69c877` to pick up stack-aware subject
+ *     derivation.
+ *
+ * Carry-over to Phase B / ops:
+ *   - **JetStream `TASKS` stream filter.** cortex#138 — the
+ *     `local.*.tasks.>` → `local.*.*.tasks.>` filter cutover — is an
+ *     operator-side NATS-server config change, not cortex code. Cortex
+ *     publishes stack-aware subjects today but ships no TASKS-stream
+ *     consumer of its own; the filter cutover lands when the first
+ *     in-tree consumer arrives (Phase B / Phase C).
  */
 
 import { z } from "zod/v4";
