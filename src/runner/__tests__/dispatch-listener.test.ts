@@ -770,7 +770,10 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
     r.trigger(makeReceivedEnvelope(), "local.metafactory.dispatch.task.received");
     await new Promise((resolve) => setTimeout(resolve, 10));
 
+    // C.4.1 — system.access.allowed audit envelope precedes the
+    // lifecycle envelopes on the allow path.
     expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.allowed",
       "dispatch.task.started",
       "dispatch.task.completed",
     ]);
@@ -794,11 +797,14 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
     r.trigger(makeReceivedEnvelope(), "local.metafactory.dispatch.task.received");
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    // Echo cortex#220 round 2 M-1 — the deny path now emits a
-    // terminal `dispatch.task.failed` envelope on the same
-    // correlation_id so worklog/agent-team subscribers don't hang.
-    expect(r.published).toHaveLength(1);
-    const failed = r.published[0]!;
+    // C.4.2 — deny path emits both system.access.denied (audit) +
+    // dispatch.task.failed (lifecycle terminal — Echo cortex#220 M-1).
+    expect(r.published).toHaveLength(2);
+    expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.denied",
+      "dispatch.task.failed",
+    ]);
+    const failed = r.published[1]!;
     expect(failed.type).toBe("dispatch.task.failed");
     expect(failed.correlation_id).toBe(TASK_ID);
     expect(failed.payload.task_id).toBe(TASK_ID);
@@ -836,8 +842,11 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    expect(r.published).toHaveLength(1);
-    const failed = r.published[0]!;
+    expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.denied",
+      "dispatch.task.failed",
+    ]);
+    const failed = r.published[1]!;
     expect(failed.type).toBe("dispatch.task.failed");
     const reason = failed.payload.reason as {
       kind: string;
@@ -941,8 +950,157 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.allowed",
       "dispatch.task.started",
       "dispatch.task.completed",
     ]);
+    // C.4.3 — system.access.allowed carries signed_by from the
+    // originating envelope verbatim.
+    const allowed = r.published[0]!;
+    const signedBy = allowed.payload.signed_by as { principal: string }[];
+    expect(signedBy).toHaveLength(1);
+    expect(signedBy[0]!.principal).toBe("did:mf:cortex");
+  });
+
+  test("C.4.1 — system.access.allowed payload shape (capability, capabilities, sovereignty, signed_by)", async () => {
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      router,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["dispatch.cortex", "extra.cap"]),
+    });
+    await listener.start();
+    await router.start();
+
+    r.trigger(makeReceivedEnvelope(), "local.metafactory.dispatch.task.received");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const allowed = r.published.find((e) => e.type === "system.access.allowed");
+    expect(allowed).toBeDefined();
+    if (!allowed) return;
+    expect(allowed.correlation_id).toBe(TASK_ID);
+    expect(allowed.payload.principal_id).toBe("cortex");
+    expect(allowed.payload.capability).toBe("dispatch.cortex");
+    expect(allowed.payload.capabilities).toEqual(["dispatch.cortex", "extra.cap"]);
+    expect(allowed.payload.envelope_id).toBe("00000000-0000-4000-8000-000000000000");
+    expect(allowed.payload.envelope_subject).toBe(
+      "local.metafactory.dispatch.task.received",
+    );
+    expect(allowed.payload.intent_sovereignty).toEqual({
+      classification: "local",
+      data_residency: "NZ",
+      max_hop: 0,
+      frontier_ok: false,
+      model_class: "local-only",
+    });
+    // No signed_by on the envelope → audit carries empty array,
+    // never undefined.
+    expect(allowed.payload.signed_by).toEqual([]);
+  });
+
+  test("C.4.3 — multi-stamp signed_by chain (origin + hub-stamp) carried verbatim onto audit", async () => {
+    // Echo cortex#221 round 1 — lock the federation-case
+    // attribution contract: a hub-stamped envelope's full chain
+    // must round-trip onto `system.access.allowed.payload.signed_by`
+    // exactly as emitted, so future federation audit consumers
+    // can verify the hub re-stamp without re-parsing the
+    // originating envelope.
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      router,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["dispatch.cortex"]),
+    });
+    await listener.start();
+    await router.start();
+
+    const env = makeReceivedEnvelope();
+    env.signed_by = [
+      {
+        method: "ed25519",
+        principal: "did:mf:cortex",
+        signature: "a".repeat(88),
+        at: "2026-05-15T12:00:00Z",
+        role: "origin",
+      },
+      {
+        method: "hub-stamp",
+        principal: "did:mf:cortex",
+        stamped_by: "did:mf:metafactory-hub",
+        signature: "b".repeat(88),
+        at: "2026-05-15T12:00:01Z",
+        role: "accountability",
+      },
+    ];
+    r.trigger(env, "local.metafactory.dispatch.task.received");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const allowed = r.published.find((e) => e.type === "system.access.allowed");
+    expect(allowed).toBeDefined();
+    if (!allowed) return;
+    const signedBy = allowed.payload.signed_by as {
+      method: string;
+      principal: string;
+      role?: string;
+      stamped_by?: string;
+    }[];
+    expect(signedBy).toHaveLength(2);
+    expect(signedBy[0]!.method).toBe("ed25519");
+    expect(signedBy[0]!.role).toBe("origin");
+    expect(signedBy[1]!.method).toBe("hub-stamp");
+    expect(signedBy[1]!.stamped_by).toBe("did:mf:metafactory-hub");
+    expect(signedBy[1]!.role).toBe("accountability");
+  });
+
+  test("C.4.2 — system.access.denied carries structured reason + signed_by", async () => {
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      router,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["other.thing"]),
+    });
+    await listener.start();
+    await router.start();
+
+    const env = makeReceivedEnvelope();
+    env.signed_by = [
+      {
+        method: "ed25519",
+        principal: "did:mf:cortex",
+        signature: "a".repeat(88),
+        at: "2026-05-15T12:00:00Z",
+      },
+    ];
+    r.trigger(env, "local.metafactory.dispatch.task.received");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const denied = r.published.find((e) => e.type === "system.access.denied");
+    expect(denied).toBeDefined();
+    if (!denied) return;
+    expect(denied.correlation_id).toBe(TASK_ID);
+    expect(denied.payload.principal_id).toBe("cortex");
+    expect(denied.payload.capability).toBe("dispatch.cortex");
+    const reason = denied.payload.reason as {
+      kind: string;
+      missing_capability?: string;
+    };
+    expect(reason.kind).toBe("insufficient_role");
+    expect(reason.missing_capability).toBe("dispatch.cortex");
+    // C.4.3 — signed_by chain carried verbatim from originating envelope.
+    const signedBy = denied.payload.signed_by as { principal: string }[];
+    expect(signedBy).toHaveLength(1);
+    expect(signedBy[0]!.principal).toBe("did:mf:cortex");
   });
 });
