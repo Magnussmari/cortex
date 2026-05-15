@@ -806,6 +806,42 @@ export class TrustResolver {
   }
 
   /**
+   * IAW Phase B.1a (cortex#114) — full trust check by signing NKey. Returns
+   * true iff:
+   *   1. `signerPubKey` resolves to a known agent via
+   *      `AgentRegistry.tryGetByNkeyPub` (which also returns `undefined`
+   *      for ambiguous keys — two agents claiming the same NKey — so this
+   *      check fails closed on config bugs).
+   *   2. `receivingAgentId` is a known agent.
+   *   3. `receivingAgent.trust` includes the resolved sender agent id
+   *      (OR sender and receiver are the same agent — self-trust is
+   *      transitive, matching `AgentRegistry.trusts`).
+   *
+   * Returns false (not throws) for any unknown signer or unknown receiver,
+   * so the inbound-envelope path can reject the dispatch without a
+   * try/catch around the verification helper.
+   *
+   * This method is the NKey analog of `trustsByPlatformId`. It is the
+   * primitive Phase B.1b's `BusPeerHarness` consumes, and the primitive
+   * Phase B.1c's `verifySignedByChain` consumes when stepping through
+   * each `signed_by[]` stamp.
+   *
+   * **Cryptographic verification is out of scope here** — this method
+   * only checks the trust-registry relationship. The ed25519 signature
+   * verification (does the signer's claimed key actually verify the
+   * envelope bytes?) lands in B.1c alongside the JCS canonicalization
+   * helper.
+   */
+  trustsByNKey(
+    receivingAgentId: string,
+    signerPubKey: string,
+  ): boolean {
+    const senderAgent = this.registry.tryGetByNkeyPub(signerPubKey);
+    if (!senderAgent) return false;
+    return this.registry.trusts(receivingAgentId, senderAgent.id);
+  }
+
+  /**
    * The backing registry. Exposed for callers that need the full Agent
    * object alongside the platform-id mapping (e.g. presence adapters that
    * fetch personas after resolving the sender).

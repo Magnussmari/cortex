@@ -351,6 +351,26 @@ export const AgentSchema = z.object({
       "trust entries must be agent ids — lowercase alphanumeric + hyphen, starting with a letter (e.g. 'echo', 'team-research'); rename digit-prefixed entries like '2agent' to 'team-2agent' or 'agent-2026'",
     ),
   ).default([]),
+  /**
+   * IAW Phase B.1 (cortex#114) — NKey public key the agent uses (via its
+   * home stack) to sign outbound bot↔bot envelopes. Optional in Phase B.1:
+   * agents without `nkey_pub` cannot participate in NKey-verified bot↔bot
+   * dispatch and fall back to the platform-id trust path on Discord /
+   * Mattermost DMs. The field becomes required for any agent intended to
+   * speak on the bus once Phase C absorbs principals into the top-level
+   * `policy:` block.
+   *
+   * Same regex as `StackConfigSchema.nkey_pub` (56-char U-prefixed base32):
+   * NKeys are stack-scoped on the wire (the stack signs every envelope),
+   * but at the cortex.yaml surface they're declared per-agent because
+   * each agent has exactly one home stack today. When Phase D introduces
+   * multi-stack-per-operator membership, the principal model migrates
+   * this off `AgentSchema` onto `policy.principals[]`.
+   */
+  nkey_pub: z.string().regex(
+    /^U[A-Z2-7]{55}$/,
+    "agent.nkey_pub must be a base32 NKey public key (U-prefixed, 56 chars total)",
+  ).optional(),
   /** Per-platform presence blocks — at least one is required. */
   presence: PresenceSchema,
   /**
