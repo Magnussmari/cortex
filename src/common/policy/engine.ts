@@ -63,11 +63,11 @@ export class PolicyEngine {
   }
 
   /**
-   * Authorise a principal to exercise an intent. Returns a
+   * Authorise a principal id to exercise an intent. Returns a
    * `PolicyDecision` discriminated on `allow`.
    *
    * Decision flow:
-   *   1. Look up the principal. Unknown → `unknown_principal`.
+   *   1. Look up the principal by id. Unknown → `unknown_principal`.
    *   2. Compute effective capabilities = union of every role's
    *      capabilities. Unknown role ids are silently skipped (the
    *      caller's responsibility to keep the principals and roles
@@ -75,31 +75,28 @@ export class PolicyEngine {
    *      at config load).
    *   3. Match `intent.capability` against the effective set.
    *      Miss → `insufficient_role`.
-   *   4. (Phase D extends with sovereignty / per-peer checks.)
+   *   4. (Phase D extends with sovereignty / per-peer checks; the
+   *      `intent.sovereignty` field is part of the input shape so
+   *      C.4 audit envelopes carry it without an extra read.)
    *   5. Allow with the full effective set.
    *
-   * Principal lookup is by id, not by DID — callers strip the
-   * `did:mf:` prefix from a verified `signed_by[].principal` before
-   * calling. Phase C.3's dispatch-handler integration owns that
-   * normalisation; the engine takes ids only.
+   * Taking an id (not a `Principal` object) is deliberate: the
+   * registry is authoritative for roles/trust, and accepting a
+   * caller-constructed `Principal` would invite attacker-spoofed
+   * `{id, role: ["admin"]}` payloads from parsed envelopes. The
+   * dispatch-handler integration in C.3 strips `did:mf:` from a
+   * verified `signed_by[].principal` and passes the bare id here
+   * (Echo cortex#218 round 1).
    */
-  check(principal: Principal, intent: Intent): PolicyDecision {
-    // Resolve the principal — the caller can pass in a fresh
-    // Principal object OR one we already know about. If the
-    // caller's object isn't in the registry by id, the principal
-    // is "unknown" (an attacker spoofing a principal id would
-    // fall through here once the registry is in place).
-    const known = this.principalsById.get(principal.id);
+  check(principalId: string, intent: Intent): PolicyDecision {
+    const known = this.principalsById.get(principalId);
     if (known === undefined) {
       return {
         allow: false,
-        reason: { kind: "unknown_principal", principal_id: principal.id },
+        reason: { kind: "unknown_principal", principal_id: principalId },
       };
     }
 
-    // Use the REGISTRY's roles/trust, not the caller's. The caller
-    // may have constructed the principal from a parsed envelope —
-    // role assignments come from cortex.yaml, not the wire.
     const effectiveCapabilities = this.effectiveCapabilities(known);
 
     if (!effectiveCapabilities.has(intent.capability)) {
@@ -108,16 +105,14 @@ export class PolicyEngine {
         reason: {
           kind: "insufficient_role",
           missing_capability: intent.capability,
-          principal_id: principal.id,
+          principal_id: principalId,
         },
       };
     }
 
-    // Sovereignty enforcement is a Phase D concern; the field is
-    // part of the input shape so audit envelopes (C.4) carry it,
-    // and so this codepath has the shape ready when C.4 wires
-    // sovereignty-based rejection in.
-    void intent.sovereignty;
+    // TODO(phase-D): enforce `intent.sovereignty` — classification,
+    // residency, frontier-ok, model-class. C.4 audit envelopes
+    // already carry the field; Phase D wires the rejection branch.
 
     return {
       allow: true,

@@ -74,7 +74,7 @@ describe("PolicyEngine — happy path", () => {
       roles: [role("operator", ["code-review.typescript", "deploy.staging"])],
     });
 
-    const result = engine.check(principal({ id: "luna" }), intent());
+    const result = engine.check("luna", intent());
 
     expect(result.allow).toBe(true);
     if (result.allow) {
@@ -94,10 +94,7 @@ describe("PolicyEngine — rejection paths", () => {
       roles: [role("operator", ["code-review.typescript"])],
     });
 
-    const result = engine.check(
-      principal({ id: "nobody", role: ["operator"] }),
-      intent(),
-    );
+    const result = engine.check("nobody", intent());
 
     expect(result.allow).toBe(false);
     if (!result.allow) {
@@ -115,7 +112,7 @@ describe("PolicyEngine — rejection paths", () => {
     });
 
     const result = engine.check(
-      principal({ id: "luna" }),
+      "luna",
       intent({ capability: "code-review.typescript" }),
     );
 
@@ -135,7 +132,7 @@ describe("PolicyEngine — rejection paths", () => {
       roles: [role("operator", ["code-review.typescript"])],
     });
 
-    const result = engine.check(principal({ id: "luna" }), intent());
+    const result = engine.check("luna", intent());
 
     expect(result.allow).toBe(false);
     if (!result.allow) {
@@ -158,11 +155,11 @@ describe("PolicyEngine — role union semantics", () => {
 
     // Either capability resolves.
     const deployResult = engine.check(
-      principal({ id: "luna" }),
+      "luna",
       intent({ capability: "deploy.staging" }),
     );
     const reviewResult = engine.check(
-      principal({ id: "luna" }),
+      "luna",
       intent({ capability: "code-review.typescript" }),
     );
 
@@ -189,7 +186,7 @@ describe("PolicyEngine — role union semantics", () => {
     });
 
     const result = engine.check(
-      principal({ id: "luna" }),
+      "luna",
       intent({ capability: "deploy.staging" }),
     );
 
@@ -213,7 +210,7 @@ describe("PolicyEngine — sovereignty (C.1 smoke)", () => {
     // Federated classification — strongest sovereignty signal cortex
     // emits today. C.1 doesn't reject on this; Phase D will.
     const result = engine.check(
-      principal({ id: "luna" }),
+      "luna",
       intent({
         sovereignty: {
           classification: "federated",

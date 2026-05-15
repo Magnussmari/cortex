@@ -51,15 +51,21 @@ export interface Principal {
    * Role ids this principal holds. Each role is defined in
    * `RoleDefinition` and grants a set of capabilities. A principal's
    * effective capabilities are the union of its roles' capabilities.
+   *
+   * `readonly` deliberately — the engine treats the registry as a
+   * cortex.yaml snapshot; permitting post-construction mutation
+   * would silently change `check()` behaviour on the next call
+   * (Echo cortex#218 round 1).
    */
-  role: string[];
+  readonly role: readonly string[];
   /**
    * Peer principals this principal trusts. Empty array is legal
    * (no peer dispatches allowed). Symmetric with the existing
    * `agent.trust[]` field on `cortex.yaml` (which Phase C.2 will
-   * migrate into the top-level `policy:` block).
+   * migrate into the top-level `policy:` block). Same `readonly`
+   * snapshot discipline as `role`.
    */
-  trust: string[];
+  readonly trust: readonly string[];
 }
 
 /**
@@ -120,8 +126,11 @@ export interface RoleDefinition {
    * capability ids: `<domain>.<entity>` (e.g. `code-review.typescript`).
    * The engine matches `Intent.capability` against this list
    * literally — no glob expansion at C.1; future PRs may add it.
+   *
+   * `readonly` for the same snapshot discipline as `Principal.role`
+   * (Echo cortex#218 round 1).
    */
-  capabilities: string[];
+  readonly capabilities: readonly string[];
 }
 
 /**
