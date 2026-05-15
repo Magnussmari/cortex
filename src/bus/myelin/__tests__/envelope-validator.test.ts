@@ -482,10 +482,13 @@ describe("envelope-validator — chain helpers (IAW Phase A.2)", () => {
     expect(getLastStampPrincipal(env!)).toBeUndefined();
   });
 
-  test("schema source commit points at the post-myelin#115 stack-aware pin", () => {
+  test("schema source commit points at the post-myelin#148 identity-strict pin", () => {
     // Lock the pin so future bumps surface in a code review.
+    // Updated at B.1c (cortex#114) — bump from b69c877 to 5a0e261 to
+    // pick up myelin#146 (./identity subpath export) + myelin#148
+    // (strict-null safety on identity submodule).
     expect(SCHEMA_SOURCE_COMMIT).toBe(
-      "b69c877e23a2696040561c2d832fdc75aa83f73e",
+      "5a0e2619a4af5c91c78f552b88fafd3ad40a227f",
     );
   });
 
