@@ -41,11 +41,32 @@ import { TrustResolver } from "../common/agents/trust-resolver";
 /**
  * Reason a stamp failed structural verification. Discriminated union so
  * callers can branch on the specific class for logging / audit (Phase C
- * wires audit envelopes that carry this reason verbatim).
+ * wires audit envelopes that carry this reason verbatim — splitting now
+ * to avoid a schema break later, per Echo's B.1a review).
+ *
+ * - `malformed_principal` — the stamp's `principal` is not a `did:mf:<id>`.
+ *   Wire-format misconfiguration; either an unsupported DID method
+ *   (e.g. `did:key:…`), an empty tail, or further-segmented payload.
+ *   Phase D may add hub-trust paths that legitimise some `did:web:` /
+ *   `did:key:` shapes; at this slice, anything other than `did:mf:<id>`
+ *   is rejected.
+ * - `unknown_agent` — the principal IS a well-formed `did:mf:<id>` but
+ *   no agent with that id is registered locally. Indicates the sender
+ *   is unrecognised to this stack; different operational class from
+ *   wire-format failure.
+ * - `principal_has_no_nkey_pub` — agent is registered but its
+ *   `nkey_pub` is unset, so we can't even structurally trust it on the
+ *   bus. Indicates the agent intends to live on Discord/Mattermost
+ *   only (B.1a optional `nkey_pub`).
+ * - `signer_not_trusted` — agent is registered with an `nkey_pub`, but
+ *   `receivingAgent.trust` does not list this signer.
+ * - `empty_chain` — envelope arrived with no `signed_by[]` and the
+ *   caller asked for `rejectEmpty: true`.
  */
 export type ChainRejectionReason =
   | { kind: "empty_chain" }
-  | { kind: "unknown_principal"; principal: string }
+  | { kind: "malformed_principal"; principal: string }
+  | { kind: "unknown_agent"; principal: string; agentId: string }
   | { kind: "principal_has_no_nkey_pub"; principal: string; agentId: string }
   | { kind: "signer_not_trusted"; principal: string; agentId: string };
 
@@ -57,7 +78,11 @@ export type ChainRejectionReason =
  * - `valid: false` — at least one ed25519 stamp failed; `rejectedAt`
  *   is the chain index of the first failing stamp; `reason` carries
  *   the structured failure class. Caller does NOT continue iterating
- *   beyond `rejectedAt`; the first rejection is terminal.
+ *   beyond `rejectedAt`; the first rejection is terminal. `skipped`
+ *   carries the hub-stamp indices encountered up to (but not
+ *   including) the rejection so audit envelopes can preserve the
+ *   "rejected after skipping hub-stamps at [0, 2]" shape (per Echo's
+ *   B.1a review).
  */
 export type ChainVerificationResult =
   | {
@@ -69,6 +94,14 @@ export type ChainVerificationResult =
       valid: false;
       rejectedAt: number;
       reason: ChainRejectionReason;
+      /**
+       * Indices of stamps skipped BEFORE the rejection. Useful for audit
+       * envelopes that need to reconstruct the chain-walk context (which
+       * hub-stamps were encountered before the rejected stamp). Empty
+       * array when the rejection happens on the first stamp, OR when the
+       * rejection is `empty_chain`.
+       */
+      skipped: number[];
     };
 
 /**
@@ -113,30 +146,31 @@ export function verifySignedByChain(
 
   if (chain.length === 0) {
     if (rejectEmpty) {
-      return { valid: false, rejectedAt: 0, reason: { kind: "empty_chain" } };
+      return {
+        valid: false,
+        rejectedAt: 0,
+        reason: { kind: "empty_chain" },
+        skipped: [],
+      };
     }
     return { valid: true, skipped: [] };
   }
 
   const skipped: number[] = [];
 
-  for (let i = 0; i < chain.length; i++) {
-    const stamp = chain[i];
-    if (stamp === undefined) {
-      // Bounds-checked by the loop condition — this branch is structurally
-      // unreachable. Kept as a typed guard so lint's no-non-null-assertion
-      // gate passes without an inline disable. Skipping rather than
-      // throwing matches the file-header rule "must never crash on a
-      // malformed stamp."
-      continue;
-    }
+  for (const [i, stamp] of chain.entries()) {
     const stampResult = verifyOneStamp(stamp, opts);
     if (stampResult.kind === "skip") {
       skipped.push(i);
       continue;
     }
     if (stampResult.kind === "reject") {
-      return { valid: false, rejectedAt: i, reason: stampResult.reason };
+      return {
+        valid: false,
+        rejectedAt: i,
+        reason: stampResult.reason,
+        skipped: [...skipped],
+      };
     }
     // stampResult.kind === "accept" — continue to next stamp
   }
@@ -172,7 +206,7 @@ function verifyOneStamp(
   if (agentId === undefined) {
     return {
       kind: "reject",
-      reason: { kind: "unknown_principal", principal },
+      reason: { kind: "malformed_principal", principal },
     };
   }
 
@@ -181,7 +215,7 @@ function verifyOneStamp(
   if (!agent) {
     return {
       kind: "reject",
-      reason: { kind: "unknown_principal", principal },
+      reason: { kind: "unknown_agent", principal, agentId },
     };
   }
 
