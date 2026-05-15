@@ -253,8 +253,13 @@ export class BusDispatchListener {
       }),
       receivedAt: new Date(),
     });
-    // Fire-and-forget per MyelinRuntime.publish contract — the runtime
-    // logs and swallows publish errors internally.
-    void this.runtime.publish(visibilityEvent);
+    // Await per MyelinRuntime.publish contract — the runtime logs and
+    // swallows publish errors internally, so this returns quickly, but
+    // awaiting means `handleInbound` (and the tracked `inFlight` entry)
+    // only settles after publish settles. That makes `stop()`'s
+    // `allSettled(inFlight)` drain a true cutoff for both verify and
+    // publish side effects (Echo cortex#203 round 2 — closes the
+    // partial-fix nuance on the original async-stop fix).
+    await this.runtime.publish(visibilityEvent);
   }
 }
