@@ -120,6 +120,31 @@ export interface MyelinRuntimeOptions {
    * DID-shaped principal into this option.
    */
   signer?: BusEnvelopeSigner;
+  /**
+   * IAW Phase B.3 (cortex#114) — behaviour when the signer is
+   * configured but `signEnvelope` itself throws (malformed seed,
+   * unsupported principal DID format, etc.).
+   *
+   * - `'fallback'` (default) — log the error, publish the envelope
+   *   UNSIGNED. Acceptable while the receive side
+   *   (`verifyEnvelopeIdentity`) is not yet enforcing on the
+   *   subscribe path (B.3 ships in that window). The bus tolerates
+   *   unsigned envelopes today; a transient sign failure doesn't
+   *   crash the publish path or drop the operational signal.
+   *
+   * - `'drop'` — log the error and SKIP the publish entirely. The
+   *   envelope never reaches the wire. Use this once the receive
+   *   side becomes enforcing — at that point publishing unsigned is
+   *   a silent downgrade attack surface (an attacker who can fault-
+   *   inject the signer would otherwise get the daemon to emit
+   *   unsigned envelopes; peers in a rollout window that tolerate
+   *   unsigned would accept the bypass). Flip to `'drop'` is
+   *   tracked at cortex#210.
+   *
+   * Ignored when `signer` is undefined (no signer means no failure
+   * mode to choose).
+   */
+  signFailureMode?: "fallback" | "drop";
 }
 
 /**
@@ -289,6 +314,7 @@ export async function startMyelinRuntime(
   // Signature stays Promise<void> for symmetry with `publishDisabled` and
   // the MyelinRuntime contract; the body is sync-by-design today (NatsLink
   const signer = options?.signer;
+  const signFailureMode = options?.signFailureMode ?? "fallback";
   // Pre-encode the seed to the base64 shape myelin's `signEnvelope`
   // consumes — done once at runtime init rather than per-publish so
   // every call doesn't reallocate the encoding. Tests can pass a
@@ -356,9 +382,27 @@ export async function startMyelinRuntime(
           signer.principal,
         );
       } catch (err) {
+        // Sign failure handling — see `MyelinRuntimeOptions.signFailureMode`
+        // for the full rationale. `fallback` publishes unsigned (safe
+        // while subscribe side is non-enforcing); `drop` skips publish
+        // entirely (safe once subscribe side enforces verification).
+        //
+        // Log message deliberately omits `err.message` interpolation
+        // when the error origin is myelin's `signEnvelope` — that
+        // function constructs error strings from inputs (e.g.
+        // "Invalid private key: expected 32-byte Ed25519 seed, got N
+        // bytes") and we don't want even partial seed-shape facts
+        // landing in operator logs. The error class + envelope id
+        // gives operators enough to triage.
+        const reason = err instanceof Error ? err.name : "unknown";
+        if (signFailureMode === "drop") {
+          console.error(
+            `myelin-runtime: sign failed for id=${envelope.id} type=${envelope.type} reason=${reason} — DROPPING (signFailureMode=drop)`,
+          );
+          return;
+        }
         console.error(
-          `myelin-runtime: sign failed for id=${envelope.id} type=${envelope.type} — publishing unsigned:`,
-          err instanceof Error ? err.message : err,
+          `myelin-runtime: sign failed for id=${envelope.id} type=${envelope.type} reason=${reason} — publishing unsigned (signFailureMode=fallback)`,
         );
       }
     }

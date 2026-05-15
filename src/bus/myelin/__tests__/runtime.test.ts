@@ -572,6 +572,44 @@ describe("MyelinRuntime", () => {
       // Error was logged for visibility.
       const errLines = logs.filter((l) => l.kind === "error");
       expect(errLines.some((l) => l.msg.includes("sign failed"))).toBe(true);
+      expect(
+        errLines.some((l) => l.msg.includes("signFailureMode=fallback")),
+      ).toBe(true);
+
+      await runtime.stop();
+    });
+
+    test("IAW B.3 — signFailureMode: 'drop' skips publish on sign failure", async () => {
+      // Echo cortex#209 round 1 — explicit fail-closed mode for the
+      // window after subscribe-side verification becomes enforcing.
+      const fake = makeFakeNatsConnection();
+      const runtime = await startMyelinRuntime(
+        makeConfig({
+          url: "nats://localhost:4222",
+          name: "grove-bot",
+          subjects: ["local.{org}.system.>"],
+        }),
+        {
+          connectImpl: async () => fake.nc,
+          signer: {
+            rawSeedBytes: new Uint8Array(16),
+            principal: "did:mf:test-stack",
+          },
+          signFailureMode: "drop",
+        },
+      );
+
+      await runtime.publish(makeEnvelope());
+
+      // Publish was DROPPED — never reaches the wire.
+      expect(fake.publish).not.toHaveBeenCalled();
+
+      // Drop is logged with the explicit mode.
+      const errLines = logs.filter((l) => l.kind === "error");
+      expect(errLines.some((l) => l.msg.includes("DROPPING"))).toBe(true);
+      expect(errLines.some((l) => l.msg.includes("signFailureMode=drop"))).toBe(
+        true,
+      );
 
       await runtime.stop();
     });
