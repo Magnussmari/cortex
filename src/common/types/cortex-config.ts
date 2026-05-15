@@ -844,6 +844,205 @@ export const PathsConfigSchema = z.object({
 export type PathsConfig = z.infer<typeof PathsConfigSchema>;
 
 // =============================================================================
+// PolicySchema — IAW Phase C.2a (refs cortex#115)
+// =============================================================================
+
+/**
+ * A principal — identity-bearing actor the PolicyEngine authorises.
+ * Top-level on `cortex.yaml.policy.principals[]` post-C.2a; the
+ * PolicyEngine consumes the parsed shape via the
+ * `policyEngineFromConfig` factory.
+ *
+ * Mirrors the `Principal` type from `src/common/policy/types.ts`
+ * (C.1); kept as a Zod schema here so config parse validation is
+ * authoritative.
+ */
+export const PolicyPrincipalSchema = z.object({
+  /**
+   * Stable principal id. Letter-prefix lowercase alphanumeric +
+   * hyphen — matches the agent id grammar tightened in cortex#149
+   * (AgentSchema.id letter-prefix trilogy). A verified
+   * `signed_by[].principal` field with `did:mf:<name>` resolves to
+   * this id by stripping the prefix.
+   */
+  id: z.string().regex(
+    /^[a-z][a-z0-9-]*$/,
+    "principal id must be lowercase alphanumeric + hyphen, starting with a letter (e.g. 'luna', 'echo')",
+  ),
+  /**
+   * Operator that owns this principal. Same letter-prefix
+   * grammar — `OperatorSchema.id` enforces it at the operator
+   * level and we mirror here so a parsed principal can't carry
+   * a malformed home_operator that downstream code would have
+   * to defend against.
+   */
+  home_operator: z.string().regex(
+    /^[a-z][a-z0-9-]*$/,
+    "principal.home_operator must match the operator id grammar (lowercase alphanumeric + hyphen, starting with a letter)",
+  ),
+  /**
+   * Stack identity in `{operator_id}/{stack_id}` form — same shape
+   * as `StackConfigSchema.id` (Phase A.5).
+   */
+  home_stack: z.string().regex(
+    /^[a-z][a-z0-9_-]*\/[a-z][a-z0-9_-]*$/,
+    "principal.home_stack must match {operator_id}/{stack_id} format",
+  ),
+  /**
+   * Stack signing NKey public key. **Declared at C.2a for forward
+   * compat — not yet consumed by any verification path.** B.1c
+   * cryptoVerify currently reads `agents[].nkey_pub` from the
+   * agent registry (`src/bus/verify-signed-by-chain.ts`); C.2b/C.3
+   * will migrate the signature-verification lookup to
+   * `policy.principals[].nkey_pub` and retire the agent-side
+   * field. Until then, declaring `nkey_pub` on a principal parses
+   * cleanly but nothing gates on it (Echo cortex#219 round 1).
+   *
+   * Same regex as `StackConfigSchema.nkey_pub` (56-char U-prefixed
+   * base32).
+   */
+  nkey_pub: z.string().regex(
+    /^U[A-Z2-7]{55}$/,
+    "principal.nkey_pub must be a base32 NKey public key (U-prefixed, 56 chars total)",
+  ).optional(),
+  /**
+   * Role ids the principal holds. Each id must resolve to a
+   * `RoleDefinition` in the same policy block; cross-validation
+   * via `.refine()` below catches dangling refs at parse time.
+   */
+  role: z.array(
+    z.string().regex(
+      /^[a-z][a-z0-9-]*$/,
+      "principal.role[] entries must be role ids — lowercase alphanumeric + hyphen, starting with a letter",
+    ),
+  ).default([]),
+  /**
+   * Peer principal ids this principal trusts. Cross-validation
+   * via `.refine()` ensures every entry resolves to a known
+   * principal in the same block.
+   */
+  trust: z.array(
+    z.string().regex(
+      /^[a-z][a-z0-9-]*$/,
+      "principal.trust[] entries must be principal ids — same grammar as principal.id",
+    ),
+  ).default([]),
+});
+
+export type PolicyPrincipal = z.infer<typeof PolicyPrincipalSchema>;
+
+/**
+ * A role definition. Roles bind capability sets to a name that
+ * principals reference. The C.1 PolicyEngine computes a principal's
+ * effective capabilities as the union of all referenced roles'
+ * capabilities.
+ */
+export const PolicyRoleSchema = z.object({
+  id: z.string().regex(
+    /^[a-z][a-z0-9-]*$/,
+    "role id must be lowercase alphanumeric + hyphen, starting with a letter (e.g. 'operator', 'code-reviewer')",
+  ),
+  /**
+   * Capability ids granted by this role. Convention follows
+   * Phase A.6 capability ids — `<domain>.<entity>` dotted
+   * lowercase. The C.1 engine matches `Intent.capability`
+   * literally against this list; future PRs may add glob
+   * expansion.
+   */
+  capabilities: z.array(z.string().min(1)).default([]),
+});
+
+export type PolicyRole = z.infer<typeof PolicyRoleSchema>;
+
+/**
+ * Top-level policy block — `cortex.yaml.policy`. Replaces per-
+ * adapter `roles[]` post-C.2b (the cutover). At C.2a both shapes
+ * coexist; this block parses optionally and the PolicyEngine
+ * factory below builds an engine when the block is present and
+ * non-empty.
+ *
+ * Cross-validation at C.2a:
+ *   - Every `principal.role[]` id resolves to a declared role.
+ *   - Every `principal.trust[]` id resolves to a declared principal.
+ * Dangling refs fail at parse time with a clear pointer at the
+ * offending principal.
+ *
+ * Phase D extends with `policy.federated.networks[]` per the
+ * Q4 lock-in (`docs/design-internet-of-agentic-work.md` §3.4).
+ */
+export const PolicySchema = z.object({
+  principals: z.array(PolicyPrincipalSchema).default([]),
+  roles: z.array(PolicyRoleSchema).default([]),
+}).superRefine((policy, ctx) => {
+  // Per-offender path emission so a YAML-aware loader can render
+  // the error inline at the bad token (Echo cortex#219 round 1).
+  // Capability-catalog precedent: `superRefine` with batch
+  // `ctx.addIssue` per offender at the same nesting depth.
+
+  // Uniqueness — principals[].id.
+  const seenPrincipal = new Map<string, number>();
+  policy.principals.forEach((p, i) => {
+    const dupAt = seenPrincipal.get(p.id);
+    if (dupAt !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: `principal id "${p.id}" already declared at principals[${dupAt}]`,
+        path: ["principals", i, "id"],
+      });
+    } else {
+      seenPrincipal.set(p.id, i);
+    }
+  });
+
+  // Uniqueness — roles[].id.
+  const seenRole = new Map<string, number>();
+  policy.roles.forEach((r, i) => {
+    const dupAt = seenRole.get(r.id);
+    if (dupAt !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: `role id "${r.id}" already declared at roles[${dupAt}]`,
+        path: ["roles", i, "id"],
+      });
+    } else {
+      seenRole.set(r.id, i);
+    }
+  });
+
+  // Cross-ref: every principal.role[] resolves to a declared role.
+  // Batch-emit (not first-failure) so an operator with multiple
+  // dangling refs sees all of them on one parse pass.
+  const knownRoles = new Set(policy.roles.map((r) => r.id));
+  policy.principals.forEach((p, principalIdx) => {
+    p.role.forEach((roleId, roleIdx) => {
+      if (!knownRoles.has(roleId)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `principal "${p.id}" references undeclared role "${roleId}" — declare it in policy.roles[]`,
+          path: ["principals", principalIdx, "role", roleIdx],
+        });
+      }
+    });
+  });
+
+  // Cross-ref: every principal.trust[] resolves to a declared principal.
+  const knownPrincipals = new Set(policy.principals.map((p) => p.id));
+  policy.principals.forEach((p, principalIdx) => {
+    p.trust.forEach((peerId, trustIdx) => {
+      if (!knownPrincipals.has(peerId)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `principal "${p.id}" trusts undeclared peer "${peerId}" — declare it in policy.principals[]`,
+          path: ["principals", principalIdx, "trust", trustIdx],
+        });
+      }
+    });
+  });
+});
+
+export type Policy = z.infer<typeof PolicySchema>;
+
+// =============================================================================
 // CortexConfig — the top-level schema
 // =============================================================================
 
@@ -933,6 +1132,23 @@ export const CortexConfigSchema = z.object({
       "legacy `trustedAgentBots:` is not supported — express peer trust via " +
       "`agents[].trust: [<agent-id>, ...]` on each agent (architecture §9.3).",
   }).optional(),
+
+  /**
+   * IAW Phase C.2a (refs cortex#115) — top-level policy block. The
+   * single principal + role registry that the PolicyEngine consumes.
+   * Optional at C.2a (additive); C.2b removes the per-adapter
+   * `roles[]` legacy shape and makes `policy:` the authoritative
+   * source. Until C.2b lands, both shapes coexist and operators
+   * MAY declare `policy:` ahead of the cutover to validate their
+   * principal model without waiting on the full schema flip.
+   *
+   * Behaviour today (C.2a): schema-only. The dispatch-handler still
+   * reads per-adapter roles for authorisation; C.3 wires PolicyEngine
+   * into the dispatch path. Declaring `policy:` in cortex.yaml is
+   * forward-compatible — parses cleanly and is available via the
+   * `policyEngineFromConfig` factory for callers that opt in.
+   */
+  policy: PolicySchema.optional(),
 
   /** First-class agents — the canonical list. */
   agents: z.array(AgentSchema).min(1, "at least one agent is required"),
