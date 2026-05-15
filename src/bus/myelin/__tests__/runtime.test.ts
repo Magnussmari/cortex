@@ -425,6 +425,157 @@ describe("MyelinRuntime", () => {
       await runtime.stop();
     });
 
+    test("IAW B.3 — publish signs outbound when signer option is set", async () => {
+      // Round-trip: start the runtime with a signer; publish an
+      // unsigned envelope; assert the published JSON carries a fresh
+      // `signed_by[]` array with one ed25519 stamp whose principal +
+      // signature shape match the signer config. The actual bytes
+      // verify is exercised indirectly via the `signEnvelope` →
+      // `verifyEnvelopeIdentity` round-trip already covered in
+      // `verify-signed-by-chain.test.ts`'s cryptoVerify happy-path.
+      const { createUser } = await import("@nats-io/nkeys");
+      const kp = createUser();
+      const rawSeedBytes = (
+        kp as unknown as { getRawSeed(): Uint8Array }
+      ).getRawSeed();
+
+      const fake = makeFakeNatsConnection();
+      const runtime = await startMyelinRuntime(
+        makeConfig({
+          url: "nats://localhost:4222",
+          name: "grove-bot",
+          subjects: ["local.{org}.system.>"],
+        }),
+        {
+          connectImpl: async () => fake.nc,
+          signer: {
+            rawSeedBytes,
+            principal: "did:mf:test-stack",
+          },
+        },
+      );
+      expect(runtime.enabled).toBe(true);
+
+      const env = makeEnvelope();
+      await runtime.publish(env);
+
+      // Exactly one publish forwarded.
+      expect(fake.publish).toHaveBeenCalledTimes(1);
+      const payload = fake.publishes[0]?.payload as string;
+      const published = JSON.parse(payload) as {
+        signed_by?: { method: string; principal: string; signature: string; at: string }[];
+        id: string;
+      };
+
+      // Original envelope was unsigned; published envelope carries a
+      // fresh chain with one ed25519 stamp matching the signer config.
+      expect(published.id).toBe(env.id);
+      expect(Array.isArray(published.signed_by)).toBe(true);
+      expect(published.signed_by).toHaveLength(1);
+      const stamp = published.signed_by?.[0];
+      expect(stamp?.method).toBe("ed25519");
+      expect(stamp?.principal).toBe("did:mf:test-stack");
+      // Signature shape: base64 of 64 raw bytes ≈ 88 chars.
+      expect(stamp?.signature.length).toBeGreaterThanOrEqual(86);
+
+      await runtime.stop();
+    });
+
+    test("IAW B.3 — publish appends to existing signed_by chain (multi-hop)", async () => {
+      // Forwarding scenario: an envelope arrives already signed by
+      // peer X; we forward it via this runtime; the publish must
+      // APPEND our stamp rather than replace the prior chain. This is
+      // the chain-of-stamps property that makes cross-stack
+      // verification possible.
+      const { createUser } = await import("@nats-io/nkeys");
+      const priorSigner = createUser();
+      const ourSigner = createUser();
+      const ourRawSeed = (
+        ourSigner as unknown as { getRawSeed(): Uint8Array }
+      ).getRawSeed();
+
+      // Sign a "prior" stamp directly via myelin to seed the chain.
+      const { signEnvelope } = await import("@the-metafactory/myelin/identity");
+      const priorRawSeed = (
+        priorSigner as unknown as { getRawSeed(): Uint8Array }
+      ).getRawSeed();
+      const priorSeedBase64 = Buffer.from(priorRawSeed).toString("base64");
+      const incoming = await signEnvelope(
+        makeEnvelope(),
+        priorSeedBase64,
+        "did:mf:peer-x",
+      );
+
+      const fake = makeFakeNatsConnection();
+      const runtime = await startMyelinRuntime(
+        makeConfig({
+          url: "nats://localhost:4222",
+          name: "grove-bot",
+          subjects: ["local.{org}.system.>"],
+        }),
+        {
+          connectImpl: async () => fake.nc,
+          signer: {
+            rawSeedBytes: ourRawSeed,
+            principal: "did:mf:our-stack",
+          },
+        },
+      );
+      expect(runtime.enabled).toBe(true);
+
+      await runtime.publish(incoming);
+
+      const payload = fake.publishes[0]?.payload as string;
+      const published = JSON.parse(payload) as {
+        signed_by: { principal: string }[];
+      };
+
+      // Two stamps in arrival order: peer-x first, then us.
+      expect(published.signed_by).toHaveLength(2);
+      expect(published.signed_by[0]?.principal).toBe("did:mf:peer-x");
+      expect(published.signed_by[1]?.principal).toBe("did:mf:our-stack");
+
+      await runtime.stop();
+    });
+
+    test("IAW B.3 — sign failure falls back to publishing unsigned (logs, doesn't throw)", async () => {
+      // Defensive: a malformed signer (bad seed shape) shouldn't
+      // crash the publish path. The runtime logs and publishes the
+      // original envelope unchanged so observability stays intact.
+      const fake = makeFakeNatsConnection();
+      const runtime = await startMyelinRuntime(
+        makeConfig({
+          url: "nats://localhost:4222",
+          name: "grove-bot",
+          subjects: ["local.{org}.system.>"],
+        }),
+        {
+          connectImpl: async () => fake.nc,
+          signer: {
+            // Wrong length — myelin's signEnvelope expects 32 bytes.
+            rawSeedBytes: new Uint8Array(16),
+            principal: "did:mf:test-stack",
+          },
+        },
+      );
+
+      const env = makeEnvelope();
+      // Must not throw.
+      await runtime.publish(env);
+
+      // Publish still happened — unsigned fallback.
+      expect(fake.publish).toHaveBeenCalledTimes(1);
+      const payload = fake.publishes[0]?.payload as string;
+      const published = JSON.parse(payload) as { signed_by?: unknown };
+      expect(published.signed_by).toBeUndefined();
+
+      // Error was logged for visibility.
+      const errLines = logs.filter((l) => l.kind === "error");
+      expect(errLines.some((l) => l.msg.includes("sign failed"))).toBe(true);
+
+      await runtime.stop();
+    });
+
     test("publish after stop() is a no-op (no late publishes after drain)", async () => {
       // Pins the post-stop semantic documented on `publishEnabled` in
       // runtime.ts: once `stop()` returns, calls to `runtime.publish(...)`
