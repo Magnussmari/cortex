@@ -145,7 +145,7 @@ const SOURCE = { org: "metafactory", agent: "cortex", instance: "local" };
 // =============================================================================
 
 describe("BusDispatchListener — lifecycle", () => {
-  test("start subscribes to runtime; stop unregisters", () => {
+  test("start subscribes to runtime; stop unregisters", async () => {
     const luna = agentFixture({ id: "luna" });
     const resolver = resolverWith(luna);
     const { runtime, handlers } = fakeRuntime();
@@ -161,11 +161,11 @@ describe("BusDispatchListener — lifecycle", () => {
     expect(handlers.size).toBe(0);
     listener.start();
     expect(handlers.size).toBe(1);
-    listener.stop();
+    await listener.stop();
     expect(handlers.size).toBe(0);
   });
 
-  test("start is idempotent — second call doesn't register twice", () => {
+  test("start is idempotent — second call doesn't register twice", async () => {
     const luna = agentFixture({ id: "luna" });
     const resolver = resolverWith(luna);
     const { runtime, handlers } = fakeRuntime();
@@ -181,10 +181,10 @@ describe("BusDispatchListener — lifecycle", () => {
     listener.start();
     listener.start();
     expect(handlers.size).toBe(1);
-    listener.stop();
+    await listener.stop();
   });
 
-  test("stop is idempotent — second call doesn't throw", () => {
+  test("stop is idempotent — second call doesn't throw", async () => {
     const luna = agentFixture({ id: "luna" });
     const resolver = resolverWith(luna);
     const { runtime } = fakeRuntime();
@@ -198,8 +198,8 @@ describe("BusDispatchListener — lifecycle", () => {
     });
 
     listener.start();
-    listener.stop();
-    expect(() => listener.stop()).not.toThrow();
+    await listener.stop();
+    await expect(listener.stop()).resolves.toBeUndefined();
   });
 });
 
@@ -234,7 +234,7 @@ describe("BusDispatchListener — peer-dispatch filter", () => {
     // No visibility event published — wrong type was filtered.
     expect(published).toHaveLength(0);
 
-    listener.stop();
+    await listener.stop();
   });
 
   test("ignores envelopes whose source matches our own", async () => {
@@ -267,7 +267,7 @@ describe("BusDispatchListener — peer-dispatch filter", () => {
     await drain();
 
     expect(published).toHaveLength(0);
-    listener.stop();
+    await listener.stop();
   });
 });
 
@@ -304,6 +304,7 @@ describe("BusDispatchListener — verification gate", () => {
     expect(published).toHaveLength(1);
     const event = published[0];
     expect(event?.type).toBe("system.bus.peer_dispatch_received");
+    expect(event?.payload.receiving_agent_id).toBe("luna");
     expect(event?.payload.peer_source).toBe("metafactory.echo.local");
     expect(event?.payload.dispatch_envelope_id).toBe(
       "00000000-0000-4000-8000-000000000abc",
@@ -312,7 +313,7 @@ describe("BusDispatchListener — verification gate", () => {
       "00000000-0000-4000-8000-000000000200",
     );
 
-    listener.stop();
+    await listener.stop();
   });
 
   test("drops an inbound envelope whose signer is not trusted (stderr + no visibility event)", async () => {
@@ -354,7 +355,7 @@ describe("BusDispatchListener — verification gate", () => {
       await drain();
 
       expect(published).toHaveLength(0);
-      listener.stop();
+      await listener.stop();
     } finally {
       process.stderr.write = originalWrite;
     }

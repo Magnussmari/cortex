@@ -466,6 +466,16 @@ export interface SystemBusPeerDispatchReceivedOpts {
   /** Standard source attribution — who emitted this visibility event. */
   source: SystemEventSource;
   /**
+   * Which local agent's `BusDispatchListener` produced this event.
+   * Multi-agent stacks may run one listener per agent (the JSDoc on
+   * `BusDispatchListener.receivingAgentId` explicitly contemplates
+   * `peer-router` agents and per-agent listeners). Without this
+   * field, a dashboard subscribed to `system.bus.peer_dispatch_received`
+   * can't answer "who in our stack received this" (Echo cortex#203
+   * round 1).
+   */
+  receivingAgentId: string;
+  /**
    * Source field from the peer's dispatch envelope (the `{operator}.
    * {agent}.{instance}` triple that identifies which peer just
    * dispatched a task to us). Different from `opts.source.org` —
@@ -513,6 +523,7 @@ export function createSystemBusPeerDispatchReceivedEvent(
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
+      receiving_agent_id: opts.receivingAgentId,
       peer_source: opts.peerSource,
       dispatch_envelope_id: opts.dispatchEnvelopeId,
       received_at: opts.receivedAt.toISOString(),

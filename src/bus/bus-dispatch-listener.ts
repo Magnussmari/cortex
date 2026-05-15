@@ -105,7 +105,14 @@ export class BusDispatchListener {
   private readonly cryptoVerify: boolean;
 
   private registration: { unregister: () => void } | undefined;
-  private serial: Promise<void> = Promise.resolve();
+  /**
+   * Set of in-flight verify promises. Each inbound runs in its own
+   * microtask chain (no serial queue — see Echo cortex#203 round 1).
+   * Tracked here so `stop()` can await drain and so the listener can
+   * be cleanly torn down in tests / shutdown without late stderr or
+   * late publish side effects landing on a closed channel.
+   */
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(opts: BusDispatchListenerOpts) {
     this.runtime = opts.runtime;
@@ -118,40 +125,38 @@ export class BusDispatchListener {
 
   /**
    * Register the runtime subscription. Idempotent — calling `start()`
-   * twice is a no-op (returns the existing registration). The handler
-   * runs every inbound verify inside a serial promise chain so a slow
-   * verify on envelope A doesn't let envelope B's processing race
-   * ahead — same arrival-order discipline as `BusPeerHarness` (cortex
-   * cortex#200 round 1).
+   * twice is a no-op (returns the existing registration). Each inbound
+   * envelope's verify runs in its own microtask chain, in parallel
+   * with other inbounds — there is no per-listener arrival-order
+   * invariant (no consumer iterator, no inter-envelope dependency),
+   * so the `BusPeerHarness` serial-chain pattern is deliberately NOT
+   * reused here (Echo cortex#203 round 1 finding). In-flight promises
+   * are tracked on `inFlight` so `stop()` can await drain.
    */
   start(): void {
     if (this.registration !== undefined) return;
     this.registration = this.runtime.onEnvelope((envelope) => {
       if (!this.isPeerDispatch(envelope)) return;
-      this.serial = this.serial.then(async () => {
-        try {
-          await this.handleInbound(envelope);
-        } catch (err) {
-          process.stderr.write(
-            `[bus-dispatch-listener:${this.receivingAgentId}] verification ` +
-              `threw on envelope ${envelope.id}: ` +
-              `${err instanceof Error ? err.message : String(err)}\n`,
-          );
-        }
-      });
+      this.trackInFlight(this.runOneVerify(envelope));
     });
   }
 
   /**
-   * Detach the subscription. Idempotent. In-flight serial verifies
-   * complete but their results are no-op'd because the listener no
-   * longer cares (the visibility event constructor is a pure builder;
-   * nothing downstream observes after stop).
+   * Detach the subscription and drain any in-flight verifies.
+   * Idempotent. Async (Echo cortex#203 round 1 finding) so callers
+   * relying on `stop()` as a clean cutoff — test teardown that
+   * mocks `runtime.publish` and then restores it, shutdown sequences
+   * — can `await listener.stop()` and trust that no late stderr or
+   * publish side effects land afterwards.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.registration === undefined) return;
     this.registration.unregister();
     this.registration = undefined;
+    // Drain in-flight verifies — Promise.allSettled because individual
+    // verifies already catch their own errors; we just need the
+    // microtask chain to flush before returning.
+    await Promise.allSettled(Array.from(this.inFlight));
   }
 
   /**
@@ -162,13 +167,56 @@ export class BusDispatchListener {
    * The "own publish" check uses envelope source attribution rather
    * than envelope id — at this slice we don't track our own outbound
    * ids, and `source` is the dotted `{operator}.{agent}.{instance}`
-   * shape every cortex publish stamps. A peer's source will name a
-   * different operator/agent, so the check is conservative-but-correct.
+   * shape every cortex publish stamps.
+   *
+   * **Security note** (Echo cortex#203 round 1): the source filter is
+   * `trust-list-anchored, not source-anchored`. `envelope.source` is
+   * NOT part of the canonical bytes verified by
+   * `verifyEnvelopeIdentity` — a peer could stamp a valid signed
+   * envelope with our triple as the source, and this filter would
+   * drop it (denial-of-service for legitimate peer dispatches).
+   * Conversely, an attacker who knows our triple can suppress our
+   * visibility into their dispatches. The verify chain is the
+   * authoritative gate — `signed_by[]` is bound to canonical bytes
+   * and trusted by the receiving agent's `trust:` list. The source
+   * filter is a cheap loopback suppressor, not a security boundary.
+   * Once cortex#202 (B.2b) lands and peers start publishing
+   * `dispatch.task.dispatched` envelopes routinely, consider pairing
+   * this with the BusPeerHarness pattern of also tracking our own
+   * outbound `envelope.id`s for stricter loopback suppression.
    */
   private isPeerDispatch(envelope: Envelope): boolean {
     if (envelope.type !== "dispatch.task.dispatched") return false;
     const ourSource = `${this.source.org}.${this.source.agent}.${this.source.instance}`;
     return envelope.source !== ourSource;
+  }
+
+  /**
+   * Run a single verify in its own microtask. Catches its own errors
+   * so the caller doesn't need to attach a `.catch`. Returns the
+   * promise so the caller can track it for drain.
+   */
+  private async runOneVerify(envelope: Envelope): Promise<void> {
+    try {
+      await this.handleInbound(envelope);
+    } catch (err) {
+      process.stderr.write(
+        `[bus-dispatch-listener:${this.receivingAgentId}] verification ` +
+          `threw on envelope ${envelope.id}: ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+
+  /**
+   * Track a verify promise on `inFlight` and remove it on settle.
+   * Sibling helper that owns the bookkeeping without inline arrow
+   * gymnastics — the alternative (let / two-step bind inside the
+   * subscription callback) trips TS's definite-assignment analysis.
+   */
+  private trackInFlight(verifyPromise: Promise<void>): void {
+    this.inFlight.add(verifyPromise);
+    void verifyPromise.finally(() => this.inFlight.delete(verifyPromise));
   }
 
   private async handleInbound(envelope: Envelope): Promise<void> {
@@ -197,6 +245,7 @@ export class BusDispatchListener {
     // any other surface subscribed to `system.bus.*`.
     const visibilityEvent = createSystemBusPeerDispatchReceivedEvent({
       source: this.source,
+      receivingAgentId: this.receivingAgentId,
       peerSource: envelope.source,
       dispatchEnvelopeId: envelope.id,
       ...(envelope.correlation_id !== undefined && {
