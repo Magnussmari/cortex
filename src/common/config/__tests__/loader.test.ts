@@ -491,6 +491,64 @@ describe("MIG-7.2e — cortex-shape detection + transform", () => {
     expect(config.discord[0]!.surfaceSubjects).toEqual([]);
   });
 
+  // cortex#207 — companion field to surfaceSubjects: where the adapter
+  // posts inbound bus envelopes. Without this, surfaceSubjects matches
+  // but renderEnvelope drops the envelope with a one-shot warning.
+  test("threads agents[].presence.discord.surfaceFallbackChannelId through to DiscordInstance.surfaceFallbackChannelId", () => {
+    const cfg = minimalCortex();
+    const firstAgent = (cfg.agents as Record<string, unknown>[])[0]!;
+    const discordPresence = (firstAgent.presence as Record<string, unknown>).discord as Record<string, unknown>;
+    discordPresence.surfaceFallbackChannelId = "1234567890";
+    const path = writeCortexConfig(testDir, cfg);
+    const { config } = loadConfigWithAgents(path);
+    expect(config.discord).toHaveLength(1);
+    expect(config.discord[0]!.surfaceFallbackChannelId).toBe("1234567890");
+  });
+
+  test("surfaceFallbackChannelId is undefined when omitted from presence.discord", () => {
+    const path = writeCortexConfig(testDir, minimalCortex());
+    const { config } = loadConfigWithAgents(path);
+    // Optional field — omission round-trips as undefined, not empty string.
+    // The adapter's runtime guard discriminates on `=== undefined` to fire
+    // the drop-with-warning path (preserves v0 behaviour for legacy configs).
+    expect(config.discord[0]!.surfaceFallbackChannelId).toBeUndefined();
+  });
+
+  test("surfaceFallbackChannelId coerces a safely-representable numeric to a string", () => {
+    // Discord snowflakes are 64-bit IDs that exceed Number.MAX_SAFE_INTEGER —
+    // testing with a real snowflake as a JS Number literal silently rounds
+    // at source-parse time and proves nothing about round-trip safety. Use
+    // a small numeric to demonstrate ONLY the z.coerce.string() behavior:
+    // operator passes a number, schema returns a string of that number.
+    // The separate "preserves quoted snowflake string verbatim" test below
+    // exercises the realistic path (operator quotes the snowflake in yaml).
+    const cfg = minimalCortex();
+    const firstAgent = (cfg.agents as Record<string, unknown>[])[0]!;
+    const discordPresence = (firstAgent.presence as Record<string, unknown>).discord as Record<string, unknown>;
+    // discordPresence is typed `Record<string, unknown>`, so a numeric
+    // assignment doesn't need a cast — `unknown` accepts any value.
+    discordPresence.surfaceFallbackChannelId = 12345;
+    const path = writeCortexConfig(testDir, cfg);
+    const { config } = loadConfigWithAgents(path);
+    expect(typeof config.discord[0]!.surfaceFallbackChannelId).toBe("string");
+    expect(config.discord[0]!.surfaceFallbackChannelId).toBe("12345");
+  });
+
+  test("surfaceFallbackChannelId preserves a quoted snowflake string verbatim", () => {
+    // The realistic operator path: yaml configs surrounding `agentChannelId`,
+    // `logChannelId`, etc. all quote Discord snowflakes as strings. Verify
+    // a quoted snowflake survives the round-trip without any digit-loss
+    // from JS Number precision.
+    const snowflake = "1487029848164536361"; // Echo's actual agent-channel snowflake
+    const cfg = minimalCortex();
+    const firstAgent = (cfg.agents as Record<string, unknown>[])[0]!;
+    const discordPresence = (firstAgent.presence as Record<string, unknown>).discord as Record<string, unknown>;
+    discordPresence.surfaceFallbackChannelId = snowflake;
+    const path = writeCortexConfig(testDir, cfg);
+    const { config } = loadConfigWithAgents(path);
+    expect(config.discord[0]!.surfaceFallbackChannelId).toBe(snowflake);
+  });
+
   // ---------------------------------------------------------------------------
   // IAW Phase A.5 (refs cortex#113) — cortex-shape `stack:` block plumbed
   // through to `LoadedConfig.stack`. The boot path (`startCortex`) calls
