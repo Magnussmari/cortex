@@ -9,6 +9,7 @@
 
 import { Hono } from "hono";
 import type { Env } from "../index";
+import type { Classification } from "../../../../bus/myelin/envelope-validator";
 
 // ---------------------------------------------------------------------------
 // G-406: Module-level cache
@@ -19,16 +20,29 @@ let cachedETag: string | null = null;
 let cachedAt = 0;
 const CACHE_TTL_MS = 5_000; // 5s TTL — prevents stale reads across isolates
 
-/** Build a full (unfiltered) snapshot object from D1. */
-export async function buildSnapshot(db: D1Database, project?: string | null) {
-  const [agents, completions, activity, dailyStats, projects, accountUsage, operatorUsage] = await Promise.all([
-    getActiveAgents(db, project),
-    getRecentCompletions(db, project),
+/**
+ * Build a full (unfiltered) snapshot object from D1.
+ *
+ * IAW D.5 — `homeOperator` (when supplied) slices the snapshot's `agents`
+ * and `recentCompletions` lists by the originating operator. The other
+ * derived sections (stats, repos, heatmap) stay global because they reflect
+ * the receiving operator's totals; per-operator stats are a future slice
+ * (D.5 ships the activity-card path first per the plan §5).
+ */
+export async function buildSnapshot(
+  db: D1Database,
+  project?: string | null,
+  homeOperator?: string | null,
+) {
+  const [agents, completions, activity, dailyStats, projects, accountUsage, operatorUsage, homeOperators] = await Promise.all([
+    getActiveAgents(db, project, homeOperator),
+    getRecentCompletions(db, project, undefined, homeOperator),
     getRecentActivity(db, project),
     getDailyStats(db),
     getProjects(db),
     getLatestAccountUsage(db),
     getPerOperatorUsage(db),
+    getKnownHomeOperators(db),
   ]);
 
   return {
@@ -42,6 +56,12 @@ export async function buildSnapshot(db: D1Database, project?: string | null) {
     stats: { today: dailyStats },
     accountUsage,
     operatorUsage,
+    /**
+     * IAW D.5.2 — distinct `home_operator` values observed in recent
+     * sessions. The frontend uses this to populate the operator filter
+     * dropdown; "Local only" (the default) corresponds to `null` here.
+     */
+    homeOperators,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -188,10 +208,17 @@ export const stateRoutes = new Hono<{ Bindings: Env }>();
 stateRoutes.get("/api/state", async (c) => {
   const db = c.env.GROVE_DB;
   const project = c.req.query("project");
+  // IAW D.5.2 — `?home_operator=<id>` slices the snapshot to a single
+  // originating operator. Sentinel `"local"` means "null home_operator
+  // only" (purely local traffic, no federated stamps) and matches the
+  // dashboard's default filter chip.
+  const homeOperator = c.req.query("home_operator");
 
-  // Project-filtered requests bypass cache (rare)
-  if (project) {
-    const snapshot = await buildSnapshot(db, project);
+  // Project-filtered or operator-filtered requests bypass cache (rare).
+  // The cache key would need to grow per-(project, home_operator) tuple
+  // otherwise; not worth the complexity for the slow path.
+  if (project || homeOperator) {
+    const snapshot = await buildSnapshot(db, project, homeOperator);
     return c.json(snapshot);
   }
 
@@ -207,12 +234,17 @@ stateRoutes.get("/api/state", async (c) => {
 // Query helpers
 // ---------------------------------------------------------------------------
 
-async function getActiveAgents(db: D1Database, project?: string | null) {
+async function getActiveAgents(
+  db: D1Database,
+  project?: string | null,
+  homeOperator?: string | null,
+) {
   let sql = `
     SELECT session_id, operator_id, agent_id, agent_name, project, description,
            github_issue, started_at, completed_at, duration_ms, status, pr_url,
            events_count, last_event, last_event_at, progress_completed, progress_total,
-           input_tokens, output_tokens, cache_read_tokens, cost_usd
+           input_tokens, output_tokens, cache_read_tokens, cost_usd,
+           classification, data_residency, home_operator
     FROM sessions
     WHERE (status = 'active' AND last_event_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 hours'))
       OR (status IN ('completed', 'failed') AND completed_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 minutes'))
@@ -223,6 +255,10 @@ async function getActiveAgents(db: D1Database, project?: string | null) {
     sql += ` AND project = ?`;
     params.push(project);
   }
+
+  const homeFilter = applyHomeOperatorFilter(homeOperator);
+  sql += homeFilter.sql;
+  params.push(...homeFilter.params);
 
   sql += ` ORDER BY started_at DESC`;
 
@@ -236,6 +272,12 @@ async function getActiveAgents(db: D1Database, project?: string | null) {
     id: r.agent_id as string,
     name: r.agent_name as string,
     operatorId: r.operator_id as string | null,
+    // IAW D.5.3 — surface sovereignty + homeOperator on each agent card.
+    // `homeOperator` defaults to null (purely local traffic); the frontend
+    // renders nothing rather than a "local" chip for the null case so the
+    // 99% pre-IAW path stays visually unchanged.
+    homeOperator: (r.home_operator as string | null) ?? null,
+    sovereignty: buildSovereignty(r),
     status: r.status === "active" ? "active" as const : "completed" as const,
     currentTask: {
       sessionId: r.session_id as string,
@@ -265,6 +307,60 @@ async function getActiveAgents(db: D1Database, project?: string | null) {
       durationMs: r.duration_ms as number | null | undefined,
     },
   }));
+}
+
+/**
+ * IAW D.5.2 — translate the `home_operator` query param into a parameterised
+ * SQL fragment for chaining onto a `sessions` WHERE clause.
+ *
+ *   - `undefined` / `null` / `""` → no slicing (snapshot covers all rows).
+ *   - `"local"`                   → `home_operator IS NULL` (purely local
+ *                                   traffic, the dashboard default chip).
+ *   - any other string            → `home_operator = ?` (specific operator).
+ *
+ * Returns `{ sql, params }` rather than mutating in place so the caller's
+ * SELECT is constructible without hidden side-effects on a shared array.
+ *
+ * Echo cortex#224 round 1 — extracted to fold three (and eventually more)
+ * `getActiveAgents` / `getRecentCompletions` / future-helper copies through
+ * one place. Adding `"federated"` (all stamped traffic) or `"public"` (a
+ * specific classification cut) becomes a one-file change.
+ */
+function applyHomeOperatorFilter(homeOperator?: string | null): {
+  sql: string;
+  params: unknown[];
+} {
+  if (homeOperator === "local") {
+    return { sql: ` AND home_operator IS NULL`, params: [] };
+  }
+  if (homeOperator) {
+    return { sql: ` AND home_operator = ?`, params: [homeOperator] };
+  }
+  return { sql: "", params: [] };
+}
+
+/**
+ * IAW D.5.3 — build the snapshot's `sovereignty` block from a session row.
+ * Returns `null` when none of the three sovereignty fields are populated so
+ * the frontend can fast-path the "pre-IAW row, render nothing" case without
+ * a per-field truthy check.
+ */
+function buildSovereignty(r: Record<string, unknown>): {
+  classification: Classification | null;
+  dataResidency: string | null;
+  homeOperator: string | null;
+} | null {
+  const classification = r.classification as Classification | null | undefined;
+  const dataResidency = r.data_residency as string | null | undefined;
+  const homeOperator = r.home_operator as string | null | undefined;
+  if (classification == null && dataResidency == null && homeOperator == null) {
+    return null;
+  }
+  return {
+    classification: classification ?? null,
+    dataResidency: dataResidency ?? null,
+    homeOperator: homeOperator ?? null,
+  };
 }
 
 /** G-410: Fetch last 50 activity entries for each session ID. */
@@ -300,10 +396,16 @@ async function getSessionActivities(
   return map;
 }
 
-async function getRecentCompletions(db: D1Database, project?: string | null, limit = 50) {
+async function getRecentCompletions(
+  db: D1Database,
+  project?: string | null,
+  limit = 50,
+  homeOperator?: string | null,
+) {
   let sql = `
     SELECT agent_id, agent_name, operator_id, project, description, duration_ms,
-           completed_at, pr_url, github_issue, status
+           completed_at, pr_url, github_issue, status,
+           classification, data_residency, home_operator
     FROM sessions
     WHERE status IN ('completed', 'failed')
   `;
@@ -314,6 +416,10 @@ async function getRecentCompletions(db: D1Database, project?: string | null, lim
     params.push(project);
   }
 
+  const homeFilter = applyHomeOperatorFilter(homeOperator);
+  sql += homeFilter.sql;
+  params.push(...homeFilter.params);
+
   sql += ` ORDER BY completed_at DESC LIMIT ?`;
   params.push(limit);
 
@@ -322,7 +428,7 @@ async function getRecentCompletions(db: D1Database, project?: string | null, lim
   return (results ?? []).map((r: Record<string, unknown>) => ({
     agentId: r.agent_id as string,
     agentName: r.agent_name as string,
-    operatorId: (r as any).operator_id as string | null,
+    operatorId: r.operator_id as string | null,
     project: r.project as string | null,
     description: r.description as string,
     durationMs: r.duration_ms as number | null,
@@ -330,7 +436,30 @@ async function getRecentCompletions(db: D1Database, project?: string | null, lim
     prUrl: r.pr_url as string | null,
     githubIssue: r.github_issue as string | null,
     status: r.status as "completed" | "failed",
+    // IAW D.5.3 — sovereignty surface on completions row.
+    homeOperator: (r.home_operator as string | null) ?? null,
+    sovereignty: buildSovereignty(r),
   }));
+}
+
+/**
+ * IAW D.5.2 — return the distinct, non-null `home_operator` values seen in
+ * recent sessions. Powers the dashboard's operator filter dropdown — the
+ * frontend prepends "Local only" (default) + "All operators" to this list.
+ *
+ * Window: same 7-day horizon the heatmap uses, so the dropdown doesn't grow
+ * unboundedly with historical federated peers that have gone dark.
+ */
+async function getKnownHomeOperators(db: D1Database): Promise<string[]> {
+  const { results } = await db.prepare(`
+    SELECT DISTINCT home_operator
+    FROM sessions
+    WHERE home_operator IS NOT NULL
+      AND (last_event_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
+           OR completed_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days'))
+    ORDER BY home_operator ASC
+  `).all();
+  return (results ?? []).map((r) => r.home_operator as string);
 }
 
 async function getRecentActivity(db: D1Database, project?: string | null, limit = 500) {
