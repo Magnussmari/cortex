@@ -340,6 +340,85 @@ describe("BusPeerHarness — round-trip + verification gate", () => {
     expect(handlers.size).toBe(0);
   });
 
+  test("preserves arrival order across progress + terminal (Echo cortex#200 race regression)", async () => {
+    // Regression for Echo's B.1c finding #1+#2: with the async-IIFE
+    // pattern, a later-arriving terminal envelope's verify could
+    // resolve BEFORE an earlier progress envelope's verify, dropping
+    // the progress from the consumer's view (queue closed before
+    // pushInbound ran). Serialisation via the `inFlight` chain pins
+    // arrival order — the race is hard to deterministically trigger
+    // in a unit test, but this case proves that progress + terminal
+    // both reach the consumer in arrival order even when delivered
+    // back-to-back into the same chain.
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const resolver = resolverWith(luna, echo);
+    const { runtime, deliverInbound } = fakeRuntime();
+
+    const harness = new BusPeerHarness({
+      runtime,
+      resolver,
+      receivingAgentId: "luna",
+      source: SOURCE,
+    });
+
+    const req = dispatchRequest();
+    const yielded: MyelinEnvelope[] = [];
+
+    const iterator = harness.dispatch(req)[Symbol.asyncIterator]();
+    const started = await iterator.next();
+    if (!started.done) yielded.push(started.value);
+
+    // Deliver progress + terminal back-to-back. The serialised
+    // verify chain must push both before close fires, and in arrival
+    // order.
+    deliverInbound({
+      id: "11111111-1111-4111-8111-111111111111",
+      source: "metafactory.echo.local",
+      type: "dispatch.task.progress",
+      timestamp: "2026-05-15T10:30:00.000Z",
+      correlation_id: req.requestId,
+      sovereignty: {
+        classification: "local",
+        data_residency: "NZ",
+        max_hop: 4,
+        frontier_ok: false,
+        model_class: "any",
+      },
+      payload: { step: 1 },
+      signed_by: {
+        method: "ed25519",
+        principal: "did:mf:echo",
+        signature: "A".repeat(88),
+        at: "2026-05-15T10:30:00.000Z",
+      },
+    });
+    deliverInbound(
+      inboundEnvelope({
+        correlationId: req.requestId,
+        type: "dispatch.task.completed",
+        signerPrincipal: "did:mf:echo",
+      }),
+    );
+
+    // Drain the iterator — both envelopes must yield in arrival order
+    // (progress first, terminal second), then the iterator closes.
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) break;
+      yielded.push(next.value);
+    }
+
+    expect(yielded).toHaveLength(3);
+    expect(yielded[0]?.type).toBe("dispatch.task.started");
+    expect(yielded[1]?.type).toBe("dispatch.task.progress");
+    expect(yielded[2]?.type).toBe("dispatch.task.completed");
+  });
+
   test("ignores envelopes whose correlation_id does not match this dispatch", async () => {
     const luna = agentFixture({ id: "luna", trust: ["echo"] });
     const echo = agentFixture({
