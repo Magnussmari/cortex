@@ -449,6 +449,7 @@ export async function startCortex(
       dm: instance.dm,
       ...(instance.operatorRoleId !== undefined && { operatorRoleId: instance.operatorRoleId }),
       trustedBotIds: instance.trustedBotIds,
+      surfaceSubjects: instance.surfaceSubjects,
     };
     // MIG-7.2e: prefer the cortex-shape `inlineAgents` lookup when present —
     // per-instance identity (real id, persona, roles, trust) flows from
@@ -481,6 +482,17 @@ export async function startCortex(
           runtime,
           systemEventSource,
           trustedBotIds: explicitTrustedBotIds,
+          // cortex#205: plumb the operator's configured subject patterns
+          // through to the surface-router. Pass the array verbatim — `[]`
+          // included — so the adapter's one-shot empty-array warning at
+          // `discord/index.ts:178` actually fires for the "operator
+          // forgot / typoed surfaceSubjects" case the schema docstrings
+          // promise. A conditional short-circuit here would convert
+          // `[]` → `undefined` on the infra side and silently disable
+          // the diagnostic. Setting e.g.
+          // `["local.metafactory.tasks.code-review.>"]` wires pilot's
+          // IoAW review-requests into the Discord render path.
+          surfaceSubjects: presence.surfaceSubjects,
         },
       );
       // Register the adapter's surface-router face. Empty `surfaceSubjects`
