@@ -63,10 +63,7 @@ import { randomUUID } from "crypto";
 import type { Envelope } from "../../bus/myelin/envelope-validator";
 import type { MyelinRuntime } from "../../bus/myelin/runtime";
 import type { TrustResolver } from "../../common/agents/trust-resolver";
-import {
-  verifySignedByChain,
-  type ChainVerificationResult,
-} from "../../bus/verify-signed-by-chain";
+import { verifySignedByChain } from "../../bus/verify-signed-by-chain";
 import type {
   Capability,
   DispatchRequest,
@@ -242,6 +239,12 @@ export class BusPeerHarness implements SessionHarness {
       }
     }
 
+    // Serial-verification chain. Each inbound envelope's verify is
+    // appended via `.then(...)` so verifies run in arrival order and
+    // the terminal-envelope detection fires only after every prior
+    // envelope has pushed. Echo cortex#200 round 1, findings #1+#2.
+    let inFlight: Promise<void> = Promise.resolve();
+
     // Register the handler BEFORE the try block so envelopes arriving
     // between registration and the first yield are captured; the
     // unregister in `finally` (which wraps the publish + every yield
@@ -262,44 +265,71 @@ export class BusPeerHarness implements SessionHarness {
       // this harness just published.
       if (envelope.id === requestEnvelope.id) return;
 
-      const verification: ChainVerificationResult = verifySignedByChain(
-        envelope,
-        {
-          resolver: this.resolver,
-          receivingAgentId: this.receivingAgentId,
-          // Peers always sign at least the bare ed25519 stamp; an
-          // unsigned envelope on the bus-peer path is a misconfig
-          // we want surfaced.
-          rejectEmpty: true,
-        },
-      );
+      // verifySignedByChain is async (B.1c) but onEnvelope's handler
+      // is sync. Chain each verify onto `inFlight` so:
+      //   1. Verifies run in arrival order (Echo cortex#200 finding #1
+      //      — bare IIFE would let later-arrived B's verify resolve
+      //      before A's, breaking the dispatch progress→terminal
+      //      arrival-order invariant the SessionHarness contract
+      //      implicitly relies on).
+      //   2. Terminal-envelope detection runs AFTER every prior
+      //      envelope has pushed (Echo finding #2 — without
+      //      serialisation, terminal-detection on B could close the
+      //      queue while A's verify was still pending, dropping A
+      //      from the consumer's view).
+      // The chain swallows rejections (try/catch + stderr log) so an
+      // unexpected throw from verifySignedByChain (e.g. the
+      // operatorId-missing guard once a follow-up flips cryptoVerify
+      // on without threading operatorId — Echo finding #3) doesn't
+      // surface as an unhandled rejection on the process.
+      inFlight = inFlight.then(async () => {
+        try {
+          const verification = await verifySignedByChain(envelope, {
+            resolver: this.resolver,
+            receivingAgentId: this.receivingAgentId,
+            // Peers always sign at least the bare ed25519 stamp; an
+            // unsigned envelope on the bus-peer path is a misconfig
+            // we want surfaced.
+            rejectEmpty: true,
+          });
 
-      if (!verification.valid) {
-        // Phase C wires audit envelopes; for now stderr is the
-        // visibility surface. Format the reason discriminator inline
-        // so an operator grepping stderr gets the structural class
-        // without consulting code.
-        const reason = verification.reason;
-        process.stderr.write(
-          `[bus-peer:${this.receivingAgentId}] dropped inbound envelope ` +
-            `${envelope.id} (correlation_id=${correlationId}): ` +
-            `${reason.kind} at chain index ${verification.rejectedAt}\n`,
-        );
-        return;
-      }
+          if (!verification.valid) {
+            // Phase C wires audit envelopes; for now stderr is the
+            // visibility surface. Format the reason discriminator
+            // inline so an operator grepping stderr gets the
+            // structural class without consulting code.
+            const reason = verification.reason;
+            process.stderr.write(
+              `[bus-peer:${this.receivingAgentId}] dropped inbound envelope ` +
+                `${envelope.id} (correlation_id=${correlationId}): ` +
+                `${reason.kind} at chain index ${verification.rejectedAt}\n`,
+            );
+            return;
+          }
 
-      pushInbound(envelope);
+          pushInbound(envelope);
 
-      // Terminal-envelope detection — when the peer signals end of
-      // the dispatch, close the inbound queue so the generator can
-      // exit cleanly. Conventional terminal types per G-1111 §3.4.
-      if (
-        envelope.type === "dispatch.task.completed" ||
-        envelope.type === "dispatch.task.failed" ||
-        envelope.type === "dispatch.task.aborted"
-      ) {
-        signalClosed();
-      }
+          // Terminal-envelope detection — when the peer signals end of
+          // the dispatch, close the inbound queue so the generator
+          // can exit cleanly. Conventional terminal types per
+          // G-1111 §3.4. Runs INSIDE the same chain link as the
+          // preceding push, so the queue contains every prior
+          // envelope before close fires (Echo finding #2 fix).
+          if (
+            envelope.type === "dispatch.task.completed" ||
+            envelope.type === "dispatch.task.failed" ||
+            envelope.type === "dispatch.task.aborted"
+          ) {
+            signalClosed();
+          }
+        } catch (err) {
+          process.stderr.write(
+            `[bus-peer:${this.receivingAgentId}] verification threw on ` +
+              `envelope ${envelope.id} (correlation_id=${correlationId}): ` +
+              `${err instanceof Error ? err.message : String(err)}\n`,
+          );
+        }
+      });
     });
 
     // ----------------------------------------------------------------

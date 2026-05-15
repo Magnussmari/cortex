@@ -17,6 +17,8 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { createUser } from "@nats-io/nkeys";
+import { signEnvelope } from "@the-metafactory/myelin/identity";
 import { AgentRegistry } from "../../common/agents/registry";
 import { TrustResolver } from "../../common/agents/trust-resolver";
 import {
@@ -124,7 +126,7 @@ function resolverWith(...agents: Agent[]): TrustResolver {
 // =============================================================================
 
 describe("verifySignedByChain — happy path + skipped semantics", () => {
-  test("[1] single trusted ed25519 stamp → valid with empty skipped", () => {
+  test("[1] single trusted ed25519 stamp → valid with empty skipped", async () => {
     // Receiver "luna" trusts sender "echo" with known nkey.
     const luna = agentFixture({ id: "luna", trust: ["echo"] });
     const echo = agentFixture({
@@ -135,7 +137,7 @@ describe("verifySignedByChain — happy path + skipped semantics", () => {
     const resolver = resolverWith(luna, echo);
 
     const env = envelopeWithChain([ed25519Stamp("did:mf:echo")]);
-    const result: ChainVerificationResult = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -146,7 +148,7 @@ describe("verifySignedByChain — happy path + skipped semantics", () => {
     }
   });
 
-  test("[8] mixed chain — hub-stamp at index 0 (skipped), trusted ed25519 at index 1 → valid w/ skipped:[0]", () => {
+  test("[8] mixed chain — hub-stamp at index 0 (skipped), trusted ed25519 at index 1 → valid w/ skipped:[0]", async () => {
     const luna = agentFixture({ id: "luna", trust: ["echo"] });
     const echo = agentFixture({
       id: "echo",
@@ -159,7 +161,7 @@ describe("verifySignedByChain — happy path + skipped semantics", () => {
       hubStamp("did:mf:echo", "did:mf:hub-alpha"),
       ed25519Stamp("did:mf:echo"),
     ]);
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -172,12 +174,12 @@ describe("verifySignedByChain — happy path + skipped semantics", () => {
 });
 
 describe("verifySignedByChain — empty chain semantics", () => {
-  test("[2] empty chain, rejectEmpty defaults to true → empty_chain rejection", () => {
+  test("[2] empty chain, rejectEmpty defaults to true → empty_chain rejection", async () => {
     const luna = agentFixture({ id: "luna" });
     const resolver = resolverWith(luna);
     const env = envelopeWithChain(undefined);
 
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -190,12 +192,12 @@ describe("verifySignedByChain — empty chain semantics", () => {
     }
   });
 
-  test("[3] empty chain, rejectEmpty explicit false → valid w/ empty skipped", () => {
+  test("[3] empty chain, rejectEmpty explicit false → valid w/ empty skipped", async () => {
     const luna = agentFixture({ id: "luna" });
     const resolver = resolverWith(luna);
     const env = envelopeWithChain(undefined);
 
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
       rejectEmpty: false,
@@ -209,12 +211,12 @@ describe("verifySignedByChain — empty chain semantics", () => {
 });
 
 describe("verifySignedByChain — split rejection reasons", () => {
-  test("[4] malformed principal (did:key:…) → malformed_principal", () => {
+  test("[4] malformed principal (did:key:…) → malformed_principal", async () => {
     const luna = agentFixture({ id: "luna" });
     const resolver = resolverWith(luna);
     const env = envelopeWithChain([ed25519Stamp("did:key:abc123")]);
 
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -229,12 +231,12 @@ describe("verifySignedByChain — split rejection reasons", () => {
     }
   });
 
-  test("[5] well-formed did:mf but agent not registered → unknown_agent", () => {
+  test("[5] well-formed did:mf but agent not registered → unknown_agent", async () => {
     const luna = agentFixture({ id: "luna" });
     const resolver = resolverWith(luna);
     const env = envelopeWithChain([ed25519Stamp("did:mf:nobody")]);
 
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -250,14 +252,14 @@ describe("verifySignedByChain — split rejection reasons", () => {
     }
   });
 
-  test("[6] agent registered but no nkey_pub → principal_has_no_nkey_pub", () => {
+  test("[6] agent registered but no nkey_pub → principal_has_no_nkey_pub", async () => {
     const luna = agentFixture({ id: "luna", trust: ["echo"] });
     // echo has no nkey_pub — intentional.
     const echo = agentFixture({ id: "echo", displayName: "Echo" });
     const resolver = resolverWith(luna, echo);
 
     const env = envelopeWithChain([ed25519Stamp("did:mf:echo")]);
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -273,7 +275,7 @@ describe("verifySignedByChain — split rejection reasons", () => {
     }
   });
 
-  test("[7] signer's NKey known but receiver doesn't trust them → signer_not_trusted", () => {
+  test("[7] signer's NKey known but receiver doesn't trust them → signer_not_trusted", async () => {
     // luna does NOT include echo in `trust:`.
     const luna = agentFixture({ id: "luna", trust: [] });
     const echo = agentFixture({
@@ -284,7 +286,7 @@ describe("verifySignedByChain — split rejection reasons", () => {
     const resolver = resolverWith(luna, echo);
 
     const env = envelopeWithChain([ed25519Stamp("did:mf:echo")]);
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -302,7 +304,7 @@ describe("verifySignedByChain — split rejection reasons", () => {
 });
 
 describe("verifySignedByChain — multi-stamp rejection", () => {
-  test("[9] valid stamp at index 0, untrusted stamp at index 1 → rejectedAt:1, skipped:[]", () => {
+  test("[9] valid stamp at index 0, untrusted stamp at index 1 → rejectedAt:1, skipped:[]", async () => {
     // luna trusts echo (NKey present) but not holly. Chain has echo first
     // (accepted), holly second (rejected — signer_not_trusted). Verify
     // that `rejectedAt: 1` carries the per-stamp index, and that the
@@ -325,7 +327,7 @@ describe("verifySignedByChain — multi-stamp rejection", () => {
       ed25519Stamp("did:mf:echo"),
       ed25519Stamp("did:mf:holly"),
     ]);
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -342,7 +344,7 @@ describe("verifySignedByChain — multi-stamp rejection", () => {
     }
   });
 
-  test("rejection on stamp 2 with hub-stamp at index 0 → skipped:[0] preserved", () => {
+  test("rejection on stamp 2 with hub-stamp at index 0 → skipped:[0] preserved", async () => {
     // Extra coverage on the new `skipped` carry-through behaviour for
     // failure variants: hub-stamp at 0 was skipped before the rejection
     // at index 2 fires, so the failure result must surface skipped:[0].
@@ -359,7 +361,7 @@ describe("verifySignedByChain — multi-stamp rejection", () => {
       ed25519Stamp("did:mf:echo"),
       ed25519Stamp("did:mf:nobody"),
     ]);
-    const result = verifySignedByChain(env, {
+    const result = await verifySignedByChain(env, {
       resolver,
       receivingAgentId: "luna",
     });
@@ -370,5 +372,166 @@ describe("verifySignedByChain — multi-stamp rejection", () => {
       expect(result.reason.kind).toBe("unknown_agent");
       expect(result.skipped).toEqual([0]);
     }
+  });
+});
+
+// =============================================================================
+// Crypto-verify (B.1c)
+// =============================================================================
+
+/**
+ * Generate a fresh ed25519 NATS user keypair for tests. Returns both
+ * encodings cortex/myelin care about:
+ *   - `nkeyPub`: the U-prefixed base32 NATS NKey shape — fed into
+ *     `AgentSchema.nkey_pub` so `buildPrincipalRegistry` can derive
+ *     the matching base64 ed25519 pubkey via `@nats-io/nkeys`.
+ *   - `privateKeyBase64`: the 32-byte ed25519 seed encoded as base64 —
+ *     what `signEnvelope` expects for the signing key argument.
+ *
+ * The seed returned by `getSeed()` is the 58-char NKey-encoded seed
+ * (`SU...`). To get the raw 32-byte ed25519 seed `signEnvelope` wants,
+ * we extract via the `_seed` field on the concrete `KP` class. This is
+ * a test-only cast — production-side signing (B.3) will use a
+ * cortex-controlled path that owns its own private-key storage shape.
+ */
+function generateEd25519KeyPair(): {
+  nkeyPub: string;
+  privateKeyBase64: string;
+} {
+  const kp = createUser();
+  const nkeyPub = kp.getPublicKey();
+  // KP's concrete class exposes `getRawSeed()` returning the 32-byte
+  // ed25519 seed — that's the shape signEnvelope wants (which calls
+  // bytesFromBase64 then expects 32 bytes). `getSeed()` returns the
+  // wrapped 58-char NKey-encoded seed (`SU...`) which is the wrong
+  // shape for crypto consumption.
+  const rawSeed = (kp as unknown as { getRawSeed(): Uint8Array }).getRawSeed();
+  const privateKeyBase64 = Buffer.from(rawSeed).toString("base64");
+  return { nkeyPub, privateKeyBase64 };
+}
+
+describe("verifySignedByChain — cryptoVerify (B.1c)", () => {
+  test("cryptoVerify accepts an envelope signed by a trusted agent's NKey", async () => {
+    const { nkeyPub: echoNKey, privateKeyBase64: echoSeed } =
+      generateEd25519KeyPair();
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: echoNKey,
+    });
+    const resolver = resolverWith(luna, echo);
+
+    // Build an envelope WITHOUT signed_by, then have echo sign it via
+    // myelin's signEnvelope. That produces a canonically-signed chain
+    // that verifyEnvelopeIdentity will accept.
+    // Cast through Parameters because cortex's Envelope.signed_by is
+    // the back-compat union `SignedBy | SignedBy[] | undefined` while
+    // myelin's MyelinEnvelope tightens to `SignedBy[] | undefined`.
+    // For this test the envelope has no signed_by yet, so the cast
+    // is structurally safe.
+    const base = envelopeWithChain(undefined) as Parameters<
+      typeof signEnvelope
+    >[0];
+    const signed = await signEnvelope(base, echoSeed, "did:mf:echo");
+
+    const result: ChainVerificationResult = await verifySignedByChain(
+      signed,
+      {
+        resolver,
+        receivingAgentId: "luna",
+        cryptoVerify: true,
+        operatorId: "test-operator",
+      },
+    );
+
+    expect(result.valid).toBe(true);
+    if (result.valid) {
+      expect(result.skipped).toEqual([]);
+    }
+  });
+
+  test("cryptoVerify rejects an envelope whose signature was tampered post-signing", async () => {
+    const { nkeyPub: echoNKey, privateKeyBase64: echoSeed } =
+      generateEd25519KeyPair();
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: echoNKey,
+    });
+    const resolver = resolverWith(luna, echo);
+
+    const base = envelopeWithChain(undefined) as Parameters<
+      typeof signEnvelope
+    >[0];
+    const signed = await signEnvelope(base, echoSeed, "did:mf:echo");
+
+    // Tamper: flip the signature so the bytes no longer match the
+    // canonical envelope. Structurally the stamp still looks valid
+    // (the principal is echo, NKey is registered, trust list includes
+    // echo); only the bytes-check exposes the forgery.
+    const chain = Array.isArray(signed.signed_by)
+      ? signed.signed_by
+      : signed.signed_by
+        ? [signed.signed_by]
+        : [];
+    const firstStamp = chain[0];
+    if (firstStamp?.method !== "ed25519") {
+      throw new Error("test fixture: expected ed25519 stamp at index 0");
+    }
+    const tamperedSig = firstStamp.signature.startsWith("A")
+      ? "B" + firstStamp.signature.slice(1)
+      : "A" + firstStamp.signature.slice(1);
+    const tamperedEnvelope: Envelope = {
+      ...signed,
+      signed_by: [{ ...firstStamp, signature: tamperedSig }],
+    };
+
+    const result = await verifySignedByChain(tamperedEnvelope, {
+      resolver,
+      receivingAgentId: "luna",
+      cryptoVerify: true,
+      operatorId: "test-operator",
+    });
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason.kind).toBe("crypto_verify_failed");
+      if (result.reason.kind === "crypto_verify_failed") {
+        // myelin's reason string carries the specific failure class
+        // (signature mismatch vs. timestamp drift vs. principal lookup).
+        // We don't pin the exact text — myelin may rephrase — but we
+        // assert it isn't an empty / placeholder string.
+        expect(result.reason.myelinReason.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("cryptoVerify throws when operatorId is missing", async () => {
+    // Agent must have an nkey_pub + be self-trusted so the structural
+    // check passes and the cryptoVerify-without-operatorId branch is
+    // reached. (A structural rejection would mask the operatorId guard.)
+    const { nkeyPub: lunaNKey } = generateEd25519KeyPair();
+    const luna = agentFixture({
+      id: "luna",
+      trust: ["luna"],
+      nkey_pub: lunaNKey,
+    });
+    const resolver = resolverWith(luna);
+    const env = envelopeWithChain([ed25519Stamp("did:mf:luna")]);
+
+    // bun's `expect(promise).rejects.toThrow` is the canonical pattern
+    // for promise-rejection assertions; `expect(async fn).toThrow`
+    // doesn't await the inner async call before checking, which silently
+    // passes the test even when the function does throw.
+    await expect(
+      verifySignedByChain(env, {
+        resolver,
+        receivingAgentId: "luna",
+        cryptoVerify: true,
+        // operatorId omitted — must throw.
+      }),
+    ).rejects.toThrow(/operatorId/);
   });
 });
