@@ -13,7 +13,7 @@
 import { Hono } from "hono";
 import type { Env } from "../index";
 import { requireAdmin, type OperatorKey } from "../auth";
-import { requireRole } from "grove-auth";
+import { requireRole } from "../user-auth";
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
 

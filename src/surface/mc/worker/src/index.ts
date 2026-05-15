@@ -6,7 +6,7 @@
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { authRoutes, type AuthBindings } from "grove-auth";
+import { authRoutes, type AuthBindings } from "./user-auth";
 import { rateLimit } from "./rate-limiter";
 import { ingestRoutes } from "./routes/ingest";
 import { stateRoutes } from "./routes/state";
