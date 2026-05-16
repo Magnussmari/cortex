@@ -173,9 +173,23 @@ export interface DispatchListenerOptions {
   /** Source identity for the lifecycle envelopes the listener emits. */
   source: SystemEventSource;
   /**
-   * Subject pattern(s) to subscribe to. Defaults to
-   * `local.{org}.dispatch.task.received` per the plan §4.5. Tests can
-   * override with broader patterns (`local.test.dispatch.task.received`).
+   * Operator stack segment (IAW Phase A.5, cortex#267) used to build the
+   * subscription subject and the audit-envelope `dispatch.task.received`
+   * synthesis path. When supplied, both subjects land on the 6-segment
+   * stack-aware grammar `local.{org}.{stack}.dispatch.task.received`
+   * matching sage's emit-side post-IAW A.5. When omitted, the legacy
+   * 5-segment form is used — bit-identical to pre-cortex#267 output, so
+   * deployments without a `cortex.yaml stack:` block see no change.
+   *
+   * Production callers source this from `deriveStackId(loadedConfig).stack`
+   * — same value `MyelinRuntime.publish` receives post-cortex#262.
+   */
+  stack?: string;
+  /**
+   * Subject pattern(s) to subscribe to. When omitted, the listener
+   * derives the default from `source.org` + optional `stack` per
+   * the IAW A.5 grammar. Tests can override with broader patterns
+   * (`local.test.dispatch.task.received`).
    */
   subjects?: string[];
   /**
@@ -226,13 +240,33 @@ export interface DispatchListener {
 // ---------------------------------------------------------------------------
 
 /**
+ * Build the canonical `dispatch.task.received` subject for `{org}`
+ * (+ optional `{stack}`). Used by both `defaultSubjects` (subscribe-side)
+ * and the audit-envelope fallback in `handleDispatchEnvelope`
+ * (synthesised when an inbound envelope arrived without a wire
+ * subject). Single source of truth so the next subject-shape change
+ * (e.g. cortex#264 underscore-regex resolution) updates both paths in
+ * lockstep — cortex#276 Maintainability finding cycle 2.
+ *
+ * IAW Phase A.5 (cortex#267): emits the 6-segment stack-aware grammar
+ * when `stack` is supplied; falls through to the legacy 5-segment form
+ * for backward compatibility with pre-A.5 deployments.
+ */
+function dispatchReceivedSubject(org: string, stack?: string): string {
+  if (stack === undefined) {
+    return `local.${org}.dispatch.task.received`;
+  }
+  return `local.${org}.${stack}.dispatch.task.received`;
+}
+
+/**
  * Default subject for the runner's bus subscription. The `{org}` segment
  * is substituted at registration time using `source.org` so a misconfigured
  * runner with no operator id can still subscribe (it'll match nothing
  * unless someone publishes under `local.default.dispatch.task.received`).
  */
-function defaultSubjects(org: string): string[] {
-  return [`local.${org}.dispatch.task.received`];
+function defaultSubjects(org: string, stack?: string): string[] {
+  return [dispatchReceivedSubject(org, stack)];
 }
 
 export function createDispatchListener(
@@ -246,7 +280,7 @@ export function createDispatchListener(
     policyEngine,
     adapterId = "runner-dispatch-listener",
   } = opts;
-  const subjects = opts.subjects ?? defaultSubjects(source.org);
+  const subjects = opts.subjects ?? defaultSubjects(source.org, opts.stack);
 
   let registration: { unregister: () => void } | null = null;
 
@@ -264,14 +298,13 @@ export function createDispatchListener(
     // false })` so surface-router timeouts end the CC process eagerly
     // rather than waiting for cc-session's internal timer to fire.
     render: (envelope, _signal, subject) =>
-      handleDispatchEnvelope(
-        envelope,
-        subject,
+      handleDispatchEnvelope(envelope, subject, {
         runtime,
         source,
         ccSessionFactory,
         policyEngine,
-      ),
+        stack: opts.stack,
+      }),
   };
 
   return {
@@ -415,14 +448,25 @@ function buildDispatchRequest(
  * worth the savings for A.1b. Shared infrastructure (the CC factory)
  * is threaded through via constructor opts.
  */
+/**
+ * Per-dispatch wiring grouped into one shape so the handler signature
+ * stays narrow (cortex#276 cycle 3 — Sage Maintainability suggestion).
+ * Mutates nothing — pure dependency injection.
+ */
+interface DispatchHandlerContext {
+  runtime: MyelinRuntime;
+  source: SystemEventSource;
+  ccSessionFactory: CCSessionFactory | undefined;
+  policyEngine: PolicyEngine | undefined;
+  stack: string | undefined;
+}
+
 async function handleDispatchEnvelope(
   envelope: Envelope,
   subject: string | undefined,
-  runtime: MyelinRuntime,
-  source: SystemEventSource,
-  ccSessionFactory: CCSessionFactory | undefined,
-  policyEngine: PolicyEngine | undefined,
+  ctx: DispatchHandlerContext,
 ): Promise<void> {
+  const { runtime, source, ccSessionFactory, policyEngine, stack } = ctx;
   const payload = parsePayload(envelope);
   if (!payload) {
     console.error(
@@ -493,8 +537,13 @@ async function handleDispatchEnvelope(
     // misrepresent the wire path on audit consumers. Fall back to the
     // synthesised local subject when `subject` is undefined (legacy
     // callers / unit tests that don't pass a subject).
-    const auditEnvelopeSubject =
-      subject ?? `local.${source.org}.dispatch.task.received`;
+    //
+    // IAW Phase A.5 (cortex#267): the synthesised fallback honours the
+    // operator's stack via the shared `dispatchReceivedSubject` helper —
+    // single source of truth across the listener's subscribe-side
+    // default AND this audit-envelope synthesis path (cortex#276
+    // Maintainability finding cycle 2).
+    const auditEnvelopeSubject = subject ?? dispatchReceivedSubject(source.org, stack);
     const auditCommon = {
       source,
       principalId: decision.principalId,
