@@ -381,6 +381,13 @@ export type SlackPresence = z.infer<typeof SlackPresenceSchema>;
  * presence under the parent agent, not the other way around. Adding a new
  * platform (Slack, etc.) adds a new optional key here at the time the
  * adapter lands — no speculative placeholders.
+ *
+ * **Empty presence (`presence: {}`) is valid** (cortex#245). A
+ * headless agent has no human-facing surface — it runs CC sessions
+ * via the dispatch-listener, emits envelopes onto the bus, and
+ * surfaces on the dashboard. Useful for the multi-stack pattern
+ * (cortex#244) where the second stack is bus-only until its
+ * platform presence is wired in.
  */
 export const PresenceSchema = z.object({
   discord: DiscordPresenceSchema.optional(),
@@ -520,7 +527,12 @@ export const AgentSchema = z.object({
     /^U[A-Z2-7]{55}$/,
     "agent.nkey_pub must be a base32 NKey public key (U-prefixed, 56 chars total)",
   ).optional(),
-  /** Per-platform presence blocks — at least one is required. */
+  /**
+   * Per-platform presence blocks. Empty object (`presence: {}`) is
+   * valid — it declares a headless agent (cortex#245). The field
+   * itself is still required, so a missing or mistyped `presence:`
+   * key is rejected by Zod's required-field check.
+   */
   presence: PresenceSchema,
   /**
    * F-2 (cortex#60 §5) — substrate harness + dispatch mode. Optional in v1:
@@ -529,15 +541,29 @@ export const AgentSchema = z.object({
    * declare it so the dashboard renders accurate substrate provenance.
    */
   runtime: AgentRuntimeSchema.optional(),
-}).refine(
-  // Zod's `.refine` callback receives the parsed type; presence values
-  // are `DiscordPresence | MattermostPresence | undefined`. Use `Boolean`
-  // to coerce — lint sees the refine inference differently than tsc and
-  // flags the explicit `!== undefined` as "no overlap" even though the
-  // optional fields above legitimately produce undefined values.
-  (agent) => Object.values(agent.presence).some(Boolean),
-  { message: "agent must have at least one presence block", path: ["presence"] },
-);
+});
+// cortex#245 — the previous `at least one presence block` refine was
+// dropped to admit headless agents (bus-only participants with no
+// platform presence). A valid headless agent declares `presence: {}` —
+// it still runs CC sessions via the dispatch-listener, emits
+// envelopes onto the bus, and surfaces on the dashboard, but has no
+// human-facing surface.
+//
+// What changes vs. the pre-#245 schema:
+//   - `presence: {}`         was rejected, now ACCEPTED (headless).
+//   - `presence:` missing    was rejected, still REJECTED
+//                            (the `presence` field on AgentSchema is
+//                             required, so an absent key fails at the
+//                             field-presence layer, not the refine).
+//   - `presnce:` (typo)      was rejected (because the agent ended up
+//                            with no `presence` key at all), still
+//                            REJECTED for the same reason.
+//   - Platform sub-blocks    each enforce their own structural
+//                            requirements (token/guildId/...) when
+//                            an operator DOES declare a platform.
+//
+// Net effect: operator-friendliness is preserved for the typo case;
+// the relaxation is narrowly scoped to "explicit empty object."
 
 export type Agent = z.infer<typeof AgentSchema>;
 
@@ -1602,10 +1628,12 @@ export const CortexConfigSchema = z.object({
    * under `agents[].presence.discord` (architecture §9.1). A typical
    * hand-migration miss is to lift `agents:` into the new file but leave
    * the legacy `discord:[...]` block alongside it — Zod would silently
-   * strip it, producing agents with no presence and a confusing
-   * "at least one presence block" failure rather than a pointer at the
-   * actual mistake. This guard surfaces the migration error at the
-   * source (Holly W3 review).
+   * strip it, producing a headless agent (no platform presence) without
+   * an obvious migration-error signal. This guard surfaces the
+   * mistake at the source (Holly W3 review). Post-cortex#245 headless
+   * is a legitimate config, so this guard is the only thing now
+   * differentiating "intentional headless" from "stripped legacy
+   * discord block."
    */
   discord: z.never({
     error: () =>
