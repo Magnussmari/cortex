@@ -125,6 +125,23 @@ export type CCSessionFactory = ClaudeCodeFactory;
  * silently ignores unknown fields — adding a payload field is non-breaking
  * per §3.1's append-only rule.
  */
+/**
+ * **Known asymmetry vs. DispatchRequest / DispatchRuntime (Echo cortex#127 items 2 + 3).**
+ *
+ * The in-process dispatch contract carries typed knobs that this bus
+ * payload intentionally does not yet surface:
+ *
+ *   - `DispatchRequest.inactivityMs` (top-level, alongside `timeoutMs`) —
+ *     no corresponding `inactivity_ms` here.
+ *   - `DispatchRuntime.bashAllowlist` / `DispatchRuntime.bashGuardDisabled` —
+ *     no corresponding `bash_allowlist` / `bash_guard_disabled` here.
+ *
+ * Adapter-direct (non-bus) dispatches can populate these in-process
+ * fields; bus-mediated dispatches today pick up the harness/dispatch-handler
+ * defaults. Plumbing them through is future-facing work — natural fit for
+ * the next payload-schema revision (Phase A.5+ stack identity expansion or
+ * a dedicated payload-versioning PR).
+ */
 export interface DispatchTaskReceivedPayload {
   /** UUID-shaped task identifier (also envelope.correlation_id). */
   task_id: string;
