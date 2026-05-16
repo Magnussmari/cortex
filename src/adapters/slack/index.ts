@@ -1,0 +1,440 @@
+/**
+ * F-slack: Slack Platform Adapter.
+ *
+ * Sibling to `DiscordAdapter` + `MattermostAdapter`. Wraps a pluggable
+ * `SlackClient` into the `PlatformAdapter` interface so the
+ * MessageRouter / dispatch-handler can dispatch Slack messages uniformly
+ * with Discord + Mattermost. Pure I/O wrapper — every pipeline concern
+ * (access control, context fetch, response posting, surface-router
+ * envelope rendering) lives at the same layer the other adapters use.
+ *
+ * Transport choice: Socket Mode (xoxb- bot token + xapp- app-level
+ * token). No public webhook URL needed — fits cortex's single-machine
+ * deployment model. HTTP / Events API mode is deferred.
+ */
+
+import type {
+  PlatformAdapter,
+  InboundMessage,
+  AccessDecision,
+  ResponseTarget,
+  OutboundFile,
+  ContextMessage,
+} from "../types";
+import type { Agent, SlackPresence } from "../../common/types/cortex-config";
+import type { Envelope } from "../../bus/myelin/envelope-validator";
+import type { SurfaceAdapter } from "../../bus/surface-router";
+import type { PayloadFilter } from "../../bus/payload-filter";
+import { resolveRole } from "../discord/role-resolver";
+import { formatEnvelopeAsMarkdown } from "../envelope-renderer";
+import { RealSlackClient, type SlackClient, type SlackInboundEvent, type SlackBotIdentity } from "./client";
+
+/**
+ * Cortex-deployment-level wiring passed alongside the agent + presence
+ * pair. Mirror of `DiscordAdapterInfra` / `MattermostAdapterInfra`.
+ *
+ * `operator.slackId` is the operator's Slack user id (`U...`), used to
+ * route `notifyOperator` DMs the same way the Discord/Mattermost
+ * variants route theirs.
+ *
+ * `client` is the pluggable Slack client surface — defaults to
+ * `RealSlackClient` in production, mocked in unit tests.
+ */
+export interface SlackAdapterInfra {
+  /** Surface-router + log-prefix key. Cortex derives `${agent.id}-slack`. */
+  instanceId: string;
+  /** Operator's platform identity. */
+  operator: { slackId?: string };
+  /** MIG-3b: NATS subject patterns this adapter renders to Slack. */
+  surfaceSubjects?: string[];
+  /** MIG-3b: optional payload filter applied AFTER subject match. */
+  surfaceFilter?: PayloadFilter;
+  /** MIG-3b: fallback Slack channel id for envelope rendering. */
+  surfaceFallbackChannelId?: string;
+  /** Operator-set trusted peer bot user ids (`U...`). */
+  trustedBotIds?: ReadonlySet<string>;
+  /**
+   * Pluggable client implementation. Production callers omit this and
+   * get a `RealSlackClient` built from `presence.botToken` +
+   * `presence.appToken`. Tests inject a fake.
+   */
+  client?: SlackClient;
+}
+
+/**
+ * Slack adapter. Constructor wires the agent + presence + infra and
+ * either instantiates `RealSlackClient` (production) or accepts the
+ * caller's mock (tests).
+ */
+export class SlackAdapter implements PlatformAdapter {
+  readonly platform = "slack";
+  readonly instanceId: string;
+
+  private readonly agent: Agent;
+  private readonly presence: SlackPresence;
+  private readonly infra: SlackAdapterInfra;
+  private readonly client: SlackClient;
+  /**
+   * Resolved bot identity, fetched in `start()` BEFORE the socket opens
+   * (Echo cortex#233 round-1 TOCTOU fix). `userId` is the `U…` carried
+   * on normal messages; `botId` is the `B…` carried on `bot_message`
+   * subtype events. The self-loop guard checks BOTH so a `chat.postMessage`
+   * that round-trips through Slack as a `bot_message` cannot echo
+   * (Echo cortex#233 round-2 N1).
+   */
+  private botIdentity: SlackBotIdentity | null = null;
+  /** Operator-explicit + adapter-side anti-self-loop set. */
+  private readonly trustedBotIds: ReadonlySet<string>;
+  /**
+   * Echo cortex#233: bounded FIFO dedup ring of recently-seen Slack
+   * message `ts` values. Slack's Socket Mode fires BOTH the `message`
+   * and `app_mention` events for a single user message when the bot is
+   * a member of the channel where it was mentioned — the client
+   * subscribes to both events (so DMs + outside-channel mentions still
+   * arrive), and this set collapses the duplicate at the adapter layer
+   * before the dispatch pipeline sees it. Capacity 256 is generous
+   * versus the bot's effective ingest rate (one human + a few trusted
+   * bots) and is small enough to be irrelevant for memory.
+   */
+  private readonly seenTs = new Set<string>();
+  private readonly seenTsOrder: string[] = [];
+  private static readonly DEDUP_CAPACITY = 256;
+
+  constructor(agent: Agent, presence: SlackPresence, infra: SlackAdapterInfra) {
+    this.agent = agent;
+    this.presence = presence;
+    this.infra = infra;
+    this.instanceId = infra.instanceId;
+    this.trustedBotIds = infra.trustedBotIds ?? new Set(presence.trustedBotIds);
+    this.client = infra.client ?? new RealSlackClient({
+      botToken: presence.botToken,
+      appToken: presence.appToken,
+      instanceId: this.instanceId,
+    });
+
+    // Same one-shot warning the Discord + Mattermost adapters emit when
+    // surfaceSubjects is explicitly empty — an `undefined` is silent
+    // (opted out), `[]` is the config-typo signal worth surfacing.
+    if (infra.surfaceSubjects?.length === 0) {
+      console.warn(
+        `slack-${this.instanceId}: surfaceSubjects is empty — adapter will never render bus envelopes`,
+      );
+    }
+  }
+
+  async start(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void> {
+    // Echo cortex#233 (review #2): close the self-loop TOCTOU window by
+    // resolving the bot identity BEFORE opening the Socket Mode
+    // connection. `auth.test` uses the bot token (xoxb-) — it does NOT
+    // need a live Socket Mode session. Fetching identity after
+    // `client.start()` opens a ~one-round-trip gap where inbound events
+    // would pass through `translateEvent` with the cache null, silently
+    // failing-open on the self-loop guard. Fail-closed: if
+    // `getBotIdentity()` rejects, abort startup rather than open a
+    // socket whose self-echo will be dispatched as a real message.
+    this.botIdentity = await this.client.getBotIdentity();
+    await this.client.start({
+      onEvent: async (event) => {
+        const msg = this.translateEvent(event);
+        if (!msg) return;
+        await onMessage(msg);
+      },
+    });
+  }
+
+  async stop(): Promise<void> {
+    await this.client.stop();
+    // Drop the cached bot identity so a subsequent `start()` re-fetches —
+    // guards against a token swap between sessions.
+    this.botIdentity = null;
+    // Echo cortex#233 round-2 N4: clear the dedup ring so a reused
+    // adapter instance doesn't carry over `ts` values from a prior run.
+    // For long-lived processes this is academic (the cap bounds memory),
+    // but for hot-restart and test-fixture reuse it prevents stale
+    // dedup decisions that would silently drop legitimate messages.
+    this.seenTs.clear();
+    this.seenTsOrder.length = 0;
+  }
+
+  async getPlatformUserId(): Promise<string> {
+    if (this.botIdentity) return this.botIdentity.userId;
+    const identity = await this.client.getBotIdentity();
+    this.botIdentity = identity;
+    return identity.userId;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async fetchContext(_msg: InboundMessage, _depth: number): Promise<ContextMessage[]> {
+    // v1: no thread/channel context fetch yet. The dispatch pipeline can
+    // operate on the direct message alone; thread context via
+    // `conversations.replies` lands as a follow-up. Returning [] matches
+    // the contract for "no context available" without forcing the
+    // pipeline to special-case Slack.
+    return [];
+  }
+
+  resolveAccess(msg: InboundMessage): AccessDecision {
+    // Self-loop guard: never act on messages authored by this bot.
+    // Check both the user id and the bot id — `chat.postMessage` from
+    // this bot can round-trip as a `bot_message` event where
+    // `authorId === botId`, not `botUserId` (Echo cortex#233 round-2 N1).
+    const isSelfUser = this.botIdentity?.userId === msg.authorId;
+    const isSelfBot = this.botIdentity?.botId !== undefined && this.botIdentity.botId === msg.authorId;
+    if (this.botIdentity && (isSelfUser || isSelfBot)) {
+      return {
+        allowed: false,
+        features: { chat: false, async: false, team: false },
+        denyReason: "Self-loop guard: message authored by this bot.",
+      };
+    }
+
+    // allowedUserIds gate (mirror of MattermostAdapter.allowedUsers).
+    // Empty list = "no allowlist" = fall through to role resolution.
+    if (
+      this.presence.allowedUserIds.length > 0 &&
+      !this.presence.allowedUserIds.includes(msg.authorId)
+    ) {
+      return {
+        allowed: false,
+        features: { chat: false, async: false, team: false },
+        denyReason: "Sorry, I'm only configured to respond to specific users.",
+      };
+    }
+
+    const role = resolveRole(msg.authorId, {
+      roles: this.presence.roles,
+      defaultRole: this.presence.defaultRole,
+    });
+
+    if (role.denied) {
+      return {
+        allowed: false,
+        features: { chat: false, async: false, team: false },
+        denyReason: "Sorry, I'm only configured to respond to my operator.",
+      };
+    }
+
+    return {
+      allowed: true,
+      features: {
+        chat: role.features.has("chat"),
+        async: role.features.has("async"),
+        team: role.features.has("team"),
+      },
+      toolRestrictions: role.disallowedTools.length > 0 ? role.disallowedTools : undefined,
+      dirRestrictions: role.allowedDirs,
+      allowedSkills: role.allowedSkills,
+    };
+  }
+
+  async postResponse(target: ResponseTarget, text: string, files?: OutboundFile[]): Promise<void> {
+    if (files && files.length > 0) {
+      // File upload via files.upload / files.uploadV2 deferred to a
+      // follow-up — v1 of the Slack adapter is text-only. Flag the
+      // limitation so it surfaces in logs rather than silently dropping.
+      console.warn(
+        `slack-${this.instanceId}: file attachments not yet supported on Slack — ` +
+          `dropping ${files.length} file(s) and posting text only`,
+      );
+    }
+    await this.client.postMessage(target.channelId, text, target.threadId);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async sendTyping(_target: ResponseTarget): Promise<void> {
+    // Slack has no public typing-indicator API for Socket Mode bots — no-op.
+  }
+
+  private progressSent = new Set<string>();
+
+  async sendProgress(target: ResponseTarget, text: string): Promise<void> {
+    const key = target.threadId ?? target.channelId;
+    // Like Mattermost, we can't edit posts easily without tracking ts +
+    // calling chat.update. v1: send once, skip subsequent — matches the
+    // Mattermost adapter's shape so operators get consistent UX.
+    if (this.progressSent.has(key)) return;
+    this.progressSent.add(key);
+    await this.client.postMessage(target.channelId, `> ${text}`, target.threadId);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async clearProgress(target: ResponseTarget): Promise<void> {
+    const key = target.threadId ?? target.channelId;
+    this.progressSent.delete(key);
+    // Slack: no delete in v1 — leave the single progress message in place.
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async createThread(msg: InboundMessage, _name: string): Promise<ResponseTarget> {
+    // Slack threads are implicit: post with `thread_ts` set to the parent
+    // message's ts and the reply lands in that thread. The "thread name"
+    // parameter is irrelevant on Slack (no thread titles).
+    //
+    // Echo cortex#233 round-2: `thread_ts` is a Slack message timestamp
+    // (`1700000000.123456`), NEVER a channel id (`C...`/`G...`). The
+    // legitimate sources are, in order:
+    //   1. `_native.thread_ts` — message arrived inside a thread
+    //   2. `_native.ts`         — root of a new thread (this message)
+    //   3. `msg.threadId`       — already-translated thread id
+    // If none of these are available we cannot synthesise a thread root;
+    // return `threadId: undefined` so the caller posts top-level. (The
+    // old fallback used `msg.channelId`, which `chat.postMessage`
+    // silently treated as "no thread" — same effect, but masked the
+    // bug.)
+    const ev = msg._native as SlackInboundEvent | undefined;
+    const threadTs = ev?.thread_ts ?? ev?.ts ?? msg.threadId;
+    return {
+      instanceId: this.instanceId,
+      channelId: msg.channelId,
+      ...(threadTs !== undefined && { threadId: threadTs }),
+    };
+  }
+
+  async notifyOperator(text: string): Promise<void> {
+    const operatorId = this.infra.operator.slackId;
+    if (!operatorId) return;
+    try {
+      // For DMs, Slack accepts the user id directly as `channel`. The
+      // Web API opens (or reuses) the IM channel implicitly.
+      await this.client.postMessage(operatorId, text);
+    } catch (err) {
+      // Match the Mattermost/Discord notifyOperator pattern: log + drop.
+      // A failed DM should never tear down the adapter; the operator can
+      // see the same content on the dashboard / agent-log path.
+      console.warn(
+        `slack-${this.instanceId}: failed to notify operator:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // MIG-3b: Surface-router integration
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Surface-adapter face for the surface-router. Mirror of
+   * `DiscordAdapter.surfaceConfig` / `MattermostAdapter.surfaceConfig` —
+   * same shape, same render contract, same failure mode (log + drop;
+   * JetStream replay handles recovery per architecture §3.3).
+   */
+  get surfaceConfig(): SurfaceAdapter {
+    return {
+      id: this.instanceId,
+      subjects: this.infra.surfaceSubjects ?? [],
+      ...(this.infra.surfaceFilter ? { filter: this.infra.surfaceFilter } : {}),
+      render: (envelope, signal) => this.renderEnvelope(envelope, signal),
+    };
+  }
+
+  private async renderEnvelope(envelope: Envelope, _signal?: AbortSignal): Promise<void> {
+    const channelId = this.infra.surfaceFallbackChannelId;
+    if (!channelId) {
+      console.warn(
+        `slack-${this.instanceId}: has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
+      );
+      return;
+    }
+    try {
+      await this.client.postMessage(channelId, formatEnvelopeAsMarkdown(envelope));
+    } catch (err) {
+      console.warn(
+        `slack-${this.instanceId}: renderEnvelope failed for envelope ${envelope.id}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Translate a raw Slack event into a cortex `InboundMessage`. Returns
+   * `null` for events we intentionally ignore (system subtypes like
+   * `channel_join`, bot-authored messages not on the trusted list, etc.).
+   *
+   * Subtype filtering: real human messages have `subtype === undefined`.
+   * `bot_message` is the only subtype we conditionally accept — and only
+   * when the author is in `trustedBotIds`. Everything else is dropped to
+   * keep the dispatch pipeline focused on actual chat content.
+   */
+  private translateEvent(event: SlackInboundEvent): InboundMessage | null {
+    // Echo cortex#233 (review #1): collapse the `message`/`app_mention`
+    // double-dispatch by ts BEFORE doing any other work. Events without
+    // a `ts` (defensive — real Slack messages always carry one) skip
+    // dedup and pass through. See `seenTs` field docstring for the
+    // ring's capacity rationale.
+    if (event.ts) {
+      if (this.seenTs.has(event.ts)) {
+        // Second sighting — drop. This is the expected path for a
+        // channel-member mention, where Slack fires both the
+        // `message` and `app_mention` events for the same `ts`.
+        return null;
+      }
+      this.seenTs.add(event.ts);
+      this.seenTsOrder.push(event.ts);
+      if (this.seenTsOrder.length > SlackAdapter.DEDUP_CAPACITY) {
+        const evicted = this.seenTsOrder.shift();
+        if (evicted !== undefined) this.seenTs.delete(evicted);
+      }
+    }
+
+    // Self-loop drop at the source. Echo cortex#233 round-2 N1:
+    // `auth.test` exposes BOTH `user_id` (`U…`) and `bot_id` (`B…`);
+    // Slack delivers self-echoed `chat.postMessage` calls as either
+    // shape depending on subtype. Match both.
+    if (this.botIdentity) {
+      if (event.user === this.botIdentity.userId) return null;
+      if (event.bot_id !== undefined && event.bot_id === this.botIdentity.botId) return null;
+    }
+
+    // Subtype gate: accept only "real" messages and trusted bot
+    // messages. System notices like `channel_join`, `channel_leave`,
+    // `message_changed` are noise for cortex's dispatch path.
+    if (event.subtype !== undefined && event.subtype !== "bot_message") {
+      return null;
+    }
+    if (event.subtype === "bot_message") {
+      // bot_message events authenticate via `bot_id` (`B…`) — NOT the
+      // `user_id` (`U…`) shape carried on normal messages. Echo
+      // cortex#233 round-2 N2: the schema doc previously said "user
+      // ids (`U…`)" while the runtime checked `event.user ?? event.bot_id`,
+      // which silently never matched the `B…` shape Slack actually
+      // delivers for bot_message events. Match `event.bot_id`
+      // explicitly; operators populate `trustedBotIds` with `B…`
+      // values (schema doc updated to reflect this).
+      const author = event.bot_id ?? "";
+      if (!author || !this.trustedBotIds.has(author)) return null;
+    }
+
+    const authorId = event.user ?? event.bot_id ?? "";
+    if (!authorId) return null;
+
+    const channelName = this.presence.channels.find((c) => c.id === event.channel)?.name;
+
+    return {
+      platform: "slack",
+      instanceId: this.instanceId,
+      authorId,
+      // v1: we don't resolve users.info for display names — Slack user
+      // ids are already stable identifiers, and the dispatch pipeline
+      // tolerates an id-as-name. Display-name resolution is a
+      // straightforward follow-up via `users.info`.
+      authorName: authorId,
+      content: event.text ?? "",
+      channelId: event.channel,
+      ...(event.thread_ts !== undefined && { threadId: event.thread_ts }),
+      ...(channelName !== undefined && { channelName }),
+      ...(event.team !== undefined && { guildId: event.team }),
+      attachments: (event.files ?? []).map((f) => ({
+        url: f.url_private ?? "",
+        filename: f.name ?? "unnamed",
+        ...(f.mimetype !== undefined && { contentType: f.mimetype }),
+        ...(f.size !== undefined && { size: f.size }),
+      })),
+      timestamp: new Date(Number(event.ts.split(".")[0]) * 1000),
+      _native: event,
+    };
+  }
+}
