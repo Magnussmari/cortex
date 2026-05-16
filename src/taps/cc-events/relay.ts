@@ -24,6 +24,7 @@ interface StartOptions {
   natsUrl?: string;
   natsToken?: string;
   org?: string;
+  stack?: string;
 }
 interface TestOptions {
   policy: string;
@@ -162,6 +163,10 @@ program
     "--org <org>",
     "Operator/org segment for published subjects (local.{org}.{type}). Falls back to env var GROVE_OPERATOR or NATS_ORG.",
   )
+  .option(
+    "--stack <stack>",
+    "Operator stack segment for stack-aware subjects (local.{org}.{stack}.{type}). Matches the cortex.yaml stack: block. Falls back to env var CORTEX_STACK. When omitted, relay publishes on the legacy 5-segment form.",
+  )
   .action(async (options: StartOptions) => {
     if (!existsSync(options.policy)) {
       console.error(`Policy file not found: ${options.policy}`);
@@ -190,6 +195,24 @@ program
       options.natsToken ?? process.env.NATS_TOKEN;
     const org: string =
       options.org ?? process.env.GROVE_OPERATOR ?? process.env.NATS_ORG ?? "default";
+    // cortex#266 — IAW A.5 stack segment for 6-segment publishes.
+    const stack: string | undefined =
+      options.stack ?? process.env.CORTEX_STACK ?? undefined;
+    // cortex#275 (Sage cycle 1) — fail-fast stack validation. If the
+    // operator supplied a malformed stack value (`*`, `>`, empty,
+    // uppercase, etc.), reject at startup with a clear error rather
+    // than letting the bad value reach `deriveNatsSubject` per-event
+    // and producing a stream of stderr lines. Mirrors the same regex
+    // myelin's `assertSegment` uses; inlined here so the relay doesn't
+    // depend on a non-barreled internal export.
+    if (stack !== undefined && !/^[a-z][a-z0-9-]{0,62}$/.test(stack)) {
+      console.error(
+        `cortex-relay: invalid --stack / CORTEX_STACK value ${JSON.stringify(stack)} — ` +
+          `must match /^[a-z][a-z0-9-]{0,62}$/ (lowercase alphanumeric + hyphens, ` +
+          `start with letter, 1–63 chars)`,
+      );
+      process.exit(1);
+    }
 
     let natsLink: NatsLink | undefined;
     let onPublished: ((e: import("./hooks/lib/event-types").PublishedEvent) => void) | undefined;
@@ -204,10 +227,12 @@ program
         onPublished = createCcEventPublisher({
           link: natsLink,
           org,
+          ...(stack !== undefined && { stack }),
         });
         const safeUrl = natsUrl.replace(/\/\/[^@/]+@/, "//***@");
+        const stackSuffix = stack !== undefined ? ` stack="${stack}"` : "";
         console.log(
-          `cortex-relay: nats publishing enabled — ${safeUrl} (org="${org}")`,
+          `cortex-relay: nats publishing enabled — ${safeUrl} (org="${org}"${stackSuffix})`,
         );
       } catch (err) {
         // Per the design rule: failed NATS startup must NOT crash the
