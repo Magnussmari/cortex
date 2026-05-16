@@ -48,6 +48,11 @@ import {
   publishCapabilityRegistry,
   type CapabilityRegistryEntry,
 } from "./bus";
+import {
+  ReviewConsumer,
+  type ReviewConsumerAgent,
+} from "./bus/review-consumer";
+import { CCSession } from "./runner/cc-session";
 
 import { DiscordAdapter } from "./adapters/discord";
 import { createRenderer, type Renderer } from "./renderers";
@@ -586,6 +591,127 @@ export async function startCortex(
   } else {
     console.log(
       "cortex: capability-registry skipped — 0 agents declare runtime.capabilities[]",
+    );
+  }
+
+  // cortex#237 PR-6 — review-consumer boot wiring.
+  //
+  // Per `docs/design-capability-dispatch-review-consumer.md` §3 + §10.1
+  // PR-6: for each agent in `mergedAgents` that declares at least one
+  // `code-review` / `code-review.<flavor>` capability, instantiate a
+  // dedicated `ReviewConsumer` AND drive it through `start()` so it
+  // actually subscribes to the JetStream `local.{org}.tasks.code-review.>`
+  // pull consumer. One consumer per agent — the spec's routing is
+  // single-agent (the consumer's capability filter checks the owning
+  // agent's claims only; multi-agent fan-out is the runtime's namespace
+  // job, not the consumer's).
+  //
+  // **Ordering.** Runs AFTER the capability-registry block above so an
+  // operator scanning boot logs sees registrations before consumers.
+  // Runs BEFORE the bus-dispatch-listener so the review path is in place
+  // before the first `dispatch.task.received` envelope can arrive
+  // (defensive — pilot publishes review requests on a different subject
+  // namespace, but the ordering keeps the cognitive model "all
+  // capability-side bring-up first, then dispatch").
+  //
+  // **Subscription wiring (cortex#290).** `MyelinRuntime.subscribePull`
+  // captures the runtime's private `NatsLink` and threads it into a
+  // `MyelinSubscriber` on the consumer's behalf. `consumer.start(...)`
+  // calls that helper internally — the runtime stays the single owner of
+  // the raw NATS connection lifecycle while consumers declare what they
+  // want subscribed. When the runtime is disabled (no NATS configured),
+  // `subscribePull` returns `null` and the consumer stays dormant; the
+  // instantiation + shutdown-drain wiring still runs so the boot path
+  // behaves identically whether or not the bus is up.
+  //
+  // **Error handling.** Each instantiate-and-start cycle is wrapped in
+  // try/catch per CLAUDE.md "no empty catch blocks": a throw on one
+  // agent logs to stderr and the boot continues with the rest of the
+  // roster. Sibling consumers are not abandoned because one agent's
+  // config (or one agent's subscriber bind) tripped.
+  //
+  // **Shutdown drain.** Every consumer the boot wiring creates lands in
+  // the `reviewConsumers` array; the shutdown drain below calls `.stop()`
+  // on each, allowing in-flight pipelines to finish per the consumer's
+  // own drain contract.
+  const reviewConsumers: ReviewConsumer[] = [];
+  const reviewCapableAgents = mergedAgents.filter((a) => {
+    const caps = a.runtime?.capabilities ?? [];
+    return caps.some(
+      (c) => c === "code-review" || c.startsWith("code-review."),
+    );
+  });
+  // Stable identity inputs for the per-agent durable consumer name. Org
+  // is taken from the canonical operatorId resolution (same fallback as
+  // the surface-router and capability-registry boot paths). Durable name
+  // convention per `docs/design-capability-dispatch-review-consumer.md`
+  // §2.3: `cortex-review-consumer-{operator}-{agent}` — unique per
+  // (operator, agent) pair so dev + prod instances on the same operator
+  // share competing-consumer semantics and a daemon restart resumes from
+  // the same JetStream offset.
+  const reviewOperatorId = config.agent.operatorId ?? "default";
+  const reviewSubjectPattern = `local.${reviewOperatorId}.tasks.code-review.>`;
+  const reviewStream = "CODE_REVIEW";
+  for (const agent of reviewCapableAgents) {
+    try {
+      const caps = agent.runtime?.capabilities ?? [];
+      const consumerAgent: ReviewConsumerAgent = {
+        id: agent.id,
+        capabilities: caps,
+        ...(agent.runtime?.maxConcurrent !== undefined && {
+          maxConcurrent: agent.runtime.maxConcurrent,
+        }),
+      };
+      const consumer = new ReviewConsumer({
+        agent: consumerAgent,
+        source: systemEventSource,
+        runtime,
+        // CC session factory — spawns a real `claude` process. Mirrors the
+        // default factory inside `ClaudeCodeHarness` (the harness keeps its
+        // own copy private; we don't re-export to avoid the symbol leaking
+        // into the public bus surface). Tests don't reach the factory
+        // unless `processEnvelope` is invoked; the boot test in
+        // `src/__tests__/cortex.review-consumer-boot.test.ts` only
+        // exercises instantiation + subscribe.
+        ccSessionFactory: (opts) => new CCSession(opts),
+        // PR-6 has no policy hook — that's a future PR (sovereignty /
+        // compliance gate). Until then the pipeline goes straight to CC.
+        promptBuilder: ({ payload }) =>
+          // Minimal prompt — the real skill-aware builder lands in PR-8.
+          // Echo's skill consumes `/review <owner/repo>#<pr>` style today.
+          `/review ${payload.repo}#${payload.pr}`,
+      });
+      reviewConsumers.push(consumer);
+      // Subscribe via the runtime's subscribePull helper. When the
+      // runtime is disabled the helper returns null inside start() and
+      // the consumer stays dormant — boot continues with the
+      // instantiation logged as ready (the disabled-runtime case is the
+      // typical state for cortex deployments that haven't wired NATS).
+      const durable = `cortex-review-consumer-${reviewOperatorId}-${agent.id}`;
+      await consumer.start({
+        pattern: reviewSubjectPattern,
+        stream: reviewStream,
+        durable,
+      });
+      const flavorSummary =
+        consumer.flavors.length > 0 ? consumer.flavors.join(",") : "(none)";
+      console.log(
+        `cortex: review consumer ready for agent=${agent.id} flavors=[${flavorSummary}]`,
+      );
+    } catch (err) {
+      // Per CLAUDE.md: log every error. A single agent's consumer crash
+      // does NOT abort boot — siblings still get wired. Boot keeps the
+      // consumer in `reviewConsumers[]` so shutdown drain still calls
+      // `.stop()` (idempotent — handles the "never subscribed" case).
+      process.stderr.write(
+        `cortex: review consumer init failed for agent=${agent.id}: ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+  if (reviewConsumers.length === 0) {
+    console.log(
+      "cortex: review-consumer skipped — 0 agents declare code-review capabilities",
     );
   }
 
@@ -1396,6 +1522,7 @@ export async function startCortex(
       "dashboard stop",
       "github webhook receiver stop",
       ...adapterCleanup.map((_, i) => `outbound poller stop[${i}]`),
+      ...reviewConsumers.map((c, i) => `review-consumer stop[${i}] (agent=${c.agent.id})`),
       "dispatch-listener stop",
       "surface-router stop",
       "dispatch-handler shutdown",
@@ -1430,6 +1557,20 @@ export async function startCortex(
       for (let i = 0; i < adapterCleanup.length; i++) {
         const cleanup = adapterCleanup[i];
         if (cleanup) completeSync(`outbound poller stop[${i}]`, cleanup);
+      }
+      // cortex#237 PR-6 — drain review consumers before the dispatch
+      // listener so any in-flight CC review pipelines get a chance to
+      // publish their terminal envelope (verdict / failed) before the
+      // runtime closes. `ReviewConsumer.stop()` is idempotent and awaits
+      // the in-flight set per its own drain contract.
+      for (let i = 0; i < reviewConsumers.length; i++) {
+        const consumer = reviewConsumers[i];
+        if (consumer) {
+          await completeAsync(
+            `review-consumer stop[${i}] (agent=${consumer.agent.id})`,
+            consumer.stop(),
+          );
+        }
       }
       await completeAsync("dispatch-listener stop", dispatchListener.stop());
       // IAW B.2a — bus-dispatch-listener drain runs after the dispatch
