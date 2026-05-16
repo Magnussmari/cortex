@@ -33,6 +33,7 @@ import type { UsageStats } from "./runner/stream-parser";
 import { buildSecurityPreamble } from "./runner/security-preamble";
 import { DispatchHandler } from "./bus/dispatch-handler";
 import {
+  makeSubjectPlaceholderSubstituter,
   startMyelinRuntime,
   type BusEnvelopeSigner,
   type MyelinRuntime,
@@ -1089,6 +1090,26 @@ export async function startCortex(
   // classes covering `local.{org}.system.>` so an operational alert
   // reliably reaches the operator even if one sink is the thing that
   // broke. Renderers never publish on the bus (architecture §9.3).
+  // cortex#269 — substitute `{org}` AND `{stack}` in renderer subscribe
+  // patterns so they resolve against the same canonical shape that
+  // `MyelinRuntime` already substitutes for `nats.subjects`. Without
+  // this, an operator-written `local.{org}.{stack}.system.>` pattern
+  // never matches an actual envelope's wire subject. The `{stack}.`
+  // placeholder includes the trailing dot so stack-less deployments
+  // collapse cleanly to `local.{org}.system.>`.
+  //
+  // cortex#279 cycle 2 — extracted to a shared helper so renderer- and
+  // runtime-side substitution can't drift. The stack-less branch
+  // (`{stack}.` → empty) mirrors `MyelinRuntime.publish`'s same-named
+  // helper, satisfying Sage's "renderer stack-less collapse missing"
+  // finding even though `derivedStack.stack` is currently always
+  // defined in production. Symmetric logic keeps future refactors
+  // honest if the boot ever passes `undefined`.
+  const subjectPlaceholderSubstituter = makeSubjectPlaceholderSubstituter({
+    org: config.agent.operatorId ?? "default",
+    stack: options.stack !== undefined ? derivedStack.stack : undefined,
+  });
+
   const renderers: Renderer[] = [];
   for (const raw of config.renderers ?? []) {
     // BotConfig types renderers as z.unknown() so legacy bot.yaml loads
@@ -1104,7 +1125,10 @@ export async function startCortex(
       );
       continue;
     }
-    const rendererConfig = parseResult.data;
+    const rendererConfig = {
+      ...parseResult.data,
+      subscribe: subjectPlaceholderSubstituter(parseResult.data.subscribe),
+    };
     try {
       const renderer = createRenderer(rendererConfig);
       await renderer.start();
