@@ -7,8 +7,10 @@ type: component
 tier: community
 description: "Layer-7 collaboration surface for the metafactory ecosystem — the M7 application that consumes the Myelin stack"
 authors:
-  - "Andreas Astrom"
-  - "Jens-Christian Fischer"
+  - name: Jens-Christian Fischer
+    github: jcfischer
+  - name: mellanon
+    github: mellanon
 repository: "the-metafactory/cortex"
 
 # Provides surface at MIG-7.7 cutover: bot binary + relay + operator CLIs +
