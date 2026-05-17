@@ -30,6 +30,7 @@ import {
   buildPolicy,
   policyPreflight,
   type LegacyDMConfig,
+  type LegacyRoleEntry,
   type PolicyAdapterView,
   type PolicyBuilderInput,
   type PolicyPreflightGap,
@@ -353,9 +354,10 @@ function convertDiscordPresence(inst: LegacyDiscordInstance): DiscordPresence {
   if (inst.enabled !== undefined) candidate.enabled = inst.enabled;
   if (inst.contextDepth !== undefined) candidate.contextDepth = inst.contextDepth;
   if (inst.enableAgentLog !== undefined) candidate.enableAgentLog = inst.enableAgentLog;
-  if (inst.roles !== undefined) candidate.roles = inst.roles;
-  if (inst.defaultRole !== undefined) candidate.defaultRole = inst.defaultRole;
-  if (inst.dm !== undefined) candidate.dm = inst.dm;
+  // v2.0.0 (cortex#297) — `roles[]` / `defaultRole` / `dm` retired from
+  // DiscordPresenceSchema. The legacy values are still READ from the raw
+  // input by `collectAdapterViews` upstream to drive the policy synthesis;
+  // we deliberately don't pass them through to the new presence shape.
   const worklog = coerceString(inst.worklogChannelId);
   if (worklog) candidate.worklogChannelId = worklog;
   const role = coerceString(inst.operatorRoleId);
@@ -380,8 +382,7 @@ function convertMattermostPresence(inst: LegacyMattermostInstance): MattermostPr
   if (inst.channels !== undefined) candidate.channels = inst.channels;
   if (inst.pollIntervalMs !== undefined) candidate.pollIntervalMs = inst.pollIntervalMs;
   if (inst.allowedUsers !== undefined) candidate.allowedUsers = inst.allowedUsers;
-  if (inst.roles !== undefined) candidate.roles = inst.roles;
-  if (inst.defaultRole !== undefined) candidate.defaultRole = inst.defaultRole;
+  // v2.0.0 (cortex#297) — `roles[]` / `defaultRole` retired.
   return MattermostPresenceSchema.parse(candidate);
 }
 
@@ -720,7 +721,7 @@ function buildAgents(
       // (Holly cortex#51 round 1 nit-1.)
       displayName: i === 0 ? displayName : `${displayName} (${i + 1})`,
       persona,
-      roles: [],
+      // v2.0.0 (cortex#297) — `AgentSchema.roles[]` retired.
       trust,
       presence,
     });
@@ -924,76 +925,104 @@ function collectAdapterViews(
   agents: CortexConfig["agents"],
 ): PolicyAdapterView[] {
   const views: PolicyAdapterView[] = [];
-  // Path 1: cortex-shape input — read from the SCHEMA-PARSED `agents[]`
-  // (not the raw `legacy.agents[]`), so the per-presence DM defaults
-  // applied by `emptyDefault(DMConfigSchema)` are visible. Reading the
-  // raw input loses the operatorRole+defaultRole defaults that Zod
-  // injects, which breaks idempotency: round 1 sees no DM block, round
-  // 2 sees the schema-default DM block parsed from round 1's output,
-  // and the policy block drifts between runs.
-  const cortexShape = Array.isArray(legacy.agents) && legacy.agents.length > 0;
-  // Both paths read off the SCHEMA-PARSED `agents[]` (not the raw legacy
-  // input), so the per-presence DM defaults applied by
-  // `emptyDefault(DMConfigSchema)` are visible. Reading the raw input
-  // loses the operatorRole+defaultRole defaults Zod injects and breaks
-  // idempotency: round 1 sees no DM block, round 2 sees the schema-
-  // default DM block parsed from round 1's output, and the policy block
-  // drifts between runs.
+  // v2.0.0 (cortex#297) — read legacy `roles[]` + `defaultRole` + `dm`
+  // declarations from the RAW input (`legacy.agents[].presence`),
+  // typed as `Record<string, unknown>` on `LegacyBotYaml`. The schema-
+  // parsed `agents` arg no longer carries these fields (they retired
+  // from `DiscordPresenceSchema` / `MattermostPresenceSchema` /
+  // `SlackPresenceSchema` in this slice), so the only place they
+  // survive is the raw YAML the operator handed the migrator.
   //
-  // The two paths are otherwise identical — `agents[]` is synthesised
-  // from grove-v2 `discord[]/mattermost[]` in the legacy path and read
-  // directly from cortex-shape `agents[]` in the new path.
-  void cortexShape; // explicit no-op — kept for grep/intent traceability
-  for (const parsed of agents) {
-    // Skip disabled adapters entirely. Echo PR #306 r1 M4: a headless
-    // placeholder presence (e.g. cortex.work.yaml's `enabled: false` discord
-    // block) would otherwise flow through to `buildPolicy` and synthesise
-    // an `anonymous-discord-<agent>` principal with `allow-all` capabilities
-    // (the schema-default `defaultRole`). Disabled = no auth surface = no
-    // policy effect should leak.
-    if (parsed.presence.discord?.enabled) {
-      const p = parsed.presence.discord;
-      const dm = p.dm as LegacyDMConfig | undefined;
-      // `p.defaultRole` always defaults to "allow-all" via the schema,
-      // so it's never `undefined`. Surface it verbatim.
-      const defaultRole = p.defaultRole;
-      if (p.roles.length > 0 || dm !== undefined) {
+  // Idempotency: when the operator re-runs the migrator on a config
+  // they already migrated, `legacy.agents[*].presence.<platform>` has
+  // no `roles[]`/`defaultRole`/`dm` keys at all → this loop emits no
+  // views → the existing `policy:` block carried forward via
+  // `existingPolicy` is preserved verbatim (re-emitting the same
+  // synthesis output).
+  const parsedById = new Map(agents.map((a) => [a.id, a]));
+  const rawAgents = Array.isArray(legacy.agents) ? legacy.agents : [];
+  for (const rawAgent of rawAgents) {
+    if (typeof rawAgent.id !== "string") continue;
+    const parsed = parsedById.get(rawAgent.id);
+    if (parsed === undefined) continue;
+    const presence = rawAgent.presence;
+    if (!presence || typeof presence !== "object") continue;
+
+    const visit = (
+      platform: "discord" | "mattermost" | "slack",
+      includeDm: boolean,
+    ): void => {
+      const block = presence[platform];
+      if (!block || typeof block !== "object") return;
+      if (block.enabled === false) return;
+      const rawRoles = Array.isArray(block.roles) ? (block.roles as LegacyRoleEntry[]) : [];
+      const defaultRole = typeof block.defaultRole === "string" ? block.defaultRole : "allow-all";
+      const dm = includeDm
+        ? (block.dm as LegacyDMConfig | undefined)
+        : undefined;
+      if (rawRoles.length > 0 || dm !== undefined) {
         views.push({
           agentId: parsed.id,
-          platform: "discord",
-          roles: p.roles,
+          platform,
+          roles: rawRoles,
           defaultRole,
           dm,
         });
       }
-    }
-    if (parsed.presence.mattermost?.enabled) {
-      const p = parsed.presence.mattermost;
-      const defaultRole = p.defaultRole;
-      if (p.roles.length > 0) {
-        views.push({
-          agentId: parsed.id,
-          platform: "mattermost",
-          roles: p.roles,
-          defaultRole,
-          dm: undefined,
-        });
-      }
-    }
-    if (parsed.presence.slack?.enabled) {
-      const p = parsed.presence.slack;
-      const defaultRole = p.defaultRole;
-      if (p.roles.length > 0) {
-        views.push({
-          agentId: parsed.id,
-          platform: "slack",
-          roles: p.roles,
-          defaultRole,
-          dm: undefined,
-        });
-      }
-    }
+    };
+    visit("discord", true);
+    visit("mattermost", false);
+    visit("slack", false);
   }
+
+  // cortex#297 r1 B-1 fix — bot.yaml (grove-v2 legacy) shape carries roles
+  // at top-level `legacy.discord[i].roles[]` + `legacy.mattermost[i].roles[]`,
+  // not under `legacy.agents[].presence`. Without this branch the policy
+  // synthesis silently dropped every authorization declaration in every
+  // grove-v2 upgrade — the dominant install shape pre-MIG-7.9.
+  //
+  // Zip top-level platform arrays against the synthesised `agents[]` by
+  // index: `legacy.discord[i]` maps to `agents[i]` (which `buildAgents`
+  // synthesised in the same order).
+  const isBotYamlShape = !Array.isArray(legacy.agents) || rawAgents.length === 0;
+  if (isBotYamlShape) {
+    const visitTopLevel = (
+      platform: "discord" | "mattermost" | "slack",
+      raw: unknown,
+      includeDm: boolean,
+    ): void => {
+      const instances = toArray<unknown>(raw);
+      if (instances.length === 0) return;
+      for (let i = 0; i < instances.length; i++) {
+        const block = instances[i] as Record<string, unknown> | undefined;
+        if (!block || typeof block !== "object") continue;
+        if (block.enabled === false) continue;
+        const agent = agents[i];
+        if (agent === undefined) continue;
+        const rawRoles = Array.isArray(block.roles)
+          ? (block.roles as LegacyRoleEntry[])
+          : [];
+        const defaultRole =
+          typeof block.defaultRole === "string" ? block.defaultRole : "allow-all";
+        const dm = includeDm
+          ? (block.dm as LegacyDMConfig | undefined)
+          : undefined;
+        if (rawRoles.length > 0 || dm !== undefined) {
+          views.push({
+            agentId: agent.id,
+            platform,
+            roles: rawRoles,
+            defaultRole,
+            dm,
+          });
+        }
+      }
+    };
+    visitTopLevel("discord", legacy.discord, true);
+    visitTopLevel("mattermost", legacy.mattermost, false);
+    // bot.yaml has no top-level `slack[]` (Slack was post-MIG-7 only) — no third visit.
+  }
+
   return views;
 }
 
@@ -1114,13 +1143,13 @@ function buildAgentsFromCortexShape(
     // Note: slack pass-through goes through PresenceSchema validation
     // when CortexConfigSchema.parse runs at the end of convertBotYaml.
     // We don't gate it here.
+    // v2.0.0 (cortex#297) — `AgentSchema.roles[]` retired. Any legacy
+    // `roles:` field on the input is ignored; capability declarations
+    // flow into the top-level `policy:` block now.
     const agentOut: CortexConfig["agents"][number] = {
       id,
       displayName,
       persona,
-      roles: Array.isArray(a.roles)
-        ? a.roles.filter((r): r is string => typeof r === "string")
-        : [],
       trust,
       presence,
     };
