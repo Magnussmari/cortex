@@ -420,6 +420,32 @@ describe("convertBotYaml — full fixture", () => {
     expect(result.cortex.nats?.url).toBe("nats://localhost:4222");
     expect(result.cortex.nats?.subjects).toEqual(["local.{org}.>"]);
   });
+
+  test("bot.yaml-shape discord[].roles[] lifts into policy block (PR #310 r1 B-1 fix)", () => {
+    // Echo PR #310 r1 BLOCKER caught: collectAdapterViews only walked
+    // legacy.agents[].presence.<platform>.roles[] but bot.yaml-shape carries
+    // roles at top-level legacy.discord[i].roles[] / legacy.mattermost[i].
+    // The fix extends collectAdapterViews with a bot.yaml-shape branch that
+    // zips top-level instances against the synthesised agents[] by index.
+    //
+    // Pre-fix: this fixture's discord[0].roles[].operator silently dropped,
+    // leaving an empty policy block — every grove-v2 upgrade lost auth.
+    const legacy = loadFixture("full.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    expect(result.cortex.policy).toBeDefined();
+    const policy = result.cortex.policy!;
+    // The legacy `operator` role + its users[] entry must surface as
+    // (a) a PolicyRole with the operator capability, and
+    // (b) a PolicyPrincipal whose platform_ids.discord includes 112233445566778899.
+    const operatorRole = policy.roles.find((r) => r.id === "operator");
+    expect(operatorRole).toBeDefined();
+    expect(operatorRole?.capabilities).toContain("operator");
+    const operatorPrincipal = policy.principals.find(
+      (p) => p.platform_ids?.discord?.includes("112233445566778899"),
+    );
+    expect(operatorPrincipal).toBeDefined();
+    expect(operatorPrincipal?.role).toContain("operator");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -618,10 +644,8 @@ describe("convertBotYaml — schema-sourced defaults", () => {
     const d = result.cortex.agents[0]!.presence.discord!;
     expect(d.contextDepth).toBe(10);
     expect(d.enableAgentLog).toBe(false);
-    expect(d.defaultRole).toBe("allow-all");
     expect(d.enabled).toBe(true);
-    // dm block defaults from DMConfigSchema (operatorRole defaulted from DMRoleSchema)
-    expect(d.dm.defaultRole).toBe("denied");
+    // v2.0.0 (cortex#297) — `defaultRole` / `dm` retired from presence.
   });
 
   test("mattermost presence fills schema defaults for unspecified fields", () => {
@@ -633,7 +657,7 @@ describe("convertBotYaml — schema-sourced defaults", () => {
     const m = result.cortex.agents[0]!.presence.mattermost!;
     expect(m.callbackPort).toBe(8080);
     expect(m.pollIntervalMs).toBe(3000);
-    expect(m.defaultRole).toBe("allow-all");
+    // v2.0.0 (cortex#297) — `defaultRole` retired from presence.
     expect(m.allowedUsers).toEqual([]);
     expect(m.channels).toEqual([]);
   });
