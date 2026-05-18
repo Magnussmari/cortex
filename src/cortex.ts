@@ -53,6 +53,10 @@ import {
   type ReviewConsumerAgent,
   type SignatureVerifier,
 } from "./bus/review-consumer";
+import {
+  provisionReviewStream,
+  provisionReviewConsumer,
+} from "./bus/jetstream/provision";
 import { verifySignedByChain } from "./bus/verify-signed-by-chain";
 import { CCSession } from "./runner/cc-session";
 import { makePiDevPipelineRunner } from "./runner/substrate/pi-dev-runner";
@@ -744,6 +748,51 @@ export async function startCortex(
   // sage's bridge subscription already uses for `local.{org}.{stack}.>`.
   const reviewSubjectPattern = `local.${reviewOperatorId}.${derivedStack.stack}.tasks.code-review.>`;
   const reviewStream = "CODE_REVIEW";
+
+  // cortex#338 — resolve the provisioning JSM and provision the
+  // CODE_REVIEW stream up-front so the per-agent `ReviewConsumer.start`
+  // calls below can bind without hitting "stream not found" against a
+  // virgin broker. `reviewJsm = null` means the runtime is dormant
+  // (no NATS / connect failed / `runtime.jetstreamManager()` itself
+  // threw / runtime stub omits the helper) — provisioning is skipped
+  // and the consumer loop stays dormant in lockstep.
+  //
+  // Extracted into `resolveReviewProvisioningJsm` so the JSM-
+  // resolution failure path is covered by the same boot-survives-
+  // provisioning-failure contract as the stream-add path. Pre-fix
+  // an `await runtime.jetstreamManager()` throw bypassed the inner
+  // try/catch and aborted boot (sage review on #338, round 2).
+  const reviewJsm = await resolveReviewProvisioningJsm(runtime, reviewCapableAgents);
+
+  if (reviewJsm !== null) {
+    try {
+      const outcome = await provisionReviewStream({
+        jsm: reviewJsm,
+        name: reviewStream,
+        subjects: [reviewSubjectPattern],
+      });
+      if (outcome === "created") {
+        console.log(
+          `cortex: provisioned JetStream stream "${reviewStream}" (subjects=[${reviewSubjectPattern}])`,
+        );
+      } else if (outcome === "exists") {
+        console.log(
+          `cortex: JetStream stream "${reviewStream}" already present — binding existing config`,
+        );
+      }
+      // config-drift-warning is already logged by the helper.
+    } catch (err) {
+      // A provisioning failure does NOT abort boot — siblings still
+      // wire, and the per-agent `consumer.start()` below will surface
+      // the binding failure via its existing try/catch + stderr line.
+      // We log here so operators see provisioning was even attempted.
+      process.stderr.write(
+        `cortex: provisionReviewStream failed for "${reviewStream}": ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+
   for (const agent of reviewCapableAgents) {
     try {
       const caps = agent.runtime?.capabilities ?? [];
@@ -855,6 +904,37 @@ export async function startCortex(
       // the two cases so the boot log can be honest (cortex#334)
       // instead of unconditionally claiming "ready".
       const durable = `cortex-review-consumer-${reviewOperatorId}-${agent.id}`;
+
+      // cortex#338 — provision the per-agent durable consumer up-front
+      // so `consumer.start()` below binds successfully against a virgin
+      // broker. Reuses `reviewJsm` resolved once before this loop.
+      // Idempotent — safe across restarts. Skipped when JSM isn't
+      // available (runtime dormant); the subsequent `consumer.start()`
+      // will then stay dormant too.
+      if (reviewJsm !== null) {
+        try {
+          const outcome = await provisionReviewConsumer({
+            jsm: reviewJsm,
+            stream: reviewStream,
+            durable,
+          });
+          if (outcome === "created") {
+            console.log(
+              `cortex: provisioned JetStream durable "${durable}" on stream "${reviewStream}"`,
+            );
+          }
+        } catch (provisionErr) {
+          // Don't abort — let consumer.start surface the bind failure
+          // through its own error path so the operator sees the same
+          // stderr shape they'd see if the consumer existed but bind
+          // failed for another reason.
+          process.stderr.write(
+            `cortex: provisionReviewConsumer failed for "${durable}": ` +
+              `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+          );
+        }
+      }
+
       const started = await consumer.start({
         pattern: reviewSubjectPattern,
         stream: reviewStream,
@@ -1882,6 +1962,38 @@ export async function startCortex(
  * the boundary; production callers see the typed return signature.
  */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unnecessary-type-assertion */
+/**
+ * cortex#338 — resolve the JetStreamManager-shaped provisioning
+ * capability needed by the review-stream + per-agent durable boot
+ * wiring. Returns `null` when the runtime is dormant (no NATS / connect
+ * failed / runtime stub omits the helper / the JSM resolution itself
+ * throws). Logging the resolution failure here keeps the boot path
+ * survives-provisioning-failure contract intact — the inner
+ * `provisionReviewStream` + `provisionReviewConsumer` try/catches alone
+ * can't catch a throw from `runtime.jetstreamManager()` itself.
+ *
+ * Extracted from `startCortex` so the resolution surface stays a single
+ * place to read on review and a single place to test going forward
+ * (per sage review on #338 round 2 — Maintainability).
+ */
+async function resolveReviewProvisioningJsm(
+  runtime: MyelinRuntime,
+  reviewCapableAgents: readonly Agent[],
+): Promise<import("./bus/jetstream/types").ProvisionJsm | null> {
+  if (reviewCapableAgents.length === 0 || !runtime.jetstreamManager) {
+    return null;
+  }
+  try {
+    return await runtime.jetstreamManager();
+  } catch (err) {
+    process.stderr.write(
+      `cortex: jetstreamManager() resolution failed — review provisioning skipped: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    return null;
+  }
+}
+
 async function setupDashboard(
   config: BotConfig,
   dispatchHandler: DispatchHandler,
