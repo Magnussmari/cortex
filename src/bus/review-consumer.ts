@@ -261,10 +261,18 @@ export interface ReviewConsumerStartOpts {
  * Boot/log entries the consumer produces. Surfaced so the boot wiring in
  * `src/cortex.ts` can render a uniform `cortex: review consumer ready for
  * agent={id} flavors=[...]` line without re-deriving the data.
+ *
+ * `subscribed` distinguishes the two structurally-valid `start()` outcomes
+ * (cortex#334): `true` when the pull subscription actually opened on the
+ * NATS broker; `false` when `MyelinRuntime.subscribePull` returned null
+ * (disabled runtime / empty `nats.subjects` / G-1111 pending). The boot
+ * path uses this to log "ready" vs "DORMANT" honestly instead of always
+ * claiming readiness while the consumer is silently dormant.
  */
 export interface ReviewConsumerStartedInfo {
   agentId: string;
   flavors: readonly string[];
+  subscribed: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -388,13 +396,14 @@ export class ReviewConsumer {
       // subscribePull helper. Either way this is a structurally-valid
       // no-op for capability-side features — the consumer stays
       // dormant and shutdown drain works against the empty `inFlight`
-      // set. The boot path logs the disabled-runtime case once at
-      // startup; we don't double-log here.
-      return { agentId: this.agent.id, flavors: this.flavors };
+      // set. The boot path branches its log line on `subscribed: false`
+      // so operators see "DORMANT" instead of a misleading "ready"
+      // (cortex#334).
+      return { agentId: this.agent.id, flavors: this.flavors, subscribed: false };
     }
     this.subscriber = sub;
     await this.subscriber.ready;
-    return { agentId: this.agent.id, flavors: this.flavors };
+    return { agentId: this.agent.id, flavors: this.flavors, subscribed: true };
   }
 
   /**
