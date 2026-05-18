@@ -851,11 +851,11 @@ export async function startCortex(
       reviewConsumers.push(consumer);
       // Subscribe via the runtime's subscribePull helper. When the
       // runtime is disabled the helper returns null inside start() and
-      // the consumer stays dormant — boot continues with the
-      // instantiation logged as ready (the disabled-runtime case is the
-      // typical state for cortex deployments that haven't wired NATS).
+      // the consumer stays dormant — `started.subscribed` distinguishes
+      // the two cases so the boot log can be honest (cortex#334)
+      // instead of unconditionally claiming "ready".
       const durable = `cortex-review-consumer-${reviewOperatorId}-${agent.id}`;
-      await consumer.start({
+      const started = await consumer.start({
         pattern: reviewSubjectPattern,
         stream: reviewStream,
         durable,
@@ -871,9 +871,20 @@ export async function startCortex(
       // to confirm sage agents (or any future substrate) actually
       // received the substrate-aware factory. Unset substrate defaults
       // to `claude-code` in the log (matches the runtime fallthrough).
-      console.log(
-        `cortex: review consumer ready for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate}`,
-      );
+      //
+      // cortex#334 — distinguish "ready" (subscription open) from
+      // "DORMANT" (subscribePull returned null; G-1111 pending or
+      // nats.subjects empty). The previous unconditional "ready" line
+      // misled operators into chasing phantom misconfigs.
+      if (started.subscribed) {
+        console.log(
+          `cortex: review consumer ready for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate}`,
+        );
+      } else {
+        console.log(
+          `cortex: review consumer DORMANT for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} — cortex MyelinRuntime subscriptions disabled (G-1111 pending; tasks.code-review.* envelopes will not be claimed by this consumer)`,
+        );
+      }
     } catch (err) {
       // Per CLAUDE.md: log every error. A single agent's consumer crash
       // does NOT abort boot — siblings still get wired. Boot keeps the
