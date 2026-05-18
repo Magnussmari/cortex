@@ -114,6 +114,21 @@ export interface MyelinRuntime {
    * pull subscriptions wired" — and stay dormant.
    */
   subscribePull?(opts: MyelinSubscribePullOpts): MyelinSubscriber | null;
+  /**
+   * Resolve the JetStreamManager for the underlying link, or `null` when
+   * the runtime is disabled (no NATS configured or connect failed).
+   *
+   * Used by the boot path to provision streams + per-agent durables
+   * (cortex#338) before `ReviewConsumer.start` binds to them. Like
+   * `subscribePull`, this is OPTIONAL on the interface so existing
+   * fake-runtime stubs in tests stay byte-identical until each test
+   * file opts in.
+   *
+   * Returns a Promise to match nats.js's `nc.jetstreamManager()`
+   * shape — the first call does a server round-trip; subsequent calls
+   * are cached.
+   */
+  jetstreamManager?(): Promise<import("nats").JetStreamManager | null>;
   /** Best-effort shutdown — drains subscribers, closes the link. */
   stop(): Promise<void>;
 }
@@ -314,12 +329,20 @@ export async function startMyelinRuntime(
   // eslint-disable-next-line @typescript-eslint/no-empty-function, @typescript-eslint/require-await
   const stopDisabled = async () => {};
 
+  // cortex#338 — disabled JSM helper mirrors `subscribePullDisabled`.
+  // Boot path calls `runtime.jetstreamManager()` to provision streams /
+  // consumers; a null resolution means "no link, no provisioning" and
+  // the caller must skip.
+  // eslint-disable-next-line @typescript-eslint/require-await
+  const jetstreamManagerDisabled = async (): Promise<null> => null;
+
   if (!config.nats?.url) {
     return {
       enabled: false,
       onEnvelope,
       publish: publishDisabled,
       subscribePull: subscribePullDisabled,
+      jetstreamManager: jetstreamManagerDisabled,
       stop: stopDisabled,
     };
   }
@@ -392,6 +415,7 @@ export async function startMyelinRuntime(
       onEnvelope,
       publish: publishDisabled,
       subscribePull: subscribePullDisabled,
+      jetstreamManager: jetstreamManagerDisabled,
       stop: stopDisabled,
     };
   }
@@ -446,6 +470,7 @@ export async function startMyelinRuntime(
       onEnvelope,
       publish: publishDisabled,
       subscribePull: subscribePullDisabled,
+      jetstreamManager: jetstreamManagerDisabled,
       stop: stopDisabled,
     };
   }
@@ -620,11 +645,24 @@ export async function startMyelinRuntime(
     return sub;
   };
 
+  // cortex#338 — expose the live JetStreamManager so the boot path can
+  // provision streams + per-agent durables before `ReviewConsumer.start`
+  // binds to them. Cached on first call so the boot path doesn't pay a
+  // server round-trip per per-agent provisioning call.
+  let jsmCache: Promise<import("nats").JetStreamManager> | null = null;
+  const jetstreamManagerEnabled = (): Promise<import("nats").JetStreamManager> => {
+    if (jsmCache === null) {
+      jsmCache = link.raw.jetstreamManager();
+    }
+    return jsmCache;
+  };
+
   return {
     enabled: true,
     onEnvelope,
     publish: publishEnabled,
     subscribePull: subscribePullEnabled,
+    jetstreamManager: jetstreamManagerEnabled,
     stop: async () => {
       if (stopped) return;
       stopped = true;

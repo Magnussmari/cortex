@@ -53,6 +53,10 @@ import {
   type ReviewConsumerAgent,
   type SignatureVerifier,
 } from "./bus/review-consumer";
+import {
+  provisionReviewStream,
+  provisionReviewConsumer,
+} from "./bus/jetstream/provision";
 import { verifySignedByChain } from "./bus/verify-signed-by-chain";
 import { CCSession } from "./runner/cc-session";
 import { makePiDevPipelineRunner } from "./runner/substrate/pi-dev-runner";
@@ -744,6 +748,45 @@ export async function startCortex(
   // sage's bridge subscription already uses for `local.{org}.{stack}.>`.
   const reviewSubjectPattern = `local.${reviewOperatorId}.${derivedStack.stack}.tasks.code-review.>`;
   const reviewStream = "CODE_REVIEW";
+
+  // cortex#338 — provision the CODE_REVIEW stream up-front so the
+  // per-agent `ReviewConsumer.start` calls below can bind without
+  // hitting "stream not found" against a virgin broker. Idempotent —
+  // safe across restarts. Skipped when the runtime is dormant (no NATS
+  // configured / connect failed); the consumer loop also stays dormant
+  // in that case.
+  if (reviewCapableAgents.length > 0 && runtime.jetstreamManager) {
+    const jsm = await runtime.jetstreamManager();
+    if (jsm !== null) {
+      try {
+        const outcome = await provisionReviewStream({
+          jsm,
+          name: reviewStream,
+          subjects: [reviewSubjectPattern],
+        });
+        if (outcome === "created") {
+          console.log(
+            `cortex: provisioned JetStream stream "${reviewStream}" (subjects=[${reviewSubjectPattern}])`,
+          );
+        } else if (outcome === "exists") {
+          console.log(
+            `cortex: JetStream stream "${reviewStream}" already present — binding existing config`,
+          );
+        }
+        // config-drift-warning is already logged by the helper.
+      } catch (err) {
+        // A provisioning failure does NOT abort boot — siblings still
+        // wire, and the per-agent `consumer.start()` below will surface
+        // the binding failure via its existing try/catch + stderr line.
+        // We log here so operators see provisioning was even attempted.
+        process.stderr.write(
+          `cortex: provisionReviewStream failed for "${reviewStream}": ` +
+            `${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    }
+  }
+
   for (const agent of reviewCapableAgents) {
     try {
       const caps = agent.runtime?.capabilities ?? [];
@@ -855,6 +898,39 @@ export async function startCortex(
       // the two cases so the boot log can be honest (cortex#334)
       // instead of unconditionally claiming "ready".
       const durable = `cortex-review-consumer-${reviewOperatorId}-${agent.id}`;
+
+      // cortex#338 — provision the per-agent durable consumer up-front
+      // so `consumer.start()` below binds successfully against a virgin
+      // broker. Idempotent — safe across restarts. Skipped when JSM
+      // isn't available (runtime dormant / no NATS configured); the
+      // subsequent `consumer.start()` will then stay dormant too.
+      if (runtime.jetstreamManager) {
+        const jsm = await runtime.jetstreamManager();
+        if (jsm !== null) {
+          try {
+            const outcome = await provisionReviewConsumer({
+              jsm,
+              stream: reviewStream,
+              durable,
+            });
+            if (outcome === "created") {
+              console.log(
+                `cortex: provisioned JetStream durable "${durable}" on stream "${reviewStream}"`,
+              );
+            }
+          } catch (provisionErr) {
+            // Don't abort — let consumer.start surface the bind failure
+            // through its own error path so the operator sees the same
+            // stderr shape they'd see if the consumer existed but bind
+            // failed for another reason.
+            process.stderr.write(
+              `cortex: provisionReviewConsumer failed for "${durable}": ` +
+                `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+            );
+          }
+        }
+      }
+
       const started = await consumer.start({
         pattern: reviewSubjectPattern,
         stream: reviewStream,
