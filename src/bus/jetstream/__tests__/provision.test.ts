@@ -146,6 +146,19 @@ describe("describeStreamDrift", () => {
     ).toBeNull();
   });
 
+  test("null when subjects match as a set (order doesn't matter)", () => {
+    // JetStream stream subjects are semantically a set — order is
+    // implementation-detail on the wire. A live config that returns
+    // the same set in a different order MUST NOT false-warn.
+    expect(
+      describeStreamDrift(
+        streamInfo(["b.>", "a.>"], 24 * 3600 * 1e9),
+        ["a.>", "b.>"],
+        24 * 3600 * 1e9,
+      ),
+    ).toBeNull();
+  });
+
   test("non-null when subjects differ", () => {
     expect(
       describeStreamDrift(

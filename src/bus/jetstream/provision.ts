@@ -39,23 +39,15 @@
 // values keeps the wire-config strings centralised in nats.js rather
 // than duplicating literals here.
 import { AckPolicy, DeliverPolicy, RetentionPolicy, StorageType } from "nats";
-import type { ConsumerConfig, StreamConfig, StreamInfo, ConsumerInfo } from "nats";
+import type { ConsumerConfig, StreamInfo } from "nats";
 
-/**
- * Narrow JetStreamManager surface — the operations we use. Mirror of
- * `nats.JetStreamManager` minus everything we don't touch. Tests stub
- * this; production wires it via `link.raw.jetstreamManager()`.
- */
-export interface ProvisionJsm {
-  streams: {
-    info(name: string): Promise<StreamInfo>;
-    add(cfg: Partial<StreamConfig>): Promise<StreamInfo>;
-  };
-  consumers: {
-    info(stream: string, durable: string): Promise<ConsumerInfo>;
-    add(stream: string, cfg: Partial<ConsumerConfig>): Promise<ConsumerInfo>;
-  };
-}
+// Re-exported from the neutral types module so existing callers
+// importing `ProvisionJsm` from this file keep working AND new
+// callers (MyelinRuntime, future bus consumers) can import from
+// `./types` without dragging review-specific code with them.
+// Background: sage review on #338 round 3 (architecture).
+export type { ProvisionJsm } from "./types";
+import type { ProvisionJsm } from "./types";
 
 export type ProvisionOutcome = "created" | "exists" | "config-drift-warning";
 
@@ -242,11 +234,17 @@ export function describeStreamDrift(
 ): string | null {
   const cfg = existing.config;
   const actualSubjects = cfg.subjects ?? [];
+  // JetStream stream subjects are semantically a set — order on the
+  // wire is implementation-detail. Compare as sets so a re-ordered live
+  // config doesn't false-warn on every boot (sage review on #338
+  // round 3 — CodeQuality suggestion).
+  const actualSet = new Set(actualSubjects);
+  const expectedSet = new Set(expectedSubjects);
   const subjectsEqual =
-    actualSubjects.length === expectedSubjects.length &&
-    actualSubjects.every((s, i) => s === expectedSubjects[i]);
+    actualSet.size === expectedSet.size &&
+    [...expectedSet].every((s) => actualSet.has(s));
   if (!subjectsEqual) {
-    return `subjects differ (expected [${expectedSubjects.join(", ")}], got [${actualSubjects.join(", ")}])`;
+    return `subjects differ (expected {${[...expectedSet].sort().join(", ")}}, got {${[...actualSet].sort().join(", ")}})`;
   }
   // Allow ±1s slack on max_age to absorb floating-point round-trips
   // through the wire JSON.

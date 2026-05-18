@@ -135,7 +135,7 @@ export interface MyelinRuntime {
    * shape — the first call does a server round-trip; subsequent calls
    * are cached.
    */
-  jetstreamManager?(): Promise<import("../jetstream/provision").ProvisionJsm | null>;
+  jetstreamManager?(): Promise<import("../jetstream/types").ProvisionJsm | null>;
   /** Best-effort shutdown — drains subscribers, closes the link. */
   stop(): Promise<void>;
 }

@@ -1979,7 +1979,7 @@ export async function startCortex(
 async function resolveReviewProvisioningJsm(
   runtime: MyelinRuntime,
   reviewCapableAgents: readonly Agent[],
-): Promise<import("./bus/jetstream/provision").ProvisionJsm | null> {
+): Promise<import("./bus/jetstream/types").ProvisionJsm | null> {
   if (reviewCapableAgents.length === 0 || !runtime.jetstreamManager) {
     return null;
   }
