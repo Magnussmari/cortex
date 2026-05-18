@@ -641,6 +641,57 @@ describe("ReviewConsumer.processEnvelope — cortex#237 PR-6", () => {
     expect(d3).toEqual({ kind: "ack" });
   });
 
+  // cortex#340 — publish-routing audit. Pins the contract that EVERY
+  // verdict variant emits exactly three envelopes via runtime.publish in
+  // the same order: started → review.verdict.<variant> → completed. The
+  // existing tests cover `approved` directly (test 1) and `commented`
+  // indirectly via the redelivery path (test 7); this parametric test
+  // adds `changes-requested` and locks the invariant across all three so
+  // a future change that bypasses safePublish for one verdict variant
+  // can't slip through unnoticed.
+  for (const variant of ["approved", "changes-requested", "commented"] as const) {
+    test(`cortex#340 — verdict=${variant} publishes exactly 3 envelopes via runtime.publish`, async () => {
+      const runtime = createRecordingRuntime();
+      const request = makeRequest("typescript");
+      const verdict = buildVerdictEnvelope(request, variant);
+
+      const consumer = new ReviewConsumer(
+        baseOpts({
+          runtime,
+          pipelineRunner: fixedPipeline(() => ({ kind: "verdict", envelope: verdict })),
+        }),
+      );
+
+      const decision = await consumer.processEnvelope(
+        request,
+        "local.metafactory.tasks.code-review.typescript",
+        null,
+      );
+
+      expect(decision).toEqual({ kind: "ack" });
+
+      // Exactly three envelopes — anti-criterion: any silent additional
+      // emit would either bypass runtime.publish (won't be captured)
+      // or land here as an unexpected fourth entry.
+      expect(runtime.published.length).toBe(3);
+      expect(runtime.published[0]!.type).toBe("dispatch.task.started");
+      expect(runtime.published[1]!.type).toBe(`review.verdict.${variant}`);
+      expect(runtime.published[2]!.type).toBe("dispatch.task.completed");
+
+      // The verdict envelope is the EXACT one the pipeline returned —
+      // not a copy, not a re-built envelope. Catches a regression that
+      // rebuilds the verdict on the way out (which would silently drop
+      // the pipeline's correlation_id / signed_by chain).
+      expect(runtime.published[1]!).toBe(verdict);
+
+      // Correlation id flows onto every lifecycle envelope so pilot's
+      // wait can filter consistently across the three.
+      for (const env of runtime.published) {
+        expect(env.correlation_id).toBe(request.id);
+      }
+    });
+  }
+
   test("10. compliance_block variant → term with documented v1 message", async () => {
     const runtime = createRecordingRuntime();
     const request = makeRequest("typescript");

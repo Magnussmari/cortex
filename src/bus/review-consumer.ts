@@ -761,6 +761,16 @@ export class ReviewConsumer {
    * own builders should already satisfy this; the assertion catches
    * regressions early rather than producing orphan envelopes pilot
    * silently fails to filter.
+   *
+   * **SINGLE PUBLISH PATH (cortex#340).** Every lifecycle + verdict
+   * envelope ReviewConsumer emits routes through this method —
+   * `runtime.publish` is the only legitimate exit. Adding a direct
+   * `link.publish` or `nc.publish` call would bypass the error trap
+   * AND the recording-runtime test fixture, both of which we rely on
+   * for the publish-routing audit covered by parametric tests in
+   * `__tests__/review-consumer.test.ts`. If a future feature needs a
+   * publish from inside this class, extend `safePublish` rather than
+   * introducing a sibling path.
    */
   private async safePublish(
     envelope: Envelope,
