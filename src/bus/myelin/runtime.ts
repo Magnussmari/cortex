@@ -349,27 +349,21 @@ export async function startMyelinRuntime(
   });
   const subjects = substituter(nats.subjects);
 
-  if (subjects.length === 0) {
-    // cortex#88 item 6: empty `subjects` is the typical state today —
-    // cortex publishes envelopes but doesn't subscribe (subscription
-    // routing is G-1111+ territory). Demoted from `console.warn` to
-    // `console.info`: the prior wording ("no subscriptions started")
-    // misled every operator into chasing a phantom misconfiguration on
-    // every boot. The runtime IS still considered disabled here because
-    // `publish` from this branch requires the same connect-and-subscribe
-    // path the populated case takes — keeping the early-return preserves
-    // the existing publish-disabled contract until G-1111 wires the
-    // publish-only mode end-to-end.
+  // cortex#337 — empty `nats.subjects` is the documented default
+  // today. Pre-#337 this branch returned a fully-disabled runtime
+  // (publish: publishDisabled, subscribePull: subscribePullDisabled),
+  // which left capability-side consumers (ReviewConsumer) structurally
+  // dormant even when NATS was configured. The runtime now opens the
+  // link unconditionally (any url-configured case → live link), skips
+  // push-mode subscribers when `subjects` is empty, and exposes a real
+  // `publish` + `subscribePull`. Pull-mode capability consumers can
+  // wire themselves; push-mode broad-pattern subscribers stay absent
+  // by design.
+  const pushSubscribersConfigured = subjects.length > 0;
+  if (!pushSubscribersConfigured) {
     console.info(
-      "myelin-runtime: nats.url configured, nats.subjects empty — no subscriptions started (this is normal for current cortex deployments; subscription routing lands in G-1111)",
+      "myelin-runtime: nats.url configured, nats.subjects empty — entering pull-only mode (capability consumers may subscribe via subscribePull; no push-mode broad-pattern subscribers will start)",
     );
-    return {
-      enabled: false,
-      onEnvelope,
-      publish: publishDisabled,
-      subscribePull: subscribePullDisabled,
-      stop: stopDisabled,
-    };
   }
 
   let link: NatsLink;
@@ -435,9 +429,15 @@ export async function startMyelinRuntime(
     }
   }
 
-  if (subscribers.length === 0) {
-    // Nothing actually subscribed — close the link so we don't hold a
-    // socket open for nothing.
+  // cortex#337 — pre-#337 a non-empty `subjects[]` that ALL failed to
+  // subscribe collapsed back to the disabled path. Preserve that
+  // safety net: when push-mode subscribers were configured but none
+  // came up, the link is closed and the runtime returns disabled —
+  // there is no operator intent for a pull-only path here, just a
+  // broken subscribe. Pull-only mode (empty subjects → enabled link)
+  // is the new path; failed push subscribers are still treated as a
+  // boot failure for that configuration shape.
+  if (pushSubscribersConfigured && subscribers.length === 0) {
     await link.close().catch(() => {
       // best-effort close on no-subscribers path; ignore errors
     });
