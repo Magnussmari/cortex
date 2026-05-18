@@ -214,6 +214,22 @@ describe("provisionReviewStream", () => {
     expect(String(cfg.retention)).toBe("interest");
     expect(String(cfg.storage)).toBe("file");
     expect(cfg.max_age).toBe(24 * 3600 * 1e9);
+    // Finite max_bytes default — live deployment surfaced that NATS
+    // accounts with storage-reservation caps reject max_bytes=-1
+    // (unlimited) with "insufficient storage resources available".
+    expect(cfg.max_bytes).toBe(512 * 1024 * 1024);
+  });
+
+  test("honors maxBytes override", async () => {
+    const { jsm, state } = makeJsm({ existingStream: "not-found" });
+    await provisionReviewStream({
+      jsm,
+      name: "CODE_REVIEW",
+      subjects: ["x.>"],
+      maxBytes: 128 * 1024 * 1024,
+      log: silentLog(),
+    });
+    expect(state.streamAddCalls[0]!.max_bytes).toBe(128 * 1024 * 1024);
   });
 
   test("idempotent — exists path returns 'exists' without calling add", async () => {
