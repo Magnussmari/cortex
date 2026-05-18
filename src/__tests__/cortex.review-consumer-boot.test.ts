@@ -531,4 +531,90 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
     await handle.stop();
     rmSync(tmpAgentsDir, { recursive: true, force: true });
   });
+
+  test("cortex#338 — jetstreamManager() throw is contained, boot completes, stderr explains", async () => {
+    // sage review on #338 round 2 (CodeQuality, important): the
+    // `await runtime.jetstreamManager()` call itself can throw (e.g.
+    // a transient JS request failure mid-boot); pre-fix that propagated
+    // out of startCortex and aborted boot, even though the downstream
+    // `provisionReviewStream` / `provisionReviewConsumer` calls were
+    // already wrapped in try/catch. The fix wraps the await inside
+    // `resolveReviewProvisioningJsm` so the resolution failure is
+    // contained — boot continues with provisioning skipped, and
+    // operator-actionable stderr explains.
+    //
+    // Test stands up a runtime whose `jetstreamManager()` rejects, and
+    // asserts: (a) startCortex completes (no thrown error), (b) the
+    // expected stderr line appears, (c) the review consumer is still
+    // wired (boot didn't bail out before that step).
+    const onEnvelopeHandlers = new Set<EnvelopeHandler>();
+    const published: Envelope[] = [];
+    const subscribePullCalls: MyelinSubscribePullOpts[] = [];
+    const throwingRuntime: RecordingRuntime = {
+      enabled: true,
+      onEnvelopeHandlers,
+      published,
+      subscribePullCalls,
+      onEnvelope(handler) {
+        onEnvelopeHandlers.add(handler);
+        return {
+          unregister: () => {
+            onEnvelopeHandlers.delete(handler);
+          },
+        };
+      },
+      publish: async (envelope: Envelope) => {
+        published.push(envelope);
+      },
+      subscribePull: (opts: MyelinSubscribePullOpts): MyelinSubscriber => {
+        subscribePullCalls.push(opts);
+        return {
+          pattern: opts.pattern,
+          ready: Promise.resolve(),
+          stop: async () => {},
+        } as unknown as MyelinSubscriber;
+      },
+      jetstreamManager: async () => {
+        throw new Error("simulated JSM round-trip failure");
+      },
+      stop: async () => {},
+    };
+
+    const tmpAgentsDir = mkdtempSync(join(tmpdir(), "cortex-revboot-jsmthrow-"));
+    const inlineAgents: Agent[] = [
+      makeAgent("sage", ["code-review.typescript"]),
+    ];
+
+    let booted = false;
+    const { result: bootResult, stderr } = await withCapturedStderr(() =>
+      withCapturedConsoleLog(async () => {
+        const h = await startCortex(minimalConfig(), {
+          disableConfigWatcher: true,
+          disableDashboard: true,
+          disableOutboundPoller: true,
+          agentsDir: tmpAgentsDir,
+          injectRuntime: throwingRuntime,
+          inlineAgents,
+        });
+        booted = true;
+        return h;
+      }),
+    );
+
+    // (a) boot completed despite the JSM throw
+    expect(booted).toBe(true);
+    expect(bootResult.result).toBeDefined();
+
+    // (b) actionable stderr line surfaced
+    expect(stderr).toContain("jetstreamManager() resolution failed");
+    expect(stderr).toContain("review provisioning skipped");
+
+    // (c) the review consumer was still wired downstream — boot didn't
+    // bail before that step. `subscribePullCalls` is the witness; one
+    // call = one consumer attempted to subscribe.
+    expect(throwingRuntime.subscribePullCalls.length).toBe(1);
+
+    await bootResult.result.stop();
+    rmSync(tmpAgentsDir, { recursive: true, force: true });
+  });
 });

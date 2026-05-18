@@ -749,21 +749,21 @@ export async function startCortex(
   const reviewSubjectPattern = `local.${reviewOperatorId}.${derivedStack.stack}.tasks.code-review.>`;
   const reviewStream = "CODE_REVIEW";
 
-  // cortex#338 — resolve the provisioning JSM once. Reused by the
-  // up-front stream provisioning AND the per-agent durable
-  // provisioning inside the loop below. `null` means the runtime is
-  // dormant (no NATS configured / connect failed / runtime stub
-  // omits jetstreamManager); provisioning is skipped in that case
-  // and the consumer loop also stays dormant.
-  const reviewJsm =
-    reviewCapableAgents.length > 0 && runtime.jetstreamManager
-      ? await runtime.jetstreamManager()
-      : null;
+  // cortex#338 — resolve the provisioning JSM and provision the
+  // CODE_REVIEW stream up-front so the per-agent `ReviewConsumer.start`
+  // calls below can bind without hitting "stream not found" against a
+  // virgin broker. `reviewJsm = null` means the runtime is dormant
+  // (no NATS / connect failed / `runtime.jetstreamManager()` itself
+  // threw / runtime stub omits the helper) — provisioning is skipped
+  // and the consumer loop stays dormant in lockstep.
+  //
+  // Extracted into `resolveReviewProvisioningJsm` so the JSM-
+  // resolution failure path is covered by the same boot-survives-
+  // provisioning-failure contract as the stream-add path. Pre-fix
+  // an `await runtime.jetstreamManager()` throw bypassed the inner
+  // try/catch and aborted boot (sage review on #338, round 2).
+  const reviewJsm = await resolveReviewProvisioningJsm(runtime, reviewCapableAgents);
 
-  // cortex#338 — provision the CODE_REVIEW stream up-front so the
-  // per-agent `ReviewConsumer.start` calls below can bind without
-  // hitting "stream not found" against a virgin broker. Idempotent —
-  // safe across restarts.
   if (reviewJsm !== null) {
     try {
       const outcome = await provisionReviewStream({
@@ -1962,6 +1962,38 @@ export async function startCortex(
  * the boundary; production callers see the typed return signature.
  */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unnecessary-type-assertion */
+/**
+ * cortex#338 — resolve the JetStreamManager-shaped provisioning
+ * capability needed by the review-stream + per-agent durable boot
+ * wiring. Returns `null` when the runtime is dormant (no NATS / connect
+ * failed / runtime stub omits the helper / the JSM resolution itself
+ * throws). Logging the resolution failure here keeps the boot path
+ * survives-provisioning-failure contract intact — the inner
+ * `provisionReviewStream` + `provisionReviewConsumer` try/catches alone
+ * can't catch a throw from `runtime.jetstreamManager()` itself.
+ *
+ * Extracted from `startCortex` so the resolution surface stays a single
+ * place to read on review and a single place to test going forward
+ * (per sage review on #338 round 2 — Maintainability).
+ */
+async function resolveReviewProvisioningJsm(
+  runtime: MyelinRuntime,
+  reviewCapableAgents: readonly Agent[],
+): Promise<import("./bus/jetstream/provision").ProvisionJsm | null> {
+  if (reviewCapableAgents.length === 0 || !runtime.jetstreamManager) {
+    return null;
+  }
+  try {
+    return await runtime.jetstreamManager();
+  } catch (err) {
+    process.stderr.write(
+      `cortex: jetstreamManager() resolution failed — review provisioning skipped: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    return null;
+  }
+}
+
 async function setupDashboard(
   config: BotConfig,
   dispatchHandler: DispatchHandler,
