@@ -115,20 +115,27 @@ export interface MyelinRuntime {
    */
   subscribePull?(opts: MyelinSubscribePullOpts): MyelinSubscriber | null;
   /**
-   * Resolve the JetStreamManager for the underlying link, or `null` when
-   * the runtime is disabled (no NATS configured or connect failed).
+   * Resolve a narrow provisioning capability against the underlying
+   * link, or `null` when the runtime is disabled (no NATS configured
+   * or connect failed).
    *
    * Used by the boot path to provision streams + per-agent durables
-   * (cortex#338) before `ReviewConsumer.start` binds to them. Like
-   * `subscribePull`, this is OPTIONAL on the interface so existing
-   * fake-runtime stubs in tests stay byte-identical until each test
-   * file opts in.
+   * (cortex#338) before `ReviewConsumer.start` binds to them. The
+   * return type is the narrow `ProvisionJsm` interface (subset of
+   * nats.js's `JetStreamManager` we actually use) rather than the
+   * concrete manager — the runtime stays decoupled from nats.js's
+   * full surface, and tests can pass a stub satisfying the same
+   * narrow shape (sage review on #338 → architecture).
+   *
+   * Like `subscribePull`, this is OPTIONAL on the interface so
+   * existing fake-runtime stubs in tests stay byte-identical until
+   * each test file opts in.
    *
    * Returns a Promise to match nats.js's `nc.jetstreamManager()`
    * shape — the first call does a server round-trip; subsequent calls
    * are cached.
    */
-  jetstreamManager?(): Promise<import("nats").JetStreamManager | null>;
+  jetstreamManager?(): Promise<import("../jetstream/provision").ProvisionJsm | null>;
   /** Best-effort shutdown — drains subscribers, closes the link. */
   stop(): Promise<void>;
 }

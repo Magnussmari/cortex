@@ -139,7 +139,20 @@ export async function provisionReviewStream(
   await opts.jsm.streams.add({
     name: opts.name,
     subjects: [...opts.subjects],
-    retention: RetentionPolicy.Workqueue,
+    // `Interest` retention (not Workqueue): JetStream keeps a message
+    // only while at least one consumer has unacked interest in it.
+    // Workqueue would block the per-agent-durable model — each new
+    // unfiltered durable on the same subject space conflicts with the
+    // first under Workqueue semantics. Interest lets sage / fern /
+    // future reviewers each maintain their own durable on the same
+    // stream without provisioning collisions. Competing-consumer
+    // semantics (one of N agents claims a given task) are layered at
+    // the consumer level by sharing a durable name; cortex#237's
+    // current per-agent durable model is fan-out per agent, which is
+    // the intended shape for sage#43 + fern routing (each agent sees
+    // every task it claims a capability for, then the routing layer
+    // decides via the cortex.yaml `provided_by` table).
+    retention: RetentionPolicy.Interest,
     storage: StorageType.File,
     max_age: maxAgeNs,
     max_msgs: -1,
@@ -147,7 +160,7 @@ export async function provisionReviewStream(
     num_replicas: 1,
   });
   log.info(
-    `jetstream-provision: created stream "${opts.name}" (subjects=[${opts.subjects.join(", ")}], retention=workqueue, max_age=${Math.round(maxAgeNs / 1_000_000_000)}s)`,
+    `jetstream-provision: created stream "${opts.name}" (subjects=[${opts.subjects.join(", ")}], retention=interest, max_age=${Math.round(maxAgeNs / 1_000_000_000)}s)`,
   );
   return "created";
 }

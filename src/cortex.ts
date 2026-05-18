@@ -749,41 +749,47 @@ export async function startCortex(
   const reviewSubjectPattern = `local.${reviewOperatorId}.${derivedStack.stack}.tasks.code-review.>`;
   const reviewStream = "CODE_REVIEW";
 
+  // cortex#338 — resolve the provisioning JSM once. Reused by the
+  // up-front stream provisioning AND the per-agent durable
+  // provisioning inside the loop below. `null` means the runtime is
+  // dormant (no NATS configured / connect failed / runtime stub
+  // omits jetstreamManager); provisioning is skipped in that case
+  // and the consumer loop also stays dormant.
+  const reviewJsm =
+    reviewCapableAgents.length > 0 && runtime.jetstreamManager
+      ? await runtime.jetstreamManager()
+      : null;
+
   // cortex#338 — provision the CODE_REVIEW stream up-front so the
   // per-agent `ReviewConsumer.start` calls below can bind without
   // hitting "stream not found" against a virgin broker. Idempotent —
-  // safe across restarts. Skipped when the runtime is dormant (no NATS
-  // configured / connect failed); the consumer loop also stays dormant
-  // in that case.
-  if (reviewCapableAgents.length > 0 && runtime.jetstreamManager) {
-    const jsm = await runtime.jetstreamManager();
-    if (jsm !== null) {
-      try {
-        const outcome = await provisionReviewStream({
-          jsm,
-          name: reviewStream,
-          subjects: [reviewSubjectPattern],
-        });
-        if (outcome === "created") {
-          console.log(
-            `cortex: provisioned JetStream stream "${reviewStream}" (subjects=[${reviewSubjectPattern}])`,
-          );
-        } else if (outcome === "exists") {
-          console.log(
-            `cortex: JetStream stream "${reviewStream}" already present — binding existing config`,
-          );
-        }
-        // config-drift-warning is already logged by the helper.
-      } catch (err) {
-        // A provisioning failure does NOT abort boot — siblings still
-        // wire, and the per-agent `consumer.start()` below will surface
-        // the binding failure via its existing try/catch + stderr line.
-        // We log here so operators see provisioning was even attempted.
-        process.stderr.write(
-          `cortex: provisionReviewStream failed for "${reviewStream}": ` +
-            `${err instanceof Error ? err.message : String(err)}\n`,
+  // safe across restarts.
+  if (reviewJsm !== null) {
+    try {
+      const outcome = await provisionReviewStream({
+        jsm: reviewJsm,
+        name: reviewStream,
+        subjects: [reviewSubjectPattern],
+      });
+      if (outcome === "created") {
+        console.log(
+          `cortex: provisioned JetStream stream "${reviewStream}" (subjects=[${reviewSubjectPattern}])`,
+        );
+      } else if (outcome === "exists") {
+        console.log(
+          `cortex: JetStream stream "${reviewStream}" already present — binding existing config`,
         );
       }
+      // config-drift-warning is already logged by the helper.
+    } catch (err) {
+      // A provisioning failure does NOT abort boot — siblings still
+      // wire, and the per-agent `consumer.start()` below will surface
+      // the binding failure via its existing try/catch + stderr line.
+      // We log here so operators see provisioning was even attempted.
+      process.stderr.write(
+        `cortex: provisionReviewStream failed for "${reviewStream}": ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+      );
     }
   }
 
@@ -901,33 +907,31 @@ export async function startCortex(
 
       // cortex#338 — provision the per-agent durable consumer up-front
       // so `consumer.start()` below binds successfully against a virgin
-      // broker. Idempotent — safe across restarts. Skipped when JSM
-      // isn't available (runtime dormant / no NATS configured); the
-      // subsequent `consumer.start()` will then stay dormant too.
-      if (runtime.jetstreamManager) {
-        const jsm = await runtime.jetstreamManager();
-        if (jsm !== null) {
-          try {
-            const outcome = await provisionReviewConsumer({
-              jsm,
-              stream: reviewStream,
-              durable,
-            });
-            if (outcome === "created") {
-              console.log(
-                `cortex: provisioned JetStream durable "${durable}" on stream "${reviewStream}"`,
-              );
-            }
-          } catch (provisionErr) {
-            // Don't abort — let consumer.start surface the bind failure
-            // through its own error path so the operator sees the same
-            // stderr shape they'd see if the consumer existed but bind
-            // failed for another reason.
-            process.stderr.write(
-              `cortex: provisionReviewConsumer failed for "${durable}": ` +
-                `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+      // broker. Reuses `reviewJsm` resolved once before this loop.
+      // Idempotent — safe across restarts. Skipped when JSM isn't
+      // available (runtime dormant); the subsequent `consumer.start()`
+      // will then stay dormant too.
+      if (reviewJsm !== null) {
+        try {
+          const outcome = await provisionReviewConsumer({
+            jsm: reviewJsm,
+            stream: reviewStream,
+            durable,
+          });
+          if (outcome === "created") {
+            console.log(
+              `cortex: provisioned JetStream durable "${durable}" on stream "${reviewStream}"`,
             );
           }
+        } catch (provisionErr) {
+          // Don't abort — let consumer.start surface the bind failure
+          // through its own error path so the operator sees the same
+          // stderr shape they'd see if the consumer existed but bind
+          // failed for another reason.
+          process.stderr.write(
+            `cortex: provisionReviewConsumer failed for "${durable}": ` +
+              `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+          );
         }
       }
 

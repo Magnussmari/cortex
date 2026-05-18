@@ -198,7 +198,7 @@ describe("provisionReviewStream", () => {
     const cfg = state.streamAddCalls[0]!;
     expect(cfg.name).toBe("CODE_REVIEW");
     expect(cfg.subjects).toEqual(["local.jc.default.tasks.code-review.>"]);
-    expect(String(cfg.retention)).toBe("workqueue");
+    expect(String(cfg.retention)).toBe("interest");
     expect(String(cfg.storage)).toBe("file");
     expect(cfg.max_age).toBe(24 * 3600 * 1e9);
   });
