@@ -166,28 +166,49 @@ describe("MyelinRuntime", () => {
     await runtime.stop();
   });
 
-  test("cortex#88 item 6: emits info (not warn) when nats.url set but subjects empty", async () => {
-    // The publish-only case (typical cortex deployment today). Returning
-    // `enabled: false` is preserved — only the log level changes — so
-    // callers gated on `runtime.enabled` continue to behave identically.
+  test("cortex#337 — connects + enables runtime when nats.url set even if subjects empty (pull-only mode)", async () => {
+    // Pre-#337 cortex.yaml's default `nats.subjects: []` returned a
+    // fully-disabled runtime, including a no-op `subscribePull` — so the
+    // bus dispatch path was structurally non-functional even on installs
+    // that DID configure NATS. With #337 the runtime treats empty
+    // `subjects` as "pull-only / publish-only mode": open the link, skip
+    // push-mode subscribers, expose a live `subscribePull` and `publish`.
+    const fake = makeFakeNatsConnection();
     const config = makeConfig({
       url: "nats://localhost:4222",
       name: "grove-bot",
       subjects: [],
     });
-    const runtime = await startMyelinRuntime(config);
-    expect(runtime.enabled).toBe(false);
+    const runtime = await startMyelinRuntime(config, {
+      connectImpl: async () => fake.nc,
+    });
+    // Runtime is now ENABLED (the inverted invariant of the pre-#337
+    // test). Callers gated on `runtime.enabled` to skip publish should
+    // now see publish flow through.
+    expect(runtime.enabled).toBe(true);
+    // No push-mode subscribers started — the empty subjects list means
+    // nothing to subscribe to broadly.
+    expect(fake.subscribePatterns).toEqual([]);
+    // The info log shape is preserved for log shippers that already
+    // grep on the "no push subscribers" signal, but the wording is
+    // updated to say "pull-only mode" so operators no longer read it
+    // as "everything is disabled".
+    const informed = logs.some(
+      (l) => l.kind === "info" && l.msg.includes("pull-only mode"),
+    );
+    expect(informed).toBe(true);
     const warned = logs.some(
       (l) => l.kind === "warn" && l.msg.includes("subjects"),
     );
     expect(warned).toBe(false);
-    const informed = logs.some(
-      (l) =>
-        l.kind === "info" &&
-        l.msg.includes("nats.subjects empty") &&
-        l.msg.includes("no subscriptions started"),
-    );
-    expect(informed).toBe(true);
+
+    // Anti-criterion: subscribePull MUST be a real wired helper now
+    // (not the subscribePullDisabled no-op). The exact return value is
+    // a MyelinSubscriber stub when the fake NATS connection accepts
+    // the pull bind; the shape contract is "non-null helper present".
+    expect(typeof runtime.subscribePull).toBe("function");
+
+    await runtime.stop();
   });
 
   test("returns disabled when NATS connect fails (logs error, doesn't throw)", async () => {
