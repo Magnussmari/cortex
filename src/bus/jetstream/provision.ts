@@ -89,6 +89,18 @@ export interface ProvisionStreamOpts {
    */
   maxAgeNs?: number;
   /**
+   * Stream `max_bytes` cap. Default 512 MiB. Live deployment of #338
+   * surfaced that NATS servers running with an account-level storage
+   * reservation cap reject `max_bytes: -1` (unlimited) with
+   * "insufficient storage resources available" even when raw disk is
+   * abundant. The 512 MiB default matches sibling stream sizing on
+   * JC's laptop (GROVE_EVENTS) and is large enough to absorb ~100k
+   * typical review-task envelopes; operators can override via
+   * `cortex.yaml` `bus.review.maxBytes` once that surface lands
+   * (G-1111e / #341).
+   */
+  maxBytes?: number;
+  /**
    * Optional logger. Defaults to `console`. Surfacing this lets tests
    * pin the boot-log shape and lets future deployments swap in a
    * structured logger.
@@ -116,6 +128,7 @@ export interface ProvisionConsumerOpts {
 }
 
 const DEFAULT_MAX_AGE_NS = 24 * 3600 * 1_000_000_000;
+const DEFAULT_MAX_BYTES = 512 * 1024 * 1024;
 const DEFAULT_MAX_DELIVER = 5;
 
 /**
@@ -128,6 +141,7 @@ export async function provisionReviewStream(
 ): Promise<ProvisionStreamOutcome> {
   const log = opts.log ?? console;
   const maxAgeNs = opts.maxAgeNs ?? DEFAULT_MAX_AGE_NS;
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
 
   let existing: StreamInfo | null = null;
   try {
@@ -173,11 +187,11 @@ export async function provisionReviewStream(
     storage: StorageType.File,
     max_age: maxAgeNs,
     max_msgs: -1,
-    max_bytes: -1,
+    max_bytes: maxBytes,
     num_replicas: 1,
   });
   log.info(
-    `jetstream-provision: created stream "${opts.name}" (subjects=[${opts.subjects.join(", ")}], retention=interest, max_age=${Math.round(maxAgeNs / 1_000_000_000)}s)`,
+    `jetstream-provision: created stream "${opts.name}" (subjects=[${opts.subjects.join(", ")}], retention=interest, max_age=${Math.round(maxAgeNs / 1_000_000_000)}s, max_bytes=${Math.round(maxBytes / 1024 / 1024)}MiB)`,
   );
   return "created";
 }
