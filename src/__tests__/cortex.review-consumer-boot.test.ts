@@ -445,4 +445,90 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
     await handle.stop();
     rmSync(tmpAgentsDir, { recursive: true, force: true });
   });
+
+  test("cortex#334 — dormant subscribePull → boot logs DORMANT, not ready", async () => {
+    // The disabled-runtime case: `MyelinRuntime.subscribePull` returns
+    // null when `cortex.yaml nats.subjects: []` (the default today)
+    // and the consumer stays dormant. Pre-#334 the boot path logged
+    // "review consumer ready" unconditionally, misleading operators
+    // into thinking the bus path was live. The fix branches the log
+    // line on `started.subscribed`.
+    //
+    // Test stands up a runtime whose `subscribePull` returns null
+    // synchronously — same shape as the production disabled path —
+    // and asserts the boot log carries DORMANT plus the actionable
+    // G-1111 hint, NOT the ready line.
+    const onEnvelopeHandlers = new Set<EnvelopeHandler>();
+    const published: Envelope[] = [];
+    const subscribePullCalls: MyelinSubscribePullOpts[] = [];
+    const dormantRuntime: RecordingRuntime = {
+      enabled: false,
+      onEnvelopeHandlers,
+      published,
+      subscribePullCalls,
+      onEnvelope(handler) {
+        onEnvelopeHandlers.add(handler);
+        return {
+          unregister: () => {
+            onEnvelopeHandlers.delete(handler);
+          },
+        };
+      },
+      publish: async (envelope: Envelope) => {
+        published.push(envelope);
+      },
+      subscribePull: (opts: MyelinSubscribePullOpts) => {
+        // Record the invocation so the test can still verify the boot
+        // path WOULD have subscribed if the runtime were live.
+        subscribePullCalls.push(opts);
+        // Mirror the production dormant path: hand null back. The
+        // `MyelinRuntime` interface widens `subscribePull` to
+        // `... => MyelinSubscriber | null` for exactly this case.
+        return null as unknown as MyelinSubscriber;
+      },
+      stop: async () => {},
+    };
+
+    const tmpAgentsDir = mkdtempSync(join(tmpdir(), "cortex-revboot-dormant-"));
+    const inlineAgents: Agent[] = [
+      makeAgent("sage", ["code-review.typescript"]),
+    ];
+
+    const { result: handle, logs } = await withCapturedConsoleLog(() =>
+      startCortex(minimalConfig(), {
+        disableConfigWatcher: true,
+        disableDashboard: true,
+        disableOutboundPoller: true,
+        agentsDir: tmpAgentsDir,
+        injectRuntime: dormantRuntime,
+        inlineAgents,
+      }),
+    );
+
+    const dormantLines = logs.filter((l) =>
+      l.includes("cortex: review consumer DORMANT"),
+    );
+    expect(dormantLines.length).toBe(1);
+    expect(dormantLines[0]!).toContain("agent=sage");
+    expect(dormantLines[0]!).toContain("flavors=[typescript]");
+    expect(dormantLines[0]!).toContain("G-1111 pending");
+    expect(dormantLines[0]!).toContain(
+      "tasks.code-review.* envelopes will not be claimed by this consumer",
+    );
+
+    // Anti-criterion: the misleading "ready" line MUST NOT appear for
+    // the dormant case. This is the regression guard.
+    const readyLines = logs.filter((l) =>
+      l.includes("cortex: review consumer ready"),
+    );
+    expect(readyLines.length).toBe(0);
+
+    // `subscribePull` was still invoked exactly once — the consumer
+    // attempted the subscription, the runtime declined. Logging
+    // changes don't alter the control flow.
+    expect(dormantRuntime.subscribePullCalls.length).toBe(1);
+
+    await handle.stop();
+    rmSync(tmpAgentsDir, { recursive: true, force: true });
+  });
 });
