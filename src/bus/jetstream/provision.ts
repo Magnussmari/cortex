@@ -49,7 +49,32 @@ import type { ConsumerConfig, StreamInfo } from "nats";
 export type { ProvisionJsm } from "./types";
 import type { ProvisionJsm } from "./types";
 
-export type ProvisionOutcome = "created" | "exists" | "config-drift-warning";
+/**
+ * Outcome of `provisionReviewStream`. Includes `config-drift-warning`
+ * for the case where the live stream exists but its config differs
+ * from what we'd create — see `describeStreamDrift`. Consumer
+ * provisioning has no analogous drift surface in v1, so its outcome
+ * is the narrower `ProvisionConsumerOutcome`.
+ */
+export type ProvisionStreamOutcome = "created" | "exists" | "config-drift-warning";
+
+/**
+ * Outcome of `provisionReviewConsumer`. Narrower than the stream
+ * outcome by design — v1 doesn't drift-check consumer configs (the
+ * surface is small enough that operators rarely tune it; the
+ * subtler-than-stream drift modes are best surfaced when an operator
+ * hits one).
+ */
+export type ProvisionConsumerOutcome = "created" | "exists";
+
+/**
+ * @deprecated Use `ProvisionStreamOutcome` or `ProvisionConsumerOutcome`
+ * — the union here is wider than either helper actually returns and
+ * forces callers to handle impossible cases (sage review on #338
+ * round 4 — Maintainability). Kept as a transitional alias; remove
+ * once no internal callers reference it.
+ */
+export type ProvisionOutcome = ProvisionStreamOutcome;
 
 export interface ProvisionStreamOpts {
   jsm: ProvisionJsm;
@@ -100,7 +125,7 @@ const DEFAULT_MAX_DELIVER = 5;
  */
 export async function provisionReviewStream(
   opts: ProvisionStreamOpts,
-): Promise<ProvisionOutcome> {
+): Promise<ProvisionStreamOutcome> {
   const log = opts.log ?? console;
   const maxAgeNs = opts.maxAgeNs ?? DEFAULT_MAX_AGE_NS;
 
@@ -163,7 +188,7 @@ export async function provisionReviewStream(
  */
 export async function provisionReviewConsumer(
   opts: ProvisionConsumerOpts,
-): Promise<ProvisionOutcome> {
+): Promise<ProvisionConsumerOutcome> {
   const log = opts.log ?? console;
   const maxDeliver = opts.maxDeliver ?? DEFAULT_MAX_DELIVER;
 
