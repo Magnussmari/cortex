@@ -86,8 +86,6 @@ import type { Envelope } from "../../bus/myelin/envelope-validator";
 import {
   createReviewTaskFailedEvent,
   createReviewVerdictEvent,
-  type ReviewEventSource,
-  type ReviewRequestPayload,
 } from "../../bus/review-events";
 import type {
   ReviewPipelineOpts,
@@ -201,7 +199,7 @@ export function makePiDevPipelineRunner(
     // Coerce the payload — review-consumer already validated the shape
     // before handing it to the pipeline runner, but the type on
     // `Envelope.payload` is `unknown` so we narrow once here.
-    const payload = pipeline.payload as ReviewRequestPayload;
+    const payload = pipeline.payload;
 
     // Resolve the sage binary. Priority: explicit > env > $PATH.
     const sageBin =
@@ -291,8 +289,8 @@ function defaultSpawn(
     stderr: opts.stderr,
   });
   return {
-    stdout: proc.stdout as ReadableStream<Uint8Array>,
-    stderr: proc.stderr as ReadableStream<Uint8Array>,
+    stdout: proc.stdout,
+    stderr: proc.stderr,
     exited: proc.exited,
   };
 }
@@ -314,7 +312,7 @@ function failed(
   startedAt: Date,
   errorSummary: string,
 ): ReviewPipelineResult {
-  const source = pipeline.source as ReviewEventSource;
+  const source = pipeline.source;
   const envelope = createReviewTaskFailedEvent({
     source,
     taskId: crypto.randomUUID(),
@@ -339,8 +337,8 @@ function verdict(
   correlationId: string,
   stdout: string,
 ): ReviewPipelineResult {
-  const payload = pipeline.payload as ReviewRequestPayload;
-  const source = pipeline.source as ReviewEventSource;
+  const payload = pipeline.payload;
+  const source = pipeline.source;
   const envelope: Envelope = createReviewVerdictEvent({
     source,
     kind: "commented",

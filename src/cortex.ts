@@ -827,7 +827,7 @@ export async function startCortex(
       // "crypto_verify_failed", etc.) so the structured stderr line
       // landed in #329 carries the rejection class verbatim. The full
       // myelin-side detail is logged separately by the trust resolver.
-      const agentTrustList = agent.trust ?? [];
+      const agentTrustList = agent.trust;
       const verifyOperatorId = reviewOperatorId;
       const signatureVerifier: SignatureVerifier | undefined =
         agentTrustList.length === 0

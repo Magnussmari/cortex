@@ -54,7 +54,7 @@ function makeJsm(opts: {
         return opts.existingStream;
       },
       add: async (cfg) => {
-        state.streamAddCalls.push(cfg as Partial<StreamInfo["config"]>);
+        state.streamAddCalls.push(cfg);
         return { config: cfg } as unknown as StreamInfo;
       },
     },
@@ -71,7 +71,7 @@ function makeJsm(opts: {
         return opts.existingConsumer;
       },
       add: async (stream, cfg) => {
-        state.consumerAddCalls.push({ stream, cfg: cfg as Record<string, unknown> });
+        state.consumerAddCalls.push({ stream, cfg });
         return { name: cfg.durable_name } as unknown as ConsumerInfo;
       },
     },

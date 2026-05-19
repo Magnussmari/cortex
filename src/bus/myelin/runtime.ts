@@ -658,9 +658,7 @@ export async function startMyelinRuntime(
   // server round-trip per per-agent provisioning call.
   let jsmCache: Promise<import("nats").JetStreamManager> | null = null;
   const jetstreamManagerEnabled = (): Promise<import("nats").JetStreamManager> => {
-    if (jsmCache === null) {
-      jsmCache = link.raw.jetstreamManager();
-    }
+    jsmCache ??= link.raw.jetstreamManager();
     return jsmCache;
   };
 

@@ -252,7 +252,7 @@ export function isNotFoundError(err: unknown): boolean {
     .api_error;
   const code = apiError?.err_code ?? apiError?.code;
   if (code === 10059 || code === 10014 || code === 404) return true;
-  const msg = err instanceof Error ? err.message : String(err);
+  const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "";
   return /not found|no.*stream.*matched|404/i.test(msg);
 }
 
@@ -272,7 +272,7 @@ export function describeStreamDrift(
   expectedMaxAgeNs: number,
 ): string | null {
   const cfg = existing.config;
-  const actualSubjects = cfg.subjects ?? [];
+  const actualSubjects = cfg.subjects;
   // JetStream stream subjects are semantically a set — order on the
   // wire is implementation-detail. Compare as sets so a re-ordered live
   // config doesn't false-warn on every boot (sage review on #338
@@ -287,7 +287,7 @@ export function describeStreamDrift(
   }
   // Allow ±1s slack on max_age to absorb floating-point round-trips
   // through the wire JSON.
-  if (Math.abs((cfg.max_age ?? 0) - expectedMaxAgeNs) > 1_000_000_000) {
+  if (Math.abs(cfg.max_age - expectedMaxAgeNs) > 1_000_000_000) {
     return `max_age differs (expected ${expectedMaxAgeNs}ns, got ${cfg.max_age}ns)`;
   }
   return null;

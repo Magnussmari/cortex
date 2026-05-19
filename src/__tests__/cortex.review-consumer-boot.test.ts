@@ -484,7 +484,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
         // Mirror the production dormant path: hand null back. The
         // `MyelinRuntime` interface widens `subscribePull` to
         // `... => MyelinSubscriber | null` for exactly this case.
-        return null as unknown as MyelinSubscriber;
+        return null;
       },
       stop: async () => {},
     };

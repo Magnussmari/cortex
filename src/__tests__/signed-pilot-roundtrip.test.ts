@@ -225,7 +225,7 @@ describe("Thread C — signed pilot-shape envelope round-trip (P-VERIFY)", () =>
     const tampered: Envelope = {
       ...signed,
       payload: {
-        ...(signed.payload as Record<string, unknown>),
+        ...signed.payload,
         pr: 9999,
       },
     };
