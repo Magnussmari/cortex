@@ -252,6 +252,28 @@ Mission Control concepts:
 The UI should use provider-native labels when they help the operator, but the
 core model should not fork by provider.
 
+### 5.1 GitHub Abstraction Is In Scope
+
+Cortex currently has real GitHub-specific implementation: webhook ingestion,
+issue/PR import, GitHub URL parsing, `github.repos` config, GitHub event
+envelopes, and dashboard inbox paths that assume `source=github`.
+
+This design treats that as implementation history, not as the target Mission
+Control model. Abstracting GitHub into provider-neutral Mission Control concepts
+is in scope for this cockpit line of work.
+
+The rule:
+
+- keep Git-native concepts concrete: repository, branch, commit, tag, release,
+  pull request, review, check, build, deployment, artifact
+- abstract the provider layer: GitHub, GitLab, Azure DevOps, Bitbucket, custom
+- preserve provider-native display labels where useful
+- keep existing GitHub behavior working while moving it behind normalized
+  source/work-item/Git-object boundaries
+
+In other words, GitHub becomes the first provider adapter for the new model, not
+the model itself.
+
 ## 6. Proposed Domain Model
 
 Illustrative TypeScript shape:
@@ -475,10 +497,6 @@ Current Cortex Mission Control already has:
 - metrics
 - GitHub-specific issue/PR ingestion pieces
 
-The next cycle should not throw this away. It should re-ground the vocabulary
-and gradually replace provider-specific assumptions with provider-neutral
-source refs plus first-class Git/software objects.
-
 Known drift to resolve:
 
 - docs still refer to `src/mission-control` even though Cortex uses
@@ -488,6 +506,50 @@ Known drift to resolve:
 - GitHub parser/fetch code is provider-specific
 - inbox views assume `source=github`
 
+### 9.1 Current UI Findings
+
+The existing React UI has useful structure:
+
+- `App` owns the top-level tabs: default execution view, metrics, iterations,
+  and iteration detail.
+- The default view already gives the operator execution visibility through
+  `FocusArea`, `WorkingGrid`, and `TaskTable`.
+- The drill-down overlay already gives a session/assignment attention surface:
+  `DrillHeader`, `DrillLog`, `CurationToolbar`, and `DrillInput`.
+- The iterations view already has a kanban board plus a full-page detail view.
+- The task table already supports dispatch and links tasks to iteration detail.
+- The hook/test layout is relatively modular: data hooks, pure display helpers,
+  and component tests already exist under `dashboard-v2/`.
+
+The existing UI gaps are equally clear:
+
+- "Iteration" is currently a kanban/task wrapper, not the plan-lineage object
+  described in this document.
+- There is no top-level plan/program view that rolls up phases/waves, work
+  items, pull requests, branches, checks, releases, sessions, and attention.
+- GitHub-specific source assumptions leak into the task/inbox flow.
+- Git objects are not first-class UI/model concepts yet. Branches, pull
+  requests, checks, releases, and deployments appear only indirectly or through
+  provider-specific paths.
+- The dashboard still carries Grove-era language in comments and docs.
+
+### 9.2 Response To Findings
+
+The next cycle should preserve the current surfaces and evolve them:
+
+- Keep `FocusArea`, `WorkingGrid`, `TaskTable`, and `DrillDown` as the
+  execution cockpit foundation.
+- Recast the existing `Iterations` tab into a broader `Plans` or `Work Plans`
+  surface rather than adding plan lineage to the task table.
+- Treat the current iteration board/detail as a candidate implementation
+  substrate for plan phases/waves, not as the final information architecture.
+- Add provider-neutral source refs and first-class Git objects behind the UI
+  before adding new visual affordances that depend on them.
+- Keep GitHub working as the first provider while moving GitHub parsing/fetching
+  behind provider adapter boundaries.
+- Rename or annotate Grove-era comments/docs only when they mislead current
+  Cortex work; avoid noisy historical churn.
+
 ## 10. First Implementation Slices
 
 ### Slice 1 — Grounding PR
@@ -496,6 +558,7 @@ Known drift to resolve:
 - Fix dashboard build/watch script paths.
 - Mark lifted Grove v2 docs as historical/source material where needed.
 - Add a short glossary in the docs index or Mission Control design area.
+- Record the current UI findings from §9.1 as the baseline for follow-up work.
 
 ### Slice 2 — Provider-Neutral Source Refs
 
@@ -503,6 +566,8 @@ Known drift to resolve:
 - Add normalized source ref helpers.
 - Keep GitHub behavior working.
 - Add tests with GitHub, GitLab, Azure DevOps, Jira, and internal examples.
+- Move GitHub-specific parsing/fetching behind adapter-shaped boundaries where
+  the Mission Control model consumes normalized source refs.
 
 ### Slice 3 — Software Mode Model
 
@@ -510,12 +575,16 @@ Known drift to resolve:
   release, pull request, review, check/build, deployment, and artifact.
 - Map existing GitHub data into the new model.
 - Preserve provider-native display labels.
+- Ensure branch is represented explicitly as a Git object, because feature
+  branches are central to Compass worktree and pull-request workflow.
 
 ### Slice 4 — Plan Lineage UI
 
 - Add a plan overview surface.
 - Roll up phase/work-item/pull-request/session state.
 - Link existing iteration board concepts into the new plan model.
+- Decide whether the existing `Iterations` tab becomes `Plans` directly or
+  remains a compatibility view while the new plan surface lands beside it.
 
 ### Slice 5 — Attention And Notifications
 
@@ -538,4 +607,3 @@ Known drift to resolve:
    write back status changes to provider work items?
 7. Which events should be sourced from Myelin envelopes versus direct provider
    API/tap ingestion?
-
