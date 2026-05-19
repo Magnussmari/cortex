@@ -370,3 +370,87 @@ features:
       Pilot bus/legacy + mention-dispatch + Discord retirement, concluding
       with pilot v1.0.0. Sub-features on pilot:P-D1..P-D4.
     depends_on: [W3-CUTOVER]
+
+  G-1113:
+    name: Mission Control Cortex Cockpit (umbrella)
+    status: in-progress
+    description: >
+      Re-ground Mission Control as the operator cockpit for a Cortex stack.
+      Provider-neutral source refs, first-class Git objects, plan lineage UI,
+      attention queue. See docs/design-mission-control-cortex-cockpit.md and
+      docs/plan-mission-control-cockpit.md.
+    children: [G-1113.A, G-1113.B, G-1113.C, G-1113.D, G-1113.E]
+
+  G-1113.A:
+    name: Phase A — Grounding
+    status: planned
+    description: >
+      Land plan + design doc on main, fix dashboard build-script path drift,
+      add Mission Control glossary, annotate genuinely-misleading lifted
+      grove-v2 design docs as historical. Sub-features filed pre-emptively
+      because Phase A is a single PR.
+    parent: G-1113
+    children: [G-1113.A.1]
+
+  G-1113.A.1:
+    name: Grounding PR — plan + design + script-fix + glossary + historical banners
+    status: planned
+    description: >
+      Single PR landing docs/plan-mission-control-cockpit.md (already drafted),
+      fixing package.json build:dashboard + watch:dashboard paths from
+      src/mission-control/dashboard-v2 to src/surface/mc/dashboard-v2, adding
+      docs/glossary-mission-control.md, and applying a standard "Historical —
+      lifted from grove-v2" banner to ~12 lifted MC design docs.
+    parent: G-1113.A
+
+  G-1113.B:
+    name: Phase B — Provider-Neutral Source Refs
+    status: planned
+    description: >
+      Introduce normalized SourceRef model + Provider enum
+      (internal/github/gitlab/azure-devops/jira/linear/bitbucket/custom).
+      Move GitHub URL parsing + webhook ingestion + REST fetch behind an
+      adapters/github/ boundary. Keep existing GitHub behavior working. No
+      new providers wired; fixture-only tests for GitLab/Azure DevOps/Jira/
+      internal. Sub-features G-1113.B.{1..4} filed at phase start.
+    parent: G-1113
+    depends_on: [G-1113.A]
+
+  G-1113.C:
+    name: Phase C — Software Mode Domain Model
+    status: planned
+    description: >
+      First-class Git object types in the model layer: repository, branch,
+      commit, tag, release, pull request, review, check/build, deployment,
+      artifact. Provider-native labels preserved via providerNativeType.
+      GitHub adapter populates the model from existing webhook + REST data.
+      Software-mode UI flag gates the new Git-object rows. Sub-features
+      G-1113.C.{1..6} filed at phase start.
+    parent: G-1113
+    depends_on: [G-1113.B]
+
+  G-1113.D:
+    name: Phase D — Plan Lineage UI
+    status: planned
+    description: >
+      Plan + PlanPhase types and storage. Plan ingestion parses repo-local
+      plan/iteration markdown into Plan rows. Plan overview surface rolls up
+      phase, work item, PR, session, and attention state. Recasts the existing
+      Iterations tab (compatibility kanban retained until parity).
+      Sub-features G-1113.D.{1..6} filed at phase start. Benefits from C but
+      blocks on B only for the model layer.
+    parent: G-1113
+    depends_on: [G-1113.B]
+
+  G-1113.E:
+    name: Phase E — Attention + Notifications
+    status: planned
+    description: >
+      One attention queue across plans, phases, work items, PRs, sessions.
+      AttentionItem type + storage + lifecycle. Wires sources: blocked
+      sessions, permission requests, review checkpoints, failed dispatches,
+      failing checks, stale work. Notification routing via system.attention.*
+      envelopes rendered by Discord/Slack/Mattermost adapters. Sub-features
+      G-1113.E.{1..4} filed at phase start.
+    parent: G-1113
+    depends_on: [G-1113.C, G-1113.D]
