@@ -14,6 +14,7 @@ import {
   AgentSchema,
   CortexConfigSchema,
   type Agent,
+  type BusConfig,
   type CortexConfig,
   type DiscordPresence,
   type MattermostPresence,
@@ -103,6 +104,12 @@ export interface LoadedConfig {
    * unauthenticated path until C.2b removes it.
    */
   policy?: Policy;
+  /**
+   * Optional bus provisioning block from cortex-shape input. Defaults are
+   * already applied by CortexConfigSchema. Legacy bot.yaml input yields
+   * undefined and the boot path uses hardcoded defaults.
+   */
+  bus?: BusConfig;
 }
 
 /**
@@ -416,6 +423,7 @@ function loadCortexShape(
     // schema layer (PolicySchema.superRefine) has already enforced
     // cross-references + uniqueness, so this is a pure carry-through.
     ...(cortexConfig.policy !== undefined && { policy: cortexConfig.policy }),
+    bus: cortexConfig.bus,
   };
 }
 

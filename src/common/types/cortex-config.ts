@@ -897,6 +897,60 @@ export const NatsConfigSchema = z.object({
 export type NatsConfig = z.infer<typeof NatsConfigSchema>;
 
 // =============================================================================
+// Bus — application-level stream/consumer provisioning
+// =============================================================================
+
+/**
+ * Review-task JetStream provisioning knobs. These tune cortex's
+ * CODE_REVIEW stream + per-agent durable consumers; the MyelinRuntime
+ * connection itself still lives under `nats:`.
+ */
+export const BusReviewConfigSchema = z.object({
+  stream: z.object({
+    /** Stream name that carries tasks.code-review.* envelopes. */
+    name: z.string().min(1).default("CODE_REVIEW"),
+    /** How long unclaimed review-task messages remain in JetStream. */
+    maxAgeSeconds: z
+      .number()
+      .int("bus.review.stream.maxAgeSeconds must be an integer number of seconds")
+      .positive("bus.review.stream.maxAgeSeconds must be positive")
+      .default(86_400),
+    /** Finite storage cap; avoids account-level reservation failures. */
+    maxBytes: z
+      .number()
+      .int("bus.review.stream.maxBytes must be an integer number of bytes")
+      .positive("bus.review.stream.maxBytes must be positive")
+      .default(512 * 1024 * 1024),
+  }).default({
+    name: "CODE_REVIEW",
+    maxAgeSeconds: 86_400,
+    maxBytes: 512 * 1024 * 1024,
+  }),
+  consumer: z.object({
+    /** Delivery attempts before JetStream stops redelivering the task. */
+    maxDeliver: z
+      .number()
+      .int("bus.review.consumer.maxDeliver must be an integer")
+      .positive("bus.review.consumer.maxDeliver must be positive")
+      .default(5),
+  }).default({ maxDeliver: 5 }),
+});
+
+export const BusConfigSchema = z.object({
+  review: BusReviewConfigSchema.default({
+    stream: {
+      name: "CODE_REVIEW",
+      maxAgeSeconds: 86_400,
+      maxBytes: 512 * 1024 * 1024,
+    },
+    consumer: { maxDeliver: 5 },
+  }),
+});
+
+export type BusConfig = z.infer<typeof BusConfigSchema>;
+export type BusReviewConfig = z.infer<typeof BusReviewConfigSchema>;
+
+// =============================================================================
 // Cross-cutting infra blocks — carried forward in same shape as BotConfig
 // =============================================================================
 //
@@ -1892,6 +1946,9 @@ export const CortexConfigSchema = z.object({
 
   /** NATS / myelin subscriber configuration. Optional — bot stays installable without NATS. */
   nats: NatsConfigSchema.optional(),
+
+  /** Application-level bus provisioning knobs. Optional; defaults are production-safe. */
+  bus: emptyDefault(BusConfigSchema),
 }).refine(
   (config) => {
     const ids = config.agents.map((a) => a.id);

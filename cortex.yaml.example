@@ -209,9 +209,9 @@ agents:
         # Bus-side subjects this agent subscribes to via the
         # surface-router. The pattern below routes inbound code-review
         # tasks at the stack level — the segment after `local.` is your
-        # operator id (substitute as you populate the file).
+        # operator id and the next segment is your stack id.
         surfaceSubjects:
-          - local.operator-name.tasks.code-review.>  # <REPLACE_ME>: replace operator-name with your operator.id
+          - local.operator-name.meta-factory.tasks.code-review.>  # <REPLACE_ME>: keep in sync with stack.id
 
 # -----------------------------------------------------------------------------
 # renderers — non-agent-bound surfaces (dashboards, pagerduty, etc.)
@@ -294,6 +294,22 @@ networksDir: ./networks
 networks: []
 
 # -----------------------------------------------------------------------------
+# bus — application-level stream/consumer provisioning
+# -----------------------------------------------------------------------------
+# ReviewConsumer uses NATS/JetStream pull consumers for tasks.code-review.*
+# envelopes. The stream and durable consumers are provisioned at cortex boot
+# when `nats.url` is configured and at least one agent declares code-review.*
+# capabilities.
+bus:
+  review:
+    stream:
+      name: CODE_REVIEW
+      maxAgeSeconds: 86400       # 24h retention for unclaimed review tasks
+      maxBytes: 536870912        # 512 MiB finite cap
+    consumer:
+      maxDeliver: 5              # attempts before JetStream stops redelivery
+
+# -----------------------------------------------------------------------------
 # nats — myelin / NATS configuration (optional — cortex stays installable
 # without NATS; review-consumer-side wiring stays dormant until NATS is
 # configured AND at least one agent declares code-review capabilities).
@@ -302,8 +318,11 @@ networks: []
 # nats:
 #   url: nats://127.0.0.1:4222
 #   name: cortex
+#   # Push-mode broad-pattern subscribers for legacy fan-out. Leave this
+#   # empty for pull-only / capability-dispatch deployments; ReviewConsumer
+#   # binds via JetStream durables configured by `bus.review` above.
 #   subjects:
-#     - local.<REPLACE_ME>.tasks.code-review.>
+#     []
 #   identity:
 #     seedPath: ~/.config/nats/cortex.nk
 #     publicKey: <REPLACE_ME>

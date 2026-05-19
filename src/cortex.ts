@@ -66,6 +66,7 @@ import { createRenderer, type Renderer } from "./renderers";
 import { RendererSchema, deriveStackId } from "./common/types/cortex-config";
 import type {
   Agent,
+  BusConfig,
   DiscordPresence,
   MattermostPresence,
   Policy,
@@ -258,6 +259,14 @@ export interface StartCortexOptions {
    * @internal — not part of the public API; semver does not apply.
    */
   policy?: Policy;
+  /**
+   * cortex-shape `bus:` block. Currently consumed by ReviewConsumer
+   * JetStream provisioning (`bus.review.*`). Legacy bot.yaml deployments
+   * leave this undefined and receive the same defaults as before.
+   *
+   * @internal — not part of the public API; semver does not apply.
+   */
+  bus?: BusConfig;
   /**
    * v2.0.0 cutover (cortex#297) — operator's platform-side ids surfaced
    * from `OperatorSchema` via `LoadedConfig.operator`. Replaces the
@@ -747,7 +756,13 @@ export async function startCortex(
   // Reuses `derivedStack.stack` resolved at boot (line 308) — same source
   // sage's bridge subscription already uses for `local.{org}.{stack}.>`.
   const reviewSubjectPattern = `local.${reviewOperatorId}.${derivedStack.stack}.tasks.code-review.>`;
-  const reviewStream = "CODE_REVIEW";
+  const reviewConfig = options.bus?.review;
+  const reviewStream = reviewConfig?.stream.name ?? "CODE_REVIEW";
+  const reviewStreamMaxAgeNs =
+    (reviewConfig?.stream.maxAgeSeconds ?? 86_400) * 1_000_000_000;
+  const reviewStreamMaxBytes =
+    reviewConfig?.stream.maxBytes ?? 512 * 1024 * 1024;
+  const reviewConsumerMaxDeliver = reviewConfig?.consumer.maxDeliver ?? 5;
 
   // cortex#338 — resolve the provisioning JSM and provision the
   // CODE_REVIEW stream up-front so the per-agent `ReviewConsumer.start`
@@ -770,6 +785,8 @@ export async function startCortex(
         jsm: reviewJsm,
         name: reviewStream,
         subjects: [reviewSubjectPattern],
+        maxAgeNs: reviewStreamMaxAgeNs,
+        maxBytes: reviewStreamMaxBytes,
       });
       if (outcome === "created") {
         console.log(
@@ -917,6 +934,7 @@ export async function startCortex(
             jsm: reviewJsm,
             stream: reviewStream,
             durable,
+            maxDeliver: reviewConsumerMaxDeliver,
           });
           if (outcome === "created") {
             console.log(
@@ -2319,13 +2337,14 @@ if (import.meta.main) {
       // block when the operator declared one — `startCortex` calls
       // `deriveStackId` and logs the resolved stack id. Today this is
       // observational only; emit subjects are unchanged.
-      const { config, inlineAgents, stack, policy, operator } = loadConfigWithAgents(options.config);
+      const { config, inlineAgents, stack, policy, operator, bus } = loadConfigWithAgents(options.config);
       const handle = await startCortex(config, {
         configPath: options.config,
         ...(inlineAgents.length > 0 && { inlineAgents }),
         ...(stack !== undefined && { stack }),
         ...(policy !== undefined && { policy }),
         ...(operator !== undefined && { operator }),
+        ...(bus !== undefined && { bus }),
       });
 
       const shutdown = async () => {

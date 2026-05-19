@@ -394,6 +394,28 @@ describe("MIG-7.2e — cortex-shape detection + transform", () => {
     );
   });
 
+  test("passes bus.review provisioning knobs through with defaults applied", () => {
+    const cfg = minimalCortex();
+    cfg.bus = {
+      review: {
+        stream: {
+          name: "CODE_REVIEW_TEST",
+          maxAgeSeconds: 3_600,
+          maxBytes: 128 * 1024 * 1024,
+        },
+        consumer: {
+          maxDeliver: 3,
+        },
+      },
+    };
+    const path = writeCortexConfig(testDir, cfg);
+    const { bus } = loadConfigWithAgents(path);
+    expect(bus?.review.stream.name).toBe("CODE_REVIEW_TEST");
+    expect(bus?.review.stream.maxAgeSeconds).toBe(3_600);
+    expect(bus?.review.stream.maxBytes).toBe(128 * 1024 * 1024);
+    expect(bus?.review.consumer.maxDeliver).toBe(3);
+  });
+
   test("legacy shape continues to return empty inlineAgents", () => {
     const configPath = writeCentralConfig(testDir, minimalCentral());
     const loaded = loadConfigWithAgents(configPath);
