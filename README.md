@@ -118,6 +118,27 @@ CORTEX_CHANNEL=andreas CORTEX_AGENT_NAME=Andreas claude
 
 (The `cldyo-live` wrapper at `~/.local/bin/` does this for you.)
 
+## Bus Review Path
+
+Cortex owns the code-review bus consumer. Pilot or sage-shaped publishers send
+`tasks.code-review.*` envelopes to `local.{operator}.{stack}.tasks.code-review.*`;
+Cortex claims them through a JetStream durable, runs the configured review
+substrate, and emits `dispatch.task.started`, `review.verdict.*`, and
+`dispatch.task.completed` with `correlation_id` set to the request envelope id.
+
+Operator checks:
+
+```bash
+arc nats provision-streams --network <operator> --agent <agent>
+nats stream info CODE_REVIEW
+nats consumer info CODE_REVIEW cortex-review-consumer-<operator>-<agent>
+```
+
+Use `bus.review` in `cortex.yaml` to tune stream retention/storage and durable
+redelivery. Keep `nats.subjects: []` for pull-only capability dispatch unless
+you also need broad push-mode fan-out. See
+[`docs/sop-bus-review.md`](docs/sop-bus-review.md).
+
 ## Architecture
 
 The canonical architecture spec is
