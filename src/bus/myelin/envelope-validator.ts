@@ -65,8 +65,17 @@ import {
 } from "@the-metafactory/myelin/subjects";
 import schema from "./vendor/envelope.schema.json" with { type: "json" };
 
-/** Pin so future maintainers know which myelin commit the schema was lifted from. */
-export const SCHEMA_SOURCE_COMMIT = "5a0e2619a4af5c91c78f552b88fafd3ad40a227f";
+/**
+ * Pin so future maintainers know which myelin commit the schema was lifted from.
+ *
+ * Upstream issue/PR numbering note: myelin#160 is the design issue for the
+ * envelope `originator` field; myelin#161 is the merged PR. The vendored
+ * schema's description string preserves the `myelin#160:` reference
+ * verbatim (faithful vendoring of upstream wording); all cortex code +
+ * comments + tests use `myelin#161` to point at the merge that landed the
+ * feature — they're the same change, different ticket facets.
+ */
+export const SCHEMA_SOURCE_COMMIT = "3ec0aceef960f16db41507d01df5849b0dc7744e";
 
 /**
  * Hand-typed Envelope shape matching the JSON Schema. We hand-write rather
@@ -160,7 +169,46 @@ export interface Envelope {
    * DID of the receiving agent (`did:mf:<name>`).
    */
   target_principal?: string;
+  /**
+   * myelin#161 — policy-level actor identity, separate from the
+   * cryptographic `signed_by[]` chain. The chain proves WHO signed; the
+   * originator names WHO the signer claims to be acting on behalf of.
+   *
+   * `originator` IS covered by the envelope signature (a signable field —
+   * see myelin canonicalize SIGNABLE_FIELDS). Tampering with `originator`
+   * invalidates every subsequent stamp.
+   *
+   * Cortex callers should resolve the policy actor via the upstream
+   * `getActorPrincipal(envelope)` helper rather than reading this field
+   * directly — that helper falls back to `signed_by[0].principal` for
+   * legacy envelopes that pre-date myelin#161.
+   */
+  originator?: Originator;
 }
+
+/**
+ * myelin#161 — policy-attribution claim that travels next to the
+ * `signed_by[]` chain. The signer commits to the attribution claim by
+ * including the field in the canonical signature input.
+ */
+export interface Originator {
+  /** DID of the actor whose capabilities this envelope asserts. */
+  principal: string;
+  /**
+   * How the signer learned the originator identity:
+   *   - `adapter-resolved` — adapter (Discord/Slack/Mattermost/HTTP/cc-events)
+   *     mapped a non-myelin identifier (platform id, OS user) to a myelin
+   *     principal at sign time.
+   *   - `federated` — the originator claim was relayed from another
+   *     operator; the chain proves the cross-operator hop.
+   *   - `delegated` — the signer holds delegation credentials for the
+   *     originator (service principal acting on behalf of an operator).
+   */
+  attribution: AttributionMode;
+}
+
+/** myelin#161 — see {@link Originator}. */
+export type AttributionMode = "adapter-resolved" | "federated" | "delegated";
 
 /**
  * Discriminated stamp shape — one entry in an envelope's `signed_by` chain.
@@ -352,6 +400,48 @@ export function getLastStampPrincipal(envelope: Envelope): string | undefined {
   if (chain.length === 0) return undefined;
   const last = chain[chain.length - 1];
   return last?.principal;
+}
+
+/**
+ * Resolve the policy-attribution principal for an envelope (myelin#161 /
+ * cortex#346). Returns the DID string the policy engine should resolve.
+ *
+ * Precedence (delegates to myelin's `getActorPrincipal` semantics — kept
+ * vendored here so cortex's `Envelope` type can be passed directly without
+ * a cross-package cast):
+ *
+ *   1. `envelope.originator?.principal` — explicit policy-attribution
+ *      claim, covered by the envelope signature (`originator` is in
+ *      myelin's SIGNABLE_FIELDS post-#161, so tampering invalidates the
+ *      chain).
+ *   2. `envelope.signed_by[0]?.principal` — first stamp in the chain.
+ *      Legacy-compat fallback for pre-#161 envelopes that never set an
+ *      `originator`.
+ *   3. `undefined` — unsigned envelope with no originator block. Callers
+ *      decide the fallback (e.g. `payload.agent_id` in the dispatch
+ *      listener path).
+ *
+ * Pure function. No side effects.
+ *
+ * **Drift guard.** This is a vendored mirror of upstream:
+ *   {@link import("@the-metafactory/myelin").getActorPrincipal}
+ *   (definition at `node_modules/@the-metafactory/myelin/src/envelope.ts`).
+ * `SCHEMA_SOURCE_COMMIT` one screen above will surface a vendored-schema
+ * bump in code review; the three local-precedence tests in
+ * `__tests__/envelope-validator.test.ts` lock cortex's contract.
+ * **There is no upstream-parity contract test in this PR** — adding one
+ * is filed as a follow-up (blocked by a pre-existing upstream strict-null
+ * gap at `myelin/src/envelope.ts:527` unrelated to cortex#346; surfaces
+ * only when cortex's tsc walks myelin's `/envelope` subpath, which the
+ * runtime contract test would require).
+ * If you update this function, update myelin's `getActorPrincipal` too:
+ * the two implementations must agree on precedence, and nothing in CI
+ * will catch them if they diverge until that follow-up lands.
+ */
+export function getActorPrincipal(envelope: Envelope): string | undefined {
+  if (envelope.originator?.principal) return envelope.originator.principal;
+  const chain = getSignedByChain(envelope);
+  return chain[0]?.principal;
 }
 
 /**
