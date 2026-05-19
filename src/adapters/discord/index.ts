@@ -29,6 +29,7 @@ import {
   createSystemAdapterDegradedEvent,
   createSystemAdapterDisconnectedEvent,
   createSystemAdapterRecoveredEvent,
+  createSystemAccessDeniedEvent,
 } from "../../bus/system-events";
 import {
   isOperatorPrincipal,
@@ -363,12 +364,20 @@ export class DiscordAdapter implements PlatformAdapter {
         // (resolveDMAccess) then makes the final allow/deny call on
         // the message, so listing a bot here is necessary-but-not-
         // sufficient to elicit a response.
-        if (message.author.bot && !this.trustedBotIds.has(message.author.id)) return;
+        if (message.author.bot && !this.trustedBotIds.has(message.author.id)) {
+          this.publishUntrustedBotDenied(message);
+          return;
+        }
       } else {
         // Guild: require @mention (which itself honours trustedBotIds
         // via the same allowlist — peer bots that @-mention us are
         // allowed through; un-listed bot authors are dropped).
-        if (!isMentionForBot(message, this.client, this.trustedBotIds)) return;
+        if (!isMentionForBot(message, this.client, this.trustedBotIds)) {
+          if (message.author.bot && message.author.id !== this.client.user?.id) {
+            this.publishUntrustedBotDenied(message);
+          }
+          return;
+        }
       }
 
       const content = isDM ? message.content.trim() : extractContent(message, this.client);
@@ -1284,6 +1293,39 @@ export class DiscordAdapter implements PlatformAdapter {
         closeReason: opts.closeReason,
       }),
       wasClean: opts.wasClean,
+    });
+    void wiring.runtime.publish(env);
+  }
+
+  private publishUntrustedBotDenied(message: Message): void {
+    const wiring = this.canPublishSystemEvent();
+    if (!wiring) return;
+    const envelopeSubject =
+      message.guildId ?
+        `discord.${message.guildId}.${message.channelId}.messageCreate` :
+        `discord.dm.${message.channelId}.messageCreate`;
+    const env = createSystemAccessDeniedEvent({
+      source: wiring.source,
+      principalId: `discord:${message.author.id}`,
+      capability: "discord.inbound",
+      sovereignty: {
+        classification: "local",
+        data_residency: wiring.source.org,
+        max_hop: 0,
+        frontier_ok: false,
+        model_class: "local-only",
+      },
+      correlationId: `discord:${message.id}`,
+      signedBy: [],
+      envelopeSubject,
+      envelopeId: message.id,
+      reason: {
+        kind: "untrusted_bot_author",
+        platform: "discord",
+        author_id: message.author.id,
+        channel_id: message.channelId,
+        guild_id: message.guildId ?? undefined,
+      },
     });
     void wiring.runtime.publish(env);
   }
