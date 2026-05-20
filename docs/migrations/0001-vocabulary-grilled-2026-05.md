@@ -1,8 +1,10 @@
 # Cortex — Vocabulary Migration Manifest (2026-05)
 
-**Status:** draft for review · deterministic ground truth · **iteration 1** (first draft — to be looped)
+**Status:** draft for review · deterministic ground truth · **iteration 2** (5 criticals + 4 importants closed; counts re-verified)
 **Source:** `CONTEXT.md` (cortex) + `CONTEXT.md` (myelin) + `CONTEXT-MAP.md` (compass/ecosystem) — grill-with-docs sessions, May 2026
-**Method:** every entry below was produced by `grep -rn` against `main` (commit `c61a607`, 2026-05-20). Each cited line is a real occurrence in the codebase at that commit; nothing is inferred. For the heaviest prose clusters (`operator` in `cortex.ts`, `docs/`), the manifest gives the file, the verified hit count, and the known line clusters, and defers the per-line transcription to a PR-time `grep` pass — exactly as the myelin manifest does for `specs/namespace.md`. Driver, schema, wire, and config-grammar files carry exact `file:Lnn`.
+**Method:** every entry below was produced by `git grep` against `main` (commit `c61a607`, re-verified 2026-05-21). Each cited line is a real occurrence in the codebase at that commit; nothing is inferred. Iteration 2 re-ran *every* count and re-pinned *every* exact `file:Lnn` against the current `main` HEAD — `c61a607` is still the tip of `origin/main` (confirmed by `git fetch origin main && git rev-parse origin/main` on 2026-05-21), but the iteration-1 counts were measured loosely and several were materially wrong (see "count corrections" below); they are now corrected. Counts are **line counts** (`git grep -c` summed — lines containing the token), not occurrence counts, unless explicitly noted. For the heaviest prose clusters (`operator` in `cortex.ts`, `docs/`), the manifest gives the file, the verified line count, and the known line clusters, and defers the per-line transcription to a PR-time `grep` pass — exactly as the myelin manifest does for `specs/namespace.md`. Driver, schema, wire, and config-grammar files carry exact `file:Lnn`.
+
+**Count corrections (iteration 1 → iteration 2, verified at `c61a607`):** `operator` in `src/` was claimed "3,162 lines across ~280 files" → actual **2,584 lines across 298 files**; `operator` in `docs/` claimed "~1,400" → actual **1,124 lines**; `{org}` claimed "342 in docs/" → actual **143 lines in `docs/`** (175 occurrences), **199 lines in `src/`**, **347 lines repo-wide**. Per-file: `cortex-config.ts` "115" → **96**; `stack.ts` "43" → **39**; `cortex.ts` "114" → **95** `operator` + 11 `{org}`; `network-registry` carve-out "241" → **191** lines. A deterministic ground-truth document cannot carry unverified counts — these are now all re-pinned.
 
 Read this as the script: each PR claims one rename or one file/cluster, performs every listed change, runs `bunx tsc --noEmit && bun test`, opens for review.
 
@@ -12,7 +14,7 @@ Read this as the script: each PR claims one rename or one file/cluster, performs
 
 ## Scale note (read first)
 
-`operator` alone is **3,162 lines across ~280 files** in `src/`, plus ~1,400 lines across `docs/`. This is an order of magnitude larger than the myelin manifest's surface. The manifest is therefore structured in two registers:
+`operator` alone is **2,584 lines across 298 files** in `src/`, plus **1,124 lines across `docs/`** (verified at `c61a607`, 2026-05-21). This is an order of magnitude larger than the myelin manifest's surface. The manifest is therefore structured in two registers:
 
 - **Exact `file:Lnn`** — for the *load-bearing* files: the config schema (`cortex-config.ts`, `stack.ts`), the bus-wire driver files (`src/bus/myelin/*`), the vendored schema, the `migrate-config` CLI, `cortex.yaml.example`, and `CLAUDE.md`/`agents-md`. These are where a wrong edit breaks compilation, the wire, or a deployed config.
 - **File + verified count + known clusters** — for the *bulk-prose* files (`cortex.ts` comments, the ~40 `docs/*.md` design docs). Each gets a CI-grep guard (completion signal §2); the PR author transcribes per-line at PR time against a fresh `grep`. This is the myelin manifest's `specs/namespace.md` discipline applied at cortex's scale.
@@ -31,7 +33,7 @@ The CI grep guard (completion signal §2) is what makes the bulk-prose register 
 | C-R4  | `home_operator` (policy / `PolicyPrincipalSchema` field, MC worker SQL column) | `home_principal` | 2 (config + DB column) | config schema + code + SQL + prose | cortex-Q |
 | C-R5  | `{org}` (subject-grammar token in cortex's subject-building code + docs) | `{principal}` | 3 (code) / 1 (comments+docs) | code + grammar + prose | cortex-Q3 (myelin owns grammar) |
 | C-R6  | `org` (code parameter / variable in subject builders — `source.org`, `opts.org`, `orgFromConfig`) | `principal` | 3 (code — positional/keyed param) | code | cortex-Q3 |
-| C-R7  | `Broadcast` / `"broadcast"` (dispatch mode — **vendored** `distribution_mode` enum value) | `Offer` / `"offer"` | **3 (wire enum — vendored from myelin)** | vendored schema + validator + code + tests + prose | cortex-Q13b |
+| C-R7  | `Broadcast` / `"broadcast"` (dispatch mode — **vendored** `distribution_mode` enum value) | `Offer` / `"offer"` | **3 (wire enum — vendored from myelin)** | vendored schema + validator + test fixtures + prose (cortex *reads/validates* `distribution_mode`; emits none) | cortex-Q13b |
 | C-R8  | `signed_by[].principal` / `originator.principal` (myelin wire fields cortex **reads**) | `.identity` | **3 (wire — consumed from myelin)** | vendored schema + validator + every accessor + tests | myelin-R2 (cortex consumes) |
 | C-R9  | `target_principal` (myelin envelope wire field cortex **reads**) | `target_assistant` | **3 (wire — consumed from myelin)** | vendored schema + validator + dispatch path + tests | myelin-R13 (cortex consumes) |
 | C-R10 | `"Myelin stack"` (the M1–M7 architecture) | `"Myelin layer model"` | 1 | prose | cortex-CONTEXT «stack vs layer» |
@@ -43,7 +45,7 @@ The CI grep guard (completion signal §2) is what makes the bulk-prose register 
 
 ### Renames this manifest does NOT make (carve-outs)
 
-- **`src/services/network-registry/` — `operator_id` / `operator_pubkey` / `OperatorRecord` / `/operators/{operator_id}` REST routes.** The task brief flagged this service as a carve-out on the hypothesis that it handles *network-level* operator registrations. **Investigation contradicts the hypothesis** (see the dedicated decision below). `network-registry`'s `operator_id` is `{operator_id}/{stack_slug}` — e.g. `andreas/laptop`, `andreas/server` — i.e. it is *exactly* the `principal` (one human, multiple stacks, one pubkey). **It is still carved out of this manifest** — but for a *different, stronger* reason: it is a self-contained Cloudflare-Worker service with its own REST-API + signed-wire-schema versioning lifecycle, and folding its rename into the myelin-coupled lockstep PRs would entangle two independent release trains. It gets its **own** follow-up manifest (`0002-network-registry-vocabulary.md`). See "network-registry carve-out — reasoned decision" below.
+- **`src/services/network-registry/` (the SERVICE only) — `operator_id` / `operator_pubkey` / `OperatorRecord` / `/operators/{operator_id}` REST routes.** The task brief flagged this service as a carve-out on the hypothesis that it handles *network-level* operator registrations. **Investigation contradicts the hypothesis** (see the dedicated decision below). `network-registry`'s `operator_id` is `{operator_id}/{stack_slug}` — e.g. `andreas/laptop`, `andreas/server` — i.e. it is *exactly* the `principal` (one human, multiple stacks, one pubkey). **The SERVICE TREE is still carved out of this manifest** — but for a *different, stronger* reason: it is a self-contained Cloudflare-Worker service with its own REST-API + signed-wire-schema versioning lifecycle, and folding its rename into the myelin-coupled lockstep PRs would entangle two independent release trains. It gets its **own** follow-up manifest (`0002-network-registry-vocabulary.md`). See "network-registry carve-out — reasoned decision" below. **The cortex-side CLIENT of this service is NOT carved out** — `src/common/registry/` + `src/bus/network-resolver.ts` live in `src/` and are handled by *this* manifest (see the dedicated "network-registry CLIENT" section); only their `0002`-wire-coupled JSON keys are lockstep-flagged.
 - **WebSocket fan-out `broadcast`** — `broadcastEvent`, `broadcastIterationCreated`, `broadcastTaskUpdated`, `broadcastTransition`, and ~230 sibling hits across `src/surface/mc/`. This `broadcast` is the *NATS/WS fan-out mechanism verb* (broadcasting an event to every connected dashboard client) — **not** the dispatch mode. It is correct vocabulary and stays. Mirrors the myelin manifest's R12a decision ("the named mode is Offer; the transport behaviour is still a broadcast").
 - **NSC operator-account terminology** — any `nsc operator`, `OP_*`, NSC-CLI "operator account" references. NATS infra terminology, not the cortex `operator`-the-human concept. Left unchanged (none found in `src/` at `c61a607` outside docs; PR-time grep confirms).
 - **Legacy `grove` / `mf.net-{op}` references** — `docs/architecture.md:139` `mf.net-{op}.events.>` and any `mf.net-{operator}` legacy-subject citation describe the pre-myelin subject shape. Historical record; left verbatim (C-R14b).
@@ -74,7 +76,9 @@ The CI grep guard (completion signal §2) is what makes the bulk-prose register 
 
 **The decision — still carve it out, for a stronger reason:** `network-registry` is a standalone Cloudflare-Worker service (`wrangler.toml`, its own `bun install`, its own test rig, DNS at `network.meta-factory.ai`) with a **public signed REST-API contract**. Renaming its wire is a Tier-3 change to *that service's* API, on *that service's* release cadence — independent of myelin's envelope-schema cadence. Folding it into this manifest's myelin-lockstep PR train would couple two unrelated release trains and inflate every cortex Tier-3 PR's blast radius.
 
-**Action:** `network-registry`'s vocabulary rename is **deferred to a dedicated follow-up manifest** `docs/migrations/0002-network-registry-vocabulary.md` (filed as a cortex issue). Until then, the 241 `operator` lines under `src/services/network-registry/` are on the CI-grep allow-list (completion signal §2) — explicitly excepted, not silently skipped. The follow-up manifest will handle: `OperatorRecord`→`PrincipalRecord`, `operator_id`/`operator_pubkey` JSON keys, the `/operators/*` routes (with a `/principals/*` route + a deprecation-window alias for the old path), `src/services/network-registry/__tests__/operators.test.ts` → `principals.test.ts`, and the `home_operator` field that appears in `network-registry/src/types.ts` (C-R4 — flagged for review: this one field bridges both manifests; resolve in lockstep).
+**Action:** the `network-registry` SERVICE TREE's vocabulary rename is **deferred to a dedicated follow-up manifest** `docs/migrations/0002-network-registry-vocabulary.md` (filed as a cortex issue). Until then, the **191 `operator` lines under `src/services/network-registry/`** (verified at `c61a607`; iteration 1 said "241") are on the CI-grep allow-list (completion signal §2) — explicitly excepted, not silently skipped. The follow-up manifest will handle: `OperatorRecord`→`PrincipalRecord`, `operator_id`/`operator_pubkey` JSON keys, the `/operators/*` routes (with a `/principals/*` route + a deprecation-window alias for the old path), `src/services/network-registry/__tests__/operators.test.ts` → `principals.test.ts`, and the `home_operator` field that appears in `network-registry/src/types.ts` (C-R4 — flagged for review: this one field bridges both manifests; resolve in lockstep).
+
+**Coupling to the cortex-side client:** `0002` MUST cross-reference *this* manifest's "network-registry CLIENT" section. The client (`src/common/registry/client.ts`, `types.ts`, `__tests__/client.test.ts`, `src/bus/network-resolver.ts`) reads this service's `operator_id`/`operator_pubkey` JSON keys and mirrors its `OperatorRecord` shape — those wire-coupled reads rename in **lockstep** with `0002`'s API rename, in a `0002`-companion cortex PR. The client's *cortex-native code identifiers* (the `operatorId` params/locals/private fields) are NOT deferred — they rename in PR-5 of this manifest. Two registers, one for each side of the HTTP boundary.
 
 ---
 
@@ -82,7 +86,7 @@ The CI grep guard (completion signal §2) is what makes the bulk-prose register 
 
 ### `src/common/types/cortex-config.ts` — the config schema (DRIVER — land early)
 
-The Zod schema for `cortex.yaml`. **115 `operator` hits.** This file defines `OperatorSchema` and the `operator:` config key — every deployed `cortex.yaml` is shaped by it. **Tier 2 (config-file format).** Exact lines for the schema-defining block; PR-time grep for the comment cluster.
+The Zod schema for `cortex.yaml`. **96 `operator` hits** (iteration 1 said 115 — re-verified at `c61a607`). This file defines `OperatorSchema` and the `operator:` config key — every deployed `cortex.yaml` is shaped by it. **Tier 2 (config-file format).** Exact lines for the schema-defining block; PR-time grep for the comment cluster. The config *reader* that consumes this schema is `src/common/config/loader.ts` (see its dedicated section — it carries the C-R2 dual-key-read change).
 
 - **C-R1 + C-R2** — the schema definition:
   - L87 `export const OperatorSchema = z.object({` → `export const PrincipalSchema = z.object({`
@@ -91,21 +95,46 @@ The Zod schema for `cortex.yaml`. **115 `operator` hits.** This file defines `Op
   - L1859 error-message literal `"use \`operator:\` + \`agents:[]\` per architecture §9.1. "` → `"use \`principal:\` + \`agents:[]\` …"`
 - **C-R3** — the `operatorDiscordId` / `operatorMattermostId` / `operatorSlackId` fields inside `OperatorSchema` (L110–114 region — PR-time grep `operator` L110–125): each `operatorDiscordId` etc. is a *field of the schema*; the field keys themselves are `discordId` / `mattermostId` / `slackId` already (verify at PR time — the comments say "Operator's Discord user id"). The **comments** rename `Operator's` → `Principal's`.
 - **C-R5** — `{org}` token in the `OperatorSchema.id` doc (L89 region `* Operator identifier — used as the \`{org}\` subject segment … (\`local.{org}.…\`)`) → `{principal}` / `local.{principal}.…`.
-- **C-R14a** — the comment cluster: L7 `*   operator:                  who is running this cortex instance` → `principal:` ; L79 `// Operator — who is running this cortex instance` → `// Principal — …` ; L83–84 the `OperatorSchema` doc block ("The operator is the human…", "grove-v2's `agent.operatorId`…") → "The principal is the human…", "`agent.principalId`" ; L98, L100, L106 (the validation-error string `"operator id must be lowercase…"` → `"principal id must be lowercase…"`) ; L119 ; L159, L185, L198, L223, L236, L242, L311, L338 — every "operator" prose hit. **PR-time `grep -n 'operator\|Operator' src/common/types/cortex-config.ts` enumerates all 115; each gets a per-line call.** Known: the schema-structural ones above are exact; the rest are comments + the `home_operator` field (next entry).
+- **C-R14a** — the comment cluster: L7 `*   operator:                  who is running this cortex instance` → `principal:` ; L79 `// Operator — who is running this cortex instance` → `// Principal — …` ; L83–84 the `OperatorSchema` doc block ("The operator is the human…", "grove-v2's `agent.operatorId`…") → "The principal is the human…", "`agent.principalId`" ; L98, L100, L106 (the validation-error string `"operator id must be lowercase…"` → `"principal id must be lowercase…"`) ; L119 ; L159, L185, L198, L223, L236, L242, L311, L338 — every "operator" prose hit. **PR-time `grep -n 'operator\|Operator' src/common/types/cortex-config.ts` enumerates all 96; each gets a per-line call.** Known: the schema-structural ones above are exact; the rest are comments + the `home_operator` field (next entry).
 - **C-R4** — the `home_operator` field on `PolicyPrincipalSchema`:
   - L1197 `home_operator: z.string().regex(` → `home_principal: z.string().regex(`
   - L1192 comment `* grammar — \`OperatorSchema.id\` enforces it at the operator` → `\`PrincipalSchema.id\` … at the principal`
   - L1346 comment `* Peer operator id — same letter-prefix grammar as \`OperatorSchema.id\`.` → `Peer principal id … \`PrincipalSchema.id\``
 - **Config-schema note (C-R2):** renaming the top-level `operator:` key (L1798) is a **config-file-format change** — `loadConfig` reads `operator:` off every deployed `cortex.yaml`. The renaming PR MUST: (a) accept BOTH `operator:` and `principal:` keys on read for one minor cycle (prefer `principal:`), (b) emit only `principal:` when `migrate-config` writes, (c) log a deprecation warning when `operator:` is read. Treat exactly like myelin's `PrincipalRegistryFile.principals` config-key change. See "`cortex.yaml` deployment migration" below.
 
+### `src/common/config/loader.ts` — the config loader (DRIVER — the dual-key-read site for C-R2)
+
+The config *schema* (`cortex-config.ts`) defines the `operator:` key; **`loader.ts` is the file that READS it** off every deployed `cortex.yaml` and does the structural cortex-shape detection. The C-R2 back-compat plan ("config loader accepts both keys for one minor cycle") names *this* file — iteration 1 omitted it, which left the C-R2 plan with no implementation site. **41 `operator` hits, 6 `operatorId` hits.** Tier 2 (it is the reader of the config-file format). Exact lines for the structural detection.
+
+- **C-R2 — the structural dual-key detection (exact):**
+  - L84 `operator?: {` — the `operator` field on the `LoadedConfig` projection type → `principal?: {`
+  - L116 comment `* Detect whether \`raw\` is a cortex-shape config (operator + agents[]) vs` → `(principal + agents[])`
+  - L119 comment `* The check is structural — must have \`operator:\` (object) AND \`agents:\`` → `must have \`principal:\` (object) AND \`agents:\``
+  - L146–147 `raw.operator !== null && typeof raw.operator === "object"` — the runtime structural test → **dual-key during the migration window:** `((raw.principal ?? raw.operator) != null && typeof (raw.principal ?? raw.operator) === "object")`. The loader prefers `principal:`; when only `operator:` is present it reads it and logs the one-line deprecation warning naming `cortex config migrate` (C-R2 plan).
+  - L177 comment `* Detection is structural: presence of \`operator:\` (object) + \`agents:\`` → `presence of \`principal:\` …`
+  - L168 comment `* or cortex-shape \`cortex.yaml\` (operator: + agents:[] …` → `principal: + agents:[]`
+- **C-R3 (structural code) — the loader projects the config onto `LoadedConfig`:**
+  - L362 `operatorId: cortexConfig.operator.id,` (synthesised `BotConfig.agent` — see the `BotConfig` legacy-shape decision in `config.ts`; the *legacy field* `operatorId` may stay, but `cortexConfig.operator.id` → `cortexConfig.principal.id`) — PR-time: resolve against the C-R3 / legacy-`BotConfig` decision.
+  - L355, L362–364, L370, L404–413 — every `cortexConfig.operator.*` read → `cortexConfig.principal.*` (follows the schema rename in PR-1).
+- **C-R14a** — the comment bulk (L30, L59, L69, L72, L78–82, L92, L99, L197, L264, L269, L280–285, L341, L351, L368, L403) — "operator" → "principal". PR-time `grep -n 'operator' src/common/config/loader.ts` enumerates all 41.
+- **Loader note (C-R2):** `loader.ts` is the **single read-site** that makes the `operator:`→`principal:` key rename non-breaking. The PR-1 back-compat regression test (rollback artefact §4) exercises *this* file with both an `operator:`-keyed and a `principal:`-keyed `cortex.yaml`. Lands in PR-1 alongside `cortex-config.ts`.
+
+### `src/common/config/watcher.ts` — config hot-reloader (C-R3)
+
+Hot-reloads `cortex.yaml` on change. **1 `operatorId` hit** (plus `operatorName` / `operatorDiscordId` / `operatorMattermostId` siblings in the change-detection field list).
+
+- **C-R3** — L95 `"agent.operatorId",` (a watched field-path literal) → `"agent.principalId",` ; L96 `"agent.operatorDiscordId",` → `"agent.principalDiscordId",` ; L97 `"agent.operatorMattermostId",` → `"agent.principalMattermostId",` ; L68 `"agent.operatorName",` → `"agent.principalName",`. These string literals are **dotted field-paths into the parsed config shape** — they MUST flip in lockstep with the `agent.*Id` field renames (C-R3 on `LoadedConfig`/`BotConfig.agent`). If `BotConfig.agent.operatorId` is kept as a legacy model (see `config.ts` decision), the watched paths that target the *legacy* shape stay; the ones targeting the cortex-native shape rename — PR-time per-line call against the C-R3 decision.
+- **C-R14a** — L494 comment `// Skip debounce for explicit triggers — operator wants the reload now.` → `principal wants the reload now.`
+- Lands in PR-6 (non-wire code) — depends on PR-1.
+
 ### `src/common/types/stack.ts` — stack-id grammar (DRIVER)
 
-**43 `operator` hits.** Defines the `{operator_id}/{stack_id}` grammar + the `ParsedStackId.operator` field.
+**39 `operator` hits** (iteration 1 said 43 — re-verified at `c61a607`). Defines the `{operator_id}/{stack_id}` grammar + the `ParsedStackId.operator` field.
 
 - **C-R6** — the parsed-stack-id field:
   - L151 `operator: string;` (the `{operator_id}` segment field on the parsed shape) → `principal: string;`
   - L150 comment `/** The \`{operator_id}\` segment. */` → `/** The \`{principal_id}\` segment. */`
-- **C-R5 / C-R14a** — the grammar comments: L5 `* one operator can run multiple cortex stacks side-by-side` → `one principal can…` ; L7–8 `local.{operator}.{stack}.…` / `local.{operator}.…` → `local.{principal}.…` ; L13 `\`{operator_id}/{stack_id}\`` → `{principal_id}/{stack_id}` ; L16, L18, L25, L27, L36, L52, L64, L66, L68, L80, L81, L84, L88, L95 (the `stack.id` regex error string `"stack.id must match {operator_id}/{stack_id} format…"` → `{principal_id}/{stack_id}`), L116, L128, L145 — every "operator" → "principal" / `{operator_id}` → `{principal_id}`. PR-time grep enumerates all 43.
+- **C-R5 / C-R14a** — the grammar comments: L5 `* one operator can run multiple cortex stacks side-by-side` → `one principal can…` ; L7–8 `local.{operator}.{stack}.…` / `local.{operator}.…` → `local.{principal}.…` ; L13 `\`{operator_id}/{stack_id}\`` → `{principal_id}/{stack_id}` ; L16, L18, L25, L27, L36, L52, L64, L66, L68, L80, L81, L84, L88, L95 (the `stack.id` regex error string `"stack.id must match {operator_id}/{stack_id} format…"` → `{principal_id}/{stack_id}`), L116, L128, L145 — every "operator" → "principal" / `{operator_id}` → `{principal_id}`. PR-time grep enumerates all 39.
 - **Stack-id grammar note:** `{operator_id}/{stack_id}` is a **wire/identity grammar** (it surfaces as the `local.{principal}.{stack}.…` subject prefix and as `did:mf:<principal>-<stack>`). The *grammar shape* (`A/B` slash form) does not change — only the token *name* `{operator_id}` → `{principal_id}`. No runtime data migration needed for the grammar itself; the data migration is the `cortex.yaml` `operator.id` → `principal.id` (C-R2).
 
 ### `src/bus/myelin/vendor/envelope.schema.json` — vendored wire schema (Tier 3 — re-vendor)
@@ -170,7 +199,7 @@ The vendored validator + the `DistributionMode` type + the `getActorPrincipal` a
 
 ### `src/cortex.ts` — top-level entrypoint (DRIVER — heaviest prose cluster)
 
-**114 `operator`/`Operator`/`{org}` hits** — the brief's "~20 callsites in an earlier scan" was a floor; the real count is 114. This is the single heaviest prose+code cluster. Exact lines for the *structural* hits; PR-time grep for the comment bulk.
+**95 `operator`/`Operator` hits + 11 `{org}` hits** (iteration 1 said "114" — re-verified at `c61a607`: 95 `operator`-family lines, 11 `{org}` lines). The brief's "~20 callsites in an earlier scan" was a floor. This is the single heaviest prose+code cluster. Exact lines for the *structural* hits; PR-time grep for the comment bulk.
 
 - **C-R3 (structural code)** — known structural hits:
   - L279 `operator?: {` (a field on a local projection type) → `principal?: {`
@@ -179,7 +208,7 @@ The vendored validator + the `DistributionMode` type + the `getActorPrincipal` a
   - L321 `* fallback path (no \`options.stack\`, no \`agent.operatorId\`)` → `agent.principalId`
 - **C-R5** — `{org}` in comments: L314 `6-segment \`local.{org}.{stack}.{type}\` grammar` → `local.{principal}.{stack}.{type}`.
 - **C-R8** — L1703 comment `pre-Phase-B (cortex#114) unverified \`signed_by[0].principal\` claims.` → `signed_by[0].identity`.
-- **C-R14a (prose bulk)** — the remaining ~105 hits are comments: "the operator's existing `bot.yaml`", "Operators running multiple cortex instances", "operator-DM target", `notifyOperator`, "operator logs", etc. **PR-time `grep -n 'operator\|Operator\|{org}' src/cortex.ts` enumerates all 114; the PR author transcribes per-line.** The `notifyOperator` *function name* → `notifyPrincipal` is a code rename (PR-time grep for the decl + every caller); keep a deprecated alias only if it is exported (it is internal — verify; if internal, no alias).
+- **C-R14a (prose bulk)** — the remaining ~86 hits are comments: "the operator's existing `bot.yaml`", "Operators running multiple cortex instances", "operator-DM target", `notifyOperator`, "operator logs", etc. **PR-time `grep -n 'operator\|Operator\|{org}' src/cortex.ts` enumerates all 95 + 11; the PR author transcribes per-line.** The `notifyOperator` *function name* → `notifyPrincipal` is a code rename (PR-time grep for the decl + every caller); keep a deprecated alias only if it is exported (it is internal — verify; if internal, no alias).
 - **CI guard:** after this PR, `check:vocab` (completion signal §2) asserts zero `operator` in `src/cortex.ts`.
 
 ### `src/cli/cortex/commands/migrate-config-lib.ts` + `migrate-config.ts` + `migrate-config-policy.ts` — the migrate-config CLI
@@ -191,6 +220,13 @@ The vendored validator + the `DistributionMode` type + the `getActorPrincipal` a
 - **C-R4** — `migrate-config-policy.ts` + its test: `home_operator` → `home_principal` (it builds the `PolicyPrincipalSchema` block). PR-time grep `home_operator`.
 - **New behavior — the data migration:** `migrate-config` MUST gain a path that rewrites a deployed `cortex.yaml`'s `operator:` block to `principal:` (key rename, `operator.id` → `principal.id`). This is the **`cortex config migrate` step** myelin's manifest cross-references. It is idempotent (re-running on an already-`principal:` file is a no-op) and preserves every nested value. See "`cortex.yaml` deployment migration".
 - **PR-time grep** enumerates all 96+70 lines; the `__tests__/migrate-config*.test.ts` fixtures (`*.bot.yaml` under `__tests__/fixtures/`) carry `operatorId` / `operator:` keys — rename those fixture keys in lockstep (they exercise the migrator).
+
+### `src/cli/cortex/commands/cloud.ts` — the cloud-network CLI command (C-R3)
+
+**15 `operatorId` hits** verified at `c61a607`. This command reads/writes the `cloud-network` config — it carries `operatorId` on its option shapes (L81 `operatorId: string;`, L87 `operatorId: ${opts.operatorId}`, L97, L112 `Operator ID:      ${opts.operatorId}`, L120 `operatorId: opts.operatorId`, …). The `operatorId` here is the **same `cloud.operatorId`** that `src/bus/network-resolver.ts:98/105` destructures off `network.cloud` (see the network-registry CLIENT section) — so `cloud.ts` and `network-resolver.ts` rename **together**.
+
+- **C-R3** — every `operatorId` (option-shape field, local, output label) → `principalId`. PR-time `grep -n 'operatorId' src/cli/cortex/commands/cloud.ts` enumerates all 15.
+- **PR routing:** added to **PR-6** scope (CLI / non-wire code) alongside the adapters and runner — but it must land in the **same PR as `network-resolver.ts`** (PR-5/PR-6 must agree on the `network.cloud.operatorId` → `.principalId` shape; if `network-resolver.ts` is in PR-5 and `cloud.ts` in PR-6, both depend on the same `network.cloud` schema change — sequence them or fold both into PR-5).
 
 ### `src/common/policy/` — `home_operator` + policy principal model (C-R4)
 
@@ -222,6 +258,34 @@ The bus directory builds subjects (`{org}` token) and consumes myelin wire field
 - **C-R8** — `surface-router.test.ts:1888` `(payload.signed_by as { principal: string }[])[0]?.principal` → `{ identity: string }[]…?.identity`.
 - **C-R11** — `surface-router.test.ts:1283` comment `the adapter never subscribed to the topic in the first place.` → `subscribed to the subject`. **This is the ONLY genuine NATS-sense `topic` hit in `src/` — C-R11 is a one-line rename.**
 
+### `src/substrates/` + `src/common/substrates/` — substrate harnesses (C-R6 / C-R8 / C-R4 — wire + identity)
+
+`git grep substrates` returns a tree iteration 1 omitted entirely. **`src/substrates/bus-peer/harness.ts:190` builds a NATS subject from `source.org`** — the exact `source.org`→`source.principal` wire pattern (C-R6) the manifest treats with exact citations in `src/bus/`. The substrate harnesses are *substrate adapters* (the bus-peer harness and the claude-code harness); they emit and consume envelopes. Trees: `src/substrates/bus-peer/`, `src/substrates/claude-code/`, `src/common/substrates/`. Verified at `c61a607`.
+
+- **C-R6 (structural — exact)** — `src/substrates/bus-peer/harness.ts:190`
+  `` source: `${this.source.org}.${this.source.agent}.${this.source.instance}`, `` → `${this.source.principal}.${this.source.agent}.${this.source.instance}`. This is the bus-peer harness's outbound-envelope `source` field — **identical to `system-events.ts:88`'s `${src.org}.…` pattern.** Companion to myelin-R6 (`source` grammar). Tier 3. `harness.ts` also carries **6 `operator`** lines total — the rest are C-R14a prose.
+- **C-R8 (wire — exact)** — `src/substrates/bus-peer/__tests__/harness.test.ts` carries **7 `signed_by` hits** (L147, L284, L393, L560, L647, L681, L702 — envelope fixtures + a `next.value.signed_by` accessor). These are myelin-R2's `signed_by[].principal` wire field — every fixture stamp + accessor renames `.principal` → `.identity` in lockstep with PR-7/PR-8. Tier 3 (companion to myelin-R2).
+- **C-R4 (config-field reference — exact)** — `src/common/substrates/types.ts:411` comment `` * `principal.home_operator` / `home_stack` for sovereignty-aware `` → `principal.home_principal`. `types.ts` also carries **15 `operator`** lines (C-R14a prose — the substrate types describe "the operator's stack" etc.). `src/common/substrates/__tests__/types.test.ts` carries 1 `operator` hit.
+- **C-R14a** — `src/substrates/claude-code/harness.ts` (6 `operator`), `src/substrates/claude-code/__tests__/harness.test.ts` (8 `operator`), `src/substrates/bus-peer/__tests__/harness.test.ts` (1 `operator` beyond the `signed_by` set) — "operator" prose → "principal". PR-time `grep -rn 'operator' src/substrates/ src/common/substrates/`.
+- **PR routing:** the C-R6 `harness.ts:190` wire change lands in **PR-8** (bus/wire consumers, companion to myelin). The `harness.test.ts` `signed_by` fixtures land with **PR-7** (re-vendor, transition: both accepted). The `home_operator` comment + C-R14a prose land in **PR-5/PR-6** (code/prose bulk). The `check:vocab` guard must cover `src/substrates/` and `src/common/substrates/` — they were silently outside its scope in iteration 1.
+
+### `src/common/registry/` + `src/bus/network-resolver.ts` — network-registry CLIENT (C-R3 — `0002`-coupled, lockstep companion)
+
+**This section resolves the iteration-1 carve-out hole.** The `network-registry` *service* (`src/services/network-registry/`) is deferred to manifest `0002` — but the cortex-side **CLIENT** of that service lives in `src/` and *consumes its REST JSON contract*. Iteration 1 deferred the service and silently stranded the client. The client is kept in **this** manifest, **lockstep-flagged**: its renames must land in the same release as the `0002` network-registry API rename.
+
+**Why kept here, not punted to `0002`:** `src/common/registry/client.ts` imports only `./signing` locally — it has **no compile-time dependency** on `src/services/network-registry/`. It consumes the service purely over HTTP/JSON. So it *can* be migrated independently of `0002`'s code — but its JSON-key reads (`operator_id`, `operator_pubkey`) and the `OperatorRecord` shape it mirrors are a *wire contract* with the `0002` service. Therefore: **rename the cortex-native code identifiers now; flag the JSON-key reads + `OperatorRecord` mirror as lockstep-with-`0002`.** Silent omission is forbidden (the iteration-1 failure).
+
+Files + verified counts at `c61a607`:
+
+- **`src/common/registry/client.ts` — 28 `operatorId` hits (the single heaviest `operatorId` file in the repo), 41 `operator` total.**
+  - **C-R3 (cortex-native code identifiers — rename now):** the `operatorId` *parameters / locals / private fields* — L7 doc `getOperator(operatorId)`, L35 `invalidate(operatorId)`, L76 `private readonly operatorIds: readonly string[];`, L217 `getOperator(operatorId: string)`, L348, L437/L443 log strings, etc. → `principalId` / `principalIds`. PR-time `grep -n 'operatorId' src/common/registry/client.ts` enumerates all 28.
+  - **`OperatorRecord` type + `getOperator()` method name** → `PrincipalRecord` / `getPrincipal()` — but these mirror the `0002` service's published shape: **flag lockstep-with-`0002`** (rename here only when `0002`'s `OperatorRecord`→`PrincipalRecord` API rename lands; keep a `getOperator` deprecated alias for one minor).
+  - **JSON wire keys `operator_id` / `operator_pubkey`** (L392, L398, L418, L451, L94 cache comment) — these are READ off the `0002` service's signed REST payload. **They renamed ONLY in lockstep with `0002`'s route/payload rename** (`/operators/{operator_id}` → `/principals/{principal_id}`). Until `0002` lands, the client reads `operator_id`/`operator_pubkey` and these lines are on the `check:vocab` allow-list — *explicitly*, not silently.
+- **`src/common/registry/types.ts` — 3 `operatorId` hits.** L46 `* Mirrors \`OperatorRecord\` on the producer side.` — this comment names the `0002` coupling explicitly; update it to `PrincipalRecord` in lockstep. L119 `operatorIds: string[];`, L155/L163 `getOperator(operatorId)` — cortex-native shape, renames with `client.ts`.
+- **`src/common/registry/__tests__/client.test.ts` — 17 `operatorId` hits.** Renames in lockstep with `client.ts`.
+- **`src/bus/network-resolver.ts` — 4 `operator` hits (all `operatorId`).** L98–99 + L105–106: `const { …, operatorId, … } = network.cloud;` / `return { …, operatorId, … }` — `operatorId` destructured off the `network.cloud` config block (the `cloud-network` config that `cloud.ts` writes, see I2). This is a **cortex-native parsed-config-shape** field → `principalId` renames with the `network.cloud` schema (C-R3, Tier-2-adjacent — it is on a parsed config shape). Lands in PR-5.
+- **PR routing:** the cortex-native identifier renames (`operatorId` params/locals in `client.ts`, `types.ts`, `network-resolver.ts`, `client.test.ts`) land in **PR-5**. The `OperatorRecord`/`getOperator`/JSON-key changes are **flagged lockstep-with-`0002`** and land in a `0002`-companion cortex PR — the `0002` manifest MUST cross-reference this section. **`check:vocab` allow-list:** only the `operator_id`/`operator_pubkey` *JSON-key* lines in `client.ts`/`types.ts` go on the allow-list (pending `0002`), NOT the whole files — the cortex-native identifiers are migrated in PR-5 and must NOT be allow-listed.
+
 ### `src/runner/dispatch-listener.ts` + `worklog-manager.ts` + `agent-team.ts` (dispatch path)
 
 `dispatch-listener.ts` (26 `operator`, plus `{org}`, `originator`, `signed_by[0].principal`) is the heaviest runner file.
@@ -251,7 +315,22 @@ The bus directory builds subjects (`{org}` token) and consumes myelin wire field
 The MC surface has `operator` in API handlers, worker routes, SQL schema, and dashboard copy. **~89 hits in `api/handlers.ts` alone.** Distinguish three senses:
 
 - **C-R1 / C-R14a — operator-the-human prose + `operatorId` API fields:** `api/handlers.ts`, `api/types.ts`, `worker/src/routes/state.ts` (61), `worker/src/routes/ingest.ts` (21), `notifications/discord-sink.ts` (24) — `operatorId` → `principalId`, "operator" prose → "principal". **The `operatorId` on API request/response shapes is a wire field of the MC REST API** — Tier 2; the worker accepts both keys for one cycle.
-- **C-R4 — `home_operator` DB column:** `src/surface/mc/worker/schema.sql:` (PR-time grep `home_operator`) + `migrations/0003_sovereignty.sql` — the column `home_operator`. The worker ships a NEW migration `migrations/0004_rename_home_operator.sql`: `ALTER TABLE <t> RENAME COLUMN home_operator TO home_principal;` (D1 supports `RENAME COLUMN`). The route code (`worker/src/routes/state.ts`, `ingest.ts`) reads the column — update in the same release as the migration. **Do NOT hand-edit `0003_sovereignty.sql`** (it is an applied migration) — add `0004_*`.
+- **C-R4 — `home_operator` DB column + its partial INDEX (exact — MC-worker DB dir is `src/surface/mc/worker/`):** the `home_operator` column on the `sessions` table is defined in TWO places and **backed by a partial index in TWO places**. Verified at `c61a607`:
+  - `src/surface/mc/worker/schema.sql:36` — `home_operator TEXT  -- principal.home_operator (post-\`did:mf:\` strip)` (the column, fresh-DB path).
+  - `src/surface/mc/worker/schema.sql:141` — `CREATE INDEX IF NOT EXISTS idx_sessions_home_operator ON sessions(home_operator) WHERE home_operator IS NOT NULL;` (the **partial index**, fresh-DB path).
+  - `src/surface/mc/worker/migrations/0003_sovereignty.sql:22` — `ALTER TABLE sessions ADD COLUMN home_operator TEXT;` (the applied migration that introduced the column).
+  - `src/surface/mc/worker/migrations/0003_sovereignty.sql:27` — `CREATE INDEX IF NOT EXISTS idx_sessions_home_operator ON sessions(home_operator) WHERE home_operator IS NOT NULL;` (the same partial index, in the applied migration).
+  - **The `0004` step — corrected (iteration 1 omitted the index):** SQLite/D1 `ALTER TABLE … RENAME COLUMN` does **NOT** rename the index, nor rewrite the index's `WHERE home_operator IS NOT NULL` predicate. A bare `RENAME COLUMN` leaves a dangling `idx_sessions_home_operator` index whose definition references a column name that no longer exists. The new migration `src/surface/mc/worker/migrations/0004_rename_home_operator.sql` MUST therefore do **three** statements in order:
+    ```sql
+    ALTER TABLE sessions RENAME COLUMN home_operator TO home_principal;
+    DROP INDEX IF EXISTS idx_sessions_home_operator;
+    CREATE INDEX IF NOT EXISTS idx_sessions_home_principal ON sessions(home_principal) WHERE home_principal IS NOT NULL;
+    ```
+  - **`schema.sql` (the fresh-DB path) updates in lockstep** — the same PR rewrites `schema.sql:36` (`home_operator` → `home_principal`) AND `schema.sql:141` (the `CREATE INDEX` → `idx_sessions_home_principal ON sessions(home_principal) WHERE home_principal IS NOT NULL`). A fresh DB built from `schema.sql` and an upgraded DB migrated via `0004_*` MUST end in the identical schema — column name AND index name AND index predicate.
+  - **Do NOT hand-edit `0003_sovereignty.sql`** (it is an applied migration — editing it diverges already-migrated D1 instances) — the rename is a NEW `0004_*` migration only.
+  - The route code (`worker/src/routes/state.ts`, `ingest.ts`) reads the `home_operator` column — update in the same release as the migration. Tier 2; the worker accepts both column names for one cycle (read fallback) until every D1 instance has run `0004_*`.
+  - **NB — `operator_id` column is separate:** `schema.sql:139` also has `CREATE INDEX … idx_sessions_operator ON sessions(operator_id);` and an `operator_id` column. That `operator_id` is the MC-API session-ownership column (C-R3 on the MC REST wire) — a *different* rename from `home_operator`. If `operator_id` → `principal_id` is taken in this manifest's scope, its `idx_sessions_operator` index needs the same DROP/CREATE treatment — PR-time call; flagged here so it is not missed.
+- **C-R3 — `src/surface/mc/worker/src/auth.ts` (REST auth — wire-adjacent):** **5 `operatorId` hits** verified at `c61a607` — L62 doc `c.set("operatorId", …)`, L65 the `requireApiKey` context type `Variables: { operatorId: string; … }`, L88 `const operatorId = keyData.operator_id ?? (keyData as any).operatorId ?? "";`, L89 audit-log `identity: operatorId`, L90 `c.set("operatorId", operatorId)`. This is the MC-worker REST auth path — it sets `operatorId` into the Hono request context that every downstream route reads, so it is **wire-adjacent** to the MC-API `operatorId`-field rename. `operatorId` (context key + type) → `principalId`; the `keyData.operator_id` JSON read is the API-key payload key — renames in lockstep with the MC-API key-shape change (back-compat read both for one cycle, exactly as L88 already reads `operator_id ?? operatorId`). Lands in **PR-4** (MC-worker), companion to the `0004` migration.
 - **Carve-out — WS `broadcast`:** `api/handlers.ts:117-123` `broadcastEvent` / `broadcastIterationCreated` / `broadcastTaskUpdated` / `broadcastTransition` etc. and ~230 sibling hits — **the WS fan-out mechanism. NOT renamed.** Stays.
 - **Dashboard copy:** `dashboard-v2/` — `operator` appears in component copy (`drill-input.tsx:12`, `app.tsx`, `iteration-detail.tsx`) and `agent-defaults.ts`. C-R14a prose → "principal" (user-facing label change — flag for a design/UX glance: the dashboard says "operator" to the human looking at it; "principal" is the canonical term but is more jargon-y. **Flag for review:** confirm the principal wants the *user-facing* dashboard label changed, or whether the visible label stays "operator"/"you" while the *code identifier* renames. The myelin manifest had no UI surface; this is a cortex-specific judgment call.)
 
@@ -287,7 +366,7 @@ The MC surface has `operator` in API handlers, worker routes, SQL schema, and da
 
 ### `docs/` — design + iteration + plan docs (C-R5 / C-R7 / C-R10 / C-R14a — bulk-prose register)
 
-**~40 files, ~1,400 `operator` hits + 342 `{org}` hits + the `Broadcast`/`Myelin stack` clusters.** Per the myelin manifest's `specs/namespace.md` discipline: each doc gets a PR-time `grep`, and the manifest records the file, the verified count, and the rename(s) that apply. Grouped by weight:
+**~40 files, 1,124 `operator` lines + 143 `{org}` lines (175 occurrences) + the `Broadcast`/`Myelin stack` clusters** — verified at `c61a607`, 2026-05-21 (iteration 1 said "~1,400 operator + 342 {org}"; both were wrong — the `{org}` figure was nearly 2.4× the true count). Per the myelin manifest's `specs/namespace.md` discipline: each doc gets a PR-time `grep`, and the manifest records the file, the verified count, and the rename(s) that apply. Grouped by weight:
 
 **Heaviest (`operator` > 60):**
 - `docs/design-internet-of-agentic-work.md` — 116 `operator` + 4 `broadcast` + 1 `{org}`. C-R14a (prose) + C-R5 + C-R7. Note L21 `**M1–M7 Myelin stack**` → C-R10.
@@ -324,14 +403,22 @@ The MC surface has `operator` in API handlers, worker routes, SQL schema, and da
 
 Every `*.test.ts` and `__tests__/fixtures/*.bot.yaml` / `*.yaml` carrying `operatorId` / `operator:` / `home_operator` / `signed_by[].principal` / `distribution_mode: "broadcast"` / `target_principal` renames **in the same PR as its driver file** (a test must compile against the renamed shape). Heaviest test files (PR-time grep, rename in lockstep): `common/registry/__tests__/client.test.ts` (83), `common/policy/__tests__/factory.test.ts` (75), `cli/cortex/commands/__tests__/migrate-config-policy.test.ts` (69), `common/agents/__tests__/trust-resolver-operator-verify.test.ts` (67 — also `git mv`), `cli/cortex/commands/__tests__/migrate-config.test.ts` (55), `common/types/__tests__/cortex-config.test.ts` (54), `common/types/__tests__/stack.test.ts` (45), `__tests__/iaw-phase-d-integration.test.ts` (41), `runner/__tests__/dispatch-listener.test.ts` (34), `bus/myelin/__tests__/envelope-validator.test.ts` (3 `broadcast`, `target_principal`, `signed_by.principal`), `bus/myelin/__tests__/runtime.test.ts` (`signed_by[].principal` fixtures L612, L623, L676, L681–682), `bus/__tests__/verify-signed-by-chain.test.ts`, `__tests__/signed-pilot-roundtrip.test.ts`, `__tests__/cortex.stack-signing-boot.test.ts`.
 
+**Boot / integration tests (verified at `c61a607` — iteration 1 omitted these):** the `src/__tests__/` boot suite exercises the full wire-up and MUST rename in lockstep, because these tests boot cortex with a `cortex.yaml` and assert on the parsed-config shape and the dispatch path:
+- `src/__tests__/cortex.test.ts` — **3 `operatorId`** + 12 `operator` lines. The top-level boot test; renames with PR-5/PR-1.
+- `src/__tests__/cortex.capability-boot.test.ts` — **1 `operatorId`** + 5 `operator` lines. Boots the capability path.
+- `src/__tests__/cortex.review-consumer-boot.test.ts` — **1 `operatorId`** + 5 `operator` lines. Boots the review-consumer.
+These join `cortex.stack-signing-boot.test.ts` and `cortex.review-consumer.e2e.test.ts` (also in `src/__tests__/`) in the boot-suite group — each renames in lockstep with whichever driver PR changes the shape it asserts on (PR-1 for config-shape, PR-7/PR-8 for wire). The completion-signal §1 integration test (the new `principal:`-keyed end-to-end test) is added to this same directory.
+
 ---
 
 ## `distribution_mode` enum migration (C-R7 — the vendored wire-enum change)
 
-`"broadcast"` is a **live wire enum value** in cortex's *vendored* schema (`src/bus/myelin/vendor/envelope.schema.json:168`), the `DistributionMode` type (`envelope-validator.ts:285`), and ~6 test sites. cortex does **not** own this enum — myelin does. cortex's job is to **re-vendor in lockstep**:
+`"broadcast"` is a **live wire enum value** in cortex's *vendored* schema (`src/bus/myelin/vendor/envelope.schema.json:168`), the `DistributionMode` type (`envelope-validator.ts:285`), and the validator's comment table (`envelope-validator.ts:162`). cortex does **not** own this enum — myelin does.
 
-1. **Transition (companion to myelin's transition release):** re-vendor the schema/validator that accepts BOTH `"broadcast"` and `"offer"`. `DistributionMode = 'broadcast' | 'offer' | 'direct' | 'delegate'`. cortex's dispatch path that *emits* `distribution_mode` switches to `"offer"`. Tests assert `"offer"` (and retain a back-compat case for `"broadcast"`).
-2. **Breaking (companion to myelin's breaking major):** re-vendor the v2 schema (`enum: ["offer","direct","delegate"]`, `"broadcast"` rejected). `DistributionMode = 'offer' | 'direct' | 'delegate'`.
+**Iteration-1 correction — cortex does NOT emit `distribution_mode`.** Iteration 1 claimed "cortex's dispatch path that *emits* `distribution_mode` switches to `"offer"`". This was unverified and is **wrong**. `git grep 'distribution_mode:'` (the object-literal *emit* form) across `src/` non-test returns **zero hits** at `c61a607`. Every non-test `distribution_mode` reference is in the **vendored schema + validator only**: `envelope-validator.ts:166` the optional field declaration `distribution_mode?: DistributionMode;`, L50/L168/L284 comments, and `vendor/envelope.schema.json:166/198/199` the schema property + the conditional that *requires* `target_assistant` when `distribution_mode` is `direct`/`delegate`. **cortex VALIDATES and READS `distribution_mode` off inbound envelopes; it does not construct or emit it.** (cortex is not a dispatch *originator* for the bidding/offer flow — that envelope is minted upstream; cortex's dispatch path consumes it.) cortex's job is therefore purely to **re-vendor the schema/validator in lockstep** — there is no cortex emit-site to switch:
+
+1. **Transition (companion to myelin's transition release):** re-vendor the schema/validator so the validator *accepts* BOTH `"broadcast"` and `"offer"` on read. `DistributionMode = 'broadcast' | 'offer' | 'direct' | 'delegate'`. Tests that build envelope *fixtures* assert the validator accepts `"offer"` (and retain a back-compat fixture for `"broadcast"`). No cortex production code changes its emitted value — because cortex emits no `distribution_mode`.
+2. **Breaking (companion to myelin's breaking major):** re-vendor the v2 schema (`enum: ["offer","direct","delegate"]`, `"broadcast"` rejected on read). `DistributionMode = 'offer' | 'direct' | 'delegate'`.
 3. **Schedule:** cortex's two re-vendor PRs are gated on the corresponding myelin releases existing. cortex MUST NOT jump to the breaking re-vendor while any cortex JetStream consumer still replays a stream holding pre-migration `"broadcast"` envelopes (see JetStream replay note).
 
 ---
@@ -358,7 +445,7 @@ cortex consumes myelin's published language. Each row is a myelin rename cortex 
 | `signed_by[].principal` → `.identity` (myelin-R2) | C-R8 — re-vendor schema/validator + every `.principal` accessor + `verify-signed-by-chain.ts` | `bus/myelin/vendor/*`, `bus/myelin/envelope-validator.ts`, `bus/verify-signed-by-chain.ts`, `bus/system-events.ts`, dispatch path | 3 |
 | `originator.principal` → `.identity` (myelin-R2) | C-R8 — `originator` reads/writes | `bus/myelin/envelope-validator.ts`, `taps/cc-events/*`, `runner/dispatch-listener.ts` | 3 |
 | `target_principal` → `target_assistant` (myelin-R13) | C-R9 — re-vendor + dispatch-path reads | `bus/myelin/vendor/*`, `envelope-validator.ts` | 3 |
-| `distribution_mode "broadcast"` → `"offer"` (myelin-R11) | C-R7 — re-vendor enum + emit `"offer"` | `bus/myelin/vendor/*`, `envelope-validator.ts` | 3 |
+| `distribution_mode "broadcast"` → `"offer"` (myelin-R11) | C-R7 — re-vendor enum (validator *reads* it; cortex emits no `distribution_mode`) | `bus/myelin/vendor/*`, `envelope-validator.ts` | 3 |
 | `source` grammar 3–5 → fixed-3 (myelin-R6) | C-R6 — `source.org` → `source.principal` accessor + every subject builder | `bus/*`, `runner/dispatch-listener.ts`, `taps/cc-events/*` | 3 |
 | `{org}` subject token → `{principal}` (myelin owns grammar) | C-R5 — every `{org}` in cortex subject-building code + docs | `bus/myelin/runtime.ts`, all `bus/*`, `docs/*` | 3 (code) / 1 (prose) |
 | `Principal` exported type → `Identity` (myelin-R1) | cortex `import type { Principal }` from myelin → `Identity` | every cortex file importing myelin's `Principal` | 1 (follows myelin's deprecated alias) |
@@ -370,19 +457,25 @@ cortex's Tier-3 PRs land **after** myelin's transition release and **before** my
 ```
 PR-1  src/common/types/cortex-config.ts   — C-R1/C-R2/C-R3/C-R4/C-R5/C-R14a.
       + src/common/types/stack.ts           OperatorSchema→PrincipalSchema, operator:→
-                                            principal: key (back-compat read both),
+      + src/common/config/loader.ts         principal: key. loader.ts carries the
+      + src/common/config/watcher.ts        DUAL-KEY READ (back-compat both keys) +
+                                            the watched-field-path literals.
                                             home_operator→home_principal. Tier 2.
-                                            Land first — the config schema everything reads.
+                                            Land first — the config schema + reader.
 PR-2  src/cli/cortex/commands/             — C-R1/C-R3/C-R4 + the `cortex config migrate`
       migrate-config*                        data-migration step. Depends on PR-1.
 PR-3  src/common/policy/*                  — C-R4 home_operator + C-R8 comment refs.
                                             Depends on PR-1.
-PR-4  src/surface/mc/worker/* (SQL)        — C-R4 DB column + 0004 migration + route code.
+PR-4  src/surface/mc/worker/* (SQL+auth)   — C-R4 DB column + 0004 migration (RENAME
+                                            COLUMN + DROP/CREATE partial index) +
+                                            schema.sql lockstep + auth.ts + route code.
                                             Depends on PR-1, PR-3.
 PR-5  src/cortex.ts + src/common/*         — C-R3/C-R5/C-R14a prose+code bulk.
-      (event-processor, types, registry)     Depends on PR-1.
-PR-6  src/adapters/* + src/runner/*        — C-R3/C-R6/C-R14a + test-file git mv.
-      (non-wire parts)                       Depends on PR-1.
+      (event-processor, types, registry,     registry = network-registry CLIENT
+       substrates, network-resolver)         cortex-native identifiers. Depends on PR-1.
+PR-6  src/adapters/* + src/runner/*        — C-R3/C-R6/C-R14a + test-file git mv +
+      + src/cli/cortex/commands/cloud.ts     cloud.ts (must agree w/ network-resolver
+      (non-wire parts)                       on network.cloud shape). Depends on PR-1.
 ─────  myelin transition release lands here ─────
 PR-7  src/bus/myelin/vendor/* +            — C-R7/C-R8/C-R9 re-vendor (transition: both
       envelope-validator.ts (re-vendor)      old+new accepted). Companion to myelin
@@ -436,9 +529,19 @@ The `operator:` → `principal:` key rename (C-R2) means **every deployed stack'
 ### Completion signal — what proves the migration is done
 
 1. **Integration test on the new shape:** a `src/__tests__/` test boots cortex with a `principal:`-keyed `cortex.yaml`, publishes + consumes a `dispatch.task` envelope using the new vocabulary end-to-end (`signed_by[].identity`, `target_assistant`, `distribution_mode: "offer"`, `source` fixed-3) and asserts cortex routes it.
-2. **CI grep guard:** a `bun` script (`check:vocab` in `package.json`) asserts **no `operator` and no `{org}`** in `src/`, `cortex.yaml.example`, `docs/agents-md/` outside an explicit allow-list. The allow-list contains exactly: the **entire `src/services/network-registry/` tree** (deferred to manifest `0002`), the WS-mechanism `broadcast*` symbols, the legacy-env-var fallbacks (`GROVE_OPERATOR`/`NATS_ORG`), the legacy-citation lines in `docs/plan-cortex-migration.md` / `docs/migration-examples/before-*.yaml`, the `mf.net-{op}` citation in `docs/architecture.md:139`, and the back-compat config-key reader. Any new occurrence fails CI.
+2. **CI grep guard:** a `bun` script (`check:vocab` in `package.json` — does not yet exist; added by this migration) asserts **no `operator` and no `{org}`** in `src/`, `cortex.yaml.example`, `docs/agents-md/` outside an explicit allow-list. The allow-list contains exactly: the **entire `src/services/network-registry/` SERVICE tree** (deferred to manifest `0002`), the `operator_id`/`operator_pubkey` **JSON-key lines in `src/common/registry/client.ts` + `types.ts`** (the `0002`-wire-coupled reads — NOT the whole files; the cortex-native identifiers in those files are migrated in PR-5 and must stay un-allow-listed), the WS-mechanism `broadcast*` symbols, the legacy-env-var fallbacks (`GROVE_OPERATOR`/`NATS_ORG`), the legacy-citation lines in `docs/plan-cortex-migration.md` / `docs/migration-examples/before-*.yaml`, the `mf.net-{op}` citation in `docs/architecture.md:139`, and the back-compat config-key reader in `src/common/config/loader.ts`. The guard's scope MUST also cover `src/substrates/` and `src/common/substrates/` (in `src/`, so already in scope — but explicitly verified, since iteration 1 never mentioned those trees). Any new occurrence fails CI.
+   - **Allow-list review note:** the `check:vocab` allow-list is itself a code artefact and a security/correctness-relevant one. **It must be reviewed on every change** — too broad an entry wrongly *allows* a real miss (a `principal`-sense `operator` slips through un-migrated); too narrow wrongly *blocks* a legitimate infra term (e.g. an `nsc operator` NATS-account reference or a `network.operator` infra concept that is genuinely not the human). Each allow-list entry carries a one-line comment naming *why* it is excepted and which manifest (`0001`/`0002`) owns its eventual removal. Treat an allow-list diff as a reviewable change, not boilerplate.
 3. **Config back-compat removed:** the breaking major (PR-12 / cortex 3.0.0) has dropped the `operator:` config-key reader and every `@deprecated` alias.
 4. **All companion PRs merged:** every row of the myelin-coupling table has a merged cortex PR on the corresponding myelin release.
+
+### Known-residual note (post-iteration-2 sweep)
+
+A re-grep of `operatorId`, `operator.id`, `{org}`, `signed_by`, `target_principal`, `distribution_mode`, `"broadcast"` across `src/` at `c61a607` confirms the **exact register** now names every load-bearing site (config schema + reader + watcher, both `substrates/` trees, the registry CLIENT, the MC-worker DB + `auth.ts`, the vendored wire files). Remaining items are intentionally in the **bulk-prose register** (file + count + cluster, CI-guard-gated), not silently dropped:
+
+- **`src/runner/review-pipeline.ts`** — 4 `operator` hits, including L170 a comment `Sourced from cortex.yaml's \`operator.id\` …`. The runner section names `dispatch-listener.ts` / `worklog-manager.ts` / `agent-team.ts` explicitly; `review-pipeline.ts` is C-R14a prose only and is caught by the `check:vocab` guard over all of `src/runner/`. Flagged here so PR-6 includes it.
+- **`src/bus/__tests__/bus-dispatch-listener.test.ts`** (8 `operatorId`), **`src/common/config/__tests__/watcher.test.ts`** (7 `operatorId`), **`src/common/config/__tests__/loader.test.ts`** (`operator.id` fixtures) — test files that rename in lockstep with their drivers (PR-1/PR-6) per the test-fixtures rule; not individually transcribed.
+- **`src/common/types/config.ts`** carries 7 `operatorId` across the *legacy `BotConfig`* shape AND the `CloudPublisher` config shape (L558/L566) — the legacy-`BotConfig` ones are the C-R14b "keep as faithful legacy model" decision; the `CloudPublisher` ones (`network.cloud.operatorId`) rename with `cloud.ts` + `network-resolver.ts` (PR-5/PR-6). Per-line call at PR time.
+- `distribution_mode` / `"broadcast"` / `target_principal` non-test residuals are **entirely** within the vendored wire files (`bus/myelin/vendor/*`, `envelope-validator.ts`) — fully covered by the exact register; no residual.
 
 ---
 
@@ -446,7 +549,7 @@ The `operator:` → `principal:` key rename (C-R2) means **every deployed stack'
 
 Lines using "operator" / `persona` in a sense not mechanically resolvable. **Listed, not silently dropped:**
 
-- **`src/services/network-registry/` (entire tree, 241 lines)** — deferred to manifest `0002-network-registry-vocabulary.md` (own service, own release cadence). The `home_operator` field in `network-registry/src/types.ts` bridges C-R4 and `0002` — resolve in lockstep.
+- **`src/services/network-registry/` (entire SERVICE tree, 191 lines — verified at `c61a607`)** — deferred to manifest `0002-network-registry-vocabulary.md` (own service, own release cadence). The `home_operator` field in `network-registry/src/types.ts` bridges C-R4 and `0002` — resolve in lockstep. **NB:** the cortex-side CLIENT (`src/common/registry/`, `src/bus/network-resolver.ts`) is NOT deferred — it is handled by this manifest's "network-registry CLIENT" section; only its `0002`-wire-coupled JSON keys (`operator_id`/`operator_pubkey`) and the `OperatorRecord` mirror are lockstep-flagged.
 - **`src/common/types/config.ts` legacy `BotConfig.agent.operatorId`** — models the *historical* grove-v2 file format (the input to `migrate-config`). Decision leans "keep as a faithful legacy model"; flagged for review — confirm with the `migrate-config` owner.
 - **`docs/plan-cortex-migration.md` historical lines** — lines describing what MIG-0..MIG-8 migrated *from* may keep period vocabulary. Per-line legacy-vs-current call at PR time.
 - **`docs/migration-from-legacy-nats.md`-style citations + `mf.net-{op}`** — legacy subject-format citations; stay verbatim.
@@ -462,7 +565,7 @@ Lines using "operator" / `persona` in a sense not mechanically resolvable. **Lis
 3. **`topic` → `subject` is one line.** Only `surface-router.test.ts:1283` is the genuine NATS sense. **Reviewer: confirm no NATS-sense `topic` was missed (the `{topic}` image-naming + "Spec | Topic" table + "the topic is unhandled" hits are correctly excluded).**
 4. **Doc file-renames** (`design-dm-operator-channel.md`, `design-mc-f10-operator-input.md`) — `git mv` candidates; F-numbered docs may be referenced by exact filename in `blueprint.yaml`. **Reviewer: confirm before renaming.**
 5. **Dashboard user-facing label** (C-R14b) — change visible "operator" copy or only code identifiers? **Reviewer/principal: decide.**
-6. **Bulk-prose register.** ~1,400 `docs/` + ~3,000 `src/` comment lines are NOT transcribed per-line here — they are file + count + cluster, gated by the CI grep guard. This matches the myelin manifest's `specs/namespace.md` method but at larger scale. **Reviewer: confirm the bulk-prose register is acceptable, or name specific files that need exact per-line treatment promoted into the manifest.**
+6. **Bulk-prose register.** The ~1,124 `docs/` lines + the comment-bulk share of the 2,584 `src/` lines (verified at `c61a607`) are NOT transcribed per-line here — they are file + count + cluster, gated by the CI grep guard. This matches the myelin manifest's `specs/namespace.md` method but at larger scale. **Reviewer: confirm the bulk-prose register is acceptable, or name specific files that need exact per-line treatment promoted into the manifest.**
 7. **Env-var renames** (`CORTEX_ORIGINATOR_PRINCIPAL`, the `GROVE_OPERATOR` fallback) — deferred to C-R14b. **Reviewer: confirm.**
 
 ---
