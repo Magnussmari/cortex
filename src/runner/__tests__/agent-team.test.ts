@@ -8,6 +8,7 @@ import {
 import type { MyelinRuntime } from "../../bus/myelin/runtime";
 import type { TrustResolver } from "../../common/agents/trust-resolver";
 import type { DispatchEventSource } from "../../bus/dispatch-events";
+import { testClaude } from "../../common/test-utils";
 
 // =============================================================================
 // Bus-peer test fixtures (IAW Phase B.2b)
@@ -86,7 +87,7 @@ describe("AgentTeam", () => {
     expect(ctx.teamId).toMatch(/^team-/);
   });
 
-  test("emits progress and synthesis events for a real team run", async () => {
+  testClaude("emits progress and synthesis events for a real team run", async () => {
     const team = new AgentTeam({
       prompt: "What are the key benefits and risks of nuclear fusion energy? Give a brief answer.",
       groveChannel: "test",
@@ -169,7 +170,7 @@ describe("AgentTeam — bus-peer participant (B.2b)", () => {
     ).toThrow(/missing peerAgentId/);
   });
 
-  test("bus-peer participant routes via factory + delivers result to synthesis path", async () => {
+  testClaude("bus-peer participant routes via factory + delivers result to synthesis path", async () => {
     const captures: CapturedHandle[] = [];
     const team = new AgentTeam({
       prompt: "Research the team task",
@@ -233,7 +234,7 @@ describe("AgentTeam — bus-peer participant (B.2b)", () => {
     );
   });
 
-  test("bus-peer participant — onError marks member failed and decrements pending", () => {
+  testClaude("bus-peer participant — onError marks member failed and decrements pending", () => {
     const captures: CapturedHandle[] = [];
     const team = new AgentTeam({
       prompt: "Research the team task",
