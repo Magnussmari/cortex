@@ -42,6 +42,7 @@ import {
 import { AgentTeam } from "../runner/agent-team";
 import { SessionManager } from "../runner/session-manager";
 import { TaskTracker } from "../runner/task-tracker";
+import { attachHeartbeatToCCSession } from "../runner/heartbeat-ticker";
 import {
   processInboundAttachments,
   collectOutputFiles,
@@ -344,6 +345,43 @@ export class DispatchHandler extends EventEmitter {
         "dispatch-handler: publish(dispatch.task.failed) failed:",
         err instanceof Error ? err.message : String(err),
       );
+    });
+  }
+
+  /**
+   * cortex#361 — Attach a `HeartbeatTicker` to a `CCSession` so the dispatch
+   * publishes `system.agent.heartbeat` envelopes on the bus while CC is in
+   * flight. Delegates to `attachHeartbeatToCCSession` so the wiring (event
+   * mapping, start failure handling) lives in one place and can't drift
+   * between this call site and `ReviewConsumer.attachHeartbeatToSession`
+   * (Echo cortex#363 major — duplication fix).
+   *
+   * cortex#360 interaction: the chat-path retry loop calls this once per
+   * attempt (each attempt spawns a fresh CCSession). All heartbeats from
+   * one dispatch carry the same `correlationId` so observers stitch the
+   * stream across retries; the per-attempt iteration counter resets,
+   * which is the correct semantic per the cortex#361 spec.
+   *
+   * No-op when the bus isn't wired (runtime + source absent).
+   */
+  private attachHeartbeatTicker(
+    session: CCSession,
+    opts: { taskId: string; correlationId: string },
+  ): { stop: () => void } {
+    const wiring = this.canPublishSystemEvent();
+    if (!wiring) {
+      return {
+        stop: () => {
+          /* no bus wired — nothing to stop */
+        },
+      };
+    }
+    return attachHeartbeatToCCSession(session, {
+      runtime: wiring.runtime,
+      source: wiring.source,
+      agentId: this.config.agent.name,
+      taskId: opts.taskId,
+      correlationId: opts.correlationId,
     });
   }
 
@@ -682,6 +720,35 @@ export class DispatchHandler extends EventEmitter {
     let finalReason: DispatchTaskFailedReason | null = null;
     let attemptsConsumed = 0;
 
+    // cortex#361 — bus-side liveness heartbeats. ONE ticker **per
+    // attempt** (NOT one ticker per dispatch): each retry attempt spawns
+    // a fresh `CCSession`, and `attachHeartbeatTicker` constructs a new
+    // `HeartbeatTicker` per call. All attempts share the same
+    // `correlation_id`, so subscribers stitch the heartbeat stream
+    // across the retry chain by grouping on `correlation_id`. Echo
+    // cortex#363 N-1 fix — earlier docstring claimed "one ticker per
+    // dispatch" which contradicted the inner per-attempt code; rewritten
+    // to match reality.
+    //
+    // **Subscriber contract for retry boundaries.** Because each
+    // attempt's ticker has its own `HeartbeatTicker` instance, the
+    // `iteration` counter resets to 1 at every retry. Gap-detectors
+    // built off raw iteration arithmetic would mistake a retry boundary
+    // for "N-1 lost heartbeats". Subscribers stitching across attempts
+    // must key on `(correlation_id continuing) + (iteration reset)` as
+    // a retry-attempt boundary, not a lost-heartbeat gap. There's also
+    // a brief silent window between attempts (previous attempt's ticker
+    // stops on `exit`; next attempt's ticker fires its
+    // immediate-first-tick a few ms later) — bounded by spawn latency,
+    // never by `intervalMs`.
+    //
+    // Every per-attempt handle is tracked in `heartbeatHandles[]` and
+    // stopped in the outer `finally` (idempotent, defence-in-depth) in
+    // case a future refactor renames / drops one of the
+    // `result` / `error` / `exit` events the per-session listeners
+    // currently watch.
+    const heartbeatHandles: { stop: () => void }[] = [];
+
     try {
       for (let attempt = 1; attempt <= this.retryMaxAttempts; attempt++) {
         attemptsConsumed = attempt;
@@ -715,6 +782,29 @@ export class DispatchHandler extends EventEmitter {
             continue;
           }
           break;
+        }
+
+        // cortex#361 — attach a heartbeat ticker to this attempt's
+        // session. Each ticker is independent (the previous attempt's
+        // exit stops its own ticker), but all heartbeats carry the same
+        // correlation_id so observers see one logical "still working"
+        // stream per dispatch. `taskId` is the dispatch's `taskId`
+        // (stable across attempts); the per-attempt sub-ticker's
+        // iteration counter resets to 1 — that's fine, subscribers
+        // group on correlation_id.
+        // `attachHeartbeatTicker` requires the real `CCSession` class
+        // for `.on()`; test stubs return plain objects, which the
+        // public helper detects internally — but our cortex#360 call
+        // path types `session` as `CCSessionLike`, so we narrow here
+        // before passing through. The runtime no-op for test stubs is
+        // preserved by the helper's defensive check.
+        if (session instanceof CCSession) {
+          heartbeatHandles.push(
+            this.attachHeartbeatTicker(session, {
+              taskId,
+              correlationId,
+            }),
+          );
         }
 
         // Tool-use progress (single edit-in-place message, cleared on
@@ -800,6 +890,13 @@ export class DispatchHandler extends EventEmitter {
     } finally {
       clearInterval(typingInterval);
       await adapter.clearProgress(target);
+      // cortex#361 — defence-in-depth: stop every per-attempt
+      // heartbeat handle in case any of them survived the session's
+      // terminal events (e.g. a future refactor that drops one of
+      // result/error/exit). All stop()s are idempotent.
+      for (const h of heartbeatHandles) {
+        h.stop();
+      }
     }
 
     // Terminal success — post the response and forward usage.
@@ -941,6 +1038,17 @@ export class DispatchHandler extends EventEmitter {
       });
     }, 8_000);
 
+    // cortex#361 — bus-side liveness heartbeats. Ticker subscribes to the
+    // session's own stream events; wiring is independent of typing /
+    // progress (EventEmitter fans out to every listener). Echo cortex#363
+    // major — capture the handle + call stop() from terminal callbacks
+    // for defence-in-depth matching the sync path (line 651). Idempotent
+    // stop() makes the redundancy free.
+    const heartbeat = this.attachHeartbeatTicker(session, {
+      taskId,
+      correlationId: randomUUID(),
+    });
+
     // Tool-use progress (single edit-in-place message, cleared on result)
     session.on("tool-use", (toolName: string, toolInput: Record<string, unknown>) => {
       void (async () => {
@@ -950,6 +1058,7 @@ export class DispatchHandler extends EventEmitter {
     });
 
     session.on("result", (text: string) => {
+      heartbeat.stop();
       void (async () => {
         clearInterval(typingInterval);
         await adapter.clearProgress(replyTarget);
@@ -973,6 +1082,7 @@ export class DispatchHandler extends EventEmitter {
     });
 
     session.on("error", (err: Error) => {
+      heartbeat.stop();
       void (async () => {
         clearInterval(typingInterval);
         await adapter.clearProgress(replyTarget);
@@ -986,6 +1096,7 @@ export class DispatchHandler extends EventEmitter {
     });
 
     session.on("exit", (code: number) => {
+      heartbeat.stop();
       clearInterval(typingInterval);
       if (session.usage) {
         console.log(`dispatch-handler: async task completed (exit ${code}, ${session.usage.inputTokens}in/${session.usage.outputTokens}out)`);
