@@ -4,6 +4,15 @@
 
 Layer-7 collaboration surface for the metafactory Myelin stack
 
+## Domain Context
+
+Before doing work in this repo, load the domain language:
+
+- **`./CONTEXT.md`** — this repo's bounded-context glossary, if present. One canonical term per concept, with the aliases to avoid. If you find yourself using a term loosely, check it here first. Every ecosystem repo is expected to grow a `CONTEXT.md` (authored via the `grill-with-docs` skill).
+- **`compass/ecosystem/CONTEXT-MAP.md`** — the ecosystem context map: the bounded contexts (soma, cortex, myelin, signal, …) and how their boundary terms reconcile.
+
+When `CONTEXT.md` and your instinct disagree, `CONTEXT.md` wins. When a term crosses a repo boundary, the `CONTEXT-MAP.md` is authoritative.
+
 ## Architecture
 
 cortex is the **M7 application** of the metafactory Myelin stack — the operator's collaboration surface that consumes the bus (M2–M6) and presents activity to humans. It replaces both `the-metafactory/grove` (legacy v0.29.0) and `the-metafactory/grove-v2` (v0.22.1) as the canonical home for Discord/Mattermost adapters, Mission Control dashboard, workflow runner, and bus-side taps.
@@ -35,7 +44,7 @@ Internal componentisation (per `docs/architecture.md` §8):
 - `src/cli/` — Operator CLIs: `discord/` (post messages, read channels, list threads from terminal), `cldyo-live` (instrumented Opus session wrapper), `cortex/` (top-level CLI).
 - `src/renderers/` — Renderer interface + dashboard renderer + pagerduty renderer (the G-1111 §4.6 fail-safe pair).
 - `src/common/` — Shared types + utilities: agent-detection, event-processor, event-utils, github-events, agents/, config/, timeout, types/, usage.
-- `src/services/` — launchd plists: `ai.meta-factory.cortex.bot.plist`, `ai.meta-factory.cortex.relay.plist`.
+- `src/services/` — launchd plists: `ai.meta-factory.cortex.meta-factory.plist` (metafactory dev stack), `ai.meta-factory.cortex.work.plist` (parallel work stack — cortex#244), `ai.meta-factory.cortex.relay.plist` (shared relay).
 - `src/settings/` — `cortex-hooks.json` (CC hook registration).
 - Config: `~/.config/cortex/cortex.yaml` (post-MIG-7.9 — migrated from grove-v2 `~/.config/grove/bot.yaml` via `migrate-config`).
 
@@ -92,7 +101,7 @@ CORTEX_CHANNEL=<name> CORTEX_AGENT_NAME=<display> CORTEX_AGENT_ID=<id> claude
 
 During the MIG-7 cutover window the legacy `GROVE_*` env vars remain accepted by the EventLogger for backward compatibility; new sessions should prefer the `CORTEX_*` names. The deprecation shim retires at MIG-8.
 
-**Event pipeline:** CC hooks → `~/.claude/events/raw/` → cortex-relay (policy filter) → `~/.claude/events/published/` → cortex-bot → bus → dashboard API → `cortex.meta-factory.ai`
+**Event pipeline:** CC hooks → `~/.claude/events/raw/` → cortex-relay (policy filter) → `~/.claude/events/published/` → cortex daemon (`ai.meta-factory.cortex.meta-factory` and/or `.work` plist) → bus → dashboard API → `cortex.meta-factory.ai`
 
 **Pre-configured wrapper:** `cldyo-live` (at `~/.local/bin/`) starts an instrumented Opus session. Plain `cldyo` stays dark (no events). Use `cldyo-live` when you want your work visible on the dashboard.
 
