@@ -229,7 +229,28 @@ describe("MyelinRuntime", () => {
     expect(errored).toBe(true);
   });
 
-  test("subjects placeholder {org} is substituted from agent.operatorId", async () => {
+  test("subjects placeholder {principal} is substituted from agent.operatorId", async () => {
+    const fake = makeFakeNatsConnection();
+    const config = makeConfig({
+      url: "nats://localhost:4222",
+      name: "grove-bot",
+      subjects: ["local.{principal}.attention.>"],
+    });
+    const runtime = await startMyelinRuntime(config, {
+      connectImpl: async () => fake.nc,
+    });
+    expect(runtime.enabled).toBe(true);
+    expect(fake.subscribePatterns[0]).toBe("local.andreas.attention.>");
+    await runtime.stop();
+  });
+
+  // R4 (vocabulary migration 2026-05) — back-compat regression test.
+  // Pre-migration cortex.yaml configs (and migrate-config output that
+  // round-trips legacy bot.yaml verbatim) carry the deprecated `{org}`
+  // placeholder. The runtime substituter MUST resolve both tokens to
+  // the same principal slug so operators don't have to re-author
+  // their nats.subjects list mid-migration.
+  test("subjects placeholder {org} is also substituted (R4 back-compat)", async () => {
     const fake = makeFakeNatsConnection();
     const config = makeConfig({
       url: "nats://localhost:4222",
@@ -246,7 +267,7 @@ describe("MyelinRuntime", () => {
 
   // cortex#269 — `{stack}.` token substitution. Operator-written narrow
   // subscribe patterns can now reference the operator's stack identity
-  // alongside `{org}` and have it expanded at boot. The `.` is part of
+  // alongside `{principal}` and have it expanded at boot. The `.` is part of
   // the placeholder so stack-less deployments collapse cleanly to the
   // legacy 5-segment shape.
   test("subjects placeholder {stack}. is substituted from options.stack", async () => {
@@ -254,7 +275,7 @@ describe("MyelinRuntime", () => {
     const config = makeConfig({
       url: "nats://localhost:4222",
       name: "grove-bot",
-      subjects: ["local.{org}.{stack}.attention.>"],
+      subjects: ["local.{principal}.{stack}.attention.>"],
     });
     const runtime = await startMyelinRuntime(config, {
       connectImpl: async () => fake.nc,
@@ -272,7 +293,7 @@ describe("MyelinRuntime", () => {
     const config = makeConfig({
       url: "nats://localhost:4222",
       name: "grove-bot",
-      subjects: ["local.{org}.{stack}.attention.>"],
+      subjects: ["local.{principal}.{stack}.attention.>"],
     });
     const runtime = await startMyelinRuntime(config, {
       connectImpl: async () => fake.nc,
@@ -286,15 +307,15 @@ describe("MyelinRuntime", () => {
   });
 
   test("subjects without {stack} placeholder are unchanged regardless of options.stack", async () => {
-    // Default `["local.{org}.>"]` pattern uses multi-segment wildcard
+    // Default `["local.{principal}.>"]` pattern uses multi-segment wildcard
     // — already matches both 5-seg and 6-seg emissions. No substitution
     // needed; the runtime must NOT corrupt this pattern when stack is
-    // supplied (`local.{org}.>` → `local.andreas.>`, not `local.andreas.research.>`).
+    // supplied (`local.{principal}.>` → `local.andreas.>`, not `local.andreas.research.>`).
     const fake = makeFakeNatsConnection();
     const config = makeConfig({
       url: "nats://localhost:4222",
       name: "grove-bot",
-      subjects: ["local.{org}.>"],
+      subjects: ["local.{principal}.>"],
     });
     const runtime = await startMyelinRuntime(config, {
       connectImpl: async () => fake.nc,
@@ -397,13 +418,13 @@ describe("MyelinRuntime", () => {
       await runtime.stop();
     });
 
-    test("enabled runtime: publish forwards to NATS with subject local.{org}.{type}", async () => {
+    test("enabled runtime: publish forwards to NATS with subject local.{principal}.{type}", async () => {
       const fake = makeFakeNatsConnection();
       const runtime = await startMyelinRuntime(
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.system.>"],
+          subjects: ["local.{principal}.system.>"],
         }),
         { connectImpl: async () => fake.nc },
       );
@@ -411,7 +432,7 @@ describe("MyelinRuntime", () => {
       const env = makeEnvelope({ type: "system.adapter.degraded" });
       await runtime.publish(env);
       expect(fake.publish).toHaveBeenCalledTimes(1);
-      // IAW Phase A.3: subject `{org}` comes from `envelope.source`'s first
+      // IAW Phase A.3: subject `{principal}` comes from `envelope.source`'s first
       // segment ("metafactory" here), NOT from `agent.operatorId`. Subject
       // prefix mirrors `envelope.sovereignty.classification` ("local" here),
       // satisfying `validateSubjectEnvelopeAlignment`. Emit-site helpers
@@ -428,7 +449,7 @@ describe("MyelinRuntime", () => {
       await runtime.stop();
     });
 
-    test("enabled runtime: publish derives federated.{org}.{type} subject", async () => {
+    test("enabled runtime: publish derives federated.{principal}.{type} subject", async () => {
       // IAW Phase A.3 — federation unblock. When an emit site opts into
       // `classification: "federated"`, the envelope's sovereignty AND the
       // runtime-derived subject move in lockstep onto the `federated.*`
@@ -439,7 +460,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.>"],
+          subjects: ["local.{principal}.>"],
         }),
         { connectImpl: async () => fake.nc },
       );
@@ -457,7 +478,7 @@ describe("MyelinRuntime", () => {
     });
 
     test("enabled runtime: publish derives public.{type} subject (no org segment)", async () => {
-      // IAW Phase A.3 — public-tier envelopes drop the `{org}` segment per
+      // IAW Phase A.3 — public-tier envelopes drop the `{principal}` segment per
       // myelin's grammar (public is global). The runtime applies this
       // automatically via `deriveNatsSubject`.
       const fake = makeFakeNatsConnection();
@@ -465,7 +486,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.>"],
+          subjects: ["local.{principal}.>"],
         }),
         { connectImpl: async () => fake.nc },
       );
@@ -493,7 +514,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.>"],
+          subjects: ["local.{principal}.>"],
         }),
         { connectImpl: async () => fake.nc, stack: "default" },
       );
@@ -504,17 +525,17 @@ describe("MyelinRuntime", () => {
       await runtime.stop();
     });
 
-    test("IAW Phase A.5 (cortex#262): publish derives 6-segment local.{org}.{stack}.{type} when stack option is set", async () => {
+    test("IAW Phase A.5 (cortex#262): publish derives 6-segment local.{principal}.{stack}.{type} when stack option is set", async () => {
       // Stack-aware emit — operator config carries `stack: { id: andreas/research }`
       // and the entrypoint passes `stack: "research"` through to the runtime.
-      // The resulting subject lands inside sage's `local.{org}.{stack}.>`
+      // The resulting subject lands inside sage's `local.{principal}.{stack}.>`
       // subscription wildcard, closing the broadcast loop end-to-end.
       const fake = makeFakeNatsConnection();
       const runtime = await startMyelinRuntime(
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.>"],
+          subjects: ["local.{principal}.>"],
         }),
         { connectImpl: async () => fake.nc, stack: "research" },
       );
@@ -536,7 +557,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.>"],
+          subjects: ["local.{principal}.>"],
         }),
         { connectImpl: async () => fake.nc },
       );
@@ -558,7 +579,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.system.>"],
+          subjects: ["local.{principal}.system.>"],
         }),
         { connectImpl: async () => fake.nc },
       );
@@ -590,7 +611,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.system.>"],
+          subjects: ["local.{principal}.system.>"],
         }),
         {
           connectImpl: async () => fake.nc,
@@ -660,7 +681,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.system.>"],
+          subjects: ["local.{principal}.system.>"],
         }),
         {
           connectImpl: async () => fake.nc,
@@ -699,7 +720,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.system.>"],
+          subjects: ["local.{principal}.system.>"],
         }),
         {
           connectImpl: async () => fake.nc,
@@ -739,7 +760,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.system.>"],
+          subjects: ["local.{principal}.system.>"],
         }),
         {
           connectImpl: async () => fake.nc,
@@ -777,7 +798,7 @@ describe("MyelinRuntime", () => {
         makeConfig({
           url: "nats://localhost:4222",
           name: "grove-bot",
-          subjects: ["local.{org}.system.>"],
+          subjects: ["local.{principal}.system.>"],
         }),
         { connectImpl: async () => fake.nc },
       );
