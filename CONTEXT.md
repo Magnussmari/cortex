@@ -45,7 +45,7 @@ How far a **subject** may travel, set by its prefix — exactly three values: `l
 _Avoid_: reach, visibility, tier, level
 
 **Domain**:
-The functional-domain segment of a **subject** — groups related signals. Values: `tasks`, `agent`, `system`, `code`, `review`, `dispatch`. Always the segment ("the tasks domain").
+The functional-domain segment of a **subject** — groups related signals. Values: `tasks`, `agent`, `system`, `code`, `review`, `dispatch`. Always the segment ("the tasks domain"). The `tasks` and `dispatch` domains are distinct and coexist: **`tasks.{capability}.{subcapability}`** is the work-request namespace (where Offer-mode work is published, capability-routed); **`dispatch.task.{action}`** is the task-lifecycle namespace (events about an active dispatch — `received`, `dispatched`, `started`, `completed`, `failed`, `aborted`). Not a rename in flight.
 _Avoid_: channel, category — and never use `domain` for the DDD bounded-context sense (that is always written **bounded context**).
 
 **Envelope**:
@@ -62,7 +62,33 @@ _Avoid_: skill (that is the SOMA implementation term), ability, function, comman
 
 **Dispatch**:
 The act of routing a unit of work to an **assistant** over the bus. Three modes, by how the recipient is chosen — **Offer**: published to a **capability**, any capable assistant *claims* it (competing consumers, exactly-one delivery); **Direct**: sent to one named assistant (`@{assistant}`), one-shot; **Delegate**: sent to one named assistant that orchestrates a multi-step outcome. Unclaimed work escalates to **dead-letter**.
+
+Inbound subjects per mode:
+- **Offer** → `tasks.{capability}.{subcapability}` (capability routing, competing consumers)
+- **Direct, intra-stack** → `dispatch.task.received` (local **dispatch source** publishes; the stack-local listener consumes)
+- **Direct, peer-to-peer** → `dispatch.task.dispatched` (peer stack publishes via a bus-peer bridge)
+- **Delegate** → currently undefined; under design as part of the AgentTeam **substrate harness** work
+
+Lifecycle envelopes for any mode flow on `dispatch.task.{started|completed|failed|aborted}`, joined by `correlation_id`.
 _Avoid_: routing, assignment, hand-off. Never call the Offer mode "broadcast" — exactly one assistant claims an offered task, not all.
+
+### Surfaces, substrates, dispatch routing
+
+**Substrate harness** (or just **harness**):
+The M6 runtime layer that executes a single **dispatch** on one execution substrate and yields lifecycle **envelopes**. Closed enum of `HarnessId` values: `claude-code`, `bus-peer`, `openai-codex`, `cursor`, `gemini`, `mistral`, `pi-dev`, `agent-team`. The harness boundary is what makes the runner substrate-agnostic — the same `DispatchRequest` flows into any harness; the same `dispatch.task.{action}` envelopes flow out. The `agent-team` harness composes other harnesses to fulfil **Delegate**-mode dispatches.
+_Avoid_: backend, executor, engine, runtime (overloaded with `MyelinRuntime`)
+
+**Dispatch source**:
+Anything that creates and publishes an inbound dispatch **envelope** onto the bus. A platform adapter (Discord, Mattermost, Slack) is a dispatch source: it turns a platform message into a `dispatch.task.received` envelope signed by the hosted **agent**. The GitHub webhook tap is a dispatch source. The MC dashboard's "send task" action is a dispatch source. Future peer-stack agents publishing Offers cross-federation are dispatch sources. A dispatch source is the only thing that signs an envelope into existence; it carries the originating agent's signing key.
+_Avoid_: producer, ingress, intake
+
+**Dispatch sink**:
+Anything that consumes lifecycle envelopes for one dispatch and renders them to a surface. A platform adapter is both a dispatch source (inbound) and a dispatch sink (outbound) — its outbound side subscribes to `dispatch.task.{started|completed|failed|aborted}` filtered by the dispatch's **response routing** and turns lifecycle events into platform calls (`postResponse`, `sendProgress`). The Mission Control dashboard is a dispatch sink; PagerDuty is a dispatch sink. A dispatch sink does NOT sign envelopes; it consumes them.
+_Avoid_: consumer, egress, renderer (renderer is the cortex-internal interface name in `src/renderers/types.ts`; **dispatch sink** is the architectural role)
+
+**Response routing**:
+The payload field on an inbound dispatch envelope that tells the dispatch sink where to deliver lifecycle events. Carries the originating surface address — for a Discord-sourced dispatch: `{adapter_instance, channel_id, thread_id?}`. Echoed by the runner onto every `dispatch.task.{action}` lifecycle envelope so the originating dispatch sink can correlate completion → platform target without keeping state. Response routing is wire-level, not in-memory.
+_Avoid_: callback, return-address, reply-to
 
 ## Relationships
 
@@ -73,6 +99,9 @@ _Avoid_: routing, assignment, hand-off. Never call the Offer mode "broadcast" �
 - An **assistant** declares one or more **capabilities**.
 - Work is **dispatched** to an **assistant** as an **envelope** published on a **subject**.
 - A **subject** = `{scope}.{principal}.{stack}.{domain}.…`; its **scope** sets how far it travels.
+- An **agent** dispatches work via a **substrate harness** — the M6 runtime layer that executes one dispatch and yields lifecycle envelopes.
+- A **dispatch source** publishes inbound dispatch envelopes (signed by the hosted agent); a **dispatch sink** consumes lifecycle envelopes and renders to a surface. A platform adapter plays both roles.
+- A dispatch's inbound envelope carries **response routing**; the runner echoes it onto every lifecycle envelope so the originating dispatch sink can find its target without state.
 
 ## Example dialogue
 
@@ -96,6 +125,9 @@ _Avoid_: routing, assignment, hand-off. Never call the Offer mode "broadcast" �
 - **`topic` → `subject`.** "Topic" is the Kafka/MQTT word; NATS uses **subject**.
 - **`reach` → `scope`.** myelin's `namespace.md` heads the prefix column "Reach"; canonical is **scope**.
 - **`broadcast` → `Offer`.** A broadcast reaches everyone; that dispatch mode is claimed by exactly one assistant. The modes are **Offer / Direct / Delegate**.
+- **`tasks` and `dispatch` are distinct domains**, not aliases. `tasks` = work-request namespace (Offer-mode subject convention). `dispatch` = task-lifecycle namespace (events about an active task). Both will continue to exist.
+- **`renderer` vs `dispatch sink`.** The cortex-internal interface is `Renderer` (`src/renderers/types.ts`); the architectural role is **dispatch sink**. Same thing from different angles — code says `Renderer`; design discussion says `dispatch sink`.
+- **Adapter-originated Direct subject (`tasks.@{assistant}.chat`) is a future seam.** The example dialogue above shows the intended subject grammar; cortex code today publishes adapter-originated Direct dispatches to `dispatch.task.received` (the existing intra-stack inbound subject). Migration to subject-level mode encoding (Direct = `tasks.@{assistant}.…`) is deferred — payload-level mode field carries the information today.
 
 ## Boundary with adjacent contexts
 
