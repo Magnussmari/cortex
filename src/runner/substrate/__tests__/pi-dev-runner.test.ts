@@ -124,51 +124,64 @@ const whichMissing: PiDevWhichFn = () => undefined;
 
 describe("cortex#331 Phase 1 — makePiDevPipelineRunner", () => {
   test("happy path: sage exit 0 + stdout → verdict envelope with summary=stdout, correlation_id=requestEnvelope.id", async () => {
-    const stdout = "## review body\n\nverdict: commented";
-    const spawn = makeRecordingSpawn(makeSpawnResult(stdout, "", 0));
-    const runner = makePiDevPipelineRunner({
-      spawn: spawn.fn,
-      which: whichSuccess,
-    });
+    // cortex#402 — guard the argv pin against an ambient SAGE_SUBSTRATE
+    // env value. Before #402 the env var was inert; after #402 a
+    // developer machine carrying e.g. `SAGE_SUBSTRATE=claude` would
+    // flip the argv assertion below from the documented default
+    // (`pi`) and break this hermetic test. The two #402 tests below
+    // own the env-override semantics; this test just pins the
+    // default-path argv.
+    const prior = process.env.SAGE_SUBSTRATE;
+    delete process.env.SAGE_SUBSTRATE;
+    try {
+      const stdout = "## review body\n\nverdict: commented";
+      const spawn = makeRecordingSpawn(makeSpawnResult(stdout, "", 0));
+      const runner = makePiDevPipelineRunner({
+        spawn: spawn.fn,
+        which: whichSuccess,
+      });
 
-    const opts = makePipelineOpts();
-    const result = await runner(opts);
+      const opts = makePipelineOpts();
+      const result = await runner(opts);
 
-    // Result shape — verdict, not failed.
-    expect(result.kind).toBe("verdict");
-    if (result.kind !== "verdict") return; // narrow
+      // Result shape — verdict, not failed.
+      expect(result.kind).toBe("verdict");
+      if (result.kind !== "verdict") return; // narrow
 
-    // Envelope wiring — correlation_id is the request envelope's id (the
-    // single load-bearing pilot contract per design §5.1).
-    const envelope: Envelope = result.envelope;
-    expect(envelope.type).toBe("review.verdict.commented");
-    expect(envelope.correlation_id).toBe(opts.requestEnvelope.id);
+      // Envelope wiring — correlation_id is the request envelope's id (the
+      // single load-bearing pilot contract per design §5.1).
+      const envelope: Envelope = result.envelope;
+      expect(envelope.type).toBe("review.verdict.commented");
+      expect(envelope.correlation_id).toBe(opts.requestEnvelope.id);
 
-    // Payload shape — summary echoes sage's stdout verbatim, repo/pr
-    // echo the request payload, reviewer is the Phase 1 default "sage".
-    const payload = envelope.payload as {
-      repo: string;
-      pr: number;
-      reviewer: string;
-      verdict: string;
-      summary: string;
-    };
-    expect(payload.summary).toBe(stdout);
-    expect(payload.repo).toBe(VALID_PAYLOAD.repo);
-    expect(payload.pr).toBe(VALID_PAYLOAD.pr);
-    expect(payload.reviewer).toBe("sage");
-    expect(payload.verdict).toBe("commented");
+      // Payload shape — summary echoes sage's stdout verbatim, repo/pr
+      // echo the request payload, reviewer is the Phase 1 default "sage".
+      const payload = envelope.payload as {
+        repo: string;
+        pr: number;
+        reviewer: string;
+        verdict: string;
+        summary: string;
+      };
+      expect(payload.summary).toBe(stdout);
+      expect(payload.repo).toBe(VALID_PAYLOAD.repo);
+      expect(payload.pr).toBe(VALID_PAYLOAD.pr);
+      expect(payload.reviewer).toBe("sage");
+      expect(payload.verdict).toBe("commented");
 
-    // Argv pin — `sage review owner/repo#N --substrate pi`, with the
-    // resolved binary path as argv[0].
-    expect(spawn.calls.length).toBe(1);
-    expect(spawn.calls[0]).toEqual([
-      FAKE_SAGE_BIN,
-      "review",
-      `${VALID_PAYLOAD.repo}#${VALID_PAYLOAD.pr}`,
-      "--substrate",
-      "pi",
-    ]);
+      // Argv pin — `sage review owner/repo#N --substrate pi`, with the
+      // resolved binary path as argv[0].
+      expect(spawn.calls.length).toBe(1);
+      expect(spawn.calls[0]).toEqual([
+        FAKE_SAGE_BIN,
+        "review",
+        `${VALID_PAYLOAD.repo}#${VALID_PAYLOAD.pr}`,
+        "--substrate",
+        "pi",
+      ]);
+    } finally {
+      if (prior !== undefined) process.env.SAGE_SUBSTRATE = prior;
+    }
   });
 
   test("failure path: sage exit != 0 + stderr → failed envelope with reason.kind=cant_do carrying stderr in detail", async () => {
@@ -289,5 +302,48 @@ describe("cortex#331 Phase 1 — makePiDevPipelineRunner", () => {
     expect(reason.kind).toBe("cant_do");
     expect(reason.detail).toContain("sage spawn failed");
     expect(reason.detail).toContain("ENOENT");
+  });
+
+  // cortex#402 — `SAGE_SUBSTRATE` env override
+  // ---------------------------------------------------------------------
+  // Operators without a pi.dev model provider configured (e.g. no
+  // DeepSeek API key) need a way to route sage's lens execution through
+  // `claude` or `codex` instead. The runner reads `SAGE_SUBSTRATE`
+  // verbatim and threads it into argv; sage's own CLI validates the
+  // value. Unset → `pi` (preserves pre-#402 behaviour).
+
+  test("cortex#402 — SAGE_SUBSTRATE env overrides argv[4]", async () => {
+    const prior = process.env.SAGE_SUBSTRATE;
+    process.env.SAGE_SUBSTRATE = "claude";
+    try {
+      const spawn = makeRecordingSpawn(makeSpawnResult("## review\n", "", 0));
+      const runner = makePiDevPipelineRunner({
+        spawn: spawn.fn,
+        which: whichSuccess,
+      });
+      const result = await runner(makePipelineOpts());
+      expect(result.kind).toBe("verdict");
+      expect(spawn.calls.length).toBe(1);
+      expect(spawn.calls[0]!.slice(-2)).toEqual(["--substrate", "claude"]);
+    } finally {
+      if (prior === undefined) delete process.env.SAGE_SUBSTRATE;
+      else process.env.SAGE_SUBSTRATE = prior;
+    }
+  });
+
+  test("cortex#402 — unset SAGE_SUBSTRATE defaults to `pi` (pre-#402 behaviour)", async () => {
+    const prior = process.env.SAGE_SUBSTRATE;
+    delete process.env.SAGE_SUBSTRATE;
+    try {
+      const spawn = makeRecordingSpawn(makeSpawnResult("## review\n", "", 0));
+      const runner = makePiDevPipelineRunner({
+        spawn: spawn.fn,
+        which: whichSuccess,
+      });
+      await runner(makePipelineOpts());
+      expect(spawn.calls[0]!.slice(-2)).toEqual(["--substrate", "pi"]);
+    } finally {
+      if (prior !== undefined) process.env.SAGE_SUBSTRATE = prior;
+    }
   });
 });
