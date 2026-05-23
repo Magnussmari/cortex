@@ -178,6 +178,15 @@ describe("DiscordAdapter.surfaceConfig", () => {
     expect(adapter.surfaceConfig.filter).toBe(filter);
   });
 
+  test("successive accesses return the same object (identity-stable, sweep cortex#416 nit-4)", () => {
+    const { adapter } = makeAdapter({
+      surfaceSubjects: ["local.metafactory.review.>"],
+    });
+    const first = adapter.surfaceConfig;
+    const second = adapter.surfaceConfig;
+    expect(first).toBe(second);
+  });
+
   test("render is bound to the adapter (this is preserved)", async () => {
     // Sanity-check: pulling render off the surfaceConfig and calling it
     // must still find this.client / this.adapterConfig — i.e. the arrow
@@ -263,6 +272,9 @@ describe("DiscordAdapter.renderEnvelope — failure modes", () => {
     expect(warnings.some((w) => w.includes("shard reconnecting"))).toBe(true);
     // Distinguishes from the pre-start case — must NOT log "before start()".
     expect(warnings.some((w) => w.includes("before start()"))).toBe(false);
+    // Sweep cortex#416 nit-3: assert envelope.id is interpolated into the warn
+    // so a future refactor that drops it can't silently weaken operator triage.
+    expect(warnings.some((w) => w.includes("00000000-0000-4000-8000-000000000099"))).toBe(true);
   });
 
   test("drops + warns 'before start()' when client is null (adapter not started)", async () => {
@@ -275,6 +287,8 @@ describe("DiscordAdapter.renderEnvelope — failure modes", () => {
     expect(warnings.some((w) => w.includes("before start()"))).toBe(true);
     // Distinguishes from the reconnecting case — must NOT log "shard reconnecting".
     expect(warnings.some((w) => w.includes("shard reconnecting"))).toBe(false);
+    // Sweep cortex#416 nit-3: envelope.id must appear for operator correlation.
+    expect(warnings.some((w) => w.includes("00000000-0000-4000-8000-000000000099"))).toBe(true);
   });
 
   test("drops + warns when no surfaceFallbackChannelId is configured", async () => {
@@ -284,6 +298,8 @@ describe("DiscordAdapter.renderEnvelope — failure modes", () => {
     await adapter.surfaceConfig.render(makeEnvelope());
     expect(sends).toHaveLength(0);
     expect(warnings.some((w) => w.includes("no surfaceFallbackChannelId configured"))).toBe(true);
+    // Sweep cortex#416 nit-3: envelope.id must appear for operator correlation.
+    expect(warnings.some((w) => w.includes("00000000-0000-4000-8000-000000000099"))).toBe(true);
   });
 
   test("never throws even when render is called pre-start", async () => {

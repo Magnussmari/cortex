@@ -66,6 +66,13 @@ export class DiscordAdapter implements PlatformAdapter {
   private connectionHealth: ConnectionHealth | null = null;
   private botConfig: BotConfig;
   private adapterConfig: DiscordAdapterConfig;
+  /** Sweep cortex#416 nit-4: memoised SurfaceAdapter face. Built lazily on
+   * first access so successive `adapter.surfaceConfig === adapter.surfaceConfig`
+   * checks are identity-stable and zero allocations after the first call.
+   * Safe because the shape is derived from `instanceId` +
+   * `adapterConfig.surfaceSubjects/surfaceFilter`, and `updateConfig` does
+   * NOT touch surface-* fields (those are wiring-time only). */
+  private _surfaceConfig: SurfaceAdapter | null = null;
 
   constructor(adapterConfig: DiscordAdapterConfig, botConfig: BotConfig) {
     this.instanceId = adapterConfig.instanceId;
@@ -79,7 +86,7 @@ export class DiscordAdapter implements PlatformAdapter {
     // it here avoids the "why is nothing rendering?" diagnostic dance.
     if (adapterConfig.surfaceSubjects?.length === 0) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
+        `cortex: discord-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
       );
     }
   }
@@ -135,7 +142,7 @@ export class DiscordAdapter implements PlatformAdapter {
           const res = await fetch(messageTxt.url);
           if (res.ok) finalContent = (await res.text()).trim();
         } catch (err) {
-          console.warn("grove-bot: discord: failed to fetch message.txt attachment:", err instanceof Error ? err.message : err);
+          console.warn("cortex: discord: failed to fetch message.txt attachment:", err instanceof Error ? err.message : err);
         }
       }
 
@@ -162,7 +169,7 @@ export class DiscordAdapter implements PlatformAdapter {
             try {
               parent = (await this.client.channels.fetch(thread.parentId)) as TextChannel | null;
             } catch (err) {
-              console.warn("grove-bot: discord: failed to fetch parent channel:", err instanceof Error ? err.message : err);
+              console.warn("cortex: discord: failed to fetch parent channel:", err instanceof Error ? err.message : err);
             }
           }
           channelName = parent?.name ?? undefined;
@@ -171,7 +178,7 @@ export class DiscordAdapter implements PlatformAdapter {
           channelName = (channel as TextChannel).name ?? undefined;
         }
         if (channelName) {
-          console.log(`grove-bot: channel="${channelName}"${threadName ? ` thread="${threadName}"` : ""}`);
+          console.log(`cortex: channel="${channelName}"${threadName ? ` thread="${threadName}"` : ""}`);
         }
       }
 
@@ -361,9 +368,9 @@ export class DiscordAdapter implements PlatformAdapter {
           if (oldest) this.pendingResults.delete(oldest);
         }
         this.pendingResults.set(key, { target, text, files, createdAt: Date.now() });
-        console.warn(`grove-bot: discord: buffered result for ${key} (Discord disconnected, ${this.pendingResults.size} pending)`);
+        console.warn(`cortex: discord: buffered result for ${key} (Discord disconnected, ${this.pendingResults.size} pending)`);
       } else {
-        console.error("grove-bot: discord: postResponse failed while connected:", err instanceof Error ? err.message : err);
+        console.error("cortex: discord: postResponse failed while connected:", err instanceof Error ? err.message : err);
       }
     }
   }
@@ -419,7 +426,7 @@ export class DiscordAdapter implements PlatformAdapter {
     this.progressMessages.delete(key);
     this.progressSending.delete(key);
     try { await msg?.delete(); } catch (err) {
-      console.warn("grove-bot: discord: failed to delete progress message:", err instanceof Error ? err.message : err);
+      console.warn("cortex: discord: failed to delete progress message:", err instanceof Error ? err.message : err);
     }
   }
 
@@ -442,7 +449,7 @@ export class DiscordAdapter implements PlatformAdapter {
         _native: thread,
       };
     } catch (err) {
-      console.warn("grove-bot: discord: thread creation failed, falling back to channel:", err instanceof Error ? err.message : err);
+      console.warn("cortex: discord: thread creation failed, falling back to channel:", err instanceof Error ? err.message : err);
       return { instanceId: this.instanceId, channelId: msg.channelId, _native: nativeMsg.channel };
     }
   }
@@ -469,7 +476,7 @@ export class DiscordAdapter implements PlatformAdapter {
       //     the same failure forever and crowd out genuinely transient DMs.
       if (DiscordAdapter.isPermanentlyUndeliverableDMError(err)) {
         console.warn(
-          "grove-bot: discord: dropping operator DM, permanently undeliverable:",
+          "cortex: discord: dropping operator DM, permanently undeliverable:",
           err instanceof Error ? err.message : err,
         );
         return;
@@ -477,7 +484,7 @@ export class DiscordAdapter implements PlatformAdapter {
       if (!this.connectionHealth?.currentlyConnected && isRetryableError(err)) {
         this.bufferOperatorDM(text);
       } else {
-        console.warn("grove-bot: discord: failed to notify operator:", err instanceof Error ? err.message : err);
+        console.warn("cortex: discord: failed to notify operator:", err instanceof Error ? err.message : err);
       }
     }
   }
@@ -514,7 +521,7 @@ export class DiscordAdapter implements PlatformAdapter {
     }
     this.pendingOperatorDMs.push({ text, createdAt: Date.now() });
     console.warn(
-      `grove-bot: discord: buffered operator DM (Discord disconnected, ${this.pendingOperatorDMs.length} pending)`
+      `cortex: discord: buffered operator DM (Discord disconnected, ${this.pendingOperatorDMs.length} pending)`
     );
   }
 
@@ -527,7 +534,7 @@ export class DiscordAdapter implements PlatformAdapter {
     );
     const expired = before - this.pendingOperatorDMs.length;
     if (expired > 0) {
-      console.warn(`grove-bot: discord: expired ${expired} pending operator DM(s)`);
+      console.warn(`cortex: discord: expired ${expired} pending operator DM(s)`);
     }
   }
 
@@ -544,7 +551,7 @@ export class DiscordAdapter implements PlatformAdapter {
     const toDeliver = this.pendingOperatorDMs;
     this.pendingOperatorDMs = [];
 
-    console.log(`grove-bot: discord: draining ${toDeliver.length} pending operator DM(s)`);
+    console.log(`cortex: discord: draining ${toDeliver.length} pending operator DM(s)`);
     try {
       const operator = await this.client.users.fetch(operatorId);
       for (const pending of toDeliver) {
@@ -552,14 +559,14 @@ export class DiscordAdapter implements PlatformAdapter {
           await operator.send(pending.text);
         } catch (err) {
           console.error(
-            "grove-bot: discord: failed to deliver buffered operator DM:",
+            "cortex: discord: failed to deliver buffered operator DM:",
             err instanceof Error ? err.message : err,
           );
         }
       }
     } catch (err) {
       console.error(
-        "grove-bot: discord: could not fetch operator user to drain DMs:",
+        "cortex: discord: could not fetch operator user to drain DMs:",
         err instanceof Error ? err.message : err,
       );
     }
@@ -568,23 +575,23 @@ export class DiscordAdapter implements PlatformAdapter {
   private async deliverPendingResult(key: string, pending: PendingResult): Promise<boolean> {
     const channel = await this.resolveChannel(pending.target, true);
     if (!channel) {
-      console.warn(`grove-bot: discord: could not resolve channel ${key} for pending result, dropping`);
+      console.warn(`cortex: discord: could not resolve channel ${key} for pending result, dropping`);
       return false;
     }
     await postToDiscord(channel, pending.text, DiscordAdapter.toDiscordFiles(pending.files));
-    console.log(`grove-bot: discord: delivered pending result to ${key}`);
+    console.log(`cortex: discord: delivered pending result to ${key}`);
     return true;
   }
 
   private async drainPendingResults(): Promise<void> {
     if (this.pendingResults.size === 0) return;
-    console.log(`grove-bot: discord: draining ${this.pendingResults.size} pending result(s) after reconnect`);
+    console.log(`cortex: discord: draining ${this.pendingResults.size} pending result(s) after reconnect`);
 
     for (const [key, pending] of this.pendingResults) {
       try {
         await this.deliverPendingResult(key, pending);
       } catch (err) {
-        console.error(`grove-bot: discord: failed to deliver pending result to ${key}:`, err instanceof Error ? err.message : err);
+        console.error(`cortex: discord: failed to deliver pending result to ${key}:`, err instanceof Error ? err.message : err);
       }
     }
     this.pendingResults.clear();
@@ -594,7 +601,7 @@ export class DiscordAdapter implements PlatformAdapter {
     const now = Date.now();
     for (const [key, pending] of this.pendingResults) {
       if (now - pending.createdAt > DiscordAdapter.PENDING_TTL_MS) {
-        console.warn(`grove-bot: discord: expired pending result for ${key} (age: ${((now - pending.createdAt) / 1000).toFixed(0)}s)`);
+        console.warn(`cortex: discord: expired pending result for ${key} (age: ${((now - pending.createdAt) / 1000).toFixed(0)}s)`);
         this.pendingResults.delete(key);
       }
     }
@@ -654,14 +661,21 @@ export class DiscordAdapter implements PlatformAdapter {
    * once per adapter, after MyelinRuntime has started. The router never opens
    * a NATS subscription — that's MyelinRuntime's job (per spec §5.1) — so this
    * face is purely the rendering hook.
+   *
+   * Sweep cortex#416 nit-4: memoised — successive accesses return the same
+   * object reference so identity checks (`a.surfaceConfig === a.surfaceConfig`)
+   * are stable.
    */
   get surfaceConfig(): SurfaceAdapter {
-    return {
-      id: this.instanceId,
-      subjects: this.adapterConfig.surfaceSubjects ?? [],
-      ...(this.adapterConfig.surfaceFilter ? { filter: this.adapterConfig.surfaceFilter } : {}),
-      render: (envelope) => this.renderEnvelope(envelope),
-    };
+    if (this._surfaceConfig === null) {
+      this._surfaceConfig = {
+        id: this.instanceId,
+        subjects: this.adapterConfig.surfaceSubjects ?? [],
+        ...(this.adapterConfig.surfaceFilter ? { filter: this.adapterConfig.surfaceFilter } : {}),
+        render: (envelope) => this.renderEnvelope(envelope),
+      };
+    }
+    return this._surfaceConfig;
   }
 
   /**
@@ -693,20 +707,20 @@ export class DiscordAdapter implements PlatformAdapter {
     // from a transient gateway blip in the logs.
     if (this.client === null) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} renderEnvelope called before start() — dropping envelope ${envelope.id}`,
+        `cortex: discord-${this.instanceId} renderEnvelope called before start() — dropping envelope ${envelope.id}`,
       );
       return;
     }
     if (!this.client.isReady()) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} renderEnvelope called while shard reconnecting — dropping envelope ${envelope.id}`,
+        `cortex: discord-${this.instanceId} renderEnvelope called while shard reconnecting — dropping envelope ${envelope.id}`,
       );
       return;
     }
     const channelId = this.adapterConfig.surfaceFallbackChannelId;
     if (!channelId) {
       console.warn(
-        `grove-bot: discord-${this.instanceId} has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
+        `cortex: discord-${this.instanceId} has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
       );
       return;
     }

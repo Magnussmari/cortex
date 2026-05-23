@@ -57,6 +57,10 @@ export class MattermostAdapter implements PlatformAdapter {
   private botConfig: BotConfig;
   private scopedConfig: BotConfig; // Config with mattermost scoped to this instance
   private adapterConfig: MattermostAdapterConfig;
+  /** Sweep cortex#416 nit-4: memoised SurfaceAdapter face. Mirror of
+   * DiscordAdapter — identity-stable across repeat accesses. Surface-* config
+   * is wiring-time only (not touched by `updateConfig`), so caching is safe. */
+  private _surfaceConfig: SurfaceAdapter | null = null;
 
   constructor(adapterConfig: MattermostAdapterConfig, botConfig: BotConfig) {
     this.instanceId = adapterConfig.instanceId;
@@ -76,7 +80,7 @@ export class MattermostAdapter implements PlatformAdapter {
     // config-typo signal worth surfacing.
     if (adapterConfig.surfaceSubjects?.length === 0) {
       console.warn(
-        `grove-bot: mattermost-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
+        `cortex: mattermost-${this.instanceId} surfaceSubjects is empty — adapter will never render bus envelopes`,
       );
     }
   }
@@ -276,7 +280,7 @@ export class MattermostAdapter implements PlatformAdapter {
         await postReply(dmChannel.id, text, undefined, apiUrl, apiToken);
       }
     } catch (err) {
-      console.warn("grove-bot: mattermost: failed to notify operator:", err instanceof Error ? err.message : err);
+      console.warn("cortex: mattermost: failed to notify operator:", err instanceof Error ? err.message : err);
     }
   }
 
@@ -311,14 +315,19 @@ export class MattermostAdapter implements PlatformAdapter {
    * different — the poller pulls; it doesn't push), so renderEnvelope's
    * failure mode is "log + drop" rather than "buffer for retry". JetStream
    * replay covers the recovery path per design-cortex.md §3.3.
+   *
+   * Sweep cortex#416 nit-4: memoised — identity-stable across repeat accesses.
    */
   get surfaceConfig(): SurfaceAdapter {
-    return {
-      id: this.instanceId,
-      subjects: this.adapterConfig.surfaceSubjects ?? [],
-      ...(this.adapterConfig.surfaceFilter ? { filter: this.adapterConfig.surfaceFilter } : {}),
-      render: (envelope) => this.renderEnvelope(envelope),
-    };
+    if (this._surfaceConfig === null) {
+      this._surfaceConfig = {
+        id: this.instanceId,
+        subjects: this.adapterConfig.surfaceSubjects ?? [],
+        ...(this.adapterConfig.surfaceFilter ? { filter: this.adapterConfig.surfaceFilter } : {}),
+        render: (envelope) => this.renderEnvelope(envelope),
+      };
+    }
+    return this._surfaceConfig;
   }
 
   /**
@@ -337,7 +346,7 @@ export class MattermostAdapter implements PlatformAdapter {
     const channelId = this.adapterConfig.surfaceFallbackChannelId;
     if (!channelId) {
       console.warn(
-        `grove-bot: mattermost-${this.instanceId} has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
+        `cortex: mattermost-${this.instanceId} has no surfaceFallbackChannelId configured — dropping envelope ${envelope.id}`,
       );
       return;
     }
@@ -351,7 +360,7 @@ export class MattermostAdapter implements PlatformAdapter {
       );
     } catch (err) {
       console.warn(
-        `grove-bot: mattermost-${this.instanceId} renderEnvelope failed for envelope ${envelope.id}:`,
+        `cortex: mattermost-${this.instanceId} renderEnvelope failed for envelope ${envelope.id}:`,
         err instanceof Error ? err.message : err,
       );
     }

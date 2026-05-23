@@ -161,6 +161,15 @@ describe("MattermostAdapter.surfaceConfig", () => {
     expect(adapter.surfaceConfig.filter).toBe(filter);
   });
 
+  test("successive accesses return the same object (identity-stable, sweep cortex#416 nit-4)", () => {
+    const adapter = makeAdapter({
+      surfaceSubjects: ["local.metafactory.review.>"],
+    });
+    const first = adapter.surfaceConfig;
+    const second = adapter.surfaceConfig;
+    expect(first).toBe(second);
+  });
+
   test("render is bound to the adapter (this is preserved)", async () => {
     // Pulling render off surfaceConfig and calling it must still find
     // this.adapterConfig — i.e. the arrow in the getter binds correctly.
@@ -252,6 +261,11 @@ describe("MattermostAdapter.renderEnvelope — failure modes", () => {
     expect(fetchCalls).toHaveLength(0);
     expect(
       warnings.some((w) => w.includes("no surfaceFallbackChannelId configured")),
+    ).toBe(true);
+    // Sweep cortex#416 nit-3: envelope.id must appear in the warn so operator
+    // can correlate a dropped envelope with its bus source.
+    expect(
+      warnings.some((w) => w.includes("00000000-0000-4000-8000-000000000099")),
     ).toBe(true);
   });
 
