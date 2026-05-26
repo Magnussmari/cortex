@@ -89,6 +89,7 @@ import {
   createReviewTaskFailedEvent,
   createReviewVerdictEvent,
 } from "../../bus/review-events";
+import type { ReviewVerdictKind } from "../../bus/review-events";
 import type {
   ReviewPipelineOpts,
   ReviewPipelineResult,
@@ -231,6 +232,13 @@ export function makePiDevPipelineRunner(
     // below maps to `cant_do`).
     const substrate = process.env.SAGE_SUBSTRATE ?? "pi";
     const argv = [sageBin, "review", prRef, "--substrate", substrate];
+    // Propagate the dispatch's `--post` intent. `sage dispatch --post`
+    // stamps `payload.post: true` (sage#8) and the review-consumer carries
+    // it through; without this the verdict is computed but never posted to
+    // the forge (the prior `posted=false` behaviour).
+    if (pipeline.payload.post === true) {
+      argv.push("--post");
+    }
 
     let proc: PiDevSpawnResult;
     try {
@@ -270,7 +278,14 @@ export function makePiDevPipelineRunner(
       );
     }
 
-    if (exitCode !== 0) {
+    // sage's exit-code contract (sage cli/index.ts):
+    //   0   → approved / commented verdict
+    //   1   → changes-requested verdict (a VALID review outcome, CI-gate
+    //         convention — NOT an error; the review markdown is on stdout)
+    //   ≥2  → real error (forge selection, substrate parse, etc.)
+    //   -1  → subprocess killed
+    // Treat 0 and 1 as verdicts; everything else fails.
+    if (exitCode !== 0 && exitCode !== 1) {
       return failed(
         pipeline,
         correlationId,
@@ -279,11 +294,13 @@ export function makePiDevPipelineRunner(
       );
     }
 
-    // Phase 1: pass the full markdown through as the verdict summary.
-    // Verdict kind is hardcoded to `commented` — Phase 2 (sage emits
-    // structured JSON) replaces this with parsed approved /
-    // changes-requested / commented from sage's verdict block.
-    return verdict(pipeline, correlationId, stdout);
+    // Map the exit code to the verdict decision. Exit 1 ⇒ changes-requested.
+    // Exit 0 stays `commented` because sage doesn't distinguish approved
+    // from commented via exit code — Phase 2 (sage `--format json`, sage#TBD)
+    // parses the structured verdict block to recover approved/findings.
+    const decision: ReviewVerdictKind =
+      exitCode === 1 ? "changes-requested" : "commented";
+    return verdict(pipeline, correlationId, stdout, decision);
   };
 }
 
@@ -339,21 +356,23 @@ function failed(
 }
 
 /**
- * Build a `review.verdict.commented` envelope carrying sage's markdown
- * stdout as `payload.summary`. Phase 1 hardcodes `verdict: "commented"`
- * + `reviewer: "sage"`; Phase 2 derives both from sage's structured
- * verdict block.
+ * Build a `review.verdict.{decision}` envelope carrying sage's markdown
+ * stdout as `payload.summary`. `decision` is derived from sage's exit code
+ * (changes-requested vs commented). `reviewer` is hardcoded to `sage`;
+ * Phase 2 (sage `--format json`) derives reviewer + findings from the
+ * structured verdict block.
  */
 function verdict(
   pipeline: ReviewPipelineOpts,
   correlationId: string,
   stdout: string,
+  decision: ReviewVerdictKind,
 ): ReviewPipelineResult {
   const payload = pipeline.payload;
   const source = pipeline.source;
   const envelope: Envelope = createReviewVerdictEvent({
     source,
-    kind: "commented",
+    kind: decision,
     correlationId,
     payload: {
       repo: payload.repo,
@@ -362,7 +381,7 @@ function verdict(
       // Phase 2 reads the reviewer agent identity from sage's
       // structured verdict block.
       reviewer: "sage",
-      verdict: "commented",
+      verdict: decision,
       summary: stdout,
       // Placeholder fields Phase 1 doesn't have access to without a
       // structured verdict block. The verdict envelope schema requires

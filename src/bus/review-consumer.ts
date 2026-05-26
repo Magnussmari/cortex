@@ -1007,6 +1007,10 @@ export function parseReviewRequestPayload(
   if (typeof p.title === "string") out.title = p.title;
   if (typeof p.cycle === "number" && Number.isInteger(p.cycle)) out.cycle = p.cycle;
   if (typeof p.note === "string") out.note = p.note;
+  // `sage dispatch --post` stamps `post: true` (sage#8: true or omitted,
+  // never false). Carry it through so the substrate runner can pass
+  // `--post` to the sage subprocess.
+  if (p.post === true) out.post = true;
   return out;
 }
 

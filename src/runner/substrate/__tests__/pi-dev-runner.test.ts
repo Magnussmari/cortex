@@ -346,4 +346,102 @@ describe("cortex#331 Phase 1 — makePiDevPipelineRunner", () => {
       if (prior !== undefined) process.env.SAGE_SUBSTRATE = prior;
     }
   });
+
+  // cortex#409 — sage exit-code → verdict mapping
+  // ---------------------------------------------------------------------
+  // sage exits 1 for a "changes-requested" verdict (cli/index.ts) — a
+  // VALID review outcome, not an error. Only exit ≥2 (or -1 killed) is a
+  // real failure. Before this fix any non-zero exit collapsed to
+  // `dispatch.task.failed`, discarding the review markdown on stdout.
+
+  test("cortex#409 — sage exit 1 → changes-requested verdict (not failed), summary=stdout", async () => {
+    const prior = process.env.SAGE_SUBSTRATE;
+    delete process.env.SAGE_SUBSTRATE;
+    try {
+      const stdout = "## review body\n\nverdict: changes-requested";
+      const spawn = makeRecordingSpawn(
+        makeSpawnResult(stdout, "[sage] verdict: changes-requested", 1),
+      );
+      const runner = makePiDevPipelineRunner({
+        spawn: spawn.fn,
+        which: whichSuccess,
+      });
+      const opts = makePipelineOpts();
+      const result = await runner(opts);
+
+      expect(result.kind).toBe("verdict");
+      if (result.kind !== "verdict") return;
+      const envelope: Envelope = result.envelope;
+      expect(envelope.type).toBe("review.verdict.changes-requested");
+      expect(envelope.correlation_id).toBe(opts.requestEnvelope.id);
+      const payload = envelope.payload as { verdict: string; summary: string };
+      expect(payload.verdict).toBe("changes-requested");
+      expect(payload.summary).toBe(stdout);
+    } finally {
+      if (prior !== undefined) process.env.SAGE_SUBSTRATE = prior;
+    }
+  });
+
+  test("cortex#409 — sage exit -1 (killed) → failed (not a verdict)", async () => {
+    const spawn = makeRecordingSpawn(makeSpawnResult("", "killed", -1));
+    const runner = makePiDevPipelineRunner({
+      spawn: spawn.fn,
+      which: whichSuccess,
+    });
+    const result = await runner(makePipelineOpts());
+    expect(result.kind).toBe("failed");
+    if (result.kind !== "failed") return;
+    const reason = (result.envelope.payload as { reason: { kind: string } }).reason;
+    expect(reason.kind).toBe("cant_do");
+  });
+
+  // cortex#409 — `--post` propagation
+  // ---------------------------------------------------------------------
+  // `sage dispatch --post` stamps `payload.post: true`; the runner must
+  // pass `--post` to the sage subprocess so the verdict is posted to the
+  // forge. Absent/false `post` → no `--post` (sage default: no post).
+
+  test("cortex#409 — payload.post=true appends --post to argv", async () => {
+    const prior = process.env.SAGE_SUBSTRATE;
+    delete process.env.SAGE_SUBSTRATE;
+    try {
+      const spawn = makeRecordingSpawn(makeSpawnResult("## review\n", "", 0));
+      const runner = makePiDevPipelineRunner({
+        spawn: spawn.fn,
+        which: whichSuccess,
+      });
+      const base = makePipelineOpts();
+      const opts: ReviewPipelineOpts = {
+        ...base,
+        payload: { ...base.payload, post: true },
+      };
+      await runner(opts);
+      expect(spawn.calls[0]).toEqual([
+        FAKE_SAGE_BIN,
+        "review",
+        `${VALID_PAYLOAD.repo}#${VALID_PAYLOAD.pr}`,
+        "--substrate",
+        "pi",
+        "--post",
+      ]);
+    } finally {
+      if (prior !== undefined) process.env.SAGE_SUBSTRATE = prior;
+    }
+  });
+
+  test("cortex#409 — absent post → argv omits --post", async () => {
+    const prior = process.env.SAGE_SUBSTRATE;
+    delete process.env.SAGE_SUBSTRATE;
+    try {
+      const spawn = makeRecordingSpawn(makeSpawnResult("## review\n", "", 0));
+      const runner = makePiDevPipelineRunner({
+        spawn: spawn.fn,
+        which: whichSuccess,
+      });
+      await runner(makePipelineOpts());
+      expect(spawn.calls[0]).not.toContain("--post");
+    } finally {
+      if (prior !== undefined) process.env.SAGE_SUBSTRATE = prior;
+    }
+  });
 });
