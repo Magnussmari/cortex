@@ -1317,9 +1317,11 @@ describe("DispatchHandler — Direction A Stage 4-A inbound envelope publish (co
 
   test("intercept gate excludes async/team — explicit boolean coverage", () => {
     // The handleMessage intercept fires only for
-    // `parsed.mode === undefined || parsed.mode === "sync"`. Driving
-    // the async/team paths through `handleMessage` end-to-end would
-    // require either spawning a real `claude` binary (handleAsync
+    // `parsed.mode === "sync"` (post-Nit-4 in commit 8f000e8 — the
+    // `mode === undefined` branch was removed as dead code, since
+    // `parseMessageKeywords` always returns a concrete enum mode).
+    // Driving the async/team paths through `handleMessage` end-to-end
+    // would require either spawning a real `claude` binary (handleAsync
     // builds `new CCSession(...)` directly, bypassing the factory)
     // or stubbing `AgentTeam` (handleTeam path). Both are exercised
     // by the cortex#360 / cortex#419 suites with the appropriate
@@ -1332,6 +1334,8 @@ describe("DispatchHandler — Direction A Stage 4-A inbound envelope publish (co
     //   - "team: …"     → mode: "team"      → intercept skipped
     //   - "/help"       → mode: "help"      → intercept skipped
     //   - "/learning …" → mode: "learning"  → intercept skipped
+    // The `undefined` row is encoded for return-type-widening
+    // defence — production refuses to intercept it.
     type MaybeMode = string | undefined;
     const wouldIntercept = (mode: MaybeMode): boolean => mode === "sync";
     expect(wouldIntercept("sync")).toBe(true);
