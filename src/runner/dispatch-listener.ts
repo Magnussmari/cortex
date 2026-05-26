@@ -331,13 +331,44 @@ function dispatchReceivedSubject(org: string, stack?: string): string {
 }
 
 /**
- * Default subject for the runner's bus subscription. The `{principal}` segment
- * is substituted at registration time using `source.org` so a misconfigured
- * runner with no operator id can still subscribe (it'll match nothing
- * unless someone publishes under `local.default.dispatch.task.received`).
+ * Direction A Stage 4 (#409) — canonical Tasks Domain subscription pattern.
+ *
+ * Per `myelin/specs/namespace.md` §Tasks Domain and cortex/CONTEXT.md (post
+ * cortex#414), Direct/Delegate inbound dispatches publish onto
+ * `local.{principal}.{stack}.tasks.@{did-encoded-assistant}.{capability}` —
+ * the `@*` wildcard here matches any DID-encoded assistant segment, and the
+ * trailing `>` token matches any capability subtree (`chat`, `code-review`,
+ * `release`, etc.).
+ *
+ * The listener subscribes to this PATTERN once per stack; the surface-router
+ * routes every matching envelope through the same `handleDispatchEnvelope`
+ * path that handles the legacy `dispatch.task.received` subject. Both
+ * subscriptions coexist during Stages 4–6 (adapters flip publishers to
+ * canonical); Stage 7 (#412) removes the legacy subscription.
+ */
+function canonicalTasksDirectSubject(org: string, stack?: string): string {
+  if (stack === undefined) {
+    return `local.${org}.tasks.@*.>`;
+  }
+  return `local.${org}.${stack}.tasks.@*.>`;
+}
+
+/**
+ * Default subject(s) for the runner's bus subscription. The `{principal}`
+ * segment is substituted at registration time using `source.org` so a
+ * misconfigured runner with no operator id can still subscribe (it'll match
+ * nothing unless someone publishes under `local.default.…`).
+ *
+ * Direction A Stage 4 — returns BOTH the legacy `dispatch.task.received`
+ * subject and the canonical `tasks.@*.>` pattern so the listener handles
+ * both shapes during the migration window. Stage 7 cutover removes the
+ * legacy entry.
  */
 function defaultSubjects(org: string, stack?: string): string[] {
-  return [dispatchReceivedSubject(org, stack)];
+  return [
+    dispatchReceivedSubject(org, stack),
+    canonicalTasksDirectSubject(org, stack),
+  ];
 }
 
 export function createDispatchListener(
