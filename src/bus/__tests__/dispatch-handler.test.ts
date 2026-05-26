@@ -1333,10 +1333,13 @@ describe("DispatchHandler — Direction A Stage 4-A inbound envelope publish (co
     //   - "/help"       → mode: "help"      → intercept skipped
     //   - "/learning …" → mode: "learning"  → intercept skipped
     type MaybeMode = string | undefined;
-    const wouldIntercept = (mode: MaybeMode): boolean =>
-      mode === undefined || mode === "sync";
+    const wouldIntercept = (mode: MaybeMode): boolean => mode === "sync";
     expect(wouldIntercept("sync")).toBe(true);
-    expect(wouldIntercept(undefined)).toBe(true);
+    // `undefined` never appears in practice — `parseMessageKeywords` always
+    // returns a concrete enum mode — but encode the production semantic
+    // (only `"sync"` intercepts) explicitly to guard against return-type
+    // widening.
+    expect(wouldIntercept(undefined)).toBe(false);
     expect(wouldIntercept("async")).toBe(false);
     expect(wouldIntercept("team")).toBe(false);
     expect(wouldIntercept("help")).toBe(false);
