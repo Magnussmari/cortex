@@ -629,10 +629,13 @@ export class DispatchHandler extends EventEmitter {
     try {
       await publishOnSubject.call(wiring.runtime, envelope, subject);
     } catch (err) {
-      // `publishOnSubject` is contractually fire-and-forget at the
-      // transport layer (`link.publish` is sync), but defence-in-depth
-      // here in case a future signer / JetStream implementation
-      // surfaces a real Promise rejection.
+      // `publishOnSubject` propagates errors from the signer and link
+      // layers — `signAndPublishOnSubject` awaits both and rethrows,
+      // and a future JetStream publisher will surface real Promise
+      // rejections too. This catch is the propagation-aware safety
+      // net: log the failure, return `false`, and let the caller
+      // (`handleMessage`) fall through to the legacy in-process path
+      // per the migration-moves-preserve-behavior contract.
       console.error(
         `dispatch-handler: publishOnSubject(${subject}) failed:`,
         err instanceof Error ? err.message : String(err),
