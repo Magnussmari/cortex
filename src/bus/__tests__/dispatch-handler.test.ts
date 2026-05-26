@@ -1206,6 +1206,44 @@ describe("DispatchHandler — Direction A Stage 4-A inbound envelope publish (co
     await handler.shutdown();
   });
 
+  test("exotic authorId with no DID-valid encoding → returns false, no publish (cortex#420 nit-5)", async () => {
+    // After the cortex#420 nit-5 fix, `adapterOriginatorIdentity`
+    // returns `null` (rather than a collision-prone `{prefix}-unknown`
+    // fallback) when the resulting candidate fails myelin's `DID_RE`.
+    // An authorId composed entirely of characters outside `[a-z0-9._-]`
+    // collapses to all-hyphens after the safe-id replace step, which
+    // produces a candidate containing `--` — rejected by DID_RE's
+    // `-(?!-)` clause. `publishInboundDispatchEnvelope` MUST return
+    // `false` so `handleMessage` falls through to the legacy
+    // in-process path, and no envelope is published on the bus.
+    const runtime = makeRecordingRuntimeWithSubject();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+    });
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts({
+        msg: makeMsg({
+          platform: "discord",
+          // `!!!` → safe-id `---` → candidate `did:mf:discord----`
+          // contains `--`, fails DID_RE.
+          authorId: "!!!",
+        }),
+      }),
+    );
+    expect(published).toBe(false);
+    expect(runtime.subjectPublishes.length).toBe(0);
+    await handler.shutdown();
+  });
+
   // ---------------------------------------------------------------------------
   // Flag gate — handleMessage integration. Verifies that with the flag
   // OFF, the envelope path is NEVER taken (legacy behaviour byte-for-byte
