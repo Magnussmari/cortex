@@ -904,7 +904,7 @@ function parsePrUrl(url: string): { repo: string; pr: number } | null {
     return null;
   }
 
-  const gh = parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/);
+  const gh = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(parsed.pathname);
   if (gh) {
     const owner = gh[1];
     const repo = gh[2];
@@ -915,7 +915,7 @@ function parsePrUrl(url: string): { repo: string; pr: number } | null {
     return Number.isInteger(pr) && pr > 0 ? { repo: `${owner}/${repo}`, pr } : null;
   }
 
-  const gl = parsed.pathname.match(/^\/(.+)\/-\/merge_requests\/(\d+)\/?$/);
+  const gl = /^\/(.+)\/-\/merge_requests\/(\d+)\/?$/.exec(parsed.pathname);
   if (gl) {
     const projectPath = gl[1];
     const n = gl[2];
