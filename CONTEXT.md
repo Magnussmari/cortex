@@ -79,7 +79,7 @@ DID-segment encoding (`:` → `-`, `.` → `--`) via myelin's `encodeDidSegment`
 
 Lifecycle envelopes for any mode flow on `dispatch.task.{started|completed|failed|aborted}`, joined by `correlation_id`. Lifecycle envelopes mirror the inbound scope (intra-principal → `local.…dispatch.task.*`; cross-principal → `federated.…dispatch.task.*`).
 
-**Legacy:** cortex code (`src/runner/dispatch-listener.ts` + IAW Phase D integration tests) subscribes to `dispatch.task.received` as a pre-namespace-finalisation convention. The Direction A migration (C-405 + #406–#412) flips publishers to canonical `tasks.@{assistant}.{capability}` subjects and removes the legacy subscription in Stage 7.
+**Migration status (Direction A — C-405 + #406–#412):** As of Stage 4-A (cortex#409), `src/runner/dispatch-listener.ts` subscribes to BOTH the legacy `dispatch.task.received` subject AND the canonical `tasks.@*.>` pattern (additive — same `handleDispatchEnvelope` handles both). When the `CORTEX_ADAPTER_ENVELOPE_MODE=1` feature flag is set, `dispatch-handler.handleMessage` publishes chat/direct dispatches onto the canonical subject via `runtime.publishOnSubject`. Async/team paths stay on the legacy in-process CC-spawn route until Stages 4-B / 4-C; the legacy listener subscription stays until Stage 7 (#412) cutover deletes `dispatch-handler.ts` and removes it.
 _Avoid_: routing, assignment, hand-off. Never call the Offer mode "broadcast" — exactly one assistant claims an offered task, not all.
 
 ### Surfaces, substrates, dispatch routing
