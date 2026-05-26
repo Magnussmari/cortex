@@ -57,6 +57,7 @@ import {
 } from "./system-events";
 import { buildBaseEnvelope as buildSharedEnvelope } from "./envelope-builder";
 import { directTaskSubject } from "@the-metafactory/myelin/subjects";
+import { DID_RE } from "@the-metafactory/myelin/identity";
 import type { Envelope } from "./myelin/envelope-validator";
 import { join } from "path";
 
@@ -76,14 +77,6 @@ import { join } from "path";
 function isAdapterEnvelopeModeEnabled(): boolean {
   return process.env.CORTEX_ADAPTER_ENVELOPE_MODE === "1";
 }
-
-/**
- * Strict DID grammar (myelin spec): `did:mf:<name>` where `<name>` is
- * `[a-z]([a-z0-9._]|-(?!-))+`. Used by the adapter envelope path to
- * decide when a platform-side identifier (Discord snowflake, Mattermost
- * uid) is already DID-shaped vs. when it needs prefixing.
- */
-const DID_RE = /^did:mf:[a-z](?:[a-z0-9._]|-(?!-))+$/;
 
 /**
  * Map a platform-side author identifier onto a DID-grammar-compliant
