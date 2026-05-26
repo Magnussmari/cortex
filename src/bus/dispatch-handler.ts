@@ -56,10 +56,7 @@ import {
   createSystemInboundAbortedEvent,
 } from "./system-events";
 import { buildBaseEnvelope as buildSharedEnvelope } from "./envelope-builder";
-import {
-  encodeDidSegment,
-  directTaskSubject,
-} from "@the-metafactory/myelin/subjects";
+import { directTaskSubject } from "@the-metafactory/myelin/subjects";
 import type { Envelope } from "./myelin/envelope-validator";
 import { join } from "path";
 
