@@ -630,18 +630,15 @@ export async function startMyelinRuntime(
       }
     }
 
-    try {
-      link.publish(subject, JSON.stringify(envelopeToPublish));
-    } catch (err) {
-      // Swallow + log per the contract on `MyelinRuntime.publish`. A failing
-      // operational event must NOT escalate into a crash, particularly since
-      // most failure modes here (closed connection, oversized payload) are
-      // already-bad-state signals.
-      console.error(
-        `myelin-runtime: publish failed for subject=${subject} id=${envelope.id} type=${envelope.type}:`,
-        err instanceof Error ? err.message : err,
-      );
-    }
+    // cortex#420 major-3: do NOT swallow `link.publish` errors here.
+    // The legacy `publish()` contract ("logged and swallowed") is
+    // preserved by `publishEnabled` below catching + logging at its
+    // call site; the cortex#409 `publishOnSubject` path needs
+    // transport-level failures to PROPAGATE so the dispatch-handler
+    // can fall through to the legacy in-process path (silent drops
+    // here would mean inbound chat dispatches are lost when the bus
+    // is unreachable).
+    link.publish(subject, JSON.stringify(envelopeToPublish));
   };
 
   const publishEnabled = async (envelope: Envelope): Promise<void> => {
@@ -663,7 +660,21 @@ export async function startMyelinRuntime(
     // `deriveNatsSubject` returns the legacy 5-segment shape — preserving
     // emit-site behavior for deployments that haven't wired stack identity.
     const subject = deriveNatsSubject(envelope, stack);
-    await signAndPublishOnSubject(envelope, subject);
+    try {
+      await signAndPublishOnSubject(envelope, subject);
+    } catch (err) {
+      // Legacy `publish()` contract — errors at publish time are
+      // logged and swallowed (a failing operational event must NOT
+      // escalate into a crash, particularly when the bot is already
+      // in a degraded state). The cortex#409 `publishOnSubject`
+      // path lets transport errors propagate; this wrapper preserves
+      // the long-standing fire-and-forget posture on `publish()`.
+      // cortex#420 major-3.
+      console.error(
+        `myelin-runtime: publish failed for subject=${subject} id=${envelope.id} type=${envelope.type}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   };
 
   /**
