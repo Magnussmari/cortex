@@ -916,10 +916,7 @@ export class DispatchHandler extends EventEmitter {
       // `publishOnSubject`, build/publish error), we fall through
       // to the legacy `handleSync` below — migration-moves-preserve-
       // behavior contract per CLAUDE.md Critical Rules.
-      if (
-        (parsed.mode === undefined || parsed.mode === "sync") &&
-        isAdapterEnvelopeModeEnabled()
-      ) {
+      if (parsed.mode === "sync" && isAdapterEnvelopeModeEnabled()) {
         const dispatchTaskId = randomUUID();
         const published = await this.publishInboundDispatchEnvelope({
           taskId: dispatchTaskId,
