@@ -1147,7 +1147,7 @@ function validateCanonicalTaskRecipient(
   const tasksIndex = parts.indexOf("tasks");
   if (tasksIndex === -1) return null;
   const assistantSegment = parts[tasksIndex + 1];
-  if (assistantSegment === undefined || !assistantSegment.startsWith("@")) {
+  if (!assistantSegment?.startsWith("@")) {
     return null;
   }
 

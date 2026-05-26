@@ -232,13 +232,13 @@ export async function provisionReviewConsumer(
     // is recreated. Update it in place when it doesn't match the desired
     // deadline so a redeploy fixes live durables without a manual
     // `nats consumer rm`. Other fields stay un-reconciled (v1 policy).
-    if (existing.config?.ack_wait !== ackWaitNs) {
+    if (existing.config.ack_wait !== ackWaitNs) {
       await opts.jsm.consumers.update(opts.stream, opts.durable, {
         ...existing.config,
         ack_wait: ackWaitNs,
       });
       log.info(
-        `jetstream-provision: updated consumer "${opts.durable}" ack_wait ${Math.round((existing.config?.ack_wait ?? 0) / 1_000_000_000)}s → ${Math.round(ackWaitNs / 1_000_000_000)}s (cortex#422)`,
+        `jetstream-provision: updated consumer "${opts.durable}" ack_wait ${Math.round((existing.config.ack_wait ?? 0) / 1_000_000_000)}s → ${Math.round(ackWaitNs / 1_000_000_000)}s (cortex#422)`,
       );
       return "updated";
     }
