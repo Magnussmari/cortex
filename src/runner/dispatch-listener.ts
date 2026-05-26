@@ -61,7 +61,9 @@ import {
   getActorPrincipal,
   getSignedByChain,
   getFirstStampPrincipal,
+  getTargetAssistant,
 } from "../bus/myelin/envelope-validator";
+import { encodeDidSegment } from "@the-metafactory/myelin/subjects";
 import type { MyelinRuntime } from "../bus/myelin/runtime";
 import type {
   SurfaceAdapter,
@@ -335,22 +337,23 @@ function dispatchReceivedSubject(org: string, stack?: string): string {
  *
  * Per `myelin/specs/namespace.md` §Tasks Domain and cortex/CONTEXT.md (post
  * cortex#414), Direct/Delegate inbound dispatches publish onto
- * `local.{principal}.{stack}.tasks.@{did-encoded-assistant}.{capability}` —
- * the `@*` wildcard here matches any DID-encoded assistant segment, and the
- * trailing `>` token matches any capability subtree (`chat`, `code-review`,
+ * `local.{principal}.{stack}.tasks.@{did-encoded-assistant}.{capability}`.
+ * The router uses NATS-style whole-token wildcards, so the subscribe-side
+ * pattern is `tasks.*.>`: `*` matches the entire `@did-encoded-assistant`
+ * segment and `>` matches any capability subtree (`chat`, `code-review`,
  * `release`, etc.).
  *
  * The listener subscribes to this PATTERN once per stack; the surface-router
  * routes every matching envelope through the same `handleDispatchEnvelope`
- * path that handles the legacy `dispatch.task.received` subject. Both
- * subscriptions coexist during Stages 4–6 (adapters flip publishers to
- * canonical); Stage 7 (#412) removes the legacy subscription.
+ * path that handled the legacy `dispatch.task.received` subject. Legacy
+ * subjects can still be supplied explicitly through `subjects` for old
+ * tests/config, but production defaults are canonical-only.
  */
 function canonicalTasksDirectSubject(org: string, stack?: string): string {
   if (stack === undefined) {
-    return `local.${org}.tasks.@*.>`;
+    return `local.${org}.tasks.*.>`;
   }
-  return `local.${org}.${stack}.tasks.@*.>`;
+  return `local.${org}.${stack}.tasks.*.>`;
 }
 
 /**
@@ -359,16 +362,13 @@ function canonicalTasksDirectSubject(org: string, stack?: string): string {
  * misconfigured runner with no operator id can still subscribe (it'll match
  * nothing unless someone publishes under `local.default.…`).
  *
- * Direction A Stage 4 — returns BOTH the legacy `dispatch.task.received`
- * subject and the canonical `tasks.@*.>` pattern so the listener handles
- * both shapes during the migration window. Stage 7 cutover removes the
- * legacy entry.
+ * Direction A Stage 4-B — canonical Tasks Domain dispatch is now the
+ * default subscription. Tests and explicit operator overrides can still
+ * pass `subjects` for legacy/federated fixtures, but production defaults
+ * no longer subscribe to the pre-spec `dispatch.task.received` subject.
  */
 function defaultSubjects(org: string, stack?: string): string[] {
-  return [
-    dispatchReceivedSubject(org, stack),
-    canonicalTasksDirectSubject(org, stack),
-  ];
+  return [canonicalTasksDirectSubject(org, stack)];
 }
 
 export function createDispatchListener(
@@ -607,6 +607,28 @@ async function handleDispatchEnvelope(
   if (!payload) {
     console.error(
       `cortex-runner: dispatch-listener: malformed dispatch.task.received envelope id=${envelope.id} — required fields missing`,
+    );
+    return;
+  }
+
+  const recipientMismatch = validateCanonicalTaskRecipient(
+    envelope,
+    payload,
+    subject,
+  );
+  if (recipientMismatch !== null) {
+    process.stderr.write(
+      `[runner/dispatch-listener] dropped envelope ${envelope.id} ` +
+        `(correlation_id=${envelope.correlation_id ?? "<none>"} ` +
+        `task_id=${payload.task_id} agent=${payload.agent_id}): ` +
+        `${recipientMismatch}\n`,
+    );
+    await emitCanonicalRecipientMismatch(
+      runtime,
+      source,
+      envelope,
+      payload,
+      recipientMismatch,
     );
     return;
   }
@@ -1107,6 +1129,77 @@ function extractSourceNetwork(subject: string | undefined): string | undefined {
   if (networkId === undefined || networkId.length === 0) return undefined;
   if (!LETTER_PREFIX_ID_REGEX.test(networkId)) return undefined;
   return networkId;
+}
+
+/**
+ * Canonical Direct/Delegate subjects carry the target assistant in the
+ * `tasks.@{did}.{capability}` segment. Enforce that this wire recipient,
+ * the envelope target, and the payload's executing agent agree before
+ * policy or substrate dispatch sees the work.
+ */
+function validateCanonicalTaskRecipient(
+  envelope: Envelope,
+  payload: DispatchTaskReceivedPayload,
+  subject: string | undefined,
+): string | null {
+  if (subject === undefined) return null;
+  const parts = subject.split(".");
+  const tasksIndex = parts.indexOf("tasks");
+  if (tasksIndex === -1) return null;
+  const assistantSegment = parts[tasksIndex + 1];
+  if (assistantSegment === undefined || !assistantSegment.startsWith("@")) {
+    return null;
+  }
+
+  const targetDid = getTargetAssistant(envelope);
+  if (targetDid === undefined) {
+    return "canonical task subject has an assistant segment but envelope.target_assistant is missing";
+  }
+
+  let expectedSegment: string;
+  try {
+    expectedSegment = encodeDidSegment(targetDid);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return `envelope.target_assistant is not a valid DID: ${detail}`;
+  }
+
+  if (assistantSegment !== expectedSegment) {
+    return `subject assistant ${assistantSegment} does not match envelope target ${expectedSegment}`;
+  }
+
+  const targetAgentId = extractAgentIdFromDid(targetDid);
+  if (targetAgentId === undefined) {
+    return `envelope.target_assistant ${targetDid} is not a did:mf agent identity`;
+  }
+  if (payload.agent_id !== targetAgentId) {
+    return `payload.agent_id ${payload.agent_id} does not match envelope target agent ${targetAgentId}`;
+  }
+
+  return null;
+}
+
+async function emitCanonicalRecipientMismatch(
+  runtime: MyelinRuntime,
+  source: SystemEventSource,
+  envelope: Envelope,
+  payload: DispatchTaskReceivedPayload,
+  detail: string,
+): Promise<void> {
+  const now = new Date();
+  const failed = createDispatchTaskFailedEvent({
+    source,
+    taskId: payload.task_id,
+    agentId: payload.agent_id,
+    startedAt: now,
+    failedAt: now,
+    errorSummary: `canonical task recipient mismatch: ${detail}`,
+    reason: {
+      kind: "cant_do",
+      detail,
+    },
+  });
+  await runtime.publish(failed);
 }
 
 // ---------------------------------------------------------------------------

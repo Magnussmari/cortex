@@ -185,11 +185,11 @@ inbound from a surface ─→ presence adapter ─→ tap (publish dispatch.* en
 
 The **surface-router** (G-1111.A target) is the single in-process fan-out point. Adapters and renderers do not subscribe to NATS directly; they register with the surface-router and the surface-router owns the JetStream consumer. Per `docs/design-event-taxonomy.md` §7.6 anti-pattern: "DO NOT subscribe surfaces directly to NATS."
 
-#### Direction A — adapter-published inbound dispatches (Stage 4-A, cortex#409)
+#### Direction A — dispatch-source inbound envelopes (Stage 4-B, cortex#409)
 
-Behind the feature flag `CORTEX_ADAPTER_ENVELOPE_MODE=1`, `dispatch-handler.handleMessage` no longer spawns a Claude Code session inline for chat/direct mode. Instead it constructs a canonical inbound dispatch envelope and publishes it onto `local.{principal}.{stack}.tasks.@{did-encoded-assistant}.chat` via `runtime.publishOnSubject`. The runner's `dispatch-listener` subscribes to both the legacy `dispatch.task.received` subject AND the canonical `tasks.@*.>` pattern (additive — same `handleDispatchEnvelope` for both), routes the envelope to `ClaudeCodeHarness`, and yields lifecycle envelopes (`dispatch.task.{started|completed|failed|aborted}`) which the adapter's existing `surfaceConfig.render` dispatch-sink path consumes to render the response.
+Chat/direct dispatch now takes the canonical bus path by default. `dispatch-handler.handleMessage` delegates envelope construction to the shared dispatch-source publisher, which publishes onto `local.{principal}.{stack}.tasks.@{did-encoded-assistant}.chat` via `runtime.publishOnSubject`. The runner's `dispatch-listener` defaults to `local.{principal}.{stack}.tasks.*.>` (`*` matches the full `@{did-encoded-assistant}` token), routes the envelope to `ClaudeCodeHarness`, and yields lifecycle envelopes (`dispatch.task.{started|completed|failed|aborted}`) which the adapter's existing `surfaceConfig.render` dispatch-sink path consumes to render the response.
 
-This is the M7 separation-of-concerns target from cortex#414 OSI corrections: the platform adapter is a dispatch source (inbound) + dispatch sink (outbound); the bus is the medium; the harness layer (M6) executes; the listener (M7 runner) orchestrates. `async:` and `team:` paths remain on the legacy in-process `handleAsync` / `handleTeam` paths until Stages 4-B / 4-C land. Stage 7 (#412) cutover removes the legacy `dispatch.task.received` subscription and deletes `dispatch-handler.ts`.
+This is the M7 separation-of-concerns target from cortex#414 OSI corrections: platform adapters, dashboards, taps, and assistant runtimes can all be dispatch sources; adapters can also be sinks; the bus is the medium; the harness layer (M6) executes; the listener (M7 runner) orchestrates. `async:` and `team:` paths remain on the in-process `handleAsync` / `handleTeam` branches until they are promoted to canonical Direct/Delegate envelopes. Stage 7 (#412) deletes `dispatch-handler.ts` once those remaining branches move.
 
 ### 3.5 Namespace reconciliation — RESOLVED
 
@@ -417,7 +417,7 @@ An M7 app's public surface is **the set of envelopes it publishes + the set it c
 
 For cortex, concretely:
 
-- **Inbound contract:** cortex consumes `local.{org}.review.*` (from pilot), `local.{org}.dispatch.task.received` (from itself or external dispatchers), `local.{org}.attention.item.*` (from any source), `local.{org}.system.*` (operational events from any M7 app), and a few more. Each subject has a documented payload schema in cortex's domain catalogue.
+- **Inbound contract:** cortex consumes `local.{org}.{stack}.tasks.@{did-encoded-assistant}.{capability}` Direct/Delegate task envelopes (from adapters, taps, dashboards, or peer apps), `local.{org}.review.*` (from pilot), `local.{org}.attention.item.*` (from any source), `local.{org}.system.*` (operational events from any M7 app), and a few more. Each subject has a documented payload schema in cortex's domain catalogue.
 - **Outbound contract:** cortex publishes `local.{org}.dispatch.task.{started,progress,completed,failed,aborted}` (workflow runner emissions), `local.{org}.system.adapter.*` (per G-1111 §3.5), `local.{org}.review.*.decision` (operator decisions out of the surface).
 - The envelope schemas are versioned, append-only, and live in cortex's repo (`docs/api/` or `src/contracts/` — TBD; see open questions in the migration plan).
 - A consumer of cortex's contract can — in principle — replace cortex with a re-implementation that publishes/consumes the same envelopes, and the rest of the system doesn't notice. **That's the load-bearing property.**
@@ -490,7 +490,7 @@ Every routed task emits a JetStream-backed envelope sequence on the `events.>` c
 Canonical subjects:
 
 ```
-local.{org}.dispatch.task.received     ── tap or operator-input → bus; pre-dispatch
+local.{org}.{stack}.tasks.@{assistant}.{capability} ── source → bus; pre-dispatch Direct/Delegate task
 local.{org}.dispatch.task.assigned     ── routing decision (which agent claimed it)
 local.{org}.dispatch.task.started      ── agent began executing
 local.{org}.dispatch.task.progress     ── intermediate signal (Delegate sub-step, status update)
