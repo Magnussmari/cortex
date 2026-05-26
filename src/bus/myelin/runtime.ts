@@ -89,6 +89,37 @@ export interface MyelinRuntime {
    */
   publish(envelope: Envelope): Promise<void>;
   /**
+   * Publish an envelope on an EXPLICIT subject — Direction A Stage 4
+   * (cortex#409) escape hatch for callers that need a subject shape
+   * `deriveNatsSubject` can't synthesise from `envelope.type` alone.
+   *
+   * Canonical use today: inbound `tasks.@{did-encoded-assistant}.{capability}`
+   * (e.g. `tasks.@did-mf-cortex.chat`) — the envelope `type` schema
+   * forbids `@`, so `runtime.publish(envelope)` would land on
+   * `local.{principal}.{stack}.tasks.{capability}` and miss the
+   * dispatch-listener's `tasks.@*.>` wildcard. Callers compose the
+   * canonical subject with `directTaskSubject`-style helpers (from
+   * `@the-metafactory/myelin/subjects`) and pass it here directly.
+   *
+   * Signs the envelope (when a signer is configured) before publish,
+   * same as `publish()`. The classification↔subject-prefix invariant
+   * (`local.` ↔ `classification: "local"`) is the caller's
+   * responsibility — this method does NOT validate alignment; it
+   * trusts the caller because the whole point is to break out of the
+   * default derivation.
+   *
+   * **No-op when the runtime is disabled** — mirrors `publish()`.
+   *
+   * **Optional on the interface** so existing fake-runtime test stubs
+   * (which currently expose only `publish`) keep their byte-identical
+   * shape; tests that exercise the canonical-subject path opt in by
+   * adding the property. Production callers that need the canonical
+   * path MUST treat an undefined property as "runtime cannot publish
+   * on explicit subjects" and fall back to the legacy code path —
+   * matches the same defensive contract as `subscribePull`.
+   */
+  publishOnSubject?(envelope: Envelope, subject: string): Promise<void>;
+  /**
    * Bind a JetStream pull-consumer subscription via the runtime's
    * private `NatsLink`. The runtime stays the single owner of the raw
    * connection lifecycle — callers see a `MyelinSubscriber` handle and
@@ -517,7 +548,18 @@ export async function startMyelinRuntime(
     ? Buffer.from(signer.rawSeedBytes).toString("base64")
     : undefined;
 
-  const publishEnabled = async (envelope: Envelope): Promise<void> => {
+  /**
+   * Shared sign + wire-publish core. `publishEnabled` derives the
+   * subject from `envelope.type` via `deriveNatsSubject`; the
+   * cortex#409 `publishOnSubjectEnabled` path passes an explicit
+   * subject built from `directTaskSubject`-style helpers. Both then
+   * share the post-stop guard, signer wiring, and stderr-logged
+   * link.publish below.
+   */
+  const signAndPublishOnSubject = async (
+    envelope: Envelope,
+    subject: string,
+  ): Promise<void> => {
     if (stopped) {
       // Post-stop publish: short-circuit. The runtime's `link.drain()`
       // (called inside `stop()` below) flushes pending publishes before the
@@ -530,24 +572,6 @@ export async function startMyelinRuntime(
       // of the envelope on the shutdown path.
       return;
     }
-    // IAW Phase A.3: subject derivation now mirrors
-    // `envelope.sovereignty.classification`. Prior code hardcoded
-    // `local.{principal}.{type}` here, making federated/public emission
-    // structurally impossible — `{principal}` came from `config.agent.operatorId`
-    // and the classification prefix was always "local". `deriveNatsSubject`
-    // reads classification + extracts `{principal}` from `envelope.source` so the
-    // 1:1 subject↔classification invariant
-    // (`validateSubjectEnvelopeAlignment`) holds for every emit site
-    // without further changes. `envelope.source`'s first segment is the
-    // same value `agent.operatorId` produces when emit-site helpers
-    // assemble it, so subscribe-side `{principal}` substitution stays symmetric.
-    //
-    // IAW Phase A.5 (cortex#262 closes): pass `stack` so subjects land in
-    // the 6-segment `local.{principal}.{stack}.{type}` grammar that sage's
-    // bridge + pilot's review-request subscriber expect. When undefined,
-    // `deriveNatsSubject` returns the legacy 5-segment shape — preserving
-    // emit-site behavior for deployments that haven't wired stack identity.
-    const subject = deriveNatsSubject(envelope, stack);
 
     // IAW Phase B.3: sign before publish if the runtime was started
     // with a signer. The chain-aware `signEnvelope` appends to any
@@ -620,6 +644,48 @@ export async function startMyelinRuntime(
     }
   };
 
+  const publishEnabled = async (envelope: Envelope): Promise<void> => {
+    // IAW Phase A.3: subject derivation now mirrors
+    // `envelope.sovereignty.classification`. Prior code hardcoded
+    // `local.{principal}.{type}` here, making federated/public emission
+    // structurally impossible — `{principal}` came from `config.agent.operatorId`
+    // and the classification prefix was always "local". `deriveNatsSubject`
+    // reads classification + extracts `{principal}` from `envelope.source` so the
+    // 1:1 subject↔classification invariant
+    // (`validateSubjectEnvelopeAlignment`) holds for every emit site
+    // without further changes. `envelope.source`'s first segment is the
+    // same value `agent.operatorId` produces when emit-site helpers
+    // assemble it, so subscribe-side `{principal}` substitution stays symmetric.
+    //
+    // IAW Phase A.5 (cortex#262 closes): pass `stack` so subjects land in
+    // the 6-segment `local.{principal}.{stack}.{type}` grammar that sage's
+    // bridge + pilot's review-request subscriber expect. When undefined,
+    // `deriveNatsSubject` returns the legacy 5-segment shape — preserving
+    // emit-site behavior for deployments that haven't wired stack identity.
+    const subject = deriveNatsSubject(envelope, stack);
+    await signAndPublishOnSubject(envelope, subject);
+  };
+
+  /**
+   * cortex#409 Direction A Stage 4 — publish on an EXPLICIT subject.
+   * See the docblock on `MyelinRuntime.publishOnSubject` for the
+   * canonical use case (Direct-mode `tasks.@{did-encoded-assistant}.{capability}`
+   * subjects whose `@`-prefixed segment cannot live in `envelope.type`).
+   *
+   * Subject alignment with `envelope.sovereignty.classification` is the
+   * caller's responsibility — this method does NOT call
+   * `validateSubjectEnvelopeAlignment` because callers compose subjects
+   * with classification-aware helpers (`directTaskSubject` already
+   * emits `local.` / `federated.` per its input). Adding a guard here
+   * would be belt-and-braces; we defer to the helper's contract.
+   */
+  const publishOnSubjectEnabled = async (
+    envelope: Envelope,
+    subject: string,
+  ): Promise<void> => {
+    await signAndPublishOnSubject(envelope, subject);
+  };
+
   // Subscribe-pull helper for the enabled path — wraps
   // `MyelinSubscriber.start` against the closure-captured `link` so
   // capability-side consumers (e.g. ReviewConsumer, future
@@ -677,6 +743,7 @@ export async function startMyelinRuntime(
     enabled: true,
     onEnvelope,
     publish: publishEnabled,
+    publishOnSubject: publishOnSubjectEnabled,
     subscribePull: subscribePullEnabled,
     jetstreamManager: jetstreamManagerEnabled,
     stop: async () => {
