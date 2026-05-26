@@ -214,8 +214,13 @@ describe("createDispatchListener — surfaceConfig", () => {
       source: SOURCE,
       ccSessionFactory: fakeFactory(SUCCESS_RESULT).factory,
     });
+    // Direction A Stage 4 (cortex#409) — defaultSubjects returns BOTH
+    // the legacy `dispatch.task.received` subject and the canonical
+    // Tasks Domain pattern `tasks.@*.>`. Both route through the same
+    // `handleDispatchEnvelope` path during the migration window.
     expect(listener.surfaceConfig.subjects).toEqual([
       "local.metafactory.dispatch.task.received",
+      "local.metafactory.tasks.@*.>",
     ]);
   });
 
@@ -249,8 +254,12 @@ describe("createDispatchListener — surfaceConfig", () => {
       stack: "default",
       ccSessionFactory: fakeFactory(SUCCESS_RESULT).factory,
     });
+    // Direction A Stage 4 (cortex#409) — stack-aware default subjects
+    // include both the legacy dispatch.task.received subject and the
+    // canonical `tasks.@*.>` pattern, both 6-segment when stack supplied.
     expect(listener.surfaceConfig.subjects).toEqual([
       "local.metafactory.default.dispatch.task.received",
+      "local.metafactory.default.tasks.@*.>",
     ]);
   });
 
@@ -266,6 +275,7 @@ describe("createDispatchListener — surfaceConfig", () => {
     });
     expect(listener.surfaceConfig.subjects).toEqual([
       "local.metafactory.research.dispatch.task.received",
+      "local.metafactory.research.tasks.@*.>",
     ]);
   });
 
