@@ -177,6 +177,13 @@ export interface ReviewRequestPayload {
   cycle?: number;
   /** Optional free-form note (defaults to empty string in pilot's publisher). */
   note?: string;
+  /**
+   * Whether the reviewer should post the verdict back to the forge
+   * (GitHub/GitLab). Set by `sage dispatch --post` (sage#8: the sender
+   * sends `true` or omits — never `false`). When true, the substrate
+   * runner passes `--post` to the sage subprocess.
+   */
+  post?: boolean;
 }
 
 /** Options for {@link createReviewRequestEvent}. */
