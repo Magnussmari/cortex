@@ -98,7 +98,10 @@ function isAdapterEnvelopeModeEnabled(): boolean {
  * Discord IDs to canonical operator identities) is a Stage 5+
  * concern tracked separately.
  */
-function adapterOriginatorIdentity(platform: string, authorId: string): string {
+function adapterOriginatorIdentity(
+  platform: string,
+  authorId: string,
+): string | null {
   const prefix = platform.toLowerCase();
   // Squash anything not matching the DID method-specific id grammar
   // (`[a-z0-9._-]` with no `--`). Discord/Mattermost ids are already
@@ -107,11 +110,16 @@ function adapterOriginatorIdentity(platform: string, authorId: string): string {
   const safeId = authorId.toLowerCase().replace(/[^a-z0-9._-]/g, "-");
   const candidate = `did:mf:${prefix}-${safeId}`;
   if (DID_RE.test(candidate)) return candidate;
-  // Last-resort fallback — strip the offending id entirely and fall
-  // back to the platform prefix alone. Won't be unique across users
-  // but keeps the envelope valid; the legacy fallback path will
-  // handle the dispatch if this fires.
-  return `did:mf:${prefix}-unknown`;
+  // No DID-valid encoding available — refuse to publish on the
+  // canonical path. Returning a shared `did:mf:{prefix}-unknown`
+  // here would collapse every exotic-id user onto one policy
+  // identity (capability resolution, dashboard attribution all
+  // collide). The flag-on envelope path is opt-in; the caller
+  // sees `null`, returns `false` from `publishInboundDispatchEnvelope`,
+  // and the dispatch falls through to the legacy in-process path
+  // (which doesn't depend on the canonical originator DID).
+  // cortex#420 nit-5.
+  return null;
 }
 
 /** Read version from arc-manifest.yaml (cached after first read). */
@@ -551,6 +559,17 @@ export class DispatchHandler extends EventEmitter {
       opts.msg.platform,
       opts.msg.authorId,
     );
+    if (originatorIdentity === null) {
+      // No DID-valid encoding for this platform/authorId pair —
+      // refuse to publish on the canonical envelope path (would
+      // collide all such users onto a single shared policy
+      // identity). Fall through to the legacy in-process path.
+      // cortex#420 nit-5.
+      console.error(
+        `dispatch-handler: cannot derive DID-valid originator identity for platform=${opts.msg.platform} authorId=${opts.msg.authorId} — falling back to legacy path`,
+      );
+      return false;
+    }
 
     const payload: Record<string, unknown> = {
       task_id: opts.taskId,
