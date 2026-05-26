@@ -579,8 +579,16 @@ describe("envelope-validator — chain helpers (IAW Phase A.2)", () => {
     //   • PR-7..PR-13 (#170–#176) the per-cluster downstream landings
     // The transition schema accepts BOTH the deprecated and the renamed
     // form so pre-migration / JetStream-replayed envelopes still validate.
+    //
+    // cortex#409 — bumped e37b347 → 9fc8476 (latest myelin main) to align
+    // cortex and sage on a single myelin commit. The OLD sage pin (3ec0ace)
+    // predated the vocabulary migration and validated signed_by[].principal
+    // only, so it rejected cortex's renamed signed_by[].identity stamps over
+    // the bus. The envelope JSON Schema is byte-identical between e37b347 and
+    // 9fc8476 (the bump only adds myelin#181's 'chat' seed-taxonomy entry),
+    // so the vendored schema is unchanged — only this pin moves.
     expect(SCHEMA_SOURCE_COMMIT).toBe(
-      "e37b347f222a433b9715510f0eb88fc7564dce92",
+      "9fc8476e03f530561e7985bb6c0b1adf20a06bb5",
     );
   });
 

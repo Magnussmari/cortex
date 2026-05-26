@@ -75,7 +75,7 @@ import schema from "./vendor/envelope.schema.json" with { type: "json" };
  * comments + tests use `myelin#161` to point at the merge that landed the
  * feature — they're the same change, different ticket facets.
  */
-export const SCHEMA_SOURCE_COMMIT = "e37b347f222a433b9715510f0eb88fc7564dce92";
+export const SCHEMA_SOURCE_COMMIT = "9fc8476e03f530561e7985bb6c0b1adf20a06bb5";
 
 /**
  * Hand-typed Envelope shape matching the JSON Schema. We hand-write rather
