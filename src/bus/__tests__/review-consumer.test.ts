@@ -964,4 +964,63 @@ describe("parseReviewRequestPayload — cortex#384 dual-shape acceptance", () =>
     });
     expect(parseReviewRequestPayload(env)).toBeNull();
   });
+
+  // cortex#409 — the `sage dispatch` CLI publishes ONLY `{ pr_url }`
+  // (sage src/tasks/types.ts: dispatcher always knows the full URL).
+  // The receiver resolves owner/repo/pr out of the URL.
+  test("sage dispatch shape (pr_url only) resolves a GitHub URL", () => {
+    const env = makeRequestEnvelope({
+      pr_url: "https://github.com/the-metafactory/cortex/pull/421",
+    });
+    expect(parseReviewRequestPayload(env)).toEqual({
+      repo: "the-metafactory/cortex",
+      pr: 421,
+      reviewer: OFFER_DISPATCH_REVIEWER,
+    });
+  });
+
+  test("pr_url with trailing slash still resolves", () => {
+    const env = makeRequestEnvelope({
+      pr_url: "https://github.com/the-metafactory/cortex/pull/421/",
+    });
+    expect(parseReviewRequestPayload(env)).toMatchObject({
+      repo: "the-metafactory/cortex",
+      pr: 421,
+    });
+  });
+
+  test("pr_url resolves a GitLab merge-request URL", () => {
+    const env = makeRequestEnvelope({
+      pr_url: "https://gitlab.com/acme/widgets/-/merge_requests/12",
+    });
+    expect(parseReviewRequestPayload(env)).toMatchObject({
+      repo: "acme/widgets",
+      pr: 12,
+    });
+  });
+
+  test("owner/number triple takes precedence over a present pr_url", () => {
+    const env = makeRequestEnvelope({
+      owner: "the-metafactory",
+      repo: "soma",
+      number: 169,
+      pr_url: "https://github.com/the-metafactory/cortex/pull/421",
+    });
+    expect(parseReviewRequestPayload(env)).toMatchObject({
+      repo: "the-metafactory/soma",
+      pr: 169,
+    });
+  });
+
+  test("invalid: pr_url that is not a URL → null", () => {
+    const env = makeRequestEnvelope({ pr_url: "not-a-url" });
+    expect(parseReviewRequestPayload(env)).toBeNull();
+  });
+
+  test("invalid: pr_url with an unrecognised path → null", () => {
+    const env = makeRequestEnvelope({
+      pr_url: "https://github.com/the-metafactory/cortex/issues/5",
+    });
+    expect(parseReviewRequestPayload(env)).toBeNull();
+  });
 });

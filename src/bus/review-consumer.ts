@@ -885,6 +885,49 @@ const SEGMENT_RE = /^[A-Za-z0-9][\w.-]*$/;
 const OWNER_REPO_RE = /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/;
 
 /**
+ * Resolve a GitHub PR URL or GitLab MR URL into the canonical
+ * `{ repo: "owner/name", pr }` pair. Mirrors sage's `resolvePrRef`
+ * receiver contract (sage src/tasks/types.ts) so `sage dispatch`
+ * envelopes that carry only `pr_url` parse here.
+ *
+ * - GitHub: `https://<host>/{owner}/{repo}/pull/{n}`
+ * - GitLab: `https://<host>/{project/path}/-/merge_requests/{n}`
+ *
+ * Returns `null` on any unparseable URL or out-of-range PR number.
+ */
+function parsePrUrl(url: string): { repo: string; pr: number } | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // Not a URL — caller treats null as a payload-shape violation.
+    return null;
+  }
+
+  const gh = parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/);
+  if (gh) {
+    const owner = gh[1];
+    const repo = gh[2];
+    const n = gh[3];
+    if (owner === undefined || repo === undefined || n === undefined) return null;
+    if (!SEGMENT_RE.test(owner) || !SEGMENT_RE.test(repo)) return null;
+    const pr = Number(n);
+    return Number.isInteger(pr) && pr > 0 ? { repo: `${owner}/${repo}`, pr } : null;
+  }
+
+  const gl = parsed.pathname.match(/^\/(.+)\/-\/merge_requests\/(\d+)\/?$/);
+  if (gl) {
+    const projectPath = gl[1];
+    const n = gl[2];
+    if (projectPath === undefined || n === undefined) return null;
+    const pr = Number(n);
+    return Number.isInteger(pr) && pr > 0 ? { repo: projectPath, pr } : null;
+  }
+
+  return null;
+}
+
+/**
  * Parse a review-request envelope payload into the canonical
  * {@link ReviewRequestPayload}. Two wire shapes are accepted:
  *
@@ -892,9 +935,12 @@ const OWNER_REPO_RE = /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/;
  *    cortex#346 / pilot#121): `{ repo: "owner/name", pr: number,
  *    reviewer: string }`.
  * 2. **Pilot / Sage Offer dispatch** (current `pilot request-review
- *    --pr OWNER/REPO#N` shape and Sage's `sage dispatch` envelopes):
+ *    --pr OWNER/REPO#N` shape):
  *    `{ owner: string, repo: string, number: number, pr_url?: string }`.
  *    `pr_url` is ignored once `owner`/`repo`/`number` are present.
+ * 3. **Sage dispatch URL-only** (the `sage dispatch` CLI always emits
+ *    just `{ pr_url: string }`): owner/repo/pr are resolved out of the
+ *    GitHub/GitLab PR URL via {@link parsePrUrl}.
  *
  * Both shapes normalise to the canonical `{ repo, pr, reviewer }`
  * triple before returning. An empty/absent `reviewer` is treated as
@@ -921,12 +967,23 @@ export function parseReviewRequestPayload(
     if (!SEGMENT_RE.test(p.owner) || !SEGMENT_RE.test(p.repo)) return null;
     repo = `${p.owner}/${p.repo}`;
     pr = p.number;
-  } else {
+  } else if (typeof p.repo === "string" && typeof p.pr === "number") {
     // Cortex legacy shape.
-    if (typeof p.repo !== "string" || !OWNER_REPO_RE.test(p.repo)) return null;
-    if (typeof p.pr !== "number") return null;
+    if (!OWNER_REPO_RE.test(p.repo)) return null;
     repo = p.repo;
     pr = p.pr;
+  } else if (typeof p.pr_url === "string") {
+    // Sage dispatch shape — the `sage dispatch` CLI always sends only
+    // `pr_url` (see sage src/tasks/types.ts: the dispatcher knows the
+    // full URL, the `owner/repo/number` triple is the optional alt and
+    // "the receiver's resolvePrRef handles both"). Resolve owner/repo/pr
+    // out of the GitHub/GitLab PR URL here.
+    const fromUrl = parsePrUrl(p.pr_url);
+    if (fromUrl === null) return null;
+    repo = fromUrl.repo;
+    pr = fromUrl.pr;
+  } else {
+    return null;
   }
 
   if (!Number.isInteger(pr) || pr <= 0) return null;
