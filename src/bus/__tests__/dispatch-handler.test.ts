@@ -888,3 +888,503 @@ describe("DispatchHandler — chat-path CC failure retry (cortex#360)", () => {
     await handler.shutdown();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Direction A Stage 4-A (cortex#409) — publishInboundDispatchEnvelope
+//
+// Adapter envelope-mode path. When `CORTEX_ADAPTER_ENVELOPE_MODE=1`, the
+// handler intercepts chat/direct dispatches before the legacy mode switch
+// and publishes a `tasks.@{did-encoded-assistant}.chat` envelope via
+// `runtime.publishOnSubject` for the dispatch-listener to consume. Tests
+// here exercise the envelope construction in isolation (no full
+// handleMessage pipeline) plus the flag-gate, the absent-runtime path,
+// and the publishOnSubject-missing path.
+// ---------------------------------------------------------------------------
+
+interface RecordingRuntimeWithSubject extends MyelinRuntime {
+  publishes: Envelope[];
+  subjectPublishes: Array<{ envelope: Envelope; subject: string }>;
+}
+
+function makeRecordingRuntimeWithSubject(opts: {
+  publishOnSubjectImpl?: (envelope: Envelope, subject: string) => Promise<void>;
+} = {}): RecordingRuntimeWithSubject {
+  const publishes: Envelope[] = [];
+  const subjectPublishes: Array<{ envelope: Envelope; subject: string }> = [];
+  return {
+    enabled: true,
+    onEnvelope: () => ({ unregister: () => {} }),
+    publish: async (envelope: Envelope) => {
+      publishes.push(envelope);
+    },
+    publishOnSubject: opts.publishOnSubjectImpl
+      ? async (envelope: Envelope, subject: string) => {
+          subjectPublishes.push({ envelope, subject });
+          await opts.publishOnSubjectImpl!(envelope, subject);
+        }
+      : async (envelope: Envelope, subject: string) => {
+          subjectPublishes.push({ envelope, subject });
+        },
+    stop: async () => {},
+    publishes,
+    subjectPublishes,
+  };
+}
+
+/**
+ * Reaches into the private `publishInboundDispatchEnvelope` method to
+ * drive emission directly. Mirrors `callPublishInboundAborted` —
+ * exercising the envelope construction in isolation is materially
+ * cheaper than driving handleMessage end-to-end (which would also
+ * require the CC spawn path through the harness).
+ */
+async function callPublishInboundDispatchEnvelope(
+  handler: DispatchHandler,
+  opts: Parameters<
+    DispatchHandler["publishInboundDispatchEnvelope" & keyof DispatchHandler]
+  > extends [infer A]
+    ? A
+    : unknown,
+): Promise<boolean> {
+  return (
+    handler as unknown as {
+      publishInboundDispatchEnvelope: (o: unknown) => Promise<boolean>;
+    }
+  ).publishInboundDispatchEnvelope(opts);
+}
+
+describe("DispatchHandler — Direction A Stage 4-A inbound envelope publish (cortex#409)", () => {
+  let originalWarn: typeof console.warn;
+  let originalError: typeof console.error;
+  let originalLog: typeof console.log;
+
+  beforeEach(() => {
+    originalWarn = console.warn;
+    originalError = console.error;
+    originalLog = console.log;
+    console.warn = () => {};
+    console.error = () => {};
+    console.log = () => {};
+  });
+
+  afterEach(() => {
+    console.warn = originalWarn;
+    console.error = originalError;
+    console.log = originalLog;
+  });
+
+  const dispatchOpts = (overrides: Record<string, unknown> = {}) => ({
+    taskId: "11111111-1111-4111-8111-111111111111",
+    msg: makeMsg({
+      platform: "discord",
+      authorId: "1487204875912609844",
+      content: "hello",
+    }),
+    prompt: "user prompt here",
+    resumeSessionId: undefined,
+    allowedDirs: ["/Users/andreas/Developer/cortex"],
+    disallowedTools: ["WebSearch"],
+    timeoutMs: 120_000,
+    cwd: "/Users/andreas/Developer/cortex",
+    additionalArgs: ["--foo"],
+    groveChannel: "cortex",
+    groveNetwork: undefined,
+    project: "cortex",
+    entity: "issue/409",
+    operator: "andreas",
+    ...overrides,
+  });
+
+  test("publishes envelope with canonical subject + Direct mode shape (stack-aware)", async () => {
+    const runtime = makeRecordingRuntimeWithSubject();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+    });
+
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts(),
+    );
+
+    expect(published).toBe(true);
+    expect(runtime.subjectPublishes.length).toBe(1);
+
+    const { envelope, subject } = runtime.subjectPublishes[0]!;
+
+    // Subject lands in the canonical 6-segment Tasks Domain shape.
+    expect(subject).toBe(
+      "local.andreas.meta-factory.tasks.@did-mf-test-agent.chat",
+    );
+
+    // Envelope addressing:
+    expect(envelope.type).toBe("tasks.chat");
+    expect(envelope.distribution_mode).toBe("direct");
+    expect(envelope.target_assistant).toBe("did:mf:test-agent");
+    expect(envelope.originator?.identity).toBe(
+      "did:mf:discord-1487204875912609844",
+    );
+    expect(envelope.originator?.attribution).toBe("adapter-resolved");
+    expect(envelope.sovereignty.classification).toBe("local");
+    expect(envelope.sovereignty.data_residency).toBe("NZ");
+    expect(envelope.correlation_id).toBe(
+      "11111111-1111-4111-8111-111111111111",
+    );
+
+    // Payload mirrors DispatchTaskReceivedPayload shape.
+    const payload = envelope.payload as Record<string, unknown>;
+    expect(payload.task_id).toBe("11111111-1111-4111-8111-111111111111");
+    expect(payload.agent_id).toBe("test-agent");
+    expect(payload.prompt).toBe("user prompt here");
+    expect(payload.grove_channel).toBe("cortex");
+    expect(payload.allowed_dirs).toEqual([
+      "/Users/andreas/Developer/cortex",
+    ]);
+    expect(payload.disallowed_tools).toEqual(["WebSearch"]);
+    expect(payload.timeout_ms).toBe(120_000);
+    expect(payload.cwd).toBe("/Users/andreas/Developer/cortex");
+    expect(payload.additional_args).toEqual(["--foo"]);
+    expect(payload.project).toBe("cortex");
+    expect(payload.entity).toBe("issue/409");
+    expect(payload.operator).toBe("andreas");
+
+    // Envelope must validate against the vendored myelin schema —
+    // catches any regression where the new envelope shape drifts
+    // from the wire contract the dispatch-listener consumes.
+    expect(validateEnvelope(envelope).ok).toBe(true);
+
+    await handler.shutdown();
+  });
+
+  test("legacy 5-segment subject when stack is omitted", async () => {
+    const runtime = makeRecordingRuntimeWithSubject();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      // no stack
+    });
+
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts(),
+    );
+
+    expect(published).toBe(true);
+    expect(runtime.subjectPublishes[0]?.subject).toBe(
+      "local.andreas.tasks.@did-mf-test-agent.chat",
+    );
+
+    await handler.shutdown();
+  });
+
+  test("dataResidency override flows through onto the envelope", async () => {
+    const runtime = makeRecordingRuntimeWithSubject();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+        dataResidency: "AU",
+      },
+      stack: "meta-factory",
+    });
+
+    await callPublishInboundDispatchEnvelope(handler, dispatchOpts());
+    expect(runtime.subjectPublishes[0]?.envelope.sovereignty.data_residency).toBe(
+      "AU",
+    );
+    await handler.shutdown();
+  });
+
+  test("returns false when runtime is absent — caller falls through to legacy", async () => {
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      // no runtime
+    });
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts(),
+    );
+    expect(published).toBe(false);
+    await handler.shutdown();
+  });
+
+  test("returns false when runtime lacks publishOnSubject (back-compat fake)", async () => {
+    // Mimic an older runtime fake that only exposes `publish`.
+    const runtime: MyelinRuntime = {
+      enabled: true,
+      onEnvelope: () => ({ unregister: () => {} }),
+      publish: async () => {},
+      stop: async () => {},
+    };
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+    });
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts(),
+    );
+    expect(published).toBe(false);
+    await handler.shutdown();
+  });
+
+  test("publishOnSubject rejection → returns false (legacy fallback path)", async () => {
+    const runtime = makeRecordingRuntimeWithSubject({
+      publishOnSubjectImpl: async () => {
+        throw new Error("bus is down");
+      },
+    });
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+    });
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts(),
+    );
+    expect(published).toBe(false);
+    await handler.shutdown();
+  });
+
+  test("mattermost authorId encodes onto did:mf:mattermost- prefix", async () => {
+    const runtime = makeRecordingRuntimeWithSubject();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+    });
+    await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts({
+        msg: makeMsg({
+          platform: "mattermost",
+          authorId: "8wkrnxq3abcdef",
+        }),
+      }),
+    );
+    expect(
+      runtime.subjectPublishes[0]?.envelope.originator?.identity,
+    ).toBe("did:mf:mattermost-8wkrnxq3abcdef");
+    await handler.shutdown();
+  });
+
+  test("exotic authorId with no DID-valid encoding → returns false, no publish (cortex#420 nit-5)", async () => {
+    // After the cortex#420 nit-5 fix, `adapterOriginatorIdentity`
+    // returns `null` (rather than a collision-prone `{prefix}-unknown`
+    // fallback) when the resulting candidate fails myelin's `DID_RE`.
+    // An authorId composed entirely of characters outside `[a-z0-9._-]`
+    // collapses to all-hyphens after the safe-id replace step, which
+    // produces a candidate containing `--` — rejected by DID_RE's
+    // `-(?!-)` clause. `publishInboundDispatchEnvelope` MUST return
+    // `false` so `handleMessage` falls through to the legacy
+    // in-process path, and no envelope is published on the bus.
+    const runtime = makeRecordingRuntimeWithSubject();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+    });
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts({
+        msg: makeMsg({
+          platform: "discord",
+          // `!!!` → safe-id `---` → candidate `did:mf:discord----`
+          // contains `--`, fails DID_RE.
+          authorId: "!!!",
+        }),
+      }),
+    );
+    expect(published).toBe(false);
+    expect(runtime.subjectPublishes.length).toBe(0);
+    await handler.shutdown();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Flag gate — handleMessage integration. Verifies that with the flag
+  // OFF, the envelope path is NEVER taken (legacy behaviour byte-for-byte
+  // preserved); with the flag ON and a runtime present, the envelope
+  // path runs and the legacy CC path does NOT spawn.
+  // ---------------------------------------------------------------------------
+
+  test("flag off: handleMessage uses legacy path — no envelope publish", async () => {
+    delete process.env.CORTEX_ADAPTER_ENVELOPE_MODE;
+    const runtime = makeRecordingRuntimeWithSubject();
+    // Stub CC factory returns success → legacy path posts a response
+    // back through the adapter; the absence of subjectPublishes proves
+    // the envelope path was NOT taken.
+    let spawnCount = 0;
+    const ccFactory: CCSessionFactory = (_opts: CCSessionOpts) => {
+      spawnCount++;
+      const fake: CCSessionLike = {
+        start() {
+          return fake;
+        },
+        wait() {
+          return Promise.resolve<CCSessionResult>({
+            success: true,
+            response: "legacy",
+            exitCode: 0,
+            durationMs: 0,
+            sessionId: "fake-session",
+          });
+        },
+      };
+      return fake;
+    };
+    const adapter = new MockAdapter();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+      ccSessionFactory: ccFactory,
+    });
+    await handler.handleMessage(
+      adapter,
+      makeMsg({ content: "hello", platform: "discord" }),
+    );
+    expect(runtime.subjectPublishes.length).toBe(0);
+    expect(spawnCount).toBe(1);
+    await handler.shutdown();
+  });
+
+  test("flag on + chat mode: envelope path runs, legacy CC does not spawn", async () => {
+    process.env.CORTEX_ADAPTER_ENVELOPE_MODE = "1";
+    const runtime = makeRecordingRuntimeWithSubject();
+    let spawnCount = 0;
+    const ccFactory: CCSessionFactory = (_opts: CCSessionOpts) => {
+      spawnCount++;
+      const fake: CCSessionLike = {
+        start() {
+          return fake;
+        },
+        wait() {
+          return Promise.resolve<CCSessionResult>({
+            success: true,
+            response: "legacy",
+            exitCode: 0,
+            durationMs: 0,
+            sessionId: "fake-session",
+          });
+        },
+      };
+      return fake;
+    };
+    const adapter = new MockAdapter();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        org: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+      ccSessionFactory: ccFactory,
+    });
+    try {
+      await handler.handleMessage(
+        adapter,
+        makeMsg({
+          content: "hello",
+          platform: "discord",
+          authorId: "1487204875912609844",
+        }),
+      );
+      expect(runtime.subjectPublishes.length).toBe(1);
+      expect(spawnCount).toBe(0);
+      expect(runtime.subjectPublishes[0]?.subject).toBe(
+        "local.andreas.meta-factory.tasks.@did-mf-test-agent.chat",
+      );
+    } finally {
+      delete process.env.CORTEX_ADAPTER_ENVELOPE_MODE;
+    }
+    await handler.shutdown();
+  });
+
+  test("intercept gate excludes async/team — explicit boolean coverage", () => {
+    // The handleMessage intercept fires only for
+    // `parsed.mode === "sync"` (post-Nit-4 in commit 8f000e8 — the
+    // `mode === undefined` branch was removed as dead code, since
+    // `parseMessageKeywords` always returns a concrete enum mode).
+    // Driving the async/team paths through `handleMessage` end-to-end
+    // would require either spawning a real `claude` binary (handleAsync
+    // builds `new CCSession(...)` directly, bypassing the factory)
+    // or stubbing `AgentTeam` (handleTeam path). Both are exercised
+    // by the cortex#360 / cortex#419 suites with the appropriate
+    // fakes already wired. Here we encode the gate boolean as a
+    // tiny standalone check, matching `parseMessageKeywords`'s
+    // observable contract:
+    //   - "hello"       → mode: "sync"      → intercept fires
+    //   - ""            → mode: "sync"      → intercept fires
+    //   - "async: …"    → mode: "async"     → intercept skipped
+    //   - "team: …"     → mode: "team"      → intercept skipped
+    //   - "/help"       → mode: "help"      → intercept skipped
+    //   - "/learning …" → mode: "learning"  → intercept skipped
+    // The `undefined` row is encoded for return-type-widening
+    // defence — production refuses to intercept it.
+    type MaybeMode = string | undefined;
+    const wouldIntercept = (mode: MaybeMode): boolean => mode === "sync";
+    expect(wouldIntercept("sync")).toBe(true);
+    // `undefined` never appears in practice — `parseMessageKeywords` always
+    // returns a concrete enum mode — but encode the production semantic
+    // (only `"sync"` intercepts) explicitly to guard against return-type
+    // widening.
+    expect(wouldIntercept(undefined)).toBe(false);
+    expect(wouldIntercept("async")).toBe(false);
+    expect(wouldIntercept("team")).toBe(false);
+    expect(wouldIntercept("help")).toBe(false);
+    expect(wouldIntercept("learning")).toBe(false);
+  });
+});

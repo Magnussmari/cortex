@@ -185,6 +185,12 @@ inbound from a surface ─→ presence adapter ─→ tap (publish dispatch.* en
 
 The **surface-router** (G-1111.A target) is the single in-process fan-out point. Adapters and renderers do not subscribe to NATS directly; they register with the surface-router and the surface-router owns the JetStream consumer. Per `docs/design-event-taxonomy.md` §7.6 anti-pattern: "DO NOT subscribe surfaces directly to NATS."
 
+#### Direction A — adapter-published inbound dispatches (Stage 4-A, cortex#409)
+
+Behind the feature flag `CORTEX_ADAPTER_ENVELOPE_MODE=1`, `dispatch-handler.handleMessage` no longer spawns a Claude Code session inline for chat/direct mode. Instead it constructs a canonical inbound dispatch envelope and publishes it onto `local.{principal}.{stack}.tasks.@{did-encoded-assistant}.chat` via `runtime.publishOnSubject`. The runner's `dispatch-listener` subscribes to both the legacy `dispatch.task.received` subject AND the canonical `tasks.@*.>` pattern (additive — same `handleDispatchEnvelope` for both), routes the envelope to `ClaudeCodeHarness`, and yields lifecycle envelopes (`dispatch.task.{started|completed|failed|aborted}`) which the adapter's existing `surfaceConfig.render` dispatch-sink path consumes to render the response.
+
+This is the M7 separation-of-concerns target from cortex#414 OSI corrections: the platform adapter is a dispatch source (inbound) + dispatch sink (outbound); the bus is the medium; the harness layer (M6) executes; the listener (M7 runner) orchestrates. `async:` and `team:` paths remain on the legacy in-process `handleAsync` / `handleTeam` paths until Stages 4-B / 4-C land. Stage 7 (#412) cutover removes the legacy `dispatch.task.received` subscription and deletes `dispatch-handler.ts`.
+
 ### 3.5 Namespace reconciliation — RESOLVED
 
 **Decision (2026-05-09):** The federated namespace `local.{org}.{domain}.{entity}.{action}` (per `myelin/specs/namespace.md`) is the canonical subject convention. The earlier `mf.net-{operator}.*` convention was a first iteration that appeared in documentation diagrams but was never adopted in implementation — cortex's runtime already publishes exclusively on `local.{org}.*` subjects.

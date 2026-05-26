@@ -592,6 +592,38 @@ describe("MyelinRuntime", () => {
       await runtime.stop();
     });
 
+    test("cortex#420 major-3 — publishOnSubject PROPAGATES underlying NATS errors (does NOT swallow)", async () => {
+      // Inverse of the legacy `publish()` contract above: the
+      // cortex#409 explicit-subject path is used by callers that
+      // need to know whether the envelope actually hit the wire
+      // (`publishInboundDispatchEnvelope` falls through to the
+      // legacy in-process dispatch path on rejection). If
+      // `link.publish` errors were swallowed inside
+      // `signAndPublishOnSubject`, the dispatch-handler's catch
+      // would never fire and inbound chat dispatches would be
+      // SILENTLY DROPPED when the bus is unreachable.
+      const fake = makeFakeNatsConnection();
+      (fake.nc as { publish: (s: string, p: unknown) => void }).publish = () => {
+        throw new Error("connection closed");
+      };
+      const runtime = await startMyelinRuntime(
+        makeConfig({
+          url: "nats://localhost:4222",
+          name: "grove-bot",
+          subjects: ["local.{principal}.tasks.>"],
+        }),
+        { connectImpl: async () => fake.nc },
+      );
+      expect(typeof runtime.publishOnSubject).toBe("function");
+      await expect(
+        runtime.publishOnSubject!(
+          makeEnvelope({ type: "tasks.chat" }),
+          "local.metafactory.research.tasks.@did-mf-cortex.chat",
+        ),
+      ).rejects.toThrow("connection closed");
+      await runtime.stop();
+    });
+
     test("IAW B.3 — publish signs outbound when signer option is set", async () => {
       // Round-trip: start the runtime with a signer; publish an
       // unsigned envelope; assert the published JSON carries a fresh
