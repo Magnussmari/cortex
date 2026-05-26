@@ -902,14 +902,14 @@ describe("DispatchHandler — chat-path CC failure retry (cortex#360)", () => {
 
 interface RecordingRuntimeWithSubject extends MyelinRuntime {
   publishes: Envelope[];
-  subjectPublishes: Array<{ envelope: Envelope; subject: string }>;
+  subjectPublishes: { envelope: Envelope; subject: string }[];
 }
 
 function makeRecordingRuntimeWithSubject(opts: {
   publishOnSubjectImpl?: (envelope: Envelope, subject: string) => Promise<void>;
 } = {}): RecordingRuntimeWithSubject {
   const publishes: Envelope[] = [];
-  const subjectPublishes: Array<{ envelope: Envelope; subject: string }> = [];
+  const subjectPublishes: { envelope: Envelope; subject: string }[] = [];
   return {
     enabled: true,
     onEnvelope: () => ({ unregister: () => {} }),
@@ -1038,7 +1038,7 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
     );
 
     // Payload mirrors DispatchTaskReceivedPayload shape.
-    const payload = envelope.payload as Record<string, unknown>;
+    const payload = envelope.payload;
     expect(payload.task_id).toBe("11111111-1111-4111-8111-111111111111");
     expect(payload.agent_id).toBe("test-agent");
     expect(payload.prompt).toBe("user prompt here");

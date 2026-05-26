@@ -84,8 +84,7 @@ export async function publishInboundChatDispatchEnvelope(
   if (!opts.runtime || !opts.source) {
     return { published: false, reason: "missing-runtime" };
   }
-  const publishOnSubject = opts.runtime.publishOnSubject;
-  if (typeof publishOnSubject !== "function") {
+  if (typeof opts.runtime.publishOnSubject !== "function") {
     return { published: false, reason: "missing-publish-on-subject" };
   }
 
@@ -173,7 +172,7 @@ export async function publishInboundChatDispatchEnvelope(
   }
 
   try {
-    await publishOnSubject.call(opts.runtime, envelope, subject);
+    await opts.runtime.publishOnSubject(envelope, subject);
   } catch (err) {
     console.error(
       `dispatch-source: publishOnSubject(${subject}) failed:`,
