@@ -1528,3 +1528,479 @@ describe("convertBotYaml — R3 principal block emission (cortex#388)", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// cortex#428 (PR-B) — v3-complete syntheses: Stage 4-A wiring
+// ---------------------------------------------------------------------------
+//
+// Each synthesis is exercised against both a bot.yaml-shape input (grove-v2
+// legacy) and a cortex.yaml-shape input (post-MIG-7.9 — Andreas's production
+// shape). The post-PR test target is: a freshly-migrated cortex.yaml runs
+// Stage 4-A end-to-end on v3.0.x without manual editing.
+
+describe("convertBotYaml — cortex#428 PR-B runtime.capabilities synthesis", () => {
+  test("default-synthesises capabilities = [chat] when no runtime block declared", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const agent = result.cortex.agents[0]!;
+    expect(agent.runtime).toBeDefined();
+    expect(agent.runtime!.substrate).toBe("claude-code");
+    expect(agent.runtime!.mode).toBe("in-process");
+    expect(agent.runtime!.capabilities).toEqual(["chat"]);
+  });
+
+  test("persona-heuristic adds code-review.typescript at exactly the 2-match floor", () => {
+    // Boundary test: the regex `/code[- ]review|reviewer|reviewing/gi`
+    // must match EXACTLY 2 times to land on the floor and trip the
+    // heuristic. The fixture below contains "Code review" and
+    // "code-review" (and nothing else that matches), so matches=2.
+    // Reducing this fixture by one match should make the next test
+    // case (which sits at matches=1) fail-closed instead.
+    const tmp = mkdtempSync(join(tmpdir(), "cortex-mig-428-cap-floor-"));
+    const persona = join(tmp, "echo.md");
+    writeFileSync(persona, "# Echo\nCode review and code-review work.\n");
+    const cortexShape = {
+      principal: { id: "andreas" },
+      agents: [
+        {
+          id: "echo",
+          displayName: "Echo",
+          persona,
+          trust: [],
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: tmp });
+    expect(result.cortex.agents[0]!.runtime!.capabilities).toEqual(
+      expect.arrayContaining(["chat", "code-review.typescript"]),
+    );
+  });
+
+  test("persona-heuristic stays at [chat] with exactly 1 keyword match (below floor)", () => {
+    // The complement of the floor test above: matches=1 must NOT add
+    // code-review.typescript. Together the two tests pin the floor at
+    // the regex boundary instead of via the loose "Forge deflector"
+    // fixture (which mixed deflection prose with a single hit and is
+    // kept as a real-world repro lower down).
+    const tmp = mkdtempSync(join(tmpdir(), "cortex-mig-428-cap-below-"));
+    const persona = join(tmp, "solo.md");
+    writeFileSync(persona, "# Solo\nThis agent does code-review only on Tuesdays.\n");
+    const cortexShape = {
+      principal: { id: "andreas" },
+      agents: [
+        {
+          id: "solo",
+          displayName: "Solo",
+          persona,
+          trust: [],
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: tmp });
+    expect(result.cortex.agents[0]!.runtime!.capabilities).toEqual(["chat"]);
+  });
+
+  test("persona with only one review-keyword mention stays at [chat] (deflector test)", () => {
+    // Production-bug repro: Forge's persona on Andreas's deployment mentions
+    // "code review" once while DEFLECTING review work to Echo
+    // ("Code review. That's Echo. If anyone asks you for a review,
+    // redirect"). A single mention must NOT trip the heuristic.
+    const tmp = mkdtempSync(join(tmpdir(), "cortex-mig-428-deflect-"));
+    const persona = join(tmp, "forge.md");
+    writeFileSync(persona, "# Forge\nCode review — that's Echo's job, not mine.\n");
+    const cortexShape = {
+      principal: { id: "andreas" },
+      agents: [
+        {
+          id: "forge",
+          displayName: "Forge",
+          persona,
+          trust: [],
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: tmp });
+    expect(result.cortex.agents[0]!.runtime!.capabilities).toEqual(["chat"]);
+  });
+
+  test("persona-heuristic skips oversized files with a warning (defence-in-depth size cap)", () => {
+    // Defence-in-depth regression for the cortex#432 nit-3 size cap. A
+    // hostile or accidental large persona (`persona: /dev/zero`, stray
+    // huge fixture) must NOT OOM the migrator. The 1 MiB cap is well
+    // above any realistic persona; we synthesise a file just over the
+    // cap and assert (a) the heuristic short-circuits to [chat] and
+    // (b) a ConversionWarning surfaces so the operator sees the skip.
+    const tmp = mkdtempSync(join(tmpdir(), "cortex-mig-428-cap-oversize-"));
+    const persona = join(tmp, "huge.md");
+    // 1 MiB + 1 byte — sized via Buffer.alloc to avoid materialising a
+    // multi-MB string literal in test source. Content is irrelevant
+    // (the heuristic never runs); the size gate fires on statSync.
+    const oversize = 1 * 1024 * 1024 + 1;
+    writeFileSync(persona, Buffer.alloc(oversize, "x"));
+    const cortexShape = {
+      principal: { id: "andreas" },
+      agents: [
+        {
+          id: "huge",
+          displayName: "Huge",
+          persona,
+          trust: [],
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: tmp });
+    expect(result.cortex.agents[0]!.runtime!.capabilities).toEqual(["chat"]);
+    const sizeWarning = result.warnings.find(
+      (w) =>
+        w.field === "agents[huge].persona" &&
+        w.message.includes("byte cap") &&
+        w.message.includes("skipping persona-driven capability heuristic"),
+    );
+    expect(sizeWarning).toBeDefined();
+  });
+
+  test("idempotent — existing runtime.capabilities preserved + chat appended if missing", () => {
+    // Cortex-shape input that already declares capabilities should keep
+    // them and gain `chat` (so dispatch can still route conversational
+    // envelopes alongside the specialised work). The pre-existing fields
+    // (sovereignty, maxConcurrent, …) on the runtime block must survive.
+    const cortexShape = {
+      principal: { id: "andreas" },
+      agents: [
+        {
+          id: "echo",
+          displayName: "Echo",
+          persona: "./personas/echo.md",
+          trust: [],
+          runtime: {
+            substrate: "claude-code",
+            mode: "in-process",
+            capabilities: ["code-review.typescript", "code-review.security"],
+            sovereignty: "strict",
+            maxConcurrent: 3,
+          },
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: FIXTURE_DIR });
+    const rt = result.cortex.agents[0]!.runtime!;
+    expect(rt.capabilities).toEqual(
+      expect.arrayContaining(["chat", "code-review.typescript", "code-review.security"]),
+    );
+    expect(rt.sovereignty).toBe("strict");
+    expect(rt.maxConcurrent).toBe(3);
+  });
+
+  test("idempotent — chat already declared does not get duplicated", () => {
+    const cortexShape = {
+      principal: { id: "andreas" },
+      agents: [
+        {
+          id: "luna",
+          displayName: "Luna",
+          persona: "./personas/luna.md",
+          trust: [],
+          runtime: {
+            substrate: "claude-code",
+            mode: "in-process",
+            capabilities: ["chat"],
+          },
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: FIXTURE_DIR });
+    expect(result.cortex.agents[0]!.runtime!.capabilities).toEqual(["chat"]);
+  });
+
+  test("buildAgentsFromCortexShape passes through agent.runtime fields (regression for incidental fix in cortex#428)", () => {
+    // Dedicated regression for the cortex#428 buildAgentsFromCortexShape
+    // runtime-passthrough fix (migrate-config-lib.ts:1672). Earlier coverage
+    // was only via the idempotency test, which also runs
+    // synthesizeRuntimeCapabilities — that path would re-attach a runtime
+    // block (with substrate/mode/capabilities defaults) even if the
+    // passthrough were absent, hiding a regression. This test asserts the
+    // fields that synthesis does NOT touch (sovereignty, maxConcurrent)
+    // survive the round-trip end-to-end on a v3-shape input.
+    const cortexShape = {
+      principal: { id: "andreas" },
+      agents: [
+        {
+          id: "echo",
+          displayName: "Echo",
+          persona: "./personas/echo.md",
+          trust: [],
+          runtime: {
+            substrate: "claude-code",
+            mode: "in-process",
+            capabilities: ["chat"],
+            sovereignty: "selective",
+            maxConcurrent: 7,
+          },
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: FIXTURE_DIR });
+    const rt = result.cortex.agents[0]!.runtime!;
+    expect(rt.capabilities).toEqual(["chat"]);
+    // The two fields below are NOT touched by synthesizeRuntimeCapabilities;
+    // if buildAgentsFromCortexShape stops passing the runtime block through,
+    // these assertions fail immediately (whereas capabilities=[chat] would
+    // still hold from synthesis defaults).
+    expect(rt.sovereignty).toBe("selective");
+    expect(rt.maxConcurrent).toBe(7);
+  });
+
+  test("catalog augmentation — synthesised cap ids appear in top-level capabilities[]", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const catalog = result.cortex.capabilities;
+    const chatEntry = catalog.find((c) => c.id === "chat");
+    expect(chatEntry).toBeDefined();
+    expect(chatEntry!.provided_by).toContain("luna");
+  });
+
+  test("catalog merge — pre-existing entry survives, provided_by unioned", () => {
+    // Existing catalog has code-review.typescript with one provider (echo).
+    // Echo's runtime claims it; another agent's persona heuristic also
+    // would, BUT the heuristic only fires when no caps were declared. So
+    // the test exercises the unconditional `chat` cap append + the
+    // preserve-existing-catalog-entry path.
+    const cortexShape = {
+      principal: { id: "andreas" },
+      capabilities: [
+        {
+          id: "code-review.typescript",
+          description: "Hand-written description — preserve me.",
+          provided_by: ["echo"],
+        },
+      ],
+      agents: [
+        {
+          id: "echo",
+          displayName: "Echo",
+          persona: "./personas/echo.md",
+          trust: [],
+          runtime: {
+            substrate: "claude-code",
+            mode: "in-process",
+            capabilities: ["code-review.typescript"],
+          },
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: FIXTURE_DIR });
+    const tsCap = result.cortex.capabilities.find((c) => c.id === "code-review.typescript");
+    expect(tsCap).toBeDefined();
+    expect(tsCap!.description).toBe("Hand-written description — preserve me.");
+    expect(tsCap!.provided_by).toEqual(["echo"]); // already listed; no dup
+    const chatCap = result.cortex.capabilities.find((c) => c.id === "chat");
+    expect(chatCap).toBeDefined();
+    expect(chatCap!.provided_by).toContain("echo");
+  });
+
+  test("output round-trips through CortexConfigSchema (cross-validator passes)", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    // Cross-validator (cortex#314) rejects any runtime.capability not in
+    // the top-level catalog. If the synthesis missed that mirroring, this
+    // re-parse fails. Belt-and-suspenders alongside the in-conversion
+    // parse, since `convertBotYaml` itself parses on the way out.
+    expect(() => CortexConfigSchema.parse(asSchemaShape(result.cortex))).not.toThrow();
+  });
+
+  test("emits a warning for every agent that gained a synthesised capability", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const synthesisWarnings = result.warnings.filter((w) =>
+      w.field.startsWith("agents[") && w.field.endsWith("].runtime.capabilities"),
+    );
+    expect(synthesisWarnings.length).toBeGreaterThanOrEqual(1);
+    expect(synthesisWarnings[0]!.message).toContain("chat");
+  });
+});
+
+describe("convertBotYaml — cortex#428 PR-B presence.surfaceSubjects synthesis", () => {
+  test("default-synthesises surfaceSubjects on discord adapter for bot.yaml input", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const discord = result.cortex.agents[0]!.presence.discord;
+    expect(discord).toBeDefined();
+    // bot.yaml has no `stack:` block, so derives to {principal.id}/default.
+    // The minimal fixture's principal is `jc`, so the synthesised default
+    // subject is `local.jc.default.dispatch.task.*`.
+    expect(discord!.surfaceSubjects).toEqual(["local.jc.default.dispatch.task.*"]);
+  });
+
+  test("uses explicit stack.id when set (cortex.yaml-shape input)", () => {
+    const cortexShape = {
+      principal: { id: "andreas" },
+      stack: { id: "andreas/meta-factory" },
+      agents: [
+        {
+          id: "luna",
+          displayName: "Luna",
+          persona: "./personas/luna.md",
+          trust: [],
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: FIXTURE_DIR });
+    expect(result.cortex.agents[0]!.presence.discord!.surfaceSubjects).toEqual([
+      "local.andreas.meta-factory.dispatch.task.*",
+    ]);
+  });
+
+  test("idempotent — non-empty surfaceSubjects preserved verbatim", () => {
+    // Echo's production shape: explicit code-review subject already set.
+    // The migrator must NOT overwrite it.
+    const cortexShape = {
+      principal: { id: "andreas" },
+      stack: { id: "andreas/meta-factory" },
+      agents: [
+        {
+          id: "echo",
+          displayName: "Echo",
+          persona: "./personas/echo.md",
+          trust: [],
+          presence: {
+            discord: {
+              token: "t",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+              surfaceSubjects: ["local.andreas.meta-factory.tasks.code-review.>"],
+            },
+          },
+        },
+      ],
+    } as unknown as LegacyBotYaml;
+    const result = convertBotYaml(cortexShape, { configDir: FIXTURE_DIR });
+    expect(result.cortex.agents[0]!.presence.discord!.surfaceSubjects).toEqual([
+      "local.andreas.meta-factory.tasks.code-review.>",
+    ]);
+  });
+
+  test("emits a warning per adapter that gained a synthesised subjects list", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const surfaceWarnings = result.warnings.filter((w) =>
+      w.field.includes("surfaceSubjects"),
+    );
+    expect(surfaceWarnings.length).toBeGreaterThanOrEqual(1);
+    expect(surfaceWarnings[0]!.message).toMatch(/local\..*\.dispatch\.task\.\*/);
+  });
+});
+
+describe("convertBotYaml — cortex#428 PR-B agent.operatorId back-compat", () => {
+  test("attaches transient operatorId = principal.id on every agent", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    for (const agent of result.cortex.agents) {
+      // Type-laundering required — operatorId is not in the schema. The
+      // synthesis attaches it post-parse so the migrator's YAML output
+      // boots on v3.0.0–v3.0.3 (pre-PR-A) where the field IS read.
+      const raw = agent as unknown as Record<string, unknown>;
+      expect(raw.operatorId).toBe(result.cortex.principal.id);
+    }
+  });
+
+  test("survives YAML round-trip — operatorId appears in serialised output", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const yamlOut = YAML.stringify(result.cortex);
+    expect(yamlOut).toContain("operatorId: jc");
+  });
+
+  test("emits a warning explaining the deprecation timeline", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const opIdWarn = result.warnings.find((w) => w.field === "agents[].operatorId");
+    expect(opIdWarn).toBeDefined();
+    expect(opIdWarn!.message).toMatch(/v3\.0\.0–v3\.0\.3.*back-compat/);
+    expect(opIdWarn!.message).toMatch(/cortex#429/);
+  });
+});
+
+describe("formatCheckReport — cortex#428 PR-B reflects synthesised fields", () => {
+  test("renders runtime + capabilities + surfaceSubjects on each agent", () => {
+    const legacy = loadFixture("minimal.bot.yaml");
+    const result = convertBotYaml(legacy, { configDir: FIXTURE_DIR });
+    const report = formatCheckReport(result);
+    expect(report).toContain("runtime: substrate=claude-code mode=in-process capabilities=[chat]");
+    expect(report).toContain("discord.surfaceSubjects: [local.jc.default.dispatch.task.*]");
+    expect(report).toContain("capabilities: ");
+    expect(report).toContain("chat provided_by=[luna]");
+  });
+});
