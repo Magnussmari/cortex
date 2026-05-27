@@ -61,8 +61,8 @@ import {
 } from "../db/iterations";
 import {
   generateId,
-  createOperatorCurationEvent,
-  createOperatorInputEvent,
+  createPrincipalCurationEvent,
+  createPrincipalInputEvent,
   listEventsForSession,
   EVENTS_LIST_MAX_LIMIT,
 } from "../db/events";
@@ -680,7 +680,7 @@ export async function handleCreateSession(
   const insertRows = db.transaction(() => {
     if (!body.taskId) {
       db.query(
-        `INSERT INTO tasks (id, title, priority, operator_id, source_system)
+        `INSERT INTO tasks (id, title, priority, principal_id, source_system)
          VALUES (?, ?, ?, ?, 'internal')`
       ).run(taskId, title, DEFAULT_INTERNAL_TASK_PRIORITY, principalId);
     }
@@ -854,13 +854,13 @@ export async function handleCreateSession(
     }
   }
 
-  // F-12 Decision 9 + Scope Summary — emit an `operator.curation` event with
+  // F-12 Decision 9 + Scope Summary — emit an `principal.curation` event with
   // `kind: "dispatch"` so the manual-dispatch path (POST /api/sessions) lands
   // in the audit trail alongside requeue / handoff / abandon. The event
   // anchors to the newly-spawned session and captures the agent the operator
   // dispatched to; `newAssignmentId` is included for symmetry with the
   // handoff variant (the "assignment this spawn created").
-  const dispatchCurationEvent = createOperatorCurationEvent(
+  const dispatchCurationEvent = createPrincipalCurationEvent(
     db,
     endpoint.sessionId,
     {
@@ -882,7 +882,7 @@ export async function handleCreateSession(
   ) {
     try {
       endpoint.write(body.prompt);
-      const event = createOperatorInputEvent(db, endpoint.sessionId, {
+      const event = createPrincipalInputEvent(db, endpoint.sessionId, {
         text: body.prompt,
       });
       broadcastEvent(deps.wsRegistry, endpoint.sessionId, event);
@@ -1117,7 +1117,7 @@ export function handleSendInput(
     return error(`Write failed: ${(err as Error).message}`, 500);
   }
 
-  const event = createOperatorInputEvent(db, endpoint.sessionId, {
+  const event = createPrincipalInputEvent(db, endpoint.sessionId, {
     ...(textByteLength > 0 ? { text } : {}),
     ...(images.length > 0
       ? {
@@ -1144,7 +1144,7 @@ export function handleSendInput(
 //   D5  — abandon branches on context (assignment vs task)
 //   D6  — handoff: cancel-and-respawn (in-flight) / new-only (failed)
 //   D7  — requeue: 1-to-1 mirror of state-machine's operator_requeue
-//   D9  — operator.curation event family with `kind` discriminator
+//   D9  — principal.curation event family with `kind` discriminator
 //   D11 — state.transition observer that calls endpoint.close() for the
 //         {→ cancelled, operator_requeue from blocked} transitions
 
@@ -1194,7 +1194,7 @@ function readReason(rawBody: unknown): {
   if (typeof reason !== "string") {
     return { err: error("'reason' must be a string", 400) };
   }
-  // Same 50 KB cap operator.input uses — operator-authored free-text.
+  // Same 50 KB cap principal.input uses — operator-authored free-text.
   if (Buffer.byteLength(reason, "utf8") > DRILL_INPUT_MAX_BYTES) {
     return { err: error("'reason' exceeds the 50 KB limit", 413) };
   }
@@ -1337,8 +1337,8 @@ export function handleRequeueAssignment(
     db
   );
 
-  // Decision 9 — sibling operator.curation event with `kind: "requeue"`.
-  const curationEvent = createOperatorCurationEvent(db, sessionId, {
+  // Decision 9 — sibling principal.curation event with `kind: "requeue"`.
+  const curationEvent = createPrincipalCurationEvent(db, sessionId, {
     kind: "requeue",
     ...(reason ? { reason } : {}),
   });
@@ -1438,7 +1438,7 @@ export function handleAbandonAssignment(
       db
     );
 
-    const curationEvent = createOperatorCurationEvent(db, sessionId, {
+    const curationEvent = createPrincipalCurationEvent(db, sessionId, {
       kind: "abandon",
       targetKind: "assignment",
       ...(reason ? { reason } : {}),
@@ -1503,7 +1503,7 @@ export function handleAbandonAssignment(
     );
   }
 
-  const curationEvent = createOperatorCurationEvent(db, sessionId, {
+  const curationEvent = createPrincipalCurationEvent(db, sessionId, {
     kind: "abandon",
     targetKind: "task",
     ...(reason ? { reason } : {}),
@@ -1567,7 +1567,7 @@ export async function handleHandoffAssignment(
 
   // Decision 6 — a hand-off to the same agent is a no-op at best and a
   // misleading audit trail at worst (cancel-and-respawn to the same
-  // destination emits a `handoff` operator.curation event pointing nowhere
+  // destination emits a `handoff` principal.curation event pointing nowhere
   // meaningful). Reject explicitly rather than silently doing the wrong
   // thing.
   if (newAgentId === row.agent_id) {
@@ -1712,11 +1712,11 @@ export async function handleHandoffAssignment(
     broadcastEvent(deps.wsRegistry, endpoint.sessionId, result.event);
   }
 
-  // Decision 9 — operator.curation event with `kind: "handoff"` on the NEW
+  // Decision 9 — principal.curation event with `kind: "handoff"` on the NEW
   // session. The cancel of the old assignment has its own `state.transition`
   // event on the OLD session; this curation event captures the operator
   // rationale for the hand-off as a whole.
-  const curationEvent = createOperatorCurationEvent(db, endpoint.sessionId, {
+  const curationEvent = createPrincipalCurationEvent(db, endpoint.sessionId, {
     kind: "handoff",
     fromAgentId: row.agent_id,
     toAgentId: newAgentId,
@@ -1752,7 +1752,7 @@ export async function handleHandoffAssignment(
 //   Decision 5 — application-level dedup at preview time, 409 response
 //   Decision 6 — endpoint shapes
 //   Decision 8 — task-shadow-{taskId} helper in ../db/sessions.ts
-//   Decision 10 — `operator.curation` with kind: "task.imported"
+//   Decision 10 — `principal.curation` with kind: "task.imported"
 
 const TITLE_OVERRIDE_MAX_LEN = 500;
 
@@ -2001,13 +2001,13 @@ export async function handleCreateTask(
   // the caller can `broadcastEvent` after the transaction commits (the
   // event insert is inside the tx, but WS broadcast happens post-commit
   // so subscribers don't see a write-then-rollback ghost).
-  const holder: { event: ReturnType<typeof createOperatorCurationEvent> | null } =
+  const holder: { event: ReturnType<typeof createPrincipalCurationEvent> | null } =
     { event: null };
 
   const insertAll = db.transaction(() => {
     db.query(
       `INSERT INTO tasks
-         (id, title, priority, operator_id,
+         (id, title, priority, principal_id,
           source_system, source_url, source_external_id)
        VALUES (?, ?, ?, ?, 'github', ?, ?)`
     ).run(taskId, title, priority, principalId, sourceUrl, canonical);
@@ -2017,7 +2017,7 @@ export async function handleCreateTask(
       sessionId: shadowSessionId,
     });
 
-    holder.event = createOperatorCurationEvent(db, shadowSessionId, {
+    holder.event = createPrincipalCurationEvent(db, shadowSessionId, {
       kind: "task.imported",
       source: "github",
       ref: canonical,
@@ -2145,14 +2145,14 @@ export function handleAbandonTask(
   // transaction closure. See the create-task handler above for the same
   // pattern; duplicated here rather than extracted because the pair of
   // inserts is short enough that a helper would be more ceremony.
-  const holder: { event: ReturnType<typeof createOperatorCurationEvent> | null } =
+  const holder: { event: ReturnType<typeof createPrincipalCurationEvent> | null } =
     { event: null };
   const tx = db.transaction(() => {
     db.query(
       `UPDATE tasks SET status = 'cancelled', updated_at = unixepoch() WHERE id = ?`
     ).run(taskId);
 
-    holder.event = createOperatorCurationEvent(db, sessionRow.id, {
+    holder.event = createPrincipalCurationEvent(db, sessionRow.id, {
       kind: "abandon",
       targetKind: "task",
       ...(reason ? { reason } : {}),
@@ -2728,7 +2728,7 @@ export function handleAttachTaskToIteration(
       db.transaction(() => {
         db.query(
           `INSERT INTO tasks
-             (id, title, priority, operator_id, source_system, iteration_id)
+             (id, title, priority, principal_id, source_system, iteration_id)
            VALUES (?, ?, ?, ?, 'internal', ?)`
         ).run(newTaskId, newTitle, prio, DEFAULT_OPERATOR_ID, iterationId);
         touchIteration(db, iterationId);

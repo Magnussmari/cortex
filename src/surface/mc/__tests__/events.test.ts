@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SCHEMA_SQL } from "../db/schema";
-import { insertEvent, createOperatorInputEvent, createPermissionRequestEvent, generateId } from "../db/events";
+import { insertEvent, createPrincipalInputEvent, createPermissionRequestEvent, generateId } from "../db/events";
 
 function setupDb(): Database {
   const db = new Database(":memory:");
@@ -10,7 +10,7 @@ function setupDb(): Database {
   for (const sql of SCHEMA_SQL) db.exec(sql);
 
   // seed required parent rows
-  db.exec(`INSERT INTO tasks (id, title, priority, operator_id, source_system) VALUES ('t-1', 'Task', 0, 'op', 'internal')`);
+  db.exec(`INSERT INTO tasks (id, title, priority, principal_id, source_system) VALUES ('t-1', 'Task', 0, 'op', 'internal')`);
   db.exec(`INSERT INTO agents (id, name, type) VALUES ('a-1', 'Agent', 'hands')`);
   db.exec(`INSERT INTO agent_task_assignment (id, agent_id, task_id) VALUES ('ata-1', 'a-1', 't-1')`);
   db.exec(`INSERT INTO sessions (id, assignment_id, endpoint_kind) VALUES ('s-1', 'ata-1', 'local.process.controlled')`);
@@ -89,7 +89,7 @@ describe("insertEvent", () => {
   });
 });
 
-describe("createOperatorInputEvent", () => {
+describe("createPrincipalInputEvent", () => {
   let db: Database;
 
   beforeEach(() => {
@@ -100,22 +100,22 @@ describe("createOperatorInputEvent", () => {
     db.close();
   });
 
-  it("creates an operator.input event with text payload", () => {
-    const event = createOperatorInputEvent(db, "s-1", {
+  it("creates a principal.input event with text payload", () => {
+    const event = createPrincipalInputEvent(db, "s-1", {
       text: "Please use the v2 API instead",
     });
 
-    expect(event.type).toBe("operator.input");
+    expect(event.type).toBe("principal.input");
     expect(event.payload).toEqual({ text: "Please use the v2 API instead" });
   });
 
-  it("creates an operator.input event with attachments", () => {
-    const event = createOperatorInputEvent(db, "s-1", {
+  it("creates a principal.input event with attachments", () => {
+    const event = createPrincipalInputEvent(db, "s-1", {
       text: "See screenshot",
       attachments: ["/tmp/screenshot.png"],
     });
 
-    expect(event.type).toBe("operator.input");
+    expect(event.type).toBe("principal.input");
     expect(event.payload).toEqual({
       text: "See screenshot",
       attachments: ["/tmp/screenshot.png"],
