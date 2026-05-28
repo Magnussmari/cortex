@@ -15,10 +15,18 @@ export function truncateDispatchErrorSummary(msg: string): string {
 }
 
 /**
- * Trim result summaries to the first line. Surfaces typically render this
- * inline next to a task label, so cap at 1000 chars to leave room for chrome.
+ * Trim result summaries to the first useful line. PAI-formatted chat replies
+ * start with status chrome, so prefer the first content-bearing line.
  */
 export function truncateDispatchResultSummary(text: string): string {
-  const first = text.split("\n", 1)[0] ?? text;
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const first = lines.find((line) =>
+    !line.startsWith("══")
+    && !/^[-= ]*PAI\b/i.test(line)
+    && !line.startsWith("TASK:")
+    && !line.startsWith("VERIFY:")
+    && !line.startsWith("🗒️")
+    && !line.startsWith("✅")
+  ) ?? lines[0] ?? text;
   return first.length > 1000 ? first.slice(0, 997) + "..." : first;
 }

@@ -1162,7 +1162,16 @@ export class DiscordAdapter implements PlatformAdapter {
    * delivery errors and buffers when disconnected. The router's
    * `renderWithIsolation` wraps us in a timeout regardless.
    */
+  private shouldRenderEnvelope(envelope: Envelope): boolean {
+    const envelopeAgentId = envelope.payload.agent_id;
+    return typeof envelopeAgentId !== "string" || envelopeAgentId === this.agent.id;
+  }
+
   private async renderEnvelope(envelope: Envelope, _signal?: AbortSignal): Promise<void> {
+    if (!this.shouldRenderEnvelope(envelope)) {
+      return;
+    }
+
     // Buffering at the adapter level would duplicate `postResponse`'s
     // existing pending-result mechanism; instead we drop here and rely
     // on JetStream replay (per design-cortex.md §3.3 "lost event ≠ lost

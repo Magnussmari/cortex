@@ -30,6 +30,9 @@ import type { Envelope } from "../bus/myelin/envelope-validator";
  * the envelope details.
  */
 export function formatEnvelopeAsMarkdown(envelope: Envelope): string {
+  const renderedDispatch = formatDispatchLifecycle(envelope);
+  if (renderedDispatch) return renderedDispatch;
+
   const corr = envelope.correlation_id ? ` [${envelope.correlation_id}]` : "";
   return [
     `**${envelope.type}**${corr}`,
@@ -37,4 +40,31 @@ export function formatEnvelopeAsMarkdown(envelope: Envelope): string {
     JSON.stringify(envelope.payload, null, 2),
     "```",
   ].join("\n");
+}
+
+function formatDispatchLifecycle(envelope: Envelope): string | null {
+  const payload = envelope.payload;
+  const agent = typeof payload.agent_id === "string" ? payload.agent_id : "agent";
+  const label = agent.charAt(0).toUpperCase() + agent.slice(1);
+
+  if (envelope.type === "dispatch.task.started") {
+    return `${label} is working...`;
+  }
+
+  if (envelope.type === "dispatch.task.completed") {
+    const summary = typeof payload.result_summary === "string" ? payload.result_summary.trim() : "Done.";
+    return summary || "Done.";
+  }
+
+  if (envelope.type === "dispatch.task.failed") {
+    const summary = typeof payload.error_summary === "string" ? payload.error_summary.trim() : "unknown error";
+    return `${label} failed: ${summary}`;
+  }
+
+  if (envelope.type === "dispatch.task.aborted") {
+    const reason = typeof payload.reason === "string" ? payload.reason.trim() : "aborted";
+    return `${label} stopped: ${reason}`;
+  }
+
+  return null;
 }
