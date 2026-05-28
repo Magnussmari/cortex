@@ -86,7 +86,7 @@ export const SCHEMA_SOURCE_COMMIT = "4c54b8e6e2157524099f4f01f13c044bcc3b9291";
 export interface Envelope {
   /** UUID v4 — unique per envelope. */
   id: string;
-  /** `org.agent.instance` — 2-5 dotted segments. */
+  /** `{principal}.{stack}.{assistant}` — exactly 3 dotted segments (myelin#185 breaking cut). */
   source: string;
   /** `domain.entity.action` — what kind of signal this is. */
   type: string;
@@ -610,24 +610,25 @@ function firstSegment(s: string): string {
  * `agent.operatorId` at startup. These two values MUST agree for any
  * envelope this stack emits, or subjects diverge between publish/subscribe.
  *
- * Use {@link orgFromConfig} on the subscribe-side and {@link orgFromEnvelope}
- * on the publish-side. The unit test in
- * `src/bus/myelin/__tests__/runtime-org-symmetry.test.ts` pins the invariant
- * that for envelopes emitted by this stack's helpers, the two return
- * identical strings.
+ * Use {@link principalFromConfig} on the subscribe-side and
+ * {@link principalFromEnvelope} on the publish-side. The unit test in
+ * `src/bus/myelin/__tests__/runtime-principal-symmetry.test.ts` pins the
+ * invariant that for envelopes emitted by this stack's helpers, the two
+ * return identical strings.
  */
-export function orgFromEnvelope(envelope: Envelope): string {
+export function principalFromEnvelope(envelope: Envelope): string {
   return firstSegment(envelope.source);
 }
 
 /**
- * Subscribe-side `{principal}` resolver. See {@link orgFromEnvelope} for the
- * symmetric publish-side helper and the invariant they jointly preserve.
+ * Subscribe-side `{principal}` resolver. See {@link principalFromEnvelope}
+ * for the symmetric publish-side helper and the invariant they jointly
+ * preserve.
  *
  * Falls back to `"default"` when `operatorId` is unset — matches the
  * legacy inline expression at runtime.ts subscribe-site.
  */
-export function orgFromConfig(operatorId: string | undefined): string {
+export function principalFromConfig(operatorId: string | undefined): string {
   return operatorId ?? "default";
 }
 

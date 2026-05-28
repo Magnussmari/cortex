@@ -1899,6 +1899,29 @@ function convertNats(legacyNats: unknown, warnings: ConversionWarning[]): unknow
       delete nats.identity;
     }
   }
+  // R4 (vocabulary migration 2026-05, myelin#185 + cortex#453) — the
+  // legacy bot.yaml `{org}` placeholder retired. Rewrite any `{org}`
+  // tokens in `nats.subjects` to the canonical `{principal}` so the
+  // emitted cortex.yaml is consumable by post-#185 myelin runtimes.
+  const subjects = nats.subjects;
+  if (Array.isArray(subjects)) {
+    const didRewrite = subjects.some(
+      (s: unknown) => typeof s === "string" && s.includes("{org}"),
+    );
+    const rewritten: unknown[] = subjects.map((s: unknown): unknown => {
+      if (typeof s !== "string" || !s.includes("{org}")) return s;
+      return s.replaceAll("{org}", "{principal}");
+    });
+    nats.subjects = rewritten;
+    if (didRewrite) {
+      warnings.push({
+        field: "nats.subjects",
+        message:
+          "rewrote legacy `{org}` placeholder to `{principal}` (R4 vocabulary " +
+          "migration; myelin#185 dropped the `{org}` token from the subject grammar).",
+      });
+    }
+  }
   return nats;
 }
 
