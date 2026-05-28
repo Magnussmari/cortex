@@ -218,6 +218,28 @@ describe("DiscordAdapter.renderEnvelope — happy path", () => {
     expect(sends[0]?.channelId).toBe("channel-A");
   });
 
+  test("renders agent-scoped envelope for this adapter's agent", async () => {
+    const { adapter, sends } = makeAdapter({
+      surfaceFallbackChannelId: "channel-A",
+    });
+    await adapter.surfaceConfig.render(
+      makeEnvelope({ payload: { agent_id: "test" } }),
+    );
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.channelId).toBe("channel-A");
+  });
+
+  test("drops agent-scoped envelope for a different agent", async () => {
+    const { adapter, sends } = makeAdapter({
+      surfaceFallbackChannelId: "channel-A",
+    });
+    await adapter.surfaceConfig.render(
+      makeEnvelope({ payload: { agent_id: "juniper" } }),
+    );
+    expect(sends).toHaveLength(0);
+    expect(warnings).toHaveLength(0);
+  });
+
   test("formatted message contains envelope.type as bold header", async () => {
     const { adapter, sends } = makeAdapter({
       surfaceFallbackChannelId: "channel-A",

@@ -13,7 +13,7 @@
 
 import { Command } from "commander";
 import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, readdirSync } from "fs";
-import { basename, join, dirname } from "path";
+import { basename, join, dirname, isAbsolute } from "path";
 import { parse as parseYaml } from "yaml";
 import type { TextChannel } from "discord.js";
 
@@ -367,6 +367,20 @@ function resolvePrincipalId(
   );
 }
 
+function targetAgentForDispatch(
+  agent: Pick<Agent, "id" | "displayName" | "persona">,
+  configDir: string,
+): { id: string; displayName: string; persona: string } {
+  const expandedPersona = expandTilde(agent.persona);
+  return {
+    id: agent.id,
+    displayName: agent.displayName,
+    persona: isAbsolute(expandedPersona)
+      ? expandedPersona
+      : join(configDir, expandedPersona),
+  };
+}
+
 /**
  * Construct the full cortex stack and start it. Returns a stop handle.
  *
@@ -384,6 +398,7 @@ export async function startCortex(
     ? options.configPath.replace(/^~/, process.env.HOME ?? "~")
     : DEFAULT_CONFIG;
 
+  const configDir = dirname(expandedConfigPath);
   const securityPreamble = buildSecurityPreamble(config, expandedConfigPath);
   console.log("cortex: starting...");
   console.log(`  Agent: ${config.agent.displayName}`);
@@ -1462,7 +1477,7 @@ export async function startCortex(
       // Register the adapter's surface-router face. Empty `surfaceSubjects`
       // makes this a no-op match; harmless to register either way.
       router.register(adapter.surfaceConfig);
-      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg));
+      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir)));
       adapters.push(adapter);
 
       // cortex#98 (part B) — Pass 1 step c: register this adapter's bot
@@ -1619,7 +1634,7 @@ export async function startCortex(
         },
       );
       router.register(adapter.surfaceConfig);
-      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg));
+      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir)));
       adapters.push(adapter);
       console.log(`cortex: mattermost adapter started (instance: ${instanceId}, ${instance.channels.length} channel(s))`);
     } catch (err) {
@@ -1717,7 +1732,7 @@ export async function startCortex(
       // `attachInboundDispatch()`. This is the Slack equivalent of
       // discord.js's buffered-events-before-listener pattern.
       const explicitTrustedBotIds: ReadonlySet<string> = new Set(instance.trustedBotIds);
-      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg));
+      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir)));
       adapters.push(adapter);
       // Best-effort trust-resolver registration matches the Discord pattern.
       if (agentRegistry.tryGetById(agent.id)) {

@@ -1,4 +1,7 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { MockAdapter } from "../../adapters/mock";
 import { DispatchHandler } from "../dispatch-handler";
 import type { InboundMessage } from "../../adapters/types";
@@ -1099,6 +1102,41 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
     await handler.shutdown();
   });
 
+  test("per-adapter target agent overrides host config agent", async () => {
+    const runtime = makeRecordingRuntimeWithSubject();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        principal: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+      policyEngine: makePublishPolicyEngine(),
+    });
+
+    const published = await callPublishInboundDispatchEnvelope(
+      handler,
+      dispatchOpts({
+        targetAgent: { id: "holly", displayName: "Holly" },
+      }),
+    );
+
+    expect(published).toBe(true);
+    expect(runtime.subjectPublishes[0]?.subject).toBe(
+      "local.andreas.meta-factory.tasks.@did-mf-holly.chat",
+    );
+    expect(runtime.subjectPublishes[0]?.envelope.target_assistant).toBe(
+      "did:mf:holly",
+    );
+    expect(runtime.subjectPublishes[0]?.envelope.payload.agent_id).toBe("holly");
+    expect(runtime.subjectPublishes[0]?.envelope.payload.agent_name).toBe("Holly");
+
+    await handler.shutdown();
+  });
+
   test("stackless subject when stack is omitted", async () => {
     const runtime = makeRecordingRuntimeWithSubject();
     const handler = new DispatchHandler({
@@ -1370,7 +1408,51 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
     expect(runtime.subjectPublishes[0]?.subject).toBe(
       "local.andreas.meta-factory.tasks.@did-mf-test-agent.chat",
     );
+    expect(runtime.subjectPublishes[0]?.envelope.payload).not.toHaveProperty("resume_session_id");
     await handler.shutdown();
+  });
+
+  test("chat mode injects the target agent persona into canonical dispatch prompt", async () => {
+    const runtime = makeRecordingRuntimeWithSubject();
+    const adapter = new MockAdapter();
+    const dir = mkdtempSync(join(tmpdir(), "cortex-persona-"));
+    const personaPath = join(dir, "juniper.md");
+    writeFileSync(personaPath, "# Juniper\\nYou are Juniper, not Ivy.\\n");
+
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      runtime,
+      systemEventSource: {
+        principal: "andreas",
+        agent: "cortex",
+        instance: "local",
+      },
+      stack: "meta-factory",
+      policyEngine: makePublishPolicyEngine(),
+    });
+
+    try {
+      await handler.handleMessage(
+        adapter,
+        makeMsg({
+          content: "hello",
+          platform: "discord",
+          authorId: "1487204875912609844",
+        }),
+        { id: "juniper", displayName: "Juniper", persona: personaPath },
+      );
+
+      const prompt = runtime.subjectPublishes[0]?.envelope.payload.prompt;
+      expect(typeof prompt).toBe("string");
+      expect(prompt).toContain("You are Juniper (agent id: juniper).");
+      expect(prompt).toContain("# Juniper");
+      expect(prompt).toContain("hello");
+      expect(runtime.subjectPublishes[0]?.envelope.payload.agent_id).toBe("juniper");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      await handler.shutdown();
+    }
   });
 
   test("chat mode no longer consults CORTEX_ADAPTER_ENVELOPE_MODE", async () => {
