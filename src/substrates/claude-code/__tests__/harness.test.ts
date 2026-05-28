@@ -180,6 +180,19 @@ describe("ClaudeCodeHarness — happy path", () => {
     expect(completed?.payload.result_summary).toBe("Hello, world!");
   });
 
+  test("completed envelope summary skips PAI status chrome", async () => {
+    const result = makeResult({
+      response: "═══ PAI ═══════════════════════════\n🗒️ TASK: Acknowledge greeting\n✅ VERIFY: Ready\n🗣️ Ivy: Here and ready.",
+    });
+    const cap = captureFactory(result);
+    const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });
+
+    const envelopes = await drain(h.dispatch(makeRequest()));
+    const completed = envelopes[1];
+
+    expect(completed?.payload.result_summary).toBe("🗣️ Ivy: Here and ready.");
+  });
+
   test("envelope source matches the harness source triple", async () => {
     const cap = captureFactory(makeResult());
     const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });

@@ -119,6 +119,25 @@ describe("formatEnvelopeAsMarkdown — payload code block", () => {
   });
 });
 
+describe("formatEnvelopeAsMarkdown — dispatch lifecycle", () => {
+  test("renders dispatch lifecycle as concise status text", () => {
+    expect(formatEnvelopeAsMarkdown(makeEnvelope({
+      type: "dispatch.task.started",
+      payload: { agent_id: "ivy" },
+    }))).toBe("Ivy is working...");
+
+    expect(formatEnvelopeAsMarkdown(makeEnvelope({
+      type: "dispatch.task.completed",
+      payload: { agent_id: "ivy", result_summary: "🗣️ Ivy: Here." },
+    }))).toBe("🗣️ Ivy: Here.");
+
+    expect(formatEnvelopeAsMarkdown(makeEnvelope({
+      type: "dispatch.task.failed",
+      payload: { agent_id: "ivy", error_summary: "claude exited 1" },
+    }))).toBe("Ivy failed: claude exited 1");
+  });
+});
+
 describe("formatEnvelopeAsMarkdown — overall shape", () => {
   test("output has exactly the documented N-line structure with correlation_id", () => {
     const out = formatEnvelopeAsMarkdown(

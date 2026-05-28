@@ -82,6 +82,12 @@ function getGroveVersion(): string {
   return _cachedVersion;
 }
 
+interface DispatchTargetAgent {
+  id: string;
+  displayName: string;
+  persona?: string;
+}
+
 export interface DispatchHandlerOpts {
   config: AgentConfig;
   securityPreamble: string;
@@ -233,6 +239,7 @@ export class DispatchHandler extends EventEmitter {
    * at envelope-publish time. See `DispatchHandlerOpts.policyEngine`.
    */
   private readonly policyEngine: PolicyEngine | undefined;
+  private readonly personaPromptCache = new Map<string, string | null>();
 
   constructor(opts: DispatchHandlerOpts) {
     super();
@@ -292,6 +299,42 @@ export class DispatchHandler extends EventEmitter {
       return null;
     }
     return { runtime, source };
+  }
+
+
+  /**
+   * Multi-agent Discord runs share one Cortex process, so Claude Code's
+   * ambient user context is not enough to select the addressed agent. The
+   * matched adapter agent must be injected into the prompt before the
+   * bus-mediated runner sees it.
+   */
+  private targetAgentPersonaPreamble(targetAgent: DispatchTargetAgent | undefined): string {
+    if (targetAgent === undefined) return "";
+
+    const identity =
+      `You are ${targetAgent.displayName} (agent id: ${targetAgent.id}). ` +
+      `Respond as ${targetAgent.displayName}; do not identify as any other agent.\n\n`;
+
+    const personaPath = targetAgent.persona;
+    if (personaPath === undefined || personaPath.length === 0) return identity;
+
+    let persona = this.personaPromptCache.get(personaPath);
+    if (persona === undefined) {
+      try {
+        persona = readFileSync(personaPath, "utf-8").trim();
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `dispatch-handler: could not read persona for ${targetAgent.id} at ${personaPath}: ${detail}`,
+        );
+        persona = null;
+      }
+      this.personaPromptCache.set(personaPath, persona);
+    }
+
+    return persona === null || persona.length === 0
+      ? identity
+      : `${identity}${persona}\n\n`;
   }
 
   /**
@@ -403,6 +446,7 @@ export class DispatchHandler extends EventEmitter {
     taskId: string;
     msg: InboundMessage;
     prompt: string;
+    targetAgent?: DispatchTargetAgent;
     resumeSessionId: string | undefined;
     allowedDirs: string[];
     disallowedTools: string[];
@@ -420,8 +464,8 @@ export class DispatchHandler extends EventEmitter {
       runtime: wiring?.runtime,
       source: wiring?.source,
       stack: this.stack,
-      agentName: this.config.agent.name,
-      agentDisplayName: this.config.agent.displayName,
+      agentName: opts.targetAgent?.id ?? this.config.agent.name,
+      agentDisplayName: opts.targetAgent?.displayName ?? this.config.agent.displayName,
       policyEngine: this.policyEngine,
       ...opts,
     });
@@ -498,7 +542,11 @@ export class DispatchHandler extends EventEmitter {
   }
 
   /** Main entry point — called by adapters when a message arrives */
-  async handleMessage(adapter: PlatformAdapter, msg: InboundMessage): Promise<void> {
+  async handleMessage(
+    adapter: PlatformAdapter,
+    msg: InboundMessage,
+    targetAgent?: DispatchTargetAgent,
+  ): Promise<void> {
     try {
       // 1. Access control
       const access = adapter.resolveAccess(msg);
@@ -657,7 +705,7 @@ export class DispatchHandler extends EventEmitter {
         context,
         isResume: !!existingSession,
         attachmentPrompt: attachPrompt,
-        securityPreamble: channelContextNote + skillRestrictionNote + effectivePreamble,
+        securityPreamble: this.targetAgentPersonaPreamble(targetAgent) + channelContextNote + skillRestrictionNote + effectivePreamble,
       });
 
       // 10. Scan user message (not the full assembled prompt) for injection.
@@ -717,7 +765,8 @@ export class DispatchHandler extends EventEmitter {
           taskId: dispatchTaskId,
           msg,
           prompt,
-          resumeSessionId: existingSession?.sessionId ?? attachmentSessionId,
+          targetAgent,
+          resumeSessionId: existingSession?.sessionId,
           allowedDirs: invokeDirs,
           disallowedTools: effectiveDisallowed,
           timeoutMs: this.config.claude.timeoutMs,
