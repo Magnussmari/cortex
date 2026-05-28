@@ -122,6 +122,40 @@ export class PolicyEngine {
    * any federated `check()` in that case.
    */
   private readonly networksById: ReadonlyMap<string, FederatedNetwork> | undefined;
+  /**
+   * IAW cortex#482 — reverse index `platform → author_id → principal_id`.
+   *
+   * Built once at construction from each principal's `platform_ids`
+   * map so `lookupPrincipalIdByPlatformId` is O(1) per call. Uniqueness
+   * of `(platform, author_id)` tuples is enforced upstream by
+   * `PolicySchema.superRefine`; if a duplicate slips through here the
+   * later principal in the constructor list wins (last-write semantics,
+   * consistent with `principalsById`'s `new Map(...)` collision rule).
+   *
+   * **Duplication note (PR #483 — keep in sync with
+   * `PlatformPrincipalIndex` in `src/common/policy/policy-gate.ts`).**
+   * `PlatformPrincipalIndex` builds the same `(platform, platform_id)
+   * → principal_id` lookup from the same `policy.principals[]` shape,
+   * for adapter-side `resolvePolicyAccess`. Both indexes are kept
+   * because they serve different boundaries:
+   *
+   *   - `PlatformPrincipalIndex` runs adapter-side, BEFORE the
+   *     envelope hits the bus. The adapter has the platform + raw
+   *     platform-id in hand (e.g. Discord snowflake) and just needs
+   *     `resolve(platform, id)` to construct the originator DID.
+   *   - This engine-side index runs bus-side, AFTER the envelope is
+   *     verified. The runner has only a flat `did:mf:<platform>-<id>`
+   *     string and needs both (a) the platform set, for
+   *     longest-prefix disambiguation (see {@link knownPlatforms}),
+   *     and (b) the reverse lookup. Holding the registry here lets
+   *     `dispatch-listener.ts` consume policy decisions without
+   *     pulling in `policy-gate.ts` (adapter-layer module).
+   *
+   * Schema-side changes (case-folding, platform-name canonicalisation,
+   * deprecation) must land in BOTH places or the boundaries drift.
+   * Cross-referenced from `PlatformPrincipalIndex` JSDoc.
+   */
+  private readonly principalIdByPlatformId: ReadonlyMap<string, ReadonlyMap<string, string>>;
 
   constructor(opts: PolicyEngineOptions) {
     this.principalsById = new Map(opts.principals.map((p) => [p.id, p]));
@@ -129,6 +163,82 @@ export class PolicyEngine {
     this.networksById = opts.federated
       ? new Map(opts.federated.networks.map((n) => [n.id, n]))
       : undefined;
+
+    // IAW cortex#482 — flatten principals[].platform_ids[platform][]
+    // into a `platform → author_id → principal_id` reverse index.
+    // Built at construction and never mutated; the registry is a
+    // cortex.yaml snapshot (see `Principal.role`'s `readonly`
+    // discipline JSDoc).
+    const reverse = new Map<string, Map<string, string>>();
+    for (const p of opts.principals) {
+      const platformIds = p.platform_ids;
+      if (platformIds === undefined) continue;
+      for (const [platform, ids] of Object.entries(platformIds)) {
+        let bucket = reverse.get(platform);
+        if (bucket === undefined) {
+          bucket = new Map<string, string>();
+          reverse.set(platform, bucket);
+        }
+        for (const authorId of ids) {
+          bucket.set(authorId, p.id);
+        }
+      }
+    }
+    this.principalIdByPlatformId = reverse;
+  }
+
+  /**
+   * IAW cortex#482 — reverse-lookup a `(platform, author_id)` tuple
+   * to a registered principal id, or `undefined` when no principal
+   * claims that platform identity.
+   *
+   * Consumes the reverse index built from
+   * `Principal.platform_ids[platform][]` at construction. The
+   * dispatch-listener's `resolvePrincipalId` calls this when an
+   * adapter-originated envelope's `originator.identity` decodes to a
+   * platform-prefixed shape (`did:mf:<platform>-<authorId>` per
+   * `adapterOriginatorIdentity` in
+   * `src/bus/dispatch-source-publisher.ts`).
+   *
+   * Returning `undefined` for unknown tuples is the security
+   * default: the caller forwards the raw platform-prefixed id to
+   * `check()`, which then denies with `unknown_principal`. No
+   * platform identity gets implicitly authorised by failure to
+   * resolve.
+   */
+  lookupPrincipalIdByPlatformId(
+    platform: string,
+    authorId: string,
+  ): string | undefined {
+    return this.principalIdByPlatformId.get(platform)?.get(authorId);
+  }
+
+  /**
+   * IAW cortex#483 — registered platform names (the keys of the
+   * `platform → author_id → principal_id` reverse index).
+   *
+   * Exposed so callers can disambiguate platform-prefixed agent ids
+   * by longest-prefix match against the registered set. Required
+   * because `adapterOriginatorIdentity` joins `<platform>-<authorId>`
+   * with a single hyphen separator AND the schema's
+   * `LETTER_PREFIX_ID_REGEX = /^[a-z][a-z0-9-]*$/` permits hyphenated
+   * platform names (e.g. `mcp-cli`, `discord-bot`, `email-imap`).
+   * A naive first-hyphen split of `did:mf:mcp-cli-myUser123` yields
+   * `(platform=mcp, authorId=cli-myUser123)` which misses the real
+   * key `(mcp-cli, myUser123)` — silent denial-of-service for
+   * hyphenated-platform principals.
+   *
+   * The dispatch-listener's `parsePlatformPrefixedAgentId` iterates
+   * this set and picks the longest registered platform that prefixes
+   * the agent id, breaking the ambiguity symmetrically with the
+   * publisher.
+   *
+   * Returns an `Iterable` (not an array snapshot) to avoid
+   * materialising a copy on every dispatch; callers that need
+   * stable iteration should spread it.
+   */
+  get knownPlatforms(): Iterable<string> {
+    return this.principalIdByPlatformId.keys();
   }
 
   /**
