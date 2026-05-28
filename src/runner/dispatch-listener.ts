@@ -423,6 +423,26 @@ export function createDispatchListener(
   interface RuntimeSubscriber { stop(): Promise<void>; }
   let runtimeSubscribers: RuntimeSubscriber[] = [];
 
+  // cortex#484 — in-flight dispatch handlers tracked for fire-and-forget
+  // background execution. The surface-router enforces a per-render
+  // `DEFAULT_RENDER_TIMEOUT_MS = 5000` (`surface-router.ts:242`) to
+  // protect against hung adapters; CC sessions legitimately run for
+  // minutes, so awaiting them inside the `render` callback aborts
+  // every dispatch via timeout. We instead kick off the handler as a
+  // tracked background promise and return immediately from `render`;
+  // the CC session lifecycle continues to fire `dispatch.task.{started,
+  // completed,failed}` envelopes from within the background promise.
+  //
+  // Mirrors the `BusDispatchListener` `inFlight` + `trackInFlight` +
+  // `stop()`-drain pattern (`src/bus/bus-dispatch-listener.ts`) so the
+  // listener can be cleanly torn down in tests / shutdown without
+  // late publish side effects landing on a closed channel.
+  const inFlight = new Set<Promise<void>>();
+  function trackInFlight(p: Promise<void>): void {
+    inFlight.add(p);
+    void p.finally(() => inFlight.delete(p));
+  }
+
   const surfaceConfig: SurfaceAdapter = {
     id: adapterId,
     subjects,
@@ -436,21 +456,50 @@ export function createDispatchListener(
     // iteration can wire `signal.aborted` to `harness.shutdown({ graceful:
     // false })` so surface-router timeouts end the CC process eagerly
     // rather than waiting for cc-session's internal timer to fire.
-    render: (envelope, _signal, subject) =>
-      handleDispatchEnvelope(envelope, subject, {
-        runtime,
-        source,
-        ccSessionFactory,
-        agentTeamFactory,
-        policyEngine,
-        stack: opts.stack,
-        trustResolver,
-        cryptoVerify,
-        principalId,
-        receivingAgentId,
-        stackIdentity,
-        stackNKeyPub,
-      }),
+    //
+    // cortex#484 — `render` returns once the handler is INITIATED, not
+    // once it completes. The handler runs as a fire-and-forget tracked
+    // promise so the surface-router's 5s render-timeout doesn't abort
+    // long-running CC sessions. Errors from the background handler are
+    // caught locally so the unhandled-rejection contract is preserved.
+    render: (envelope, _signal, subject) => {
+      const work = (async () => {
+        try {
+          await handleDispatchEnvelope(envelope, subject, {
+            runtime,
+            source,
+            ccSessionFactory,
+            agentTeamFactory,
+            policyEngine,
+            stack: opts.stack,
+            trustResolver,
+            cryptoVerify,
+            principalId,
+            receivingAgentId,
+            stackIdentity,
+            stackNKeyPub,
+          });
+        } catch (err) {
+          // The handler already publishes structured failure envelopes
+          // for every modeled error path (parse, verify, policy deny,
+          // harness throw). Anything that escapes is a programming
+          // error or runtime-stub assertion — log it so it doesn't
+          // disappear into an unhandled-rejection void, but don't
+          // re-throw: render has already returned and there's nothing
+          // upstream to receive the throw.
+          process.stderr.write(
+            `[runner/dispatch-listener] background handler threw on ` +
+              `envelope ${envelope.id} (correlation_id=` +
+              `${envelope.correlation_id ?? "<none>"}): ` +
+              `${err instanceof Error ? err.message : String(err)}\n`,
+          );
+        }
+      })();
+      trackInFlight(work);
+      // Resolve immediately — the surface-router's render-timeout race
+      // sees a fast-settling promise and never trips.
+      return Promise.resolve();
+    },
   };
 
   return {
@@ -491,6 +540,16 @@ export function createDispatchListener(
       const drained = runtimeSubscribers;
       runtimeSubscribers = [];
       await Promise.allSettled(drained.map((s) => s.stop()));
+      // cortex#484 — drain in-flight background dispatch handlers
+      // before returning. Mirrors BusDispatchListener.stop()'s drain
+      // (`Promise.allSettled(this.inFlight)`) so test teardown and
+      // graceful shutdown can `await listener.stop()` and trust that
+      // no late publish side effects land on a closed channel. The
+      // unregister() above already prevents NEW renders from arriving;
+      // this drain ensures already-initiated CC sessions get a chance
+      // to publish their terminal lifecycle envelopes before the
+      // runtime tears down.
+      await Promise.allSettled(Array.from(inFlight));
     },
   };
 }

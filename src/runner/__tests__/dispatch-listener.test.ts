@@ -2839,3 +2839,192 @@ describe("dispatch-listener — platform-id originator resolution (cortex#482)",
     expect(captured[0]!.principalId).toBe("alice");
   });
 });
+
+// ---------------------------------------------------------------------------
+// cortex#484 — fire-and-forget render contract
+// ---------------------------------------------------------------------------
+
+describe("dispatch-listener — fire-and-forget render (cortex#484)", () => {
+  /**
+   * The surface-router enforces `DEFAULT_RENDER_TIMEOUT_MS = 5000`
+   * per adapter render. CC sessions run for minutes; awaiting them
+   * inside the render callback aborted every dispatch via timeout
+   * (cortex#484). The fix: render returns once the handler is
+   * initiated; the CC session lifecycle continues from within a
+   * tracked background promise.
+   *
+   * This test asserts the render contract directly: trigger an
+   * envelope whose harness blocks until we release it, measure that
+   * the surface-router's onEnvelope handler returns promptly, and
+   * that the terminal `dispatch.task.completed` lifecycle envelope
+   * still fires once the harness unblocks.
+   */
+  test("render returns within 100ms regardless of CC session duration", async () => {
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    // Factory whose wait() blocks until we explicitly release it.
+    let releaseSession: (() => void) | undefined;
+    const sessionUnblocked = new Promise<void>((resolve) => {
+      releaseSession = resolve;
+    });
+    const factory: CCSessionFactory = () => {
+      const session = {
+        start() {
+          return session;
+        },
+        async wait(): Promise<CCSessionResult> {
+          await sessionUnblocked;
+          return SUCCESS_RESULT;
+        },
+      };
+      return session;
+    };
+
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      router,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["dispatch.cortex"]),
+    });
+    await listener.start();
+    await router.start();
+
+    const start = performance.now();
+    // Trigger envelope through runtime fan-out. The surface-router's
+    // onEnvelope handler kicks off the render race; render itself
+    // must resolve promptly so the race never times out.
+    r.trigger(makeReceivedEnvelope(), CANONICAL_CORTEX_CHAT_SUBJECT);
+    // Yield microtasks so the render callback's synchronous wiring
+    // settles. The render callback's returned promise should already
+    // be resolved by this point.
+    await Promise.resolve();
+    await Promise.resolve();
+    const elapsed = performance.now() - start;
+
+    // Budget: render must return promptly. 100ms is the issue's
+    // acceptance criterion; in practice the synchronous wiring
+    // settles in single-digit ms.
+    expect(elapsed).toBeLessThan(100);
+
+    // The CC session is still blocked — no terminal lifecycle yet.
+    // Audit + lifecycle envelopes all fire from within the background
+    // promise, so they MAY have started; only the terminal envelope
+    // is guaranteed not to be there.
+    expect(
+      r.published.some((e) => e.type === "dispatch.task.completed"),
+    ).toBe(false);
+
+    // Unblock the session and let the lifecycle envelopes drain.
+    releaseSession!();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Terminal completion landed — full lifecycle even though render
+    // returned long before.
+    const types = r.published.map((e) => e.type);
+    expect(types).toContain("dispatch.task.completed");
+
+    // Drain so the test exits cleanly.
+    await listener.stop();
+  });
+
+  /**
+   * stop() must drain the inFlight Set so background CC sessions
+   * have a chance to publish terminal envelopes before teardown.
+   * Mirrors BusDispatchListener's `await Promise.allSettled(inFlight)`
+   * pattern.
+   */
+  test("stop() drains in-flight background dispatch handlers", async () => {
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    let releaseSession: (() => void) | undefined;
+    const sessionUnblocked = new Promise<void>((resolve) => {
+      releaseSession = resolve;
+    });
+    const factory: CCSessionFactory = () => {
+      const session = {
+        start() {
+          return session;
+        },
+        async wait(): Promise<CCSessionResult> {
+          await sessionUnblocked;
+          return SUCCESS_RESULT;
+        },
+      };
+      return session;
+    };
+
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      router,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["dispatch.cortex"]),
+    });
+    await listener.start();
+    await router.start();
+
+    r.trigger(makeReceivedEnvelope(), CANONICAL_CORTEX_CHAT_SUBJECT);
+    // Give the render kickoff a tick to register the inFlight promise.
+    await Promise.resolve();
+
+    // Kick off stop() — it must NOT return until inFlight drains.
+    // We race it against the session-release so we can prove it's
+    // actually waiting.
+    let stopResolved = false;
+    const stopPromise = listener.stop().then(() => {
+      stopResolved = true;
+    });
+    // A few microtask + macrotask flushes — stop() should still be
+    // waiting on the blocked session.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(stopResolved).toBe(false);
+
+    // Release the session — stop() unblocks once the handler's
+    // terminal envelope publish settles.
+    releaseSession!();
+    await stopPromise;
+    expect(stopResolved).toBe(true);
+
+    // Terminal envelope did fire — confirms the inFlight drain
+    // captured the in-progress dispatch all the way to completion.
+    expect(
+      r.published.some((e) => e.type === "dispatch.task.completed"),
+    ).toBe(true);
+  });
+
+  /**
+   * Lifecycle envelopes (started/completed) must fire from within
+   * the background promise even though render has already returned.
+   */
+  test("dispatch.task lifecycle envelopes still fire after render returns", async () => {
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      router,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["dispatch.cortex"]),
+    });
+    await listener.start();
+    await router.start();
+
+    r.trigger(makeReceivedEnvelope(), CANONICAL_CORTEX_CHAT_SUBJECT);
+    // Drain — the fake factory resolves synchronously inside its
+    // wait(), so a short setTimeout yields enough for the background
+    // promise to walk the harness's lifecycle.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const types = r.published.map((e) => e.type);
+    expect(types).toEqual([
+      "system.access.allowed",
+      "dispatch.task.started",
+      "dispatch.task.completed",
+    ]);
+    for (const env of r.published) {
+      expect(env.correlation_id).toBe(TASK_ID);
+    }
+  });
+});
