@@ -62,7 +62,7 @@ export function checkAgentAccess(input: AgentAccessInput): AgentAccessResult {
     return { allowed: true, resolution: "admin", availableScope: "control" };
   }
 
-  // 4. Cattle open access (any operator)
+  // 4. Cattle open access (any principal)
   if (agentClass === "cattle" && ROLE_HIERARCHY[userRole] >= ROLE_HIERARCHY["operator"]) {
     return { allowed: true, resolution: "cattle", availableScope: "control" };
   }
