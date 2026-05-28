@@ -1322,7 +1322,17 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
   // path by default.
   // ---------------------------------------------------------------------------
 
-  test("chat mode publishes canonical envelope by default — legacy CC does not spawn", async () => {
+  test("chat mode publishes canonical envelope AND falls through to reply (cortex#491)", async () => {
+    // cortex#491 (Bug 2): a successful canonical bus publish must NOT
+    // short-circuit the sync chat path. PR #421 added a bare early-return
+    // on `publishResult.published`, which skipped `handleSync` — the only
+    // code that posts the CC reply via `adapter.postResponse`. No consumer
+    // of `dispatch.task.completed` posts back to the channel, so every sync
+    // chat response was silently dropped. The fix keeps the bus publish
+    // (observability) and falls through to `handleSync`, which spawns CC
+    // and posts the reply. This test now asserts BOTH: the envelope is
+    // published (==1) AND the CC session spawns (==1) AND the reply lands
+    // on the channel.
     const runtime = makeRecordingRuntimeWithSubject();
     let spawnCount = 0;
     const ccFactory: CCSessionFactory = (_opts: CCSessionOpts) => {
@@ -1334,7 +1344,7 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
         wait() {
           return Promise.resolve<CCSessionResult>({
             success: true,
-            response: "legacy",
+            response: "hello back from CC",
             exitCode: 0,
             durationMs: 0,
             sessionId: "fake-session",
@@ -1365,11 +1375,15 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
         authorId: "1487204875912609844",
       }),
     );
+    // Bus publish preserved (observability).
     expect(runtime.subjectPublishes.length).toBe(1);
-    expect(spawnCount).toBe(0);
     expect(runtime.subjectPublishes[0]?.subject).toBe(
       "local.andreas.meta-factory.tasks.@did-mf-test-agent.chat",
     );
+    // Fall-through to handleSync: CC spawns and the reply is posted back.
+    expect(spawnCount).toBe(1);
+    expect(adapter.sentMessages).toHaveLength(1);
+    expect(adapter.sentMessages[0]?.text).toBe("hello back from CC");
     await handler.shutdown();
   });
 
@@ -1386,7 +1400,7 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
         wait() {
           return Promise.resolve<CCSessionResult>({
             success: true,
-            response: "legacy",
+            response: "hello back from CC",
             exitCode: 0,
             durationMs: 0,
             sessionId: "fake-session",
@@ -1419,10 +1433,14 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
         }),
       );
       expect(runtime.subjectPublishes.length).toBe(1);
-      expect(spawnCount).toBe(0);
       expect(runtime.subjectPublishes[0]?.subject).toBe(
         "local.andreas.meta-factory.tasks.@did-mf-test-agent.chat",
       );
+      // cortex#491 — env flag is gone AND the canonical publish no longer
+      // short-circuits the reply: CC spawns and posts back.
+      expect(spawnCount).toBe(1);
+      expect(adapter.sentMessages).toHaveLength(1);
+      expect(adapter.sentMessages[0]?.text).toBe("hello back from CC");
     } finally {
       delete process.env.CORTEX_ADAPTER_ENVELOPE_MODE;
     }

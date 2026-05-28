@@ -729,7 +729,17 @@ export class DispatchHandler extends EventEmitter {
           entity: groveEntity,
           operator: groveOperator,
         });
-        if (publishResult.published) return;
+        // cortex#491 (Bug 2): do NOT early-return on a successful canonical
+        // publish. PR #421 made the canonical-task-envelope publish the default
+        // for sync chat and added a bare `if (publishResult.published) return;`
+        // here — but no consumer of `dispatch.task.completed` posts the CC
+        // reply back to the channel, so the early-return silently dropped every
+        // sync chat response. We keep the bus publish (observability/telemetry
+        // preserved) and fall through to `switch (parsed.mode) → handleSync`,
+        // which runs the CC session and posts the full reply via
+        // `adapter.postResponse`. Async/team modes are unaffected — they never
+        // entered this `parsed.mode === "sync"` block. The `invalid-originator`
+        // and other publish-failure branches below are preserved exactly.
         if (publishResult.reason === "invalid-originator") {
           await adapter.postResponse(
             { instanceId: msg.instanceId, channelId: msg.channelId, threadId: msg.threadId },
@@ -737,9 +747,11 @@ export class DispatchHandler extends EventEmitter {
           );
           return;
         }
-        console.warn(
-          `dispatch-handler: canonical chat dispatch publish unavailable (${publishResult.reason ?? "unknown"}) — using direct sync path for this message`,
-        );
+        if (!publishResult.published) {
+          console.warn(
+            `dispatch-handler: canonical chat dispatch publish unavailable (${publishResult.reason ?? "unknown"}) — using direct sync path for this message`,
+          );
+        }
       }
 
       // 12. Route by mode
