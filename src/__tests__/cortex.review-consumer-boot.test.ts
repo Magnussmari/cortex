@@ -214,7 +214,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
         agentsDir: tmpAgentsDir,
         injectRuntime: runtime,
         inlineAgents,
-        operator: { id: "test-op" },
+        principal: { id: "test-op" },
       }),
     );
 
@@ -292,7 +292,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
         agentsDir: tmpAgentsDir,
         injectRuntime: runtime,
         inlineAgents,
-        operator: { id: "test-op" },
+        principal: { id: "test-op" },
       }),
     );
 
@@ -320,11 +320,11 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
     rmSync(tmpAgentsDir, { recursive: true, force: true });
   });
 
-  test("cortex#314 — zero code-review-capable agents → stderr carries an operator-actionable WARNING (not just info-level log)", async () => {
+  test("cortex#314 — zero code-review-capable agents → stderr carries a principal-actionable WARNING (not just info-level log)", async () => {
     // First-install safety regression guard. Mirror of the capability-
     // registry-side test in `cortex.capability-boot.test.ts`. The
     // review-consumer wiring used to log a single info-level
-    // `console.log("…skipped…")` line, which an operator running
+    // `console.log("…skipped…")` line, which a principal running
     // interactively (or with a non-debug log handler) does NOT notice.
     // The result was a fresh `pilot request-review --wait` silently
     // exiting 0 with no review having happened.
@@ -350,7 +350,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
           agentsDir: tmpAgentsDir,
           injectRuntime: runtime,
           inlineAgents,
-          operator: { id: "test-op" },
+          principal: { id: "test-op" },
         }),
       ),
     );
@@ -407,7 +407,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
           agentsDir: tmpAgentsDir,
           injectRuntime: runtime,
           inlineAgents: [echoAgent, lunaAgent],
-          operator: { id: "test-op" },
+          principal: { id: "test-op" },
         }),
       ),
     );
@@ -454,7 +454,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
     // The disabled-runtime case: `MyelinRuntime.subscribePull` returns
     // null when `cortex.yaml nats.subjects: []` (the default today)
     // and the consumer stays dormant. Pre-#334 the boot path logged
-    // "review consumer ready" unconditionally, misleading operators
+    // "review consumer ready" unconditionally, misleading principals
     // into thinking the bus path was live. The fix branches the log
     // line on `started.subscribed`.
     //
@@ -506,7 +506,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
         agentsDir: tmpAgentsDir,
         injectRuntime: dormantRuntime,
         inlineAgents,
-        operator: { id: "test-op" },
+        principal: { id: "test-op" },
       }),
     );
 
@@ -546,7 +546,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
     // already wrapped in try/catch. The fix wraps the await inside
     // `resolveReviewProvisioningJsm` so the resolution failure is
     // contained — boot continues with provisioning skipped, and
-    // operator-actionable stderr explains.
+    // principal-actionable stderr explains.
     //
     // Test stands up a runtime whose `jetstreamManager()` rejects, and
     // asserts: (a) startCortex completes (no thrown error), (b) the
@@ -600,7 +600,7 @@ describe("startCortex — review-consumer boot wiring (cortex#237 PR-6)", () => 
           agentsDir: tmpAgentsDir,
           injectRuntime: throwingRuntime,
           inlineAgents,
-          operator: { id: "test-op" },
+          principal: { id: "test-op" },
         });
         booted = true;
         return h;

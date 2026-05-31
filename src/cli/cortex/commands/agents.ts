@@ -189,7 +189,7 @@ function reloadFragment(fragmentPath: string, json: boolean): ExitResult {
     const agent = loadAgentFromFile(expanded, dirname(expanded));
     if (agent === null) {
       // File vanished between existsSync above and the loader's stat. Treat
-      // as a usage error (operator-actionable: re-run).
+      // as a usage error (principal-actionable: re-run).
       return {
         exitCode: 2,
         stdout: "",
@@ -315,7 +315,7 @@ export function dispatchAgents(argv: string[]): ExitResult {
 
 /**
  * Validation-only caveat appended to success output so arc lifecycle scripts
- * (and operators reading stdout) don't infer "the running daemon reloaded."
+ * (and principals reading stdout) don't infer "the running daemon reloaded."
  * Echo M3 on cortex#63.
  */
 const VALIDATION_ONLY_NOTE =

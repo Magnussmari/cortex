@@ -16,7 +16,7 @@
  *      failed with the thrown message.
  *   6. CCSessionOpts mapping — `tools.allow`/`tools.deny` become
  *      `allowedTools`/`disallowedTools`; env-kind context populates
- *      operator/entity/project; both timeout fields collapse to the
+ *      principal/entity/project; both timeout fields collapse to the
  *      minimum on cc-session's existing timer.
  *   7. Shutdown — `graceful: false` calls kill on active sessions;
  *      post-shutdown `dispatch()` yields started → failed (refused).
@@ -269,19 +269,19 @@ describe("ClaudeCodeHarness — DispatchRequest → CCSessionOpts mapping", () =
     expect(cap.opts[1]?.timeoutMs).toBe(45_000);
   });
 
-  test("env-kind context populates operator/entity/project", async () => {
+  test("env-kind context populates principal/entity/project", async () => {
     const cap = captureFactory(makeResult());
     const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });
     const req = makeRequest({
       context: [
-        { kind: "env", data: { operator: "andreas", entity: "pr/45", project: "cortex" } },
+        { kind: "env", data: { principal: "andreas", entity: "pr/45", project: "cortex" } },
         { kind: "discord-history", data: [{ author: "andreas", text: "hi" }] },
       ],
     });
 
     await drain(h.dispatch(req));
 
-    expect(cap.opts[0]?.operator).toBe("andreas");
+    expect(cap.opts[0]?.principal).toBe("andreas");
     expect(cap.opts[0]?.entity).toBe("pr/45");
     expect(cap.opts[0]?.project).toBe("cortex");
   });
@@ -344,17 +344,17 @@ describe("ClaudeCodeHarness — DispatchRequest → CCSessionOpts mapping", () =
     // explicit-over-implicit principle: the new typed surface beats the
     // legacy `context.data` route.
     //
-    // Note: operator/entity/project don't live on `req.runtime` today —
+    // Note: principal/entity/project don't live on `req.runtime` today —
     // they only live in env context. The conflict is only resolvable for
     // fields that overlap; for now nothing overlaps directly. This test
     // asserts the *combination* path: both blocks supplied, harness reads
-    // both without throwing, env context still surfaces operator/etc.
+    // both without throwing, env context still surfaces principal/etc.
     const cap = captureFactory(makeResult());
     const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });
     const req = makeRequest({
       runtime: { cwd: "/work", groveChannel: "grove" },
       context: [
-        { kind: "env", data: { operator: "andreas", entity: "pr/45", project: "cortex" } },
+        { kind: "env", data: { principal: "andreas", entity: "pr/45", project: "cortex" } },
       ],
     });
 
@@ -362,7 +362,7 @@ describe("ClaudeCodeHarness — DispatchRequest → CCSessionOpts mapping", () =
 
     expect(cap.opts[0]?.cwd).toBe("/work");
     expect(cap.opts[0]?.groveChannel).toBe("grove");
-    expect(cap.opts[0]?.operator).toBe("andreas");
+    expect(cap.opts[0]?.principal).toBe("andreas");
     expect(cap.opts[0]?.entity).toBe("pr/45");
     expect(cap.opts[0]?.project).toBe("cortex");
   });

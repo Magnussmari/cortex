@@ -198,8 +198,8 @@ describe("DispatchHandler", () => {
     });
   });
 
-  describe("operator notification", () => {
-    test("non-operator triggers notification", async () => {
+  describe("principal notification", () => {
+    test("non-principal triggers notification", async () => {
       // user1 is not operator1, so notification should fire
       await router.handleMessage(adapter, makeMsg({
         platform: "discord",
@@ -208,25 +208,25 @@ describe("DispatchHandler", () => {
         content: "/help",
       }));
 
-      expect(adapter.operatorNotifications).toHaveLength(1);
-      expect(adapter.operatorNotifications[0]!).toContain("Stranger");
+      expect(adapter.principalNotifications).toHaveLength(1);
+      expect(adapter.principalNotifications[0]!).toContain("Stranger");
     });
 
-    test("operator does not trigger notification", async () => {
-      // v2.0.0 (cortex#297) — operator classification flows through
-      // `msg.dmType` (set by adapters via the PolicyEngine `operator`
+    test("principal does not trigger notification", async () => {
+      // v2.0.0 (cortex#297) — principal classification flows through
+      // `msg.dmType` (set by adapters via the PolicyEngine principal-role
       // capability) instead of comparing `authorId` to a legacy
       // `agent.operatorDiscordId` field. The notifier short-circuits
-      // on `msg.dmType === "operator"`.
+      // on `msg.dmType === "principal"`.
       await router.handleMessage(adapter, makeMsg({
         platform: "discord",
         authorId: "operator1",
         content: "/help",
         isDM: true,
-        dmType: "operator",
+        dmType: "principal",
       }));
 
-      expect(adapter.operatorNotifications).toHaveLength(0);
+      expect(adapter.principalNotifications).toHaveLength(0);
     });
   });
 
@@ -1027,7 +1027,7 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
     groveNetwork: undefined,
     project: "cortex",
     entity: "issue/409",
-    operator: "andreas",
+    principal: "andreas",
     ...overrides,
   });
 
@@ -1092,7 +1092,7 @@ describe("DispatchHandler — Direction A Stage 4-B inbound envelope publish (co
     expect(payload.additional_args).toEqual(["--foo"]);
     expect(payload.project).toBe("cortex");
     expect(payload.entity).toBe("issue/409");
-    expect(payload.operator).toBe("andreas");
+    expect(payload.principal).toBe("andreas");
 
     // cortex#491 — response routing stamped from the inbound message so
     // the runner can echo it onto lifecycle envelopes and the dispatch

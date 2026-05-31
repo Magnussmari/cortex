@@ -633,7 +633,7 @@ describe("dispatch-listener — success path", () => {
         additional_args: ["--verbose"],
         project: "cortex",
         entity: "issue/12",
-        operator: "andreas",
+        principal: "andreas",
         resume_session_id: "prior-session",
       }),
       CANONICAL_CORTEX_CHAT_SUBJECT,
@@ -655,7 +655,7 @@ describe("dispatch-listener — success path", () => {
     expect(opts.additionalArgs).toEqual(["--verbose"]);
     expect(opts.project).toBe("cortex");
     expect(opts.entity).toBe("issue/12");
-    expect(opts.operator).toBe("andreas");
+    expect(opts.principal).toBe("andreas");
     expect(opts.resumeSessionId).toBe("prior-session");
   });
 
@@ -719,7 +719,7 @@ describe("dispatch-listener — success path", () => {
     expect(opts.bashAllowlist).toBeUndefined();
     expect(opts.bashGuardDisabled).toBeUndefined();
     expect(opts.timeoutMs).toBeUndefined();
-    expect(opts.operator).toBeUndefined();
+    expect(opts.principal).toBeUndefined();
     expect(opts.entity).toBeUndefined();
     expect(opts.project).toBeUndefined();
     expect(opts.allowedTools).toBeUndefined();

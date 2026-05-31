@@ -1,6 +1,6 @@
 # Design — v2.0.0 policy cutover (cortex#243 + cortex#242)
 
-**Status:** shipped — v2.0.0 cutover landed in cortex#297. Legacy `roles[]` / `defaultRole` / `dm` removed from every adapter shape; `role-resolver.ts` retired; PolicyEngine is the sole authorisation gate; `parallel_mode_enabled` + `system.access.disagreement` envelope retired with it. Operators upgrading from <v2.0.0 MUST run `bun src/cli/cortex/commands/migrate-config.ts <config.yaml>` first.
+**Status:** shipped — v2.0.0 cutover landed in cortex#297. Legacy `roles[]` / `defaultRole` / `dm` removed from every adapter shape; `role-resolver.ts` retired; PolicyEngine is the sole authorisation gate; `parallel_mode_enabled` + `system.access.disagreement` envelope retired with it. Principals upgrading from <v2.0.0 MUST run `bun src/cli/cortex/commands/migrate-config.ts <config.yaml>` first.
 **Owners:** Andreas + Luna
 **Targets:** cortex#243 (migrate-config CLI extension), cortex#242 (breaking schema removal + role-resolver retirement)
 
@@ -44,7 +44,7 @@ Plus per-instance:
 
 | Field | Type | Semantic |
 |---|---|---|
-| `operatorRole` | DMRoleSchema | Applied to DMs from the operator (identified by `agent.operatorDiscordId`). Defaults to full features + bashGuard on |
+| `operatorRole` | DMRoleSchema | Applied to DMs from the principal (identified by `agent.operatorDiscordId`). Defaults to full features + bashGuard on |
 | `defaultRole` | `"denied"` \| `"allow-all"` | Unknown DMs |
 | `userRoles[]` | DMUserRoleSchema[] | Per-user overrides — each has `users[]` + the same field bundle |
 
@@ -52,13 +52,13 @@ DMRoleSchema and DMUserRoleSchema carry the same five fields as channel roles, *
 - `bashGuard` (boolean, default true)
 - `bashAllowlist` (object: `{ rules: [{pattern, repos?}], repos: [] }`)
 
-### 2.3 Operator identity surface (lives on the agent, not roles)
+### 2.3 Principal identity surface (lives on the agent, not roles)
 
 `AgentSchema` in `src/common/types/config.ts:335`:
-- `operatorDiscordId` — operator's Discord user id
-- `operatorMattermostId` — operator's Mattermost user id
-- `operatorSlackId` — operator's Slack user id
-- `operatorId` — abstract operator id used elsewhere
+- `operatorDiscordId` — principal's Discord user id
+- `operatorMattermostId` — principal's Mattermost user id
+- `operatorSlackId` — principal's Slack user id
+- `operatorId` — abstract principal id used elsewhere
 
 The DM `operatorRole` only fires when `message.author.id === agent.operatorDiscordId`.
 
@@ -68,7 +68,7 @@ The DM `operatorRole` only fires when `message.author.id === agent.operatorDisco
 
 `PolicyPrincipal`:
 - `id` — letter-prefix lowercase alphanumeric + hyphen
-- `home_operator` — operator id (same grammar)
+- `home_operator` — principal id (same grammar)
 - `home_stack` — `{operator_id}/{stack_id}`
 - `nkey_pub?` — federated identity verification anchor
 - `role[]` — role ids
@@ -150,12 +150,12 @@ Adapter resolves inbound `message.author.id` → principal via reverse lookup. I
 Reserved capability ids:
 - `keyword.chat`, `keyword.async`, `keyword.team` — replace `features[]`
 - `tool.<lowercase-tool-name>` — granted means tool is allowed; absent means denied. `disallowedTools: ["Bash"]` migrates to: omit `tool.bash` from the role's capabilities.
-- `operator` — special capability granted only to the operator role. Used by adapter to short-circuit DM gating (operator gets full access).
+- `operator` — special capability granted only to the operator role. Used by adapter to short-circuit DM gating (operator-role principal gets full access).
 - `dispatch.<agent_id>` — already used by dispatch-listener.ts:718, unchanged.
 
 Tool deny migration is interesting: legacy `disallowedTools: ["Bash", "Edit"]` becomes role.capabilities = full tool set MINUS those two. The migrate-config CLI needs a canonical tool list to invert. **Open question:** do we keep the canonical tool list in cortex, or do we change the schema to allow `tool.deny.<name>` as a deny capability that the adapter checks for explicitly?
 
-**Recommended:** keep it allow-list. Capabilities are positive grants. The CLI converts `disallowedTools` → omit-from-list using a canonical tool inventory in `src/common/policy/tool-inventory.ts` (new file). Operators can edit the resulting `capabilities[]` after migration to be more selective.
+**Recommended:** keep it allow-list. Capabilities are positive grants. The CLI converts `disallowedTools` → omit-from-list using a canonical tool inventory in `src/common/policy/tool-inventory.ts` (new file). Principals can edit the resulting `capabilities[]` after migration to be more selective.
 
 ### 5.3 Session-construction attributes on PolicyPrincipal
 
@@ -192,9 +192,9 @@ When `resolveRole` would fall through to defaultRole today, the new model resolv
 
 ### 5.5 Operator → reserved `operator` role + capability
 
-Adapter at DM resolution time checks `message.author.id === agent.operatorDiscordId`. If yes, the adapter asks PolicyEngine to authorise against a special intent: `intent.capability = "operator"`. If granted (via the operator role), full access applies. The operator-only `bashGuard` / `bashAllowlist` migrate to the operator principal's `session_config`.
+Adapter at DM resolution time checks `message.author.id === agent.operatorDiscordId`. If yes, the adapter asks PolicyEngine to authorise against a special intent: `intent.capability = "operator"`. If granted (via the operator role), full access applies. The operator-only `bashGuard` / `bashAllowlist` migrate to the principal's `session_config`.
 
-This preserves the legacy semantic exactly: operator gets a distinct privilege class, identified at runtime by their platform id matching `agent.operatorDiscordId`.
+This preserves the legacy semantic exactly: principal gets a distinct privilege class, identified at runtime by their platform id matching `agent.operatorDiscordId`.
 
 ### 5.6 Capability namespace summary
 
@@ -231,30 +231,30 @@ For each `presence.<platform>[instance].roles[]` entry:
    - `role = [...]` per §5.4
 
 4. **DM operator role** — emit one operator principal:
-   - `id = "operator-" + operator_id` (or just `"operator"` when single-operator deployment)
+   - `id = "operator-" + operator_id` (or just `"operator"` when single-principal deployment)
    - `platform_ids = { discord: [operatorDiscordId], mattermost: [operatorMattermostId], slack: [operatorSlackId] }` (filtered to those present)
    - `role = ["operator"]`
    - `session_config` from `dm.operatorRole`'s `bashGuard` / `bashAllowlist` / `disallowedTools` / etc.
 
-5. **Cross-adapter consistency check** — if `roles[name = X]` appears in both Discord and Mattermost with **different** field bundles → emit warning + union the capabilities + flag for operator review.
+5. **Cross-adapter consistency check** — if `roles[name = X]` appears in both Discord and Mattermost with **different** field bundles → emit warning + union the capabilities + flag for principal review.
 
 ### 6.1 Principal id synthesis from platform IDs
 
 Discord snowflake `1487123456789012345` doesn't fit letter-prefix grammar. The CLI generates a synthetic id:
-- Use existing display name if reachable (CLI prompts operator to label each platform id during migration)
+- Use existing display name if reachable (CLI prompts principal to label each platform id during migration)
 - Otherwise `user-{platform[0]}{last-6-of-id}` → e.g. `user-d567890`
 
-**Open question:** should the migrate-config CLI prompt for friendly names interactively? Or generate synthetic ids and let the operator edit post-migration? Echo's earlier framing on cortex#243 said "Idempotent: running twice produces the same output" — interactive prompting breaks idempotency. Recommendation: synthetic-by-default, optional `--labels labels.yaml` flag for operator-curated names.
+**Open question:** should the migrate-config CLI prompt for friendly names interactively? Or generate synthetic ids and let the principal edit post-migration? Echo's earlier framing on cortex#243 said "Idempotent: running twice produces the same output" — interactive prompting breaks idempotency. Recommendation: synthetic-by-default, optional `--labels labels.yaml` flag for principal-curated names.
 
 ---
 
 ## 7. cortex#242 (breaking removal) scope
 
-Once cortex#243 ships and operators have a migration path:
+Once cortex#243 ships and principals have a migration path:
 
 1. Drop `roles[]` from DiscordInstanceSchema / MattermostInstanceSchema / SlackInstanceSchema (cortex-config.ts:130/205/236)
 2. Drop `defaultRole` from same
-3. Drop entire DMConfigSchema (config.ts:100) — operator handling moves to the operator principal
+3. Drop entire DMConfigSchema (config.ts:100) — principal handling moves to the principal
 4. Drop `dm.operatorRole`, `dm.defaultRole`, `dm.userRoles[]`
 5. Retire `src/adapters/discord/role-resolver.ts` (~125 LOC) — replaced by PolicyEngine calls
 6. Update DiscordAdapter to call PolicyEngine for each inbound message:
@@ -272,9 +272,9 @@ Once cortex#243 ships and operators have a migration path:
 1. **Synthetic principal ids — interactive prompt or batch with optional labels file?** Recommendation: synthetic + optional `--labels`.
 2. **Tool inventory — canonical list in repo, or invert-via-deny-capabilities?** Recommendation: canonical list in `src/common/policy/tool-inventory.ts`.
 3. **`bash_allowlist` and `bash_guard` — principal attribute or role attribute?** Recommendation: principal attribute on `session_config`. Roles are pure capability sets.
-4. **Cross-adapter role conflict (same `role.name` with different fields) — warn + union, warn + reject, or warn + pick-first?** Recommendation: warn + conservative union (preserves access; operator must tighten manually after migration if they want to).
+4. **Cross-adapter role conflict (same `role.name` with different fields) — warn + union, warn + reject, or warn + pick-first?** Recommendation: warn + conservative union (preserves access; principal must tighten manually after migration if they want to).
 5. **`defaultRole = "allow-all"` migration — emit the synthetic anonymous principal with all capabilities, or carry forward as a top-level `policy.default_grant: "allow-all"` flag?** Recommendation: synthetic principal — keeps PolicyEngine's "one principal, one decision" mental model and the migrate-config CLI doesn't need to invent a new schema field.
-6. **`operatorDiscordId` field — keep on AgentSchema (legacy) or move to PolicyPrincipal.platform_ids?** Recommendation: move. Once `platform_ids` exists on the operator principal, the legacy `operatorDiscordId` field is redundant and should retire with the same v2.0.0 bump.
+6. **`operatorDiscordId` field — keep on AgentSchema (legacy) or move to PolicyPrincipal.platform_ids?** Recommendation: move. Once `platform_ids` exists on the principal, the legacy `operatorDiscordId` field is redundant and should retire with the same v2.0.0 bump.
 
 ---
 
@@ -284,7 +284,7 @@ Once cortex#243 ships and operators have a migration path:
 2. **cortex#243b (canonical tool inventory)** — add `src/common/policy/tool-inventory.ts`. Used by migrate-config to invert `disallowedTools`. **Parallelisable with 243a** — no schema dependency.
 3. **cortex#243c (migrate-config CLI extension)** — implement the conversion in §6. Idempotent. Sample inputs/outputs in `docs/migration-examples/`. SOP in `docs/sop-migrate-config.md`. Depends on 243a (schema) + 243b (tool inventory).
 4. **cortex#242a (adapter PolicyEngine wiring)** — DiscordAdapter / MattermostAdapter / SlackAdapter call PolicyEngine for each authorization decision. Legacy role-resolver still runs in parallel as a sanity check. Depends on 243a only (NOT 243c — parallel mode runs against legacy configs).
-5. **cortex#242b (legacy schema removal)** — drop `roles[]` + `defaultRole` + `dm` from per-adapter schemas. Drop role-resolver.ts. Bump v2.0.0. Strict-mode parse error on legacy configs with a pointer to migrate-config. Depends on 242a (parallel validated) **and** 243c (operators have migration path).
+5. **cortex#242b (legacy schema removal)** — drop `roles[]` + `defaultRole` + `dm` from per-adapter schemas. Drop role-resolver.ts. Bump v2.0.0. Strict-mode parse error on legacy configs with a pointer to migrate-config. Depends on 242a (parallel validated) **and** 243c (principals have migration path).
 
 Five PRs. Dependency DAG: 243a + 243b parallel → 243c. 243a → 242a (independent of 243b/c). 243c + 242a → 242b.
 
@@ -303,10 +303,10 @@ The dispatch is allowed only if **both** gates allow. If either gate denies, the
 
 **Why most-restrictive, not new-system-wins:**
 1. Security cutovers default to most-restrictive shadow-mode posture. A new gate that mistakenly allows what legacy denies is a silent privilege-expansion vector during the validation window.
-2. The operator can monitor `system.access.disagreement` envelopes on the dashboard to spot mis-migrations *without* exposure — if PolicyEngine wrongly grants, legacy still blocks.
-3. The protection is **one-directional** — intersection-wins catches the dangerous case (new gate mistakenly **allows** what legacy denies → effective decision is deny → safe). It does **not** protect against the opposite case (new gate denies what legacy allows → effective decision is deny → previously-authorised users are blocked). That asymmetry is acceptable because the missing-principal case is operator-detectable via `system.access.disagreement` envelopes BEFORE 242b removes the legacy gate — see operator pre-flight below.
+2. The principal can monitor `system.access.disagreement` envelopes on the dashboard to spot mis-migrations *without* exposure — if PolicyEngine wrongly grants, legacy still blocks.
+3. The protection is **one-directional** — intersection-wins catches the dangerous case (new gate mistakenly **allows** what legacy denies → effective decision is deny → safe). It does **not** protect against the opposite case (new gate denies what legacy allows → effective decision is deny → previously-authorised users are blocked). That asymmetry is acceptable because the missing-principal case is principal-detectable via `system.access.disagreement` envelopes BEFORE 242b removes the legacy gate — see principal pre-flight below.
 
-**Operator pre-flight before activating 242a parallel mode:** `migrate-config` MUST have been run against the live cortex.yaml; every user the legacy role-resolver currently authorises MUST resolve to a principal in `policy.principals[]`. Without this pre-flight, intersection-wins denies every previously-authorised dispatch from unmapped legacy-known users during the validation window. The `system.access.disagreement` envelopes surface the mismatch on the dashboard, but only *after* auth has already broken for those users. The pre-flight check itself is mechanically a `migrate-config --check` invocation that fails when the legacy role-resolver's principal set is not a subset of the new `policy.principals[]` lookup space — to be implemented as part of cortex#243c.
+**Principal pre-flight before activating 242a parallel mode:** `migrate-config` MUST have been run against the live cortex.yaml; every user the legacy role-resolver currently authorises MUST resolve to a principal in `policy.principals[]`. Without this pre-flight, intersection-wins denies every previously-authorised dispatch from unmapped legacy-known users during the validation window. The `system.access.disagreement` envelopes surface the mismatch on the dashboard, but only *after* auth has already broken for those users. The pre-flight check itself is mechanically a `migrate-config --check` invocation that fails when the legacy role-resolver's principal set is not a subset of the new `policy.principals[]` lookup space — to be implemented as part of cortex#243c.
 
 **242b removes the parallel mode** — once legacy is gone, PolicyEngine is the only gate and disagreement detection is no longer applicable. The `system.access.disagreement` envelope shape retires with role-resolver.ts.
 
@@ -332,7 +332,7 @@ Anchoring the design in operational config. Two files: `~/.config/cortex/cortex.
 
 ### 11.1 meta-factory stack (the one this migration targets)
 
-**Stack identity** — `andreas/meta-factory`, operator `andreas`, residency NZ.
+**Stack identity** — `andreas/meta-factory`, principal `andreas`, residency NZ.
 
 **Three agents — Luna, Echo, Forge** — each with a Discord presence carrying its own `roles[]` list. The role lists are structurally near-identical across all three; differences are documented below.
 
@@ -358,7 +358,7 @@ Anchoring the design in operational config. Two files: `~/.config/cortex/cortex.
 - 1 unused template role (`agent-restricted` — emitted as PolicyRole with zero principals, per §13 Q7)
 - 3 synthetic anonymous-per-instance principals (`anonymous-discord-{luna,echo,forge}`, per §5.4 — landing place for `defaultRole: denied`)
 
-The "12" figure cited earlier in drafts dropped the synthetic anonymous principals; they're real principals in the new model (operators will see them after `migrate-config` runs) so they belong in the count.
+The "12" figure cited earlier in drafts dropped the synthetic anonymous principals; they're real principals in the new model (principals will see them after `migrate-config` runs) so they belong in the count.
 
 **DM model on Luna only carries real depth:**
 - `operatorRole` — features `[chat, async, team]`, no tool denies, rich `allowedDirs` (24 repos), `bashGuard: true`, custom `bashAllowlist` (broader patterns + 40 repos)
@@ -386,7 +386,7 @@ policy:
       trust: []
       nkey_pub: UDEQUP3NU...
   roles:
-    - id: operator
+    - id: principal
       capabilities:
         - dispatch.luna
         - code-review.typescript
@@ -395,19 +395,19 @@ policy:
         - team
 ```
 
-**Note:** the work stack's bare-string capabilities (`chat`, `async`, `team`) predate the namespace decision in §12.1. They'll be rewritten to the namespaced form (`keyword.chat`, etc.) by `migrate-config` at cutover time — one-line update, no operator pain.
+**Note:** the work stack's bare-string capabilities (`chat`, `async`, `team`) predate the namespace decision in §12.1. They'll be rewritten to the namespaced form (`keyword.chat`, etc.) by `migrate-config` at cutover time — one-line update, no principal pain.
 
 ### 11.3 What this reality-check changes
 
 **Principal count is much smaller than per-agent-roles count.** Three agents × ten roles = 30 role declarations in the legacy config, but only 12 distinct principals after deduplication. The CLI's first job is unification, not direct transcription.
 
-**Cross-agent role drift is mostly noise.** Where role definitions differ across the three agents, it's almost always (a) self-references that the self-loop guard makes inert, or (b) one agent forgetting to mirror an `allowedDirs` list that another agent declared. The conservative union (§8 Q4) is the right default here — no real operator decision will be lost.
+**Cross-agent role drift is mostly noise.** Where role definitions differ across the three agents, it's almost always (a) self-references that the self-loop guard makes inert, or (b) one agent forgetting to mirror an `allowedDirs` list that another agent declared. The conservative union (§8 Q4) is the right default here — no real principal decision will be lost.
 
-**The DM model carries the most unique information.** Luna's DM `operatorRole` has a substantial `bashAllowlist` (broader pattern list + 40 repos) that no channel role declares. This isn't fungible with channel access — it's specifically what the operator gets in private 1:1s. The migration must preserve it; §5.3's `session_config` on the operator principal is the natural home, **but** the legacy model permits the operator's channel-context session config and DM-context session config to differ (they happen to be identical here). The new model doesn't represent context-dependent session config. See §12.2.
+**The DM model carries the most unique information.** Luna's DM `operatorRole` has a substantial `bashAllowlist` (broader pattern list + 40 repos) that no channel role declares. This isn't fungible with channel access — it's specifically what the principal gets in private 1:1s. The migration must preserve it; §5.3's `session_config` on the principal is the natural home, **but** the legacy model permits the principal's channel-context session config and DM-context session config to differ (they happen to be identical here). The new model doesn't represent context-dependent session config. See §12.2.
 
-**The `agent-restricted` template role with no users[]** is a real schema feature operators use to declare a "potential" role that no one currently holds but `defaultRole` could reference. Migration must preserve the PolicyRole even with zero principals pointing at it — empty `users[]` doesn't mean delete.
+**The `agent-restricted` template role with no users[]** is a real schema feature principals use to declare a "potential" role that no one currently holds but `defaultRole` could reference. Migration must preserve the PolicyRole even with zero principals pointing at it — empty `users[]` doesn't mean delete.
 
-**External agent peers (ivy, holly, pilot, juniper)** appear with bare Discord IDs and no `agent_id` declaration anywhere in cortex.yaml — they're peer bots in other operators' stacks. The CLI can't infer their `home_stack`; it should emit them as principals with `home_operator: "unknown"` + a warning + `platform_ids.discord` set, and let the operator label `home_stack` post-migration.
+**External agent peers (ivy, holly, pilot, juniper)** appear with bare Discord IDs and no `agent_id` declaration anywhere in cortex.yaml — they're peer bots in other principals' stacks. The CLI can't infer their `home_stack`; it should emit them as principals with `home_operator: "unknown"` + a warning + `platform_ids.discord` set, and let the principal label `home_stack` post-migration.
 
 ---
 
@@ -431,28 +431,28 @@ Final capability namespace:
 
 The dotted-domain convention (`<domain>.<entity>`) is what `code-review.typescript` and `dispatch.luna` already follow — `keyword.chat` and `tool.bash` extend the same pattern. `operator` stays single-segment because it's a reserved privilege-class capability, not a domain action.
 
-**Migration side effect:** the work stack's `policy.roles[id=operator].capabilities = [dispatch.luna, code-review.typescript, chat, async, team]` rewrites to `[dispatch.luna, code-review.typescript, keyword.chat, keyword.async, keyword.team]`. One line, one config, no operator pain.
+**Migration side effect:** the work stack's `policy.roles[id=operator].capabilities = [dispatch.luna, code-review.typescript, chat, async, team]` rewrites to `[dispatch.luna, code-review.typescript, keyword.chat, keyword.async, keyword.team]`. One line, one config, no principal pain.
 
 ### 12.2 New schema decision — channel vs. DM session_config
 
 Andreas's config exercises **divergent session_config between channel and DM**:
-- Operator in a channel: inherits global `claude.allowedDirs` (40 repos) + global `claude.bashAllowlist` (narrow rules + 40 repos)
-- Operator in a DM: gets a separately-declared `dm.operatorRole.allowedDirs` (24 repos) + a broader `dm.operatorRole.bashAllowlist` (17 patterns + 40 repos)
+- Principal in a channel: inherits global `claude.allowedDirs` (40 repos) + global `claude.bashAllowlist` (narrow rules + 40 repos)
+- Principal in a DM: gets a separately-declared `dm.operatorRole.allowedDirs` (24 repos) + a broader `dm.operatorRole.bashAllowlist` (17 patterns + 40 repos)
 
 These aren't the same. The DM bashAllowlist permits `rm`, `mv`, `cp`, `curl`, `jq`, `mkdir` etc. that the channel-default doesn't. **The migration must preserve this divergence.**
 
 Options:
 
 **(a) Single `session_config` on the principal — channel rule prevails, DM divergence lost.**
-Rejected: loses operator's broader DM tool access.
+Rejected: loses principal's broader DM tool access.
 
 **(b) Single `session_config` — union of channel + DM rules.**
-Rejected: makes channel access more permissive than the operator declared. Privilege expansion is the wrong direction.
+Rejected: makes channel access more permissive than the principal declared. Privilege expansion is the wrong direction.
 
 **(c) Split `session_config: { default: {...}, dm: {...} }`** — principal carries baseline + optional DM override.
 Accepted: matches legacy semantic exactly. Adapter picks `dm` when `message.author` is in DM context, `default` otherwise.
 
-**(d) Drop DM differentiation — make operator declare it manually as a separate principal.**
+**(d) Drop DM differentiation — make principal declare it manually as a separate principal.**
 Rejected: principal == identity. Splitting one human into two principals based on routing context breaks the identity model.
 
 **Recommended: (c).** Updates the schema proposal in §5.3:
@@ -466,14 +466,14 @@ session_config: z.object({
 
 Where `SessionConfigShape` is the previously-proposed `{allowed_dirs, allowed_skills, bash_guard, bash_allowlist}`. Adapter picks `.dm` when present and routing-context is DM, falls back to `.default`.
 
-### 12.3 New §6 step — emit external-peer principals with operator review markers
+### 12.3 New §6 step — emit external-peer principals with principal review markers
 
 Add to the migration algorithm (§6):
 
 **6.6 External peer principals** — for each `agent-<X>` role where X is NOT a declared agent in this cortex.yaml:
-- Emit principal with `id: <X>`, `home_operator: "unknown"` (operator must label post-migration), `home_stack: "unknown/unknown"`, `platform_ids.discord: [<bot_id>]`
+- Emit principal with `id: <X>`, `home_operator: "unknown"` (principal must label post-migration), `home_stack: "unknown/unknown"`, `platform_ids.discord: [<bot_id>]`
 - Emit warning: `external peer "<X>" found in agents[].presence.discord.roles[].agent-<X>; please set home_operator + home_stack manually in policy.principals[<X>]`
-- The principal still parses + works at runtime; the placeholders just make the gap legible to the operator.
+- The principal still parses + works at runtime; the placeholders just make the gap legible to the principal.
 
 ---
 
@@ -481,21 +481,21 @@ Add to the migration algorithm (§6):
 
 Replacing §8's open questions with the post-reality-check version:
 
-1. **~~Synthetic principal ids for unmapped users~~** — *Resolved: synthetic + optional `--labels labels.yaml` flag. The CLI is idempotent; operators can label post-migration by editing the policy block or re-running with a labels file.*
+1. **~~Synthetic principal ids for unmapped users~~** — *Resolved: synthetic + optional `--labels labels.yaml` flag. The CLI is idempotent; principals can label post-migration by editing the policy block or re-running with a labels file.*
 
 2. **~~Tool capability namespace~~** — *Resolved in §12.1 — full namespace adopted (`keyword.*`, `tool.*`, `dispatch.*`, `<domain>.<entity>`). Work stack's bare-string caps get rewritten in the same cutover (one line).*
 
 3. **~~Session config — single block or `{default, dm}` split~~** — *Resolved: split. §5.3 and §12.2 hold the schema; §14 sanity-check confirms every legacy DM-vs-channel divergence in cortex.yaml maps cleanly through it.*
 
-4. **~~Cross-agent role conflict~~** — *Resolved: warn + conservative union. Real-world config audit (§11.1) shows the differences are mostly noise — Echo's self-restrictive `agent-echo` role is dead config because self-loop is guarded; cross-agent declarations of the same role name agree in 90%+ of cases. Where they differ, the union preserves access (the safe direction for migration; operators tighten manually if needed).*
+4. **~~Cross-agent role conflict~~** — *Resolved: warn + conservative union. Real-world config audit (§11.1) shows the differences are mostly noise — Echo's self-restrictive `agent-echo` role is dead config because self-loop is guarded; cross-agent declarations of the same role name agree in 90%+ of cases. Where they differ, the union preserves access (the safe direction for migration; principals tighten manually if needed).*
 
 5. **~~`defaultRole = "allow-all"` migration~~** — *Resolved: synthetic anonymous principal with all capabilities. Andreas's config uses `defaultRole: denied` everywhere, so the "allow-all" branch is dormant; making it ugly in the new shape discourages reaching for it.*
 
-6. **~~`operatorDiscordId` field on AgentSchema~~** — *Resolved: retire at v2.0.0. The migration CLI moves `agent.operatorDiscordId/Mattermost/Slack` into the operator principal's `platform_ids` block. The legacy fields become parse-time errors with a pointer to migrate-config.*
+6. **~~`operatorDiscordId` field on AgentSchema~~** — *Resolved: retire at v2.0.0. The migration CLI moves `agent.operatorDiscordId/Mattermost/Slack` into the principal's `platform_ids` block. The legacy fields become parse-time errors with a pointer to migrate-config.*
 
-7. **~~`agent-restricted` template roles with empty `users[]`~~** — *Resolved: emit as PolicyRole even with no principal references. The operator declared it for future assignment via `defaultRole`; the migration preserves that intent. Emit a comment in the rendered cortex.yaml: `# template role — currently no principals; reference via defaultRole or attach to a principal`.*
+7. **~~`agent-restricted` template roles with empty `users[]`~~** — *Resolved: emit as PolicyRole even with no principal references. The principal declared it for future assignment via `defaultRole`; the migration preserves that intent. Emit a comment in the rendered cortex.yaml: `# template role — currently no principals; reference via defaultRole or attach to a principal`.*
 
-8. **~~External-peer principals (ivy/holly/pilot/juniper)~~** — *Resolved: emit with `home_operator: "unknown"` + `home_stack: "unknown/unknown"` placeholders + warning. Skipping would break the `(platform, authorId) → principal` lookup that the new adapter dispatch path depends on. The placeholders make the gap legible — operator labels them post-migration as they discover which operator each external peer belongs to.*
+8. **~~External-peer principals (ivy/holly/pilot/juniper)~~** — *Resolved: emit with `home_operator: "unknown"` + `home_stack: "unknown/unknown"` placeholders + warning. Skipping would break the `(platform, authorId) → principal` lookup that the new adapter dispatch path depends on. The placeholders make the gap legible — principal labels them post-migration as they discover which principal each external peer belongs to.*
 
 ---
 
@@ -569,7 +569,7 @@ policy:
 
 **One gap:** The capability `federated.<network_id>.dispatch` doesn't currently exist anywhere — it would be a Phase E addition. Today's PolicyEngine federation gate (Phase D.3, per-network slicing) checks `source_network` against `policy.federated.networks[]` membership; it doesn't consult per-principal capability strings for federation gating. Pre-condition for clean orchestrator support: Phase E extends the engine to consult `federated.<network>.dispatch` capabilities on outbound federation calls. **Schema change required at that point: none.** The capability string convention slots into the existing `capabilities[]` array.
 
-### 15.2 Inbound federated dispatch from another operator
+### 15.2 Inbound federated dispatch from another principal
 
 **Scenario:** sage's stack (`jcfischer/sage-host`) publishes `federated.metafactory-net.tasks.code-review.typescript` for Echo to consume. Envelope is signed by sage's stack NKey. Echo's PolicyEngine should authorize the dispatch.
 
@@ -585,13 +585,13 @@ policy:
 **For IoAW Phase E** the gap closes via one of:
 - **(a)** Auto-promote federation peers to principals at parse time. `policy.federated.networks[].peers[]` entries create synthetic principals with `home_operator` from the peer record and `role = [<network_id>-peer]` where the role's capabilities are the network's `announce_capabilities`.
 - **(b)** Extend `PolicyFederatedPeer` schema with `role[]` so peers explicitly declare their capabilities within the network.
-- **(c)** Have the operator manually declare federation peers as both a principal AND a network peer (duplicates the operator/stack info but keeps schemas clean).
+- **(c)** Have the principal manually declare federation peers as both a principal AND a network peer (duplicates the principal/stack info but keeps schemas clean).
 
 **Recommendation for v2.0.0 cutover:** keep the Phase D behaviour (network-level accept-subjects gate). Don't try to solve per-principal federated capability in this cutover. The schema doesn't block any of (a)/(b)/(c) — all three can land as a follow-up Phase E extension. **No schema change required for cortex#242/#243 to leave this door open.**
 
 ### 15.3 Q2's `capabilities:` block (stack capability advertisement)
 
-**Scenario:** Andreas declares his stack's capabilities so other operators can discover them via the network registry. Per Q2:
+**Scenario:** Andreas declares his stack's capabilities so other principals can discover them via the network registry. Per Q2:
 
 ```yaml
 capabilities:
@@ -609,7 +609,7 @@ capabilities:
 - `policy.principals[].role[]` and `policy.roles[].capabilities[]` — authorization
 - top-level `capabilities[]` (NEW, Q2, Phase A-or-later) — advertisement, indexed by network registry
 
-They CAN share capability id strings — that's good ergonomics — but they don't have to. The migration CLI doesn't synthesize the `capabilities:` block (no legacy field to lift). It's a separate, additive operator-curated declaration.
+They CAN share capability id strings — that's good ergonomics — but they don't have to. The migration CLI doesn't synthesize the `capabilities:` block (no legacy field to lift). It's a separate, additive principal-curated declaration.
 
 **Scope decision:** the `capabilities:` block is **OUT OF SCOPE for cortex#242/#243.** It's Phase E (or later) work. Schema-wise, the v2.0.0 cutover leaves it open — adding `capabilities[]` to `CortexConfigSchema` later doesn't conflict with `policy:` block.
 
@@ -649,15 +649,15 @@ With principal-id uniqueness scoped to `id` alone (the implicit Zod array semant
 
 **(a) Scope uniqueness to `(id, home_stack)` rather than `id` alone** — schema-level change. PolicyEngine.check() takes a stack-qualified principal lookup; the wire `signed_by[0]` mapping derives the qualifier from the stack-NKey. Cleanest because the lookup contract matches the wire contract.
 
-**(b) Require composite ids on the peer side** (`luna-meta-factory`, `luna-work`) — operator-managed convention. Peer-side principal id ≠ envelope `signed_by[0].principal`; an operator-maintained mapping table resolves. Brittle: the peer's id space drifts from the originator's.
+**(b) Require composite ids on the peer side** (`luna-meta-factory`, `luna-work`) — principal-managed convention. Peer-side principal id ≠ envelope `signed_by[0].principal`; a principal-maintained mapping table resolves. Brittle: the peer's id space drifts from the originator's.
 
-**(c) Defer multi-stack-receive to Phase E** — v2.0.0 only supports single-stack-per-operator at the peer side. Federation peers don't yet receive from multi-stack operators. Punts the problem but ships v2.0.0 sooner.
+**(c) Defer multi-stack-receive to Phase E** — v2.0.0 only supports single-stack-per-principal at the peer side. Federation peers don't yet receive from multi-stack principals. Punts the problem but ships v2.0.0 sooner.
 
 **Locked-in decision: (a).** Scope `policy.principals[]` uniqueness to `(id, home_stack)` rather than `id` alone. PolicyEngine.check() signature gains a `home_stack` qualifier when looking up by federated principal claim; local-dispatch lookups (which already know the local stack) ignore it. This is a schema-level change (the `.refine()` uniqueness validator) that needs to land in **cortex#243a** alongside `platform_ids` and `session_config`. Added to §16.
 
 **Why not (b) or (c)?**
-- (b) introduces an out-of-band id mapping table that sage and Andreas must coordinate manually — operator pain that scales with peer count.
-- (c) freezes IoAW at single-stack-per-operator on the receive path, which contradicts §3.2's multi-stack-per-operator lock-in.
+- (b) introduces an out-of-band id mapping table that sage and Andreas must coordinate manually — principal pain that scales with peer count.
+- (c) freezes IoAW at single-stack-per-principal on the receive path, which contradicts §3.2's multi-stack-per-principal lock-in.
 
 ✓ **Composes with (a) — schema delta updated in §16.**
 
@@ -697,7 +697,7 @@ This change is **better made now, in the v2.0.0 cutover**, than deferred — fli
 
 ### 15.6 Capability marketplace (Phase F+, public mesh)
 
-**Scenario:** The §3.5 "public mesh" — operators advertise capabilities on `public.operator.*.capability.>` and consumers discover via the network registry. Capability marketplace dynamics.
+**Scenario:** The §3.5 "public mesh" — principals advertise capabilities on `public.principal.*.capability.>` and consumers discover via the network registry. Capability marketplace dynamics.
 
 **Schema collision check:** Out of scope today and explicitly so per §3.5 — public mesh requires myelin#9 (L5 discovery) + a marketplace economics model. The proposed `policy:` schema doesn't block it; when public mesh ships, it'll layer on top of the principal/role/capabilities triad with marketplace-specific fields (cost, rate, SLA, etc.) elsewhere.
 
@@ -787,9 +787,9 @@ const SessionConfigShape = z.object({
 - `DiscordInstanceSchema.roles[]` + `defaultRole`
 - `MattermostInstanceSchema.roles[]` + `defaultRole`
 - `SlackInstanceSchema.roles[]` + `defaultRole`
-- Entire `DMConfigSchema` (operator + DM userRoles → operator principal's `session_config.dm`)
-- `AgentSchema.operatorDiscordId/Mattermost/Slack` → operator principal's `platform_ids`
-- `AgentSchema.roles[]` — top-level agent-roles array. Always empty in operator configs in practice; agent-level authorization is fully covered by `policy.principals[].role[]` post-cutover.
+- Entire `DMConfigSchema` (principal + DM userRoles → principal's `session_config.dm`)
+- `AgentSchema.operatorDiscordId/Mattermost/Slack` → principal's `platform_ids`
+- `AgentSchema.roles[]` — top-level agent-roles array. Always empty in principal configs in practice; agent-level authorization is fully covered by `policy.principals[].role[]` post-cutover.
 
 **Retained at agent level (NOT removed):**
 - `AgentSchema.trust[]` — agents' bus-trust list. Distinct from `policy.principals[].trust[]`:
@@ -801,7 +801,7 @@ const SessionConfigShape = z.object({
 - Principal-id uniqueness scoped to `(id, home_stack)` — not `id` alone. Enables peer-side multi-stack identity per §15.4 option (a).
 - `(platform_name, platform_id)` tuple uniqueness across all principals in `policy.principals[]` — no platform identity claimed by two principals.
 
-> **Convention — federation-peer principals SHOULD NOT carry `platform_ids`.** Federation peer identity is asserted via the `signed_by` chain's stack NKey (Phase B verification + Phase D federation gate), not via platform-side IDs. The two uniqueness rules above appear contradictory at first read — sage's two Andreas-Luna principals would each have `home_stack` set but the same Discord bot id `1487...` if `platform_ids` were populated. They're not contradictory in practice because federation-peer principals' `platform_ids` SHOULD be empty: the local cortex never receives Discord-routed messages directly from Andreas's bot via sage's adapter — it receives federated NATS envelopes whose principal-resolution path is `(signed_by[0].principal, signed_by[0].stack-nkey) → policy.principals[id, home_stack]`, completely orthogonal to platform-side adapter lookup. Operators populating `platform_ids` on a federation-peer principal will hit a parse error from rule 2; the error message should point at this convention.
+> **Convention — federation-peer principals SHOULD NOT carry `platform_ids`.** Federation peer identity is asserted via the `signed_by` chain's stack NKey (Phase B verification + Phase D federation gate), not via platform-side IDs. The two uniqueness rules above appear contradictory at first read — sage's two Andreas-Luna principals would each have `home_stack` set but the same Discord bot id `1487...` if `platform_ids` were populated. They're not contradictory in practice because federation-peer principals' `platform_ids` SHOULD be empty: the local cortex never receives Discord-routed messages directly from Andreas's bot via sage's adapter — it receives federated NATS envelopes whose principal-resolution path is `(signed_by[0].principal, signed_by[0].stack-nkey) → policy.principals[id, home_stack]`, completely orthogonal to platform-side adapter lookup. Principals populating `platform_ids` on a federation-peer principal will hit a parse error from rule 2; the error message should point at this convention.
 
 **New canonical artifact:**
 - `src/common/policy/tool-inventory.ts` — canonical list of Claude tool names for `disallowedTools[]` inversion
@@ -811,7 +811,7 @@ const SessionConfigShape = z.object({
 - `keyword.{chat,async,team}` — message-keyword authorization
 - `tool.<name>` — Claude tool authorization
 
-**Convention placeholders (operator-curated post-migration):**
-- External-peer principals emit with `home_operator: "unknown"` and `home_stack: "unknown/unknown"` per §12.3 — schema still parses, operator labels manually as they discover origin.
+**Convention placeholders (principal-curated post-migration):**
+- External-peer principals emit with `home_operator: "unknown"` and `home_stack: "unknown/unknown"` per §12.3 — schema still parses, principal labels manually as they discover origin.
 
 **No schema changes outside the policy block.** Bus, federation, audit envelope, dispatch lifecycle all unchanged.

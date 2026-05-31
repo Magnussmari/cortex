@@ -69,7 +69,7 @@ export const DiscordInstanceSchema = z.object({
    * trigger this bot. Bot-authored messages are dropped by default to
    * prevent self-loops and unsolicited bot chatter; entries listed here
    * are allowed through the author-bot filter and then handled by the
-   * normal role-based access path (so the operator still has to grant
+   * normal role-based access path (so the principal still has to grant
    * each peer bot a role in `roles[]` or `dm.userRoles[]` to actually
    * respond).
    *
@@ -92,7 +92,7 @@ export const DiscordInstanceSchema = z.object({
    * threads it through verbatim.
    *
    * @see DiscordPresenceSchema.surfaceSubjects in `cortex-config.ts` for the
-   * canonical operator-facing description, IoAW examples, and contract.
+   * canonical principal-facing description, IoAW examples, and contract.
    */
   surfaceSubjects: z.array(z.string().min(1)).default([]),
   /**
@@ -101,7 +101,7 @@ export const DiscordInstanceSchema = z.object({
    * threads it through verbatim.
    *
    * @see DiscordPresenceSchema.surfaceFallbackChannelId in `cortex-config.ts`
-   * for the canonical operator-facing description.
+   * for the canonical principal-facing description.
    */
   surfaceFallbackChannelId: z.coerce.string().optional(),
 });
@@ -280,7 +280,7 @@ export const AgentConfigSchema = z.object({
      * boot path. Runtime "is this principal an operator?" decisions consult the
      * PolicyEngine via the `operator` capability per the new model.
      */
-    /** Operator data residency stamped into `sovereignty.data_residency` on emitted
+    /** Principal data residency stamped into `sovereignty.data_residency` on emitted
      *  envelopes (system.*, dispatch.task.*, cc.*). ISO-3166 country code; defaults
      *  to "NZ" when omitted. Operators in AU/EU/US/etc. set this to match their
      *  jurisdiction so envelopes accurately reflect residency for compliance audits. */
@@ -549,7 +549,7 @@ export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 
 /**
  * Network configuration for event routing.
- * Represents a single network's cloud endpoint, API key, and operator identity.
+ * Represents a single network's cloud endpoint, API key, and principal identity.
  */
 export interface NetworkConfig {
   /** Network identifier (e.g. "metafactory", "default") */
@@ -558,7 +558,7 @@ export interface NetworkConfig {
   endpoint: string;
   /** API key for this network */
   apiKey: string;
-  /** Operator ID for event attribution */
+  /** Principal ID for event attribution */
   operatorId: string;
   /** S-001: CF Access service token for machine-to-machine auth (optional) */
   cfAccessClientId?: string;
