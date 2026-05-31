@@ -327,7 +327,7 @@ export interface MyelinRuntimeOptions {
    * `{principal}` in subscribe-side subject patterns. Replaces the
    * prior read from `config.agent.operatorId` (removed together with
    * the schema field). The entrypoint passes the value resolved by
-   * `resolvePrincipalId(options.operator)`; when undefined, the
+   * `resolvePrincipalId(options.principal)`; when undefined, the
    * substituter falls back to `"default"` to preserve legacy NATS-less
    * runtime no-op semantics.
    */
