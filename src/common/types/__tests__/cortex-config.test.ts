@@ -45,7 +45,7 @@ import {
  */
 const VALID_NKEY = "U" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVZ"; // 1 + 55 = 56
 
-function minOperator() {
+function minPrincipal() {
   return { id: "andreas" };
 }
 
@@ -70,7 +70,7 @@ function minAgent(overrides: Record<string, unknown> = {}) {
 
 function minConfig() {
   return {
-    principal: minOperator(),
+    principal: minPrincipal(),
     agents: [minAgent()],
     claude: {},
   };
@@ -518,7 +518,7 @@ describe("AgentConfigSchema.nats.accountSigningKeyPath (MIRROR)", () => {
   /** Minimal AgentConfig shell to exercise the optional `nats` block. */
   function minAgentConfig(natsExtras: Record<string, unknown> = {}) {
     return {
-      agent: { name: "test", displayName: "Test", operatorId: "op" },
+      agent: { name: "test", displayName: "Test" },
       discord: [],
       mattermost: [],
       claude: { timeoutMs: 1000 },
