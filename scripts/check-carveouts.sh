@@ -77,7 +77,14 @@ CHECK_PERSONA=0
 # the reader-side union/shim is myelin-gated and excluded by construction
 # (we only match `distribution_mode ... = / : "broadcast"`, i.e. a write).
 # ──────────────────────────────────────────────────────────────────────────
-PAT_OPERATOR='\b[Oo]perator\b'
+# Widened from `\b[Oo]perator\b` to bare `[Oo]perator` so the recall catches
+# camelCase/snake_case compounds the word-boundary form was BLIND to — operatorId,
+# operator_id, home_operator, OperatorConfig, operatorRole, isOperator (the R2
+# identifier cluster, ~190 live sites). The carve-out filter below removes the
+# legitimate non-principal senses (NSC operatorAccount, policy authz-role literal,
+# R7-gated operatorDiscordId, EventBridge comparison operator). Verified no
+# `cooperat*` false-friends in the tree.
+PAT_OPERATOR='[Oo]perator'
 PAT_BOTCONFIG='\bBotConfig(Schema)?\b'
 PAT_BROADCAST_EMIT='distribution_mode[[:space:]]*[:=][[:space:]]*["'"'"']broadcast'
 PAT_PERSONA='\bpersona\b'
@@ -116,6 +123,38 @@ ALLOWLIST_PATHS=(
   # so these never appear there; this matters for the `-` per-PR-diff path.)
   'scripts/check-carveouts.sh'
   '.github/workflows/'
+  # Policy authorization-role cluster — `operator` here is the reserved
+  # authz ROLE / capability literal (CONTEXT.md → Mission Control authorization
+  # role; #513), NOT the principal. The policy engine + its fixtures + the
+  # cutover design doc carry it as a kept role-id string.
+  'src/common/policy/'
+  'docs/design-policy-cutover.md'
+  # User-auth RBAC tier `viewer|operator|admin` — the MC authorization role
+  # (CONTEXT.md, #513). A persisted privilege level, never the principal.
+  'src/surface/mc/worker/src/user-auth/'
+  # EventBridge comparison OPERATOR (equals / anything-but) — a programming
+  # term, not the vocab. Single-purpose filter-grammar file.
+  'src/bus/payload-filter.ts'
+  'src/bus/__tests__/payload-filter.test.ts'
+  # R3 dual-block-guard: this test NAMES the legacy `operator:` config key on
+  # purpose to verify the transition guard (retires with the breaking cut).
+  # Sibling to the migrate-config legacy-reader tests already allowlisted.
+  'src/common/config/__tests__/loader.test.ts'
+  # NSC trust/signing infrastructure — `operator` = the NATS account operator
+  # (cortex#76 trust anchor): OperatorVerifier, verifyOperator, operator pubkey,
+  # SA/SO/SU seed hierarchy. Platform term throughout these files.
+  'src/common/agents/trust-resolver.ts'
+  'src/common/agents/__tests__/trust-resolver-operator-verify.test.ts'
+  'src/common/config/account-signing-key.ts'
+  'src/common/config/stack-signing-key.ts'
+  # Policy converter — emits + reads the legacy `operator:` block and the
+  # reserved `operator` role/capability literal. Sibling to migrate-config-lib.
+  'src/cli/cortex/commands/migrate-config-policy.ts'
+  # IAW design/plan docs — #510-owned (refreshed); residual hits are
+  # code-identifier mentions discussed as prose, tracked on the IAW epic.
+  'docs/design-internet-of-agentic-work.md'
+  'docs/plan-internet-of-agentic-work.md'
+  'src/__tests__/iaw-phase-d-integration.test.ts'
 )
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -134,6 +173,20 @@ CARVEOUT_LINE_PATTERNS=(
   'operator-account'
   'operator[[:space:]]+(NKey|JWT|account)'
   '(NKey|JWT|account)[[:space:]]+operator'
+  # NSC camelCase/snake forms newly visible under the widened recall.
+  '[Oo]peratorAccount'
+  '[Oo]peratorVerifier'
+  'verify[Oo]perator'
+  '[Oo]peratorSign'
+  'operator_pubkey'
+  'operator-mode'
+  '[Oo]peratorRecord'
+  # R7-gated network.operator block (operatorDiscordId/Mattermost/Slack) — the
+  # held R7 wire fields; rename waits for the myelin {org}→{principal} cut.
+  'operator(DiscordId|MattermostId|SlackId|PlatformIds)'
+  # Policy authz-role literal appearing in NON-policy test fixtures (bus/runner
+  # dispatch tests): `role: ["operator"]`, `id: "operator"`, `role("operator"`.
+  '(role|roles|id|capability|allow)[^A-Za-z]{1,4}["(]operator'
   # (2/4) GROVE_* env tier (separate migration).
   'GROVE_OPERATOR'
   'GROVE_[A-Z]'
