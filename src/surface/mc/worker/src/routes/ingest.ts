@@ -1,5 +1,5 @@
 /**
- * G-400: POST /api/ingest — Batched event ingestion from bot operators.
+ * G-400: POST /api/ingest — Batched event ingestion from principals' bots.
  * Accepts events from bots, validates API key, writes to D1 with dedup.
  * Business logic delegated to shared event-processor; this file handles D1 persistence only.
  *
@@ -155,7 +155,7 @@ async function upsertSession(db: D1Database, session: SessionUpsertData): Promis
       home_principal = COALESCE(excluded.home_principal, home_principal)
   `).bind(
     session.sessionId,
-    session.operatorId ?? null,
+    session.principalId ?? null,
     session.agentId,
     session.agentName,
     session.project,
@@ -214,7 +214,7 @@ async function insertSessionDirect(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
     session.sessionId,
-    session.operatorId ?? null,
+    session.principalId ?? null,
     session.agentId,
     session.agentName,
     session.project,
@@ -298,7 +298,7 @@ async function insertUsageSnapshot(db: D1Database, snapshot: UsageSnapshotData):
      seven_day_opus_pct, seven_day_sonnet_pct, extra_usage_enabled)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
-    snapshot.operatorId ?? null,
+    snapshot.principalId ?? null,
     snapshot.source,
     snapshot.fiveHourPct,
     snapshot.fiveHourResets,
