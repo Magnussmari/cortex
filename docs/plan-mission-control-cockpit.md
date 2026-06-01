@@ -11,7 +11,7 @@
 
 ## 1. What we're building (recap from design spec)
 
-Turn the current Mission Control dashboard into an **operator cockpit**: one
+Turn the current Mission Control dashboard into an **principal cockpit**: one
 pane of glass over plans, their phases, work items, branches, PRs, checks,
 releases, agent sessions, and what needs attention. The same surface should
 work for software workflows (Git-native) and generic workflows (Jira / Linear
@@ -44,12 +44,12 @@ cockpit it produces.
 
 ### 1.1 Iterative delivery — each phase ships visible value
 
-This is not a big-bang redesign. **Every phase ships an operator-visible
-improvement to Mission Control.** If we stop after any phase, the operator is
+This is not a big-bang redesign. **Every phase ships an principal-visible
+improvement to Mission Control.** If we stop after any phase, the principal is
 left with a surface that is better than before, not a half-finished
 construction site.
 
-| Phase | What the operator sees after this phase |
+| Phase | What the principal sees after this phase |
 |---|---|
 | A — Grounding | Dashboard builds again; glossary linked from footer; "G-1113 cockpit redesign" badge in header linking to the plan |
 | B — Provider-neutral refs | Each task row shows a provider badge; a "Sources" view lists configured providers |
@@ -58,7 +58,7 @@ construction site.
 | E — Attention + notifs | Unified attention queue with deep-links; routed notifications across Discord/Slack/Mattermost |
 
 Within a phase, sub-features are sequenced so each PR moves something
-operator-visible forward, not just internal plumbing. Model-layer PRs that
+principal-visible forward, not just internal plumbing. Model-layer PRs that
 don't have an immediate UI manifestation are scheduled so they ship in the
 same phase as the UI affordance that exposes them.
 
@@ -139,7 +139,7 @@ arbitrary PR count is hit.
 **Goal:** make the work plan executable and put a first cockpit-shaped
 visible signal in the existing dashboard.
 
-**Visible deliverable (what the operator sees after Phase A):**
+**Visible deliverable (what the principal sees after Phase A):**
 
 - The dashboard builds and runs again (today the build script points at the
   wrong path).
@@ -190,7 +190,7 @@ visible signal in the existing dashboard.
 **Goal:** introduce a normalized source-ref model + make provider
 provenance visible on every task. Keep existing GitHub behavior working.
 
-**Visible deliverable (what the operator sees after Phase B):**
+**Visible deliverable (what the principal sees after Phase B):**
 
 - Every task row shows a small provider badge (icon + provider name).
   Today they all read "GitHub"; the badge is provider-aware so future
@@ -241,7 +241,7 @@ top-level `ChangeRequest` concept? Resolution should happen during B.1.
 **Goal:** first-class Git objects in the model layer **and** surface them
 in the UI as first-class chips/rows.
 
-**Visible deliverable (what the operator sees after Phase C):**
+**Visible deliverable (what the principal sees after Phase C):**
 
 - Each task row shows linked branches + PRs as compact first-class chips
   (not just a link). Chip hover reveals check status + review state.
@@ -281,7 +281,7 @@ in the UI as first-class chips/rows.
 **Goal:** the plan/program surface that rolls up phase, work item, PR,
 session, and attention state. Recasts the existing `Iterations` tab.
 
-**Visible deliverable (what the operator sees after Phase D):**
+**Visible deliverable (what the principal sees after Phase D):**
 
 - A new "Plans" tab (or recast Iterations tab) shows plans as cards: title,
   current phase, per-phase progress bar, work-item / PR / release /
@@ -313,7 +313,7 @@ session, and attention state. Recasts the existing `Iterations` tab.
   UI with each Phase A–E enumerated and progress accurate.
 - Drilling into a phase shows its sub-feature work items + linked PRs +
   current session, sourced from the Phase C model.
-- No regression in operator-visible task flow.
+- No regression in principal-visible task flow.
 
 **Dependencies:** Phase B; benefits from Phase C but does not block on C
 beyond the WI ⇄ PR linkage (D.5).
@@ -330,10 +330,10 @@ D.1.
 sessions. Notifications routed through stack surfaces (Discord, Slack,
 Mattermost).
 
-**Visible deliverable (what the operator sees after Phase E):**
+**Visible deliverable (what the principal sees after Phase E):**
 
 - An "Attention" panel (or header icon with counter) listing everything
-  that needs operator action: blocked sessions, PR review requests,
+  that needs principal action: blocked sessions, PR review requests,
   permission requests, failed checks, failed dispatches, stale work.
 - Each item carries a deep-link to the exact plan / phase / work item /
   PR / session that needs action.
@@ -359,7 +359,7 @@ Mattermost).
 **Acceptance criteria:**
 
 - Every attention kind listed in design §7.4 has a producer + a deep-link.
-- Notifications land in the operator's expected Discord/Slack/Mattermost
+- Notifications land in the principal's expected Discord/Slack/Mattermost
   channel for each kind.
 - Attention items resolve correctly when their underlying condition clears
   (PR approved, check passes, session unblocks).

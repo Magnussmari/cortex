@@ -7,8 +7,8 @@
 
 ## 1. Purpose
 
-Mission Control should become the operator cockpit for a Cortex stack. The
-operator should be able to see what assistants and Cortex agents are doing,
+Mission Control should become the principal cockpit for a Cortex stack. The
+principal should be able to see what assistants and Cortex agents are doing,
 inspect their current context, notice when work needs attention, provide input
 or review feedback, and watch higher-level plans move through issues, pull
 requests, checks, releases, and deployments.
@@ -71,7 +71,7 @@ Use Soma's layer split:
 - **Cortex agent**: the stack-local daemon/process identity that hosts or
   represents assistant work on Myelin/NATS.
 
-Mission Control may show both. The operator cares about the assistant name,
+Mission Control may show both. The principal cares about the assistant name,
 while the runtime needs the stack-local Cortex agent identity and signing
 provenance.
 
@@ -225,7 +225,7 @@ This mirrors Jira Software: a generic task/work-item system becomes a software
 cockpit when connected to source control, CI, and release providers.
 
 Software mode should be the first real Cortex Mission Control mode because the
-immediate operator workflows are software-agent workflows.
+immediate principal workflows are software-agent workflows.
 
 ## 5. Provider Neutrality
 
@@ -249,7 +249,7 @@ Mission Control concepts:
 | GitLab release | Release |
 | Azure DevOps build | Check / build |
 
-The UI should use provider-native labels when they help the operator, but the
+The UI should use provider-native labels when they help the principal, but the
 core model should not fork by provider.
 
 ### 5.1 GitHub Abstraction Is In Scope
@@ -448,7 +448,7 @@ Work item detail is the operational drill-down:
 - branch and pull request links
 - review comments
 - checks/builds
-- operator input box
+- principal input box
 - curation actions: dispatch, requeue, abandon, hand off
 
 ### 7.4 Attention Queue
@@ -479,7 +479,7 @@ Mission Control should be able to answer:
 - Which sessions are running, stale, or waiting for input?
 - Which releases are ready, blocked, or shipped?
 
-This is the pane-of-glass goal: the operator sees the whole execution pipeline
+This is the pane-of-glass goal: the principal sees the whole execution pipeline
 from design document to release.
 
 ## 9. Relation To Existing Cortex Mission Control
@@ -512,7 +512,7 @@ The existing React UI has useful structure:
 
 - `App` owns the top-level tabs: default execution view, metrics, iterations,
   and iteration detail.
-- The default view already gives the operator execution visibility through
+- The default view already gives the principal execution visibility through
   `FocusArea`, `WorkingGrid`, and `TaskTable`.
 - The drill-down overlay already gives a session/assignment attention surface:
   `DrillHeader`, `DrillLog`, `CurationToolbar`, and `DrillInput`.

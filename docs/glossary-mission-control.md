@@ -157,7 +157,7 @@ The lens that promotes software-development objects — [repositories](#reposito
 [branches](#branch), [commits](#commit), [pull requests](#pull-request),
 [reviews](#review), [checks](#check), [releases](#release),
 [deployments](#deployment), [artifacts](#artifact). The first real Cortex Mission
-Control mode, because the immediate operator workflows are software-agent
+Control mode, because the immediate principal workflows are software-agent
 workflows. (Mirrors how Jira Software turns a generic work-item system into a
 software cockpit when connected to source control, CI, and release providers.)
 
@@ -168,7 +168,7 @@ software cockpit when connected to source control, CI, and release providers.)
 A few surface-level terms that recur in the cockpit UI and design docs:
 
 - **Attention queue** — the single "who needs me right now" feed. One entry per
-  blocked/waiting [session](#session) or work item needing the operator.
+  blocked/waiting [session](#session) or work item needing the principal.
 - **Drill-down** — the detail view opened from any card: event log, input
   affordance, and (in software mode) linked Git objects.
 - **Working grid** — the live tiles of [Cortex agents](#cortex-agent) with active
