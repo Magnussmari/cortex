@@ -260,7 +260,7 @@ html, body {
 /* --- Scaffold-stage placeholder layout (MIG-1 only; MIG-2 onward replaces this) --- */
 .scaffold-shell {
   height: 100%;
-  display: grid; grid-template-rows: auto auto 1fr;
+  display: grid; grid-template-rows: auto auto 1fr auto;
 }
 .scaffold-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -271,12 +271,30 @@ html, body {
   margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.01em;
 }
 .scaffold-header .right { display: flex; align-items: center; gap: 10px; }
+/* G-1113 — cockpit-redesign signpost badge in the header */
+.cockpit-badge {
+  font-size: 10.5px; line-height: 1;
+  color: var(--fg-dim); text-decoration: none;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft); border-radius: 6px;
+  padding: 3px 7px; white-space: nowrap;
+}
+.cockpit-badge:hover { color: var(--fg); border-color: var(--line); }
 .scaffold-main {
   padding: 24px;
   display: flex; flex-direction: column; gap: 14px;
   color: var(--fg-dim);
   overflow: auto;
 }
+/* G-1113 — footer signpost (glossary link) */
+.scaffold-footer {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 12px; padding: 6px 16px;
+  border-top: 1px solid var(--line); background: var(--panel);
+  font-size: 11px;
+}
+.scaffold-footer a { color: var(--fg-dim); text-decoration: none; }
+.scaffold-footer a:hover { color: var(--fg); text-decoration: underline; }
 .scaffold-section h2 {
   margin: 0 0 6px 0;
   font-size: 11px; font-weight: 600; letter-spacing: 0.06em;

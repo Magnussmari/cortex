@@ -84,6 +84,10 @@ _Avoid_: routing, assignment, hand-off. Never call the Offer mode "broadcast" �
 
 ### Surfaces, substrates, dispatch routing
 
+**Mission Control** (the cockpit surface):
+The principal-facing M7 dashboard surface — one pane over plans, work items, sessions, and the attention queue. A **modular React application** (`src/surface/mc/dashboard-v2/`: an `App` shell over per-concern components — `FocusArea`, `WorkingGrid`, `TaskTable`, drill-down — backed by data hooks and pure, independently-testable display helpers), served by the MC server (`src/surface/mc/server.ts`) locally or the CF Worker in cloud. It **replaced the retired monolithic HTML dashboard** (`src/dashboard/`, deleted at the MIG-6 cutover): the surface is composed of small, testable components, not one rendered page. Mission Control plays the **dispatch sink** role for lifecycle envelopes; the cockpit redesign is tracked under G-1113.
+_Avoid_: monolithic dashboard, the HTML dashboard, grove dashboard, `src/dashboard` (retired)
+
 **Substrate harness** (or just **harness**):
 The M6 runtime layer that executes a single **dispatch** on one execution substrate and yields lifecycle **envelopes**. Closed enum of `HarnessId` values: `claude-code`, `bus-peer`, `openai-codex`, `cursor`, `gemini`, `mistral`, `pi-dev`, `agent-team`. The harness boundary is what makes the runner substrate-agnostic — the same `DispatchRequest` flows into any harness; the same `dispatch.task.{action}` envelopes flow out. The `agent-team` harness composes other harnesses to fulfil **Delegate**-mode dispatches.
 _Avoid_: backend, executor, engine, runtime (overloaded with `MyelinRuntime`)

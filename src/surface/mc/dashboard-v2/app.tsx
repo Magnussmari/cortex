@@ -168,6 +168,20 @@ export function App() {
       <header className="scaffold-header">
         <h1>Grove · Mission Control</h1>
         <div className="right">
+          {/*
+            G-1113 — Mission Control Cockpit redesign signpost. Links to the
+            umbrella issue tracking the cockpit rework. Hardcoded URL per
+            plan §5.1 (Phase A grounding) — no ingestion.
+          */}
+          <a
+            className="cockpit-badge mono"
+            href="https://github.com/the-metafactory/cortex/issues/354"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="G-1113 · Mission Control Cockpit redesign — umbrella issue"
+          >
+            G-1113 · Cockpit redesign
+          </a>
           <span className="dim mono" style={{ fontSize: 11 }}>
             <Keycap>⌘</Keycap> <Keycap>K</Keycap> palette
           </span>
@@ -519,6 +533,21 @@ export function App() {
           onDismiss={() => setToast(null)}
         />
       )}
+
+      {/*
+        G-1113 Phase A — footer signpost. Links to the cockpit glossary so the
+        vocabulary (Stack, Assistant, Cortex Agent, Work Item, …) is one click
+        away from the surface. Hardcoded URL per plan §5.1; no ingestion.
+      */}
+      <footer className="scaffold-footer dim mono">
+        <a
+          href="https://github.com/the-metafactory/cortex/blob/main/docs/glossary-mission-control.md"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Glossary
+        </a>
+      </footer>
     </div>
   );
 }
