@@ -18,7 +18,7 @@ describe("mission-control schema", () => {
     db.close();
   });
 
-  it("creates all 5 required tables", () => {
+  it("creates all required tables", () => {
     const tables = db
       .query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
       .all() as { name: string }[];

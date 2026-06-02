@@ -12,6 +12,8 @@ export const TABLE_NAMES = [
   "sessions",
   "events",
   "iterations",
+  "git_repositories",
+  "git_branches",
 ] as const;
 
 export const SCHEMA_SQL: string[] = [
@@ -178,6 +180,42 @@ export const SCHEMA_SQL: string[] = [
   // (mirrors F-8's idx_tasks_status_priority_updated).
   `CREATE INDEX IF NOT EXISTS idx_iterations_state_priority
      ON iterations(state, priority, updated_at DESC)`,
+
+  // --- git_repositories (G-1113.C.1 — design §3.8/§6) ---
+  // First-class Git objects. `provider` is intentionally NOT CHECK-constrained
+  // (unlike tasks.source_system): the full Provider union is app-validated via
+  // isProvider at the boundary, keeping the model provider-neutral/extensible.
+  `CREATE TABLE IF NOT EXISTS git_repositories (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    owner TEXT,
+    name TEXT NOT NULL,
+    url TEXT,
+    default_branch TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // --- git_branches (G-1113.C.1) ---
+  `CREATE TABLE IF NOT EXISTS git_branches (
+    id TEXT PRIMARY KEY,
+    -- ON DELETE RESTRICT: a repository can't be dropped while branches reference
+    -- it. Ingestion (C.5) only ever upserts Git objects, never deletes them, so
+    -- this is a safety net against orphaned branches rather than a live policy.
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    base_ref TEXT,
+    head_sha TEXT,
+    provider TEXT NOT NULL,
+    external_id TEXT,
+    url TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // Branch lookup by repository (per-repo panel, C.7).
+  `CREATE INDEX IF NOT EXISTS idx_git_branches_repository
+     ON git_branches(repository_id, name)`,
 ];
 
 /**
