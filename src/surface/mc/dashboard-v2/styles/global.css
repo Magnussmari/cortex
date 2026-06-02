@@ -347,6 +347,24 @@ html, body {
 .sources-view .source-state.state-active { color: var(--d, var(--fg)); }
 .sources-view .source-state.state-available { color: var(--fg-faint); }
 .sources-view .source-available .provider-label { color: var(--fg-faint); }
+
+/* G-1113.C.7 — per-repository panel */
+.repos-view .repo-card {
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); padding: 12px 14px; margin-top: 10px;
+}
+.repos-view .repo-card h3 { margin: 0 0 8px 0; font-size: 13px; font-weight: 600; }
+.repos-view .repo-link { margin-left: 6px; text-decoration: none; }
+.repos-view .repo-cols { display: flex; gap: 18px; flex-wrap: wrap; }
+.repos-view .repo-col { flex: 1 1 180px; min-width: 160px; }
+.repos-view .repo-col h4 {
+  margin: 0 0 4px 0; font-size: 10.5px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-faint);
+}
+.repos-view .repo-col ul { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+.repos-view .repo-col li { padding: 2px 0; }
+.repos-view .repo-col a { color: var(--fg-dim); text-decoration: none; }
+.repos-view .repo-col a:hover { color: var(--fg); text-decoration: underline; }
 .scaffold-section h2 {
   margin: 0 0 6px 0;
   font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
