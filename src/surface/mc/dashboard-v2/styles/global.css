@@ -295,6 +295,39 @@ html, body {
 }
 .scaffold-footer a { color: var(--fg-dim); text-decoration: none; }
 .scaffold-footer a:hover { color: var(--fg); text-decoration: underline; }
+
+/* G-1113.B.4 — provider source badge (task rows + Sources view) */
+.provider-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-right: 8px; vertical-align: baseline;
+  font-size: 10.5px; color: var(--fg-faint); white-space: nowrap;
+}
+.provider-badge .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--fg-faint); flex: 0 0 auto;
+}
+.provider-badge .dot.provider-github { background: #8957e5; }
+.provider-badge .dot.provider-gitlab { background: #e24329; }
+.provider-badge .dot.provider-azure-devops { background: #0078d4; }
+.provider-badge .dot.provider-jira { background: #2684ff; }
+.provider-badge .dot.provider-linear { background: #5e6ad2; }
+.provider-badge .dot.provider-bitbucket { background: #2580f4; }
+.provider-badge .dot.provider-internal { background: var(--fg-dim); }
+.provider-badge .dot.provider-custom { background: var(--fg-faint); }
+.title-text { vertical-align: baseline; }
+
+/* Sources view */
+.sources-view .sources-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.sources-view .source-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 0; border-bottom: 1px solid var(--line-soft);
+}
+.sources-view .source-state {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.sources-view .source-state.state-active { color: var(--d, var(--fg)); }
+.sources-view .source-state.state-available { color: var(--fg-faint); }
+.sources-view .source-available .provider-label { color: var(--fg-faint); }
 .scaffold-section h2 {
   margin: 0 0 6px 0;
   font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
