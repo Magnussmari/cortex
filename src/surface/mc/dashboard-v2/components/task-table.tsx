@@ -19,6 +19,7 @@ import { TaskFilters } from "./task-filters";
 import { AddTaskModal } from "./add-task-modal";
 import { DispatchButton } from "./dispatch-button";
 import { Pill } from "./pill";
+import { ProviderBadge } from "./provider-badge";
 import { DEFAULT_AGENT_DISPLAY_NAME } from "../lib/agent-defaults";
 import {
   chipPillKind,
@@ -363,7 +364,10 @@ function TaskRow({
       >
         P{task.priority}
       </td>
-      <td className="title">{task.title}</td>
+      <td className="title">
+        <ProviderBadge provider={task.source.provider} />
+        <span className="title-text">{task.title}</span>
+      </td>
       <td className="iteration">
         {task.iteration ? (
           <button

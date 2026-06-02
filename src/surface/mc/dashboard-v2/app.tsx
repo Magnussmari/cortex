@@ -19,6 +19,7 @@ import { useIterations } from "./hooks/use-iterations";
 import { useMetrics } from "./hooks/use-metrics";
 import { useWorkingAgents } from "./hooks/use-working-agents";
 import { MetricsPanel } from "./components/metrics-panel";
+import { SourcesView } from "./components/sources-view";
 import { Toast } from "./components/toast";
 import { useFocusArea } from "./hooks/use-focus-area";
 import { useTasks } from "./hooks/use-tasks";
@@ -44,7 +45,7 @@ import type { Command } from "./components/command-palette";
  * may upgrade to a hash route if deep-linking turns out to be
  * principal-requested; for now the in-memory view is sufficient.
  */
-type DashboardView = "default" | "metrics" | "iterations" | "kanban-detail";
+type DashboardView = "default" | "metrics" | "iterations" | "sources" | "kanban-detail";
 
 export function App() {
   const { theme, toggle: toggleTheme } = useTheme();
@@ -229,6 +230,15 @@ export function App() {
         >
           Iterations
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "sources"}
+          className={`tab${view === "sources" ? " active" : ""}`}
+          onClick={() => setView("sources")}
+        >
+          Sources
+        </button>
       </nav>
 
       <main className="scaffold-main">
@@ -368,6 +378,11 @@ export function App() {
             state.transition keeps the panel current as work happens.
           */
           <MetricsPanel state={metrics} />
+        )}
+
+        {view === "sources" && (
+          /* G-1113.B.4 — provider-neutral Sources config view. */
+          <SourcesView />
         )}
 
         {view === "iterations" && (
