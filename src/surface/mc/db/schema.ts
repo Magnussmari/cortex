@@ -199,7 +199,10 @@ export const SCHEMA_SQL: string[] = [
   // --- git_branches (G-1113.C.1) ---
   `CREATE TABLE IF NOT EXISTS git_branches (
     id TEXT PRIMARY KEY,
-    repository_id TEXT NOT NULL REFERENCES git_repositories(id),
+    -- ON DELETE RESTRICT: a repository can't be dropped while branches reference
+    -- it. Ingestion (C.5) only ever upserts Git objects, never deletes them, so
+    -- this is a safety net against orphaned branches rather than a live policy.
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
     base_ref TEXT,
     head_sha TEXT,

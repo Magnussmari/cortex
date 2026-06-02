@@ -83,4 +83,9 @@ describe("git-objects storage (C.1)", () => {
     upsertRepository(db, minimal);
     expect(getRepository(db, "r2")).toEqual(minimal);
   });
+
+  it("rejects a branch whose repository_id has no repository (FK enforced)", () => {
+    const db = freshDb();
+    expect(() => upsertBranch(db, { ...branch, repositoryId: "ghost-repo" })).toThrow();
+  });
 });

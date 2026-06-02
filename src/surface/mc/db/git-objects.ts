@@ -8,7 +8,8 @@
  * that fills these from the GitHub adapter is C.5; commits/tags/PRs are C.2/C.3.
  */
 import type { Database } from "bun:sqlite";
-import type { GitRepository, GitBranch, Provider } from "../types";
+import type { GitRepository, GitBranch } from "../types";
+import { isProvider } from "../types";
 
 interface RepoRow {
   id: string;
@@ -33,7 +34,9 @@ interface BranchRow {
 function rowToRepository(r: RepoRow): GitRepository {
   return {
     id: r.id,
-    provider: r.provider as Provider,
+    // Read-boundary narrowing: provider has no DB CHECK, so enforce the
+    // Provider invariant here (matches db/tasks.ts) rather than blind-casting.
+    provider: isProvider(r.provider) ? r.provider : "custom",
     owner: r.owner,
     name: r.name,
     url: r.url,
@@ -48,7 +51,7 @@ function rowToBranch(r: BranchRow): GitBranch {
     name: r.name,
     baseRef: r.base_ref,
     headSha: r.head_sha,
-    provider: r.provider as Provider,
+    provider: isProvider(r.provider) ? r.provider : "custom",
     externalId: r.external_id,
     url: r.url,
   };
