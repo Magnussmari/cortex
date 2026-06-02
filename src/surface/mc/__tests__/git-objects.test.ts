@@ -202,6 +202,10 @@ describe("git-objects storage (C.1)", () => {
     upsertReview(db, review);
     expect(getReview(db, "review-1")).toEqual(review);
     expect(listReviewsForPullRequest(db, "pr-1")).toEqual([review]);
+    // idempotent update: re-upsert with a different state + null reviewer
+    upsertReview(db, { ...review, state: "changes_requested", reviewer: null });
+    expect(getReview(db, "review-1")).toEqual({ ...review, state: "changes_requested", reviewer: null });
+    expect(listReviewsForPullRequest(db, "pr-1")).toHaveLength(1);
   });
 
   it("PR + review FKs enforced (ghost repo / ghost PR throw)", () => {
