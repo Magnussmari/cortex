@@ -18,7 +18,12 @@ export function useSoftwareMode(): { softwareMode: boolean; toggle: () => void }
   const [softwareMode, setSoftwareMode] = useState<boolean>(() => readSoftwareMode());
   useEffect(() => {
     if (typeof window === "undefined") return;
-    window.localStorage?.setItem(STORAGE_KEY, softwareMode ? "on" : "off");
+    try {
+      window.localStorage?.setItem(STORAGE_KEY, softwareMode ? "on" : "off");
+    } catch (_err) {
+      // localStorage unavailable (private mode / permissions) — the flag still
+      // applies in-session; persistence is best-effort (matches use-theme).
+    }
   }, [softwareMode]);
   const toggle = useCallback(() => setSoftwareMode((v) => !v), []);
   return { softwareMode, toggle };

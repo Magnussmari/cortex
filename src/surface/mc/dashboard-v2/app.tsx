@@ -89,6 +89,11 @@ export function App() {
   const [selectedIterationId, setSelectedIterationId] = useState<string | null>(null);
   // G-1113.C.7 — Repositories panel data (fetched only when on its tab).
   const repos = useRepositories(softwareMode && view === "repositories");
+  // If software mode is toggled OFF while on the Repositories view, the tab +
+  // render both gate off — reset to default so the main area isn't left blank.
+  useEffect(() => {
+    if (!softwareMode && view === "repositories") setView("default");
+  }, [softwareMode, view]);
 
   // Drill-down state — only one open at a time per F-7 Decision 9.
   const [drillId, setDrillId] = useState<string | null>(null);
