@@ -1,0 +1,119 @@
+/**
+ * G-1113.C.1 — storage for the first-class Git objects (design §3.8/§6).
+ *
+ * GitRepository + GitBranch persistence: upsert (id is the stable key, so
+ * re-ingesting the same object updates in place), get-by-id, and list. Rows are
+ * snake_case columns; the mappers project to the camelCase domain types. No
+ * provider branching here — the model is provider-neutral (G-1113.B). Ingestion
+ * that fills these from the GitHub adapter is C.5; commits/tags/PRs are C.2/C.3.
+ */
+import type { Database } from "bun:sqlite";
+import type { GitRepository, GitBranch, Provider } from "../types";
+
+interface RepoRow {
+  id: string;
+  provider: string;
+  owner: string | null;
+  name: string;
+  url: string | null;
+  default_branch: string | null;
+}
+
+interface BranchRow {
+  id: string;
+  repository_id: string;
+  name: string;
+  base_ref: string | null;
+  head_sha: string | null;
+  provider: string;
+  external_id: string | null;
+  url: string | null;
+}
+
+function rowToRepository(r: RepoRow): GitRepository {
+  return {
+    id: r.id,
+    provider: r.provider as Provider,
+    owner: r.owner,
+    name: r.name,
+    url: r.url,
+    defaultBranch: r.default_branch,
+  };
+}
+
+function rowToBranch(r: BranchRow): GitBranch {
+  return {
+    id: r.id,
+    repositoryId: r.repository_id,
+    name: r.name,
+    baseRef: r.base_ref,
+    headSha: r.head_sha,
+    provider: r.provider as Provider,
+    externalId: r.external_id,
+    url: r.url,
+  };
+}
+
+/** Insert or update a repository by id (idempotent re-ingestion). */
+export function upsertRepository(db: Database, repo: GitRepository): void {
+  db.query(
+    `INSERT INTO git_repositories (id, provider, owner, name, url, default_branch)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       provider = excluded.provider,
+       owner = excluded.owner,
+       name = excluded.name,
+       url = excluded.url,
+       default_branch = excluded.default_branch,
+       updated_at = unixepoch()`
+  ).run(repo.id, repo.provider, repo.owner, repo.name, repo.url, repo.defaultBranch);
+}
+
+export function getRepository(db: Database, id: string): GitRepository | null {
+  const row = db.query(`SELECT * FROM git_repositories WHERE id = ?`).get(id) as RepoRow | null;
+  return row ? rowToRepository(row) : null;
+}
+
+export function listRepositories(db: Database): GitRepository[] {
+  const rows = db.query(`SELECT * FROM git_repositories ORDER BY owner, name`).all() as RepoRow[];
+  return rows.map(rowToRepository);
+}
+
+/** Insert or update a branch by id (idempotent re-ingestion). */
+export function upsertBranch(db: Database, branch: GitBranch): void {
+  db.query(
+    `INSERT INTO git_branches
+       (id, repository_id, name, base_ref, head_sha, provider, external_id, url)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       repository_id = excluded.repository_id,
+       name = excluded.name,
+       base_ref = excluded.base_ref,
+       head_sha = excluded.head_sha,
+       provider = excluded.provider,
+       external_id = excluded.external_id,
+       url = excluded.url,
+       updated_at = unixepoch()`
+  ).run(
+    branch.id,
+    branch.repositoryId,
+    branch.name,
+    branch.baseRef,
+    branch.headSha,
+    branch.provider,
+    branch.externalId,
+    branch.url
+  );
+}
+
+export function getBranch(db: Database, id: string): GitBranch | null {
+  const row = db.query(`SELECT * FROM git_branches WHERE id = ?`).get(id) as BranchRow | null;
+  return row ? rowToBranch(row) : null;
+}
+
+export function listBranchesForRepository(db: Database, repositoryId: string): GitBranch[] {
+  const rows = db
+    .query(`SELECT * FROM git_branches WHERE repository_id = ? ORDER BY name`)
+    .all(repositoryId) as BranchRow[];
+  return rows.map(rowToBranch);
+}
