@@ -8,7 +8,7 @@
  * that fills these from the GitHub adapter is C.5; commits/tags/PRs are C.2/C.3.
  */
 import type { Database } from "bun:sqlite";
-import type { GitRepository, GitBranch } from "../types";
+import type { GitRepository, GitBranch, GitCommit, GitTag } from "../types";
 import { isProvider } from "../types";
 
 interface RepoRow {
@@ -119,4 +119,102 @@ export function listBranchesForRepository(db: Database, repositoryId: string): G
     .query(`SELECT * FROM git_branches WHERE repository_id = ? ORDER BY name`)
     .all(repositoryId) as BranchRow[];
   return rows.map(rowToBranch);
+}
+
+// --- commits (G-1113.C.2) ---
+
+interface CommitRow {
+  id: string;
+  repository_id: string;
+  sha: string;
+  title: string;
+  author: string | null;
+  url: string | null;
+}
+
+function rowToCommit(r: CommitRow): GitCommit {
+  return {
+    id: r.id,
+    repositoryId: r.repository_id,
+    sha: r.sha,
+    title: r.title,
+    author: r.author,
+    url: r.url,
+  };
+}
+
+/** Insert or update a commit by id (idempotent re-ingestion). */
+export function upsertCommit(db: Database, commit: GitCommit): void {
+  db.query(
+    `INSERT INTO git_commits (id, repository_id, sha, title, author, url)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       repository_id = excluded.repository_id,
+       sha = excluded.sha,
+       title = excluded.title,
+       author = excluded.author,
+       url = excluded.url,
+       updated_at = unixepoch()`
+  ).run(commit.id, commit.repositoryId, commit.sha, commit.title, commit.author, commit.url);
+}
+
+export function getCommit(db: Database, id: string): GitCommit | null {
+  const row = db.query(`SELECT * FROM git_commits WHERE id = ?`).get(id) as CommitRow | null;
+  return row ? rowToCommit(row) : null;
+}
+
+export function listCommitsForRepository(db: Database, repositoryId: string): GitCommit[] {
+  const rows = db
+    .query(`SELECT * FROM git_commits WHERE repository_id = ? ORDER BY sha`)
+    .all(repositoryId) as CommitRow[];
+  return rows.map(rowToCommit);
+}
+
+// --- tags (G-1113.C.2) ---
+
+interface TagRow {
+  id: string;
+  repository_id: string;
+  name: string;
+  target_sha: string | null;
+  provider: string;
+  url: string | null;
+}
+
+function rowToTag(r: TagRow): GitTag {
+  return {
+    id: r.id,
+    repositoryId: r.repository_id,
+    name: r.name,
+    targetSha: r.target_sha,
+    provider: isProvider(r.provider) ? r.provider : "custom",
+    url: r.url,
+  };
+}
+
+/** Insert or update a tag by id (idempotent re-ingestion). */
+export function upsertTag(db: Database, tag: GitTag): void {
+  db.query(
+    `INSERT INTO git_tags (id, repository_id, name, target_sha, provider, url)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       repository_id = excluded.repository_id,
+       name = excluded.name,
+       target_sha = excluded.target_sha,
+       provider = excluded.provider,
+       url = excluded.url,
+       updated_at = unixepoch()`
+  ).run(tag.id, tag.repositoryId, tag.name, tag.targetSha, tag.provider, tag.url);
+}
+
+export function getTag(db: Database, id: string): GitTag | null {
+  const row = db.query(`SELECT * FROM git_tags WHERE id = ?`).get(id) as TagRow | null;
+  return row ? rowToTag(row) : null;
+}
+
+export function listTagsForRepository(db: Database, repositoryId: string): GitTag[] {
+  const rows = db
+    .query(`SELECT * FROM git_tags WHERE repository_id = ? ORDER BY name`)
+    .all(repositoryId) as TagRow[];
+  return rows.map(rowToTag);
 }
