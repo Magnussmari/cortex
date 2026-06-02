@@ -597,8 +597,12 @@ The next cycle should preserve the current surfaces and evolve them:
 
 1. Should the canonical top-level noun be `Plan`, `Program`, or `Work Plan`?
 2. Should "phase" and "wave" be aliases, or should one be canonical?
-3. Should `PullRequest` be the normalized model name, with GitLab merge request
-   as a provider-native label, or should the model use `ChangeRequest`?
+3. ~~Should `PullRequest` be the normalized model name, with GitLab merge request
+   as a provider-native label, or should the model use `ChangeRequest`?~~
+   **Resolved (G-1113.B.1, #544): native-type-as-field.** `PullRequest` is the
+   normalized name; the provider-native label rides as `providerNativeType`
+   (e.g. `"merge_request"`) on the `SourceRef` / Git concept — no separate
+   top-level `ChangeRequest`.
 4. How much of the existing iteration board should be preserved versus folded
    into the new plan overview?
 5. Which provider should be added first after GitHub: Azure DevOps, GitLab,

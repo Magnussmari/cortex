@@ -59,7 +59,8 @@ Mission Control's **local** unit of work. A task may originate from many places
 — a manual/internal note, a GitHub/GitLab/Jira/Linear issue, an Azure Boards
 work item, or a routine- or dispatch-generated request — but it is **not**
 identical to its provider object. Provider identity is metadata on the task, not
-the task itself — it rides as `provider` / `externalId` / `url` fields on the
+the task itself — it rides as `provider` / `externalId` / `url` /
+`providerNativeType` fields (the {@link SourceRef} shape, G-1113.B.1) on the
 work item, not a named type (see the domain model,
 [§6](./design-mission-control-cortex-cockpit.md)).
 
