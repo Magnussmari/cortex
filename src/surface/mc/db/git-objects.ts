@@ -8,7 +8,17 @@
  * that fills these from the GitHub adapter is C.5; commits/tags/PRs are C.2/C.3.
  */
 import type { Database } from "bun:sqlite";
-import type { GitRepository, GitBranch, GitCommit, GitTag } from "../types";
+import type {
+  GitRepository,
+  GitBranch,
+  GitCommit,
+  GitTag,
+  PullRequest,
+  PullRequestState,
+  PullRequestReviewState,
+  Review,
+  ReviewState,
+} from "../types";
 import { isProvider } from "../types";
 
 interface RepoRow {
@@ -217,4 +227,140 @@ export function listTagsForRepository(db: Database, repositoryId: string): GitTa
     .query(`SELECT * FROM git_tags WHERE repository_id = ? ORDER BY name`)
     .all(repositoryId) as TagRow[];
   return rows.map(rowToTag);
+}
+
+// --- pull requests + reviews (G-1113.C.3) ---
+
+interface PullRequestRow {
+  id: string;
+  work_item_id: string | null;
+  repository_id: string;
+  provider: string;
+  provider_native_type: string;
+  external_id: string;
+  number_or_key: string;
+  title: string;
+  source_branch: string;
+  target_branch: string;
+  url: string;
+  state: string;
+  review_state: string;
+}
+
+function rowToPullRequest(r: PullRequestRow): PullRequest {
+  return {
+    id: r.id,
+    workItemId: r.work_item_id,
+    repositoryId: r.repository_id,
+    provider: isProvider(r.provider) ? r.provider : "custom",
+    providerNativeType: r.provider_native_type,
+    externalId: r.external_id,
+    numberOrKey: r.number_or_key,
+    title: r.title,
+    sourceBranch: r.source_branch,
+    targetBranch: r.target_branch,
+    url: r.url,
+    // state / review_state are CHECK-constrained in the schema, so the cast is
+    // backed by the DB (unlike provider, which has no CHECK).
+    state: r.state as PullRequestState,
+    reviewState: r.review_state as PullRequestReviewState,
+  };
+}
+
+/** Insert or update a pull request by id (idempotent re-ingestion). */
+export function upsertPullRequest(db: Database, pr: PullRequest): void {
+  db.query(
+    `INSERT INTO pull_requests
+       (id, work_item_id, repository_id, provider, provider_native_type,
+        external_id, number_or_key, title, source_branch, target_branch, url,
+        state, review_state)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       work_item_id = excluded.work_item_id,
+       repository_id = excluded.repository_id,
+       provider = excluded.provider,
+       provider_native_type = excluded.provider_native_type,
+       external_id = excluded.external_id,
+       number_or_key = excluded.number_or_key,
+       title = excluded.title,
+       source_branch = excluded.source_branch,
+       target_branch = excluded.target_branch,
+       url = excluded.url,
+       state = excluded.state,
+       review_state = excluded.review_state,
+       updated_at = unixepoch()`
+  ).run(
+    pr.id,
+    pr.workItemId,
+    pr.repositoryId,
+    pr.provider,
+    pr.providerNativeType,
+    pr.externalId,
+    pr.numberOrKey,
+    pr.title,
+    pr.sourceBranch,
+    pr.targetBranch,
+    pr.url,
+    pr.state,
+    pr.reviewState
+  );
+}
+
+export function getPullRequest(db: Database, id: string): PullRequest | null {
+  const row = db.query(`SELECT * FROM pull_requests WHERE id = ?`).get(id) as PullRequestRow | null;
+  return row ? rowToPullRequest(row) : null;
+}
+
+export function listPullRequestsForRepository(db: Database, repositoryId: string): PullRequest[] {
+  const rows = db
+    .query(`SELECT * FROM pull_requests WHERE repository_id = ? ORDER BY number_or_key`)
+    .all(repositoryId) as PullRequestRow[];
+  return rows.map(rowToPullRequest);
+}
+
+interface ReviewRow {
+  id: string;
+  pull_request_id: string;
+  reviewer: string | null;
+  state: string;
+  provider: string;
+  url: string | null;
+}
+
+function rowToReview(r: ReviewRow): Review {
+  return {
+    id: r.id,
+    pullRequestId: r.pull_request_id,
+    reviewer: r.reviewer,
+    state: r.state as ReviewState, // CHECK-constrained in the schema
+    provider: isProvider(r.provider) ? r.provider : "custom",
+    url: r.url,
+  };
+}
+
+/** Insert or update a review by id (idempotent re-ingestion). */
+export function upsertReview(db: Database, review: Review): void {
+  db.query(
+    `INSERT INTO reviews (id, pull_request_id, reviewer, state, provider, url)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       pull_request_id = excluded.pull_request_id,
+       reviewer = excluded.reviewer,
+       state = excluded.state,
+       provider = excluded.provider,
+       url = excluded.url,
+       updated_at = unixepoch()`
+  ).run(review.id, review.pullRequestId, review.reviewer, review.state, review.provider, review.url);
+}
+
+export function getReview(db: Database, id: string): Review | null {
+  const row = db.query(`SELECT * FROM reviews WHERE id = ?`).get(id) as ReviewRow | null;
+  return row ? rowToReview(row) : null;
+}
+
+export function listReviewsForPullRequest(db: Database, pullRequestId: string): Review[] {
+  const rows = db
+    .query(`SELECT * FROM reviews WHERE pull_request_id = ? ORDER BY id`)
+    .all(pullRequestId) as ReviewRow[];
+  return rows.map(rowToReview);
 }

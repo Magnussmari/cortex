@@ -16,6 +16,8 @@ export const TABLE_NAMES = [
   "git_branches",
   "git_commits",
   "git_tags",
+  "pull_requests",
+  "reviews",
 ] as const;
 
 export const SCHEMA_SQL: string[] = [
@@ -252,6 +254,51 @@ export const SCHEMA_SQL: string[] = [
      ON git_commits(repository_id, sha)`,
   `CREATE INDEX IF NOT EXISTS idx_git_tags_repository
      ON git_tags(repository_id, name)`,
+
+  // --- pull_requests (G-1113.C.3 — design §6) ---
+  // work_item_id is intentionally NOT a FK (the task/work-item linkage is wired
+  // in Phase D); state/review_state CHECK-constrained (closed enums, like
+  // tasks.status); provider app-validated via isProvider (no CHECK).
+  `CREATE TABLE IF NOT EXISTS pull_requests (
+    id TEXT PRIMARY KEY,
+    work_item_id TEXT,
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    provider TEXT NOT NULL,
+    provider_native_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    number_or_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_branch TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    url TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open'
+      CHECK(state IN ('draft','open','merged','closed')),
+    review_state TEXT NOT NULL DEFAULT 'none'
+      CHECK(review_state IN ('none','needs_review','changes_requested','approved')),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // --- reviews (G-1113.C.3) ---
+  `CREATE TABLE IF NOT EXISTS reviews (
+    id TEXT PRIMARY KEY,
+    pull_request_id TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE RESTRICT,
+    reviewer TEXT,
+    state TEXT NOT NULL
+      CHECK(state IN ('approved','changes_requested','commented','pending','dismissed')),
+    provider TEXT NOT NULL,
+    url TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // PR lookup by repository + work item; reviews by PR.
+  `CREATE INDEX IF NOT EXISTS idx_pull_requests_repository
+     ON pull_requests(repository_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_pull_requests_work_item
+     ON pull_requests(work_item_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_reviews_pull_request
+     ON reviews(pull_request_id)`,
 ];
 
 /**
