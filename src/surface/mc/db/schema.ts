@@ -14,6 +14,8 @@ export const TABLE_NAMES = [
   "iterations",
   "git_repositories",
   "git_branches",
+  "git_commits",
+  "git_tags",
 ] as const;
 
 export const SCHEMA_SQL: string[] = [
@@ -216,6 +218,40 @@ export const SCHEMA_SQL: string[] = [
   // Branch lookup by repository (per-repo panel, C.7).
   `CREATE INDEX IF NOT EXISTS idx_git_branches_repository
      ON git_branches(repository_id, name)`,
+
+  // --- git_commits (G-1113.C.2 — design §6) ---
+  // Per §6 a commit has no provider field (it's repository-scoped); the
+  // ON DELETE RESTRICT policy matches git_branches (ingestion upserts only).
+  `CREATE TABLE IF NOT EXISTS git_commits (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    sha TEXT NOT NULL,
+    title TEXT NOT NULL,
+    author TEXT,
+    url TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // --- git_tags (G-1113.C.2) ---
+  // provider left app-validated via isProvider (no CHECK), matching the other
+  // Git objects.
+  `CREATE TABLE IF NOT EXISTS git_tags (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    target_sha TEXT,
+    provider TEXT NOT NULL,
+    url TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // Commit lookup by repository + sha; tag lookup by repository.
+  `CREATE INDEX IF NOT EXISTS idx_git_commits_repository
+     ON git_commits(repository_id, sha)`,
+  `CREATE INDEX IF NOT EXISTS idx_git_tags_repository
+     ON git_tags(repository_id, name)`,
 ];
 
 /**
