@@ -13,8 +13,14 @@ import {
   upsertBranch,
   getBranch,
   listBranchesForRepository,
+  upsertCommit,
+  getCommit,
+  listCommitsForRepository,
+  upsertTag,
+  getTag,
+  listTagsForRepository,
 } from "../db/git-objects";
-import type { GitRepository, GitBranch } from "../types";
+import type { GitRepository, GitBranch, GitCommit, GitTag } from "../types";
 
 describe("git-objects storage (C.1)", () => {
   const paths: string[] = [];
@@ -87,5 +93,55 @@ describe("git-objects storage (C.1)", () => {
   it("rejects a branch whose repository_id has no repository (FK enforced)", () => {
     const db = freshDb();
     expect(() => upsertBranch(db, { ...branch, repositoryId: "ghost-repo" })).toThrow();
+  });
+
+  // --- C.2: commits + tags ---
+
+  const commit: GitCommit = {
+    id: "commit-1",
+    repositoryId: "repo-1",
+    sha: "abc1234def",
+    title: "feat: add the thing",
+    author: "Andreas",
+    url: "https://github.com/the-metafactory/cortex/commit/abc1234def",
+  };
+  const tag: GitTag = {
+    id: "tag-1",
+    repositoryId: "repo-1",
+    name: "v3.1.0",
+    targetSha: "abc1234def",
+    provider: "github",
+    url: "https://github.com/the-metafactory/cortex/releases/tag/v3.1.0",
+  };
+
+  it("round-trips a commit (upsert → get → list) + idempotent update", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    upsertCommit(db, commit);
+    expect(getCommit(db, "commit-1")).toEqual(commit);
+    expect(listCommitsForRepository(db, "repo-1")).toEqual([commit]);
+    upsertCommit(db, { ...commit, title: "feat: renamed", author: null });
+    expect(getCommit(db, "commit-1")).toEqual({ ...commit, title: "feat: renamed", author: null });
+    expect(listCommitsForRepository(db, "repo-1")).toHaveLength(1);
+  });
+
+  it("round-trips a tag and narrows an unknown provider to custom", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    upsertTag(db, tag);
+    expect(getTag(db, "tag-1")).toEqual(tag);
+    expect(listTagsForRepository(db, "repo-1")).toEqual([tag]);
+  });
+
+  it("commit + tag FKs are enforced (ghost repository_id throws)", () => {
+    const db = freshDb();
+    expect(() => upsertCommit(db, { ...commit, repositoryId: "ghost" })).toThrow();
+    expect(() => upsertTag(db, { ...tag, repositoryId: "ghost" })).toThrow();
+  });
+
+  it("getCommit / getTag return null for unknown ids", () => {
+    const db = freshDb();
+    expect(getCommit(db, "nope")).toBeNull();
+    expect(getTag(db, "nope")).toBeNull();
   });
 });

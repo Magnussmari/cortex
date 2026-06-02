@@ -163,6 +163,30 @@ export interface GitBranch {
   url: string | null;
 }
 
+export interface GitCommit {
+  id: string;
+  repositoryId: string;
+  sha: string;
+  title: string;
+  author: string | null;
+  url: string | null;
+}
+
+/**
+ * A Git tag. Design §3.8 lists `tag` as a first-class noun but §6 has no
+ * dedicated interface (Release carries a `tagName`); this is the minimal
+ * provider-neutral shape, consistent with the other Git objects.
+ */
+export interface GitTag {
+  id: string;
+  repositoryId: string;
+  name: string;
+  /** SHA of the commit/object the tag points to, when known. */
+  targetSha: string | null;
+  provider: Provider;
+  url: string | null;
+}
+
 export interface Task {
   id: string;
   title: string;
