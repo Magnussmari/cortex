@@ -128,7 +128,8 @@ export interface TaskListItem {
  * + `source_url` + `source_external_id` (B.2 is additive — columns and the
  * `source_system` CHECK are unchanged; widening to new providers is B.3+). This
  * shim is the single boundary that produces the normalized shape, so the rest
- * of Mission Control stops branching on `source_system === "github"`.
+ * of Mission Control can stop branching on `source_system === "github"`
+ * (the remaining call sites migrate in B.3/B.4).
  *
  * `provider` falls back to `"custom"` only if the stored value isn't a known
  * {@link Provider} — today the CHECK guarantees `github`/`internal`, both valid

@@ -38,8 +38,12 @@ test("falls back to 'custom' for an unknown stored provider (defensive)", () => 
     source_url: null,
     source_external_id: "r1234",
   });
-  expect(ref.provider).toBe("custom");
-  expect(ref.externalId).toBe("r1234");
+  expect(ref).toEqual({
+    provider: "custom",
+    externalId: "r1234",
+    url: null,
+    providerNativeType: null,
+  });
 });
 
 test("never sets providerNativeType in B.2 (adapters populate it in B.3+)", () => {
