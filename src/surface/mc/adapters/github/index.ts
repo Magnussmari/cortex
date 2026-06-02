@@ -19,6 +19,7 @@ import { type GitHubRef, canonicalRef, canonicalUrl } from "./ref";
 
 export * from "./ref";
 export * from "./fetch";
+export * from "./ingest";
 
 /**
  * Normalize a parsed {@link GitHubRef} into a {@link SourceRef}. `externalId`
