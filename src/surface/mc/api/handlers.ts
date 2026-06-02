@@ -85,6 +85,11 @@ import {
   isGitHubFetchError,
   type GhSpawnFn,
   type GitHubFetchError,
+  // G-1113.C.5 — software-mode Git-model ingestion (best-effort)
+  fetchPullRequest,
+  buildGithubPrModel,
+  persistGithubPrModel,
+  persistGithubRepository,
 } from "../adapters/github";
 import {
   DEFAULT_ITERATION_LABEL,
@@ -2040,6 +2045,31 @@ export async function handleCreateTask(
     return error("Internal error: import event not produced", 500);
   }
   broadcastEvent(deps.wsRegistry, shadowSessionId, holder.event);
+
+  // G-1113.C.5 — best-effort: populate the software-mode Git model from the
+  // just-ingested ref. Strictly non-blocking — any failure (extra gh call,
+  // storage error) is logged and swallowed so it can never break task
+  // creation, which has already committed + broadcast above.
+  try {
+    if (flow.metadata.type === "pr") {
+      const prDetail = await fetchPullRequest(
+        flow.ref,
+        deps.ghSpawn ? { spawn: deps.ghSpawn } : {}
+      );
+      if ("kind" in prDetail) {
+        // PR detail unavailable — fall back to repository-only ingestion.
+        persistGithubRepository(db, flow.ref);
+      } else {
+        persistGithubPrModel(db, buildGithubPrModel(flow.ref, prDetail));
+      }
+    } else {
+      persistGithubRepository(db, flow.ref);
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[api] C.5 git-model ingest (best-effort) failed for ${canonical}: ${(err as Error).message}\n`
+    );
+  }
 
   const resp: CreateTaskResponse = {
     taskId,

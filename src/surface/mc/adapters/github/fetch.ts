@@ -280,6 +280,171 @@ export async function fetchIssueOrPr(
 }
 
 /**
+ * Rich pull-request detail from `gh api /repos/:owner/:repo/pulls/:number`.
+ *
+ * The issues endpoint {@link fetchIssueOrPr} uses does NOT carry branch/sha, so
+ * G-1113.C.5 fetches the pulls endpoint to populate the GitBranch + GitCommit +
+ * PullRequest model. PR-only (issues have no head/base).
+ */
+export interface GitHubPullRequestDetail {
+  state: string; // "open" | "closed"
+  merged: boolean;
+  draft: boolean;
+  title: string;
+  html_url: string;
+  number: number;
+  headRef: string;
+  baseRef: string;
+  headSha: string;
+  /** Head repo `owner/name` — differs from the base repo for fork PRs; null when absent. */
+  headRepoFullName: string | null;
+}
+
+interface RawGithubPull {
+  state?: string;
+  merged?: boolean;
+  draft?: boolean;
+  title?: string;
+  html_url?: string;
+  number?: number;
+  head?: { ref?: string; sha?: string; repo?: { full_name?: string } | null } | null;
+  base?: { ref?: string } | null;
+}
+
+/**
+ * Run a `gh api <path>` call and return stdout, mapping gh's stderr shapes to
+ * the same {@link GitHubFetchError} kinds as {@link fetchIssueOrPr}. Self-
+ * contained (does not disturb the existing fetcher); used by
+ * {@link fetchPullRequest}. (fetchIssueOrPr predates this and could migrate to
+ * it in a later cleanup.)
+ */
+async function runGhApi(
+  path: string,
+  opts: { spawn?: GhSpawnFn; timeoutMs?: number } = {}
+): Promise<{ ok: true; stdout: string } | GitHubFetchError> {
+  const spawn = opts.spawn ?? defaultSpawn;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const args = ["gh", "api", "-H", "Accept: application/vnd.github+json", path];
+
+  let proc: SpawnResult;
+  try {
+    proc = spawn(args);
+  } catch (err) {
+    return {
+      kind: "spawn_failed",
+      message: `Could not spawn gh CLI: ${(err as Error).message}. Is 'gh' installed and in PATH?`,
+    };
+  }
+
+  let timedOut = false;
+  const SIGKILL_GRACE_MS = 2_000;
+  let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      proc.kill("SIGTERM");
+    } catch (_err) {
+      // best-effort
+    }
+    sigkillTimer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch (_err) {
+        // best-effort
+      }
+    }, SIGKILL_GRACE_MS);
+  }, timeoutMs);
+
+  let exitCode: number;
+  let stdout: string;
+  let stderr: string;
+  try {
+    const [so, se, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    stdout = so;
+    stderr = se;
+    exitCode = code;
+  } catch (err) {
+    clearTimeout(timer);
+    /* eslint-disable @typescript-eslint/no-unnecessary-condition */
+    if (sigkillTimer) clearTimeout(sigkillTimer);
+    if (timedOut) return { kind: "timeout", message: "GitHub took too long to respond. Try again." };
+    /* eslint-enable @typescript-eslint/no-unnecessary-condition */
+    return {
+      kind: "spawn_failed",
+      message: `gh CLI failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  clearTimeout(timer);
+  /* eslint-disable @typescript-eslint/no-unnecessary-condition */
+  if (sigkillTimer) clearTimeout(sigkillTimer);
+  if (timedOut) return { kind: "timeout", message: "GitHub took too long to respond. Try again." };
+  /* eslint-enable @typescript-eslint/no-unnecessary-condition */
+
+  if (exitCode !== 0) {
+    const n = stderr.toLowerCase();
+    if (n.includes("rate limit")) return { kind: "rate_limited", message: "GitHub rate limit reached. Try again in a few minutes.", stderr };
+    if (n.includes("http 404") || n.includes("not found")) return { kind: "not_found", message: "That pull request could not be found on GitHub.", stderr };
+    if (n.includes("http 401") || n.includes("unauthorized") || n.includes("gh auth") || n.includes("authentication required"))
+      return { kind: "unauthorized", message: "GitHub auth failed. Run 'gh auth login' to authenticate, then try again.", stderr };
+    return { kind: "upstream", message: `gh CLI exited ${exitCode}: ${stderr.trim() || "(empty stderr)"}`, stderr };
+  }
+  return { ok: true, stdout };
+}
+
+/**
+ * Fetch rich PR detail (head/base branch + head sha + merged/draft) via the
+ * `/pulls/:number` endpoint. Returns {@link GitHubPullRequestDetail} or a
+ * {@link GitHubFetchError}.
+ */
+export async function fetchPullRequest(
+  ref: { owner: string; repo: string; number: number },
+  opts: { spawn?: GhSpawnFn; timeoutMs?: number } = {}
+): Promise<GitHubPullRequestDetail | GitHubFetchError> {
+  const res = await runGhApi(`/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`, opts);
+  if ("kind" in res) return res; // GitHubFetchError carries `kind`; success carries `ok`/`stdout`
+
+  let raw: RawGithubPull;
+  try {
+    raw = JSON.parse(res.stdout) as RawGithubPull;
+  } catch (err) {
+    return { kind: "parse_error", message: `Could not parse GitHub PR response: ${(err as Error).message}` };
+  }
+
+  if (
+    typeof raw.state !== "string" ||
+    typeof raw.title !== "string" ||
+    typeof raw.html_url !== "string" ||
+    !raw.head ||
+    typeof raw.head.ref !== "string" ||
+    typeof raw.head.sha !== "string" ||
+    !raw.base ||
+    typeof raw.base.ref !== "string"
+  ) {
+    return { kind: "parse_error", message: "GitHub PR response missing required fields (state/title/html_url/head.ref/head.sha/base.ref)." };
+  }
+
+  return {
+    state: raw.state,
+    merged: raw.merged === true,
+    draft: raw.draft === true,
+    title: raw.title,
+    html_url: raw.html_url,
+    number: typeof raw.number === "number" ? raw.number : ref.number,
+    headRef: raw.head.ref,
+    baseRef: raw.base.ref,
+    headSha: raw.head.sha,
+    headRepoFullName:
+      raw.head.repo && typeof raw.head.repo.full_name === "string"
+        ? raw.head.repo.full_name
+        : null,
+  };
+}
+
+/**
  * Type guard: distinguish error from successful metadata.
  */
 export function isGitHubFetchError(
