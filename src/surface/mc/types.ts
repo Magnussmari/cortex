@@ -240,6 +240,76 @@ export interface Review {
   url: string | null;
 }
 
+export type CheckKind = "check" | "build";
+export type CheckState =
+  | "pending"
+  | "success"
+  | "failure"
+  | "error"
+  | "neutral"
+  | "cancelled";
+
+/**
+ * A status check or build (design §3.8 lists "check / status check" and "build"
+ * — modelled as one entity with a `kind`, since they share a lifecycle). §6 has
+ * no dedicated interface; this is the minimal provider-neutral shape.
+ */
+export interface Check {
+  id: string;
+  repositoryId: string;
+  /** Commit SHA the check ran against, when known. */
+  commitSha: string | null;
+  name: string;
+  kind: CheckKind;
+  state: CheckState;
+  provider: Provider;
+  url: string | null;
+}
+
+export type DeploymentState =
+  | "pending"
+  | "in_progress"
+  | "success"
+  | "failure"
+  | "inactive";
+
+/** A deployment of a build/release to an environment (design §3.8 noun). */
+export interface Deployment {
+  id: string;
+  repositoryId: string;
+  environment: string;
+  state: DeploymentState;
+  provider: Provider;
+  url: string | null;
+}
+
+/** A build output / release asset (design §3.8 noun). */
+export interface Artifact {
+  id: string;
+  repositoryId: string;
+  name: string;
+  provider: Provider;
+  url: string | null;
+}
+
+export type ReleaseState = "draft" | "published" | "failed" | "archived";
+
+/**
+ * A published cut of a repository (design §6). `repositoryId` is nullable per
+ * §6 (a release can predate repo linkage); `tagName` links to the {@link GitTag}
+ * by name when present.
+ */
+export interface Release {
+  id: string;
+  repositoryId: string | null;
+  provider: Provider;
+  externalId: string | null;
+  name: string;
+  tagName: string | null;
+  url: string | null;
+  state: ReleaseState;
+}
+
 export interface Task {
   id: string;
   title: string;
