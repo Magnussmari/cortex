@@ -260,8 +260,10 @@ describe("validateTaskUpdatedPayload", () => {
     return validateTaskUpdatedPayload(raw) !== null;
   }
 
+  const SRC = { provider: "github", externalId: null, url: null, providerNativeType: null };
+
   it("accepts a well-formed payload (no iteration)", () => {
-    expect(isAccepted({ id: "t-1", title: "T", iteration: null })).toBe(true);
+    expect(isAccepted({ id: "t-1", title: "T", iteration: null, source: SRC })).toBe(true);
   });
 
   it("accepts a well-formed payload (with iteration)", () => {
@@ -270,8 +272,19 @@ describe("validateTaskUpdatedPayload", () => {
         id: "t-1",
         title: "T",
         iteration: { id: "it-1", title: "Alpha", state: "designing" },
+        source: SRC,
       })
     ).toBe(true);
+  });
+
+  it("returns null when source is missing or malformed (G-1113.B.4 guard)", () => {
+    expect(validateTaskUpdatedPayload({ id: "t-1", title: "T", iteration: null })).toBeNull();
+    expect(
+      validateTaskUpdatedPayload({ id: "t-1", title: "T", iteration: null, source: { provider: "svn-bogus", externalId: null, url: null, providerNativeType: null } })
+    ).toBeNull();
+    expect(
+      validateTaskUpdatedPayload({ id: "t-1", title: "T", iteration: null, source: { provider: "github", externalId: 42, url: null, providerNativeType: null } })
+    ).toBeNull();
   });
 
   it("returns null for non-object input", () => {
@@ -299,6 +312,7 @@ describe("validateTaskUpdatedPayload", () => {
         id: "t-1",
         title: "T",
         iteration: { id: "it-1", title: 42, state: "designing" },
+        source: SRC,
       })
     ).toBeNull();
   });
@@ -309,6 +323,7 @@ describe("validateTaskUpdatedPayload", () => {
         id: "t-1",
         title: "T",
         iteration: { id: "it-1", title: "Alpha", state: "bogus" },
+        source: SRC,
       })
     ).toBeNull();
   });
