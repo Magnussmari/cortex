@@ -81,7 +81,7 @@
  * failed envelope's `reason.detail` when sage exits non-zero. Both pipes
  * are drained via `new Response(stream).text()` in parallel with the
  * `exited` promise so a large markdown blob can't deadlock on the OS
- * pipe buffer (same pattern as `src/surface/mc/api/github-fetch.ts`).
+ * pipe buffer (same pattern as `src/surface/mc/adapters/github/fetch.ts`).
  */
 
 import type { Envelope } from "../../bus/myelin/envelope-validator";
@@ -259,7 +259,7 @@ export function makePiDevPipelineRunner(
 
     // Drain stdout + stderr in parallel with `exited` so a large markdown
     // blob can't deadlock on the OS pipe buffer (same pattern as
-    // `src/surface/mc/api/github-fetch.ts`).
+    // `src/surface/mc/adapters/github/fetch.ts`).
     let stdout: string;
     let stderr: string;
     let exitCode: number;

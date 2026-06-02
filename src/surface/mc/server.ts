@@ -128,7 +128,7 @@ export interface StartServerOptions {
    * F-12b Decision 3 — gh CLI spawn override for tests. Omitted in
    * production; real `Bun.spawn(['gh', 'api', ...])` is used.
    */
-  ghSpawn?: import("./api/github-fetch").GhSpawnFn;
+  ghSpawn?: import("./adapters/github").GhSpawnFn;
   /**
    * F-17 — per-network iteration label override. Defaults to
    * `"iteration"` when absent. Plumbed through to `ApiDeps.iterationLabel`
