@@ -38,6 +38,7 @@ import {
   handleSendInput,
   IMAGE_BODY_MAX_BYTES,
 } from "./api/handlers";
+import { handleListGitLinks } from "./api/git-links";
 import type { ProcessManager } from "./session/process-manager";
 import type { SpawnFn } from "./session/endpoint-resolver";
 import { join, dirname } from "path";
@@ -386,6 +387,15 @@ async function handleApi(
       return methodNotAllowed(["GET"]);
     }
     return handleListFocusArea(db);
+  }
+
+  // G-1113.C.6 — GET /api/git/links?refs=… — batch task→PR/branch link lookup
+  // for the dashboard's PR/branch chips.
+  if (pathname === "/api/git/links") {
+    if (req.method !== "GET") {
+      return methodNotAllowed(["GET"]);
+    }
+    return handleListGitLinks(db, url);
   }
 
   if (pathname === "/api/tasks") {

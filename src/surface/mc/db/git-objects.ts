@@ -319,6 +319,19 @@ export function getPullRequest(db: Database, id: string): PullRequest | null {
   return row ? rowToPullRequest(row) : null;
 }
 
+/**
+ * G-1113.C.6 — look up a PR by its provider-native `externalId` (e.g.
+ * `owner/repo#N`). This is how a github-sourced task links to its PR until
+ * Phase D wires `PullRequest.workItemId`: the task's `source_external_id` (the
+ * canonical ref) equals the PR's `externalId`.
+ */
+export function getPullRequestByExternalId(db: Database, externalId: string): PullRequest | null {
+  const row = db
+    .query(`SELECT * FROM pull_requests WHERE external_id = ? ORDER BY id LIMIT 1`)
+    .get(externalId) as PullRequestRow | null;
+  return row ? rowToPullRequest(row) : null;
+}
+
 export function listPullRequestsForRepository(db: Database, repositoryId: string): PullRequest[] {
   const rows = db
     .query(`SELECT * FROM pull_requests WHERE repository_id = ? ORDER BY number_or_key`)

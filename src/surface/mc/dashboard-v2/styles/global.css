@@ -316,6 +316,21 @@ html, body {
 .provider-badge .dot.provider-custom { background: var(--fg-faint); }
 .title-text { vertical-align: baseline; }
 
+/* G-1113.C.6 — first-class PR + branch chips on task rows */
+.git-chips { display: inline-flex; align-items: center; gap: 6px; margin-right: 8px; }
+.git-chip {
+  font-size: 10px; line-height: 1; white-space: nowrap;
+  padding: 2px 6px; border-radius: 6px;
+  border: 1px solid var(--line-soft); color: var(--fg-dim);
+  background: var(--panel-2); text-decoration: none;
+}
+.git-chip.pr:hover { border-color: var(--line); color: var(--fg); }
+.git-chip.pr.pr-open { color: var(--a); border-color: color-mix(in oklch, var(--a) 30%, transparent); background: color-mix(in oklch, var(--a) 10%, transparent); }
+.git-chip.pr.pr-merged { color: var(--d); border-color: color-mix(in oklch, var(--d) 30%, transparent); background: color-mix(in oklch, var(--d) 10%, transparent); }
+.git-chip.pr.pr-closed { color: var(--h); border-color: color-mix(in oklch, var(--h) 30%, transparent); background: color-mix(in oklch, var(--h) 10%, transparent); }
+.git-chip.pr.pr-draft { color: var(--fg-faint); }
+.git-chip.branch { font-family: var(--mono); color: var(--fg-faint); }
+
 /* Sources view */
 .sources-view .sources-list { list-style: none; margin: 8px 0 0; padding: 0; }
 .sources-view .source-row {
