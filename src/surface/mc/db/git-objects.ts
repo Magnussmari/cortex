@@ -605,3 +605,19 @@ export function listReleasesForRepository(db: Database, repositoryId: string): R
     .all(repositoryId) as ReleaseRow[];
   return rows.map(rowToRelease);
 }
+
+/**
+ * G-1113.C.7 — most-recent releases for a repository, newest first, capped.
+ * Backs the Repositories panel's "recent releases" (vs the unbounded
+ * name-ordered list above).
+ */
+export function listRecentReleasesForRepository(
+  db: Database,
+  repositoryId: string,
+  limit = 10
+): Release[] {
+  const rows = db
+    .query(`SELECT * FROM releases WHERE repository_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`)
+    .all(repositoryId, limit) as ReleaseRow[];
+  return rows.map(rowToRelease);
+}

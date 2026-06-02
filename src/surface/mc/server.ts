@@ -39,6 +39,7 @@ import {
   IMAGE_BODY_MAX_BYTES,
 } from "./api/handlers";
 import { handleListGitLinks } from "./api/git-links";
+import { handleListRepositories } from "./api/git-repos";
 import type { ProcessManager } from "./session/process-manager";
 import type { SpawnFn } from "./session/endpoint-resolver";
 import { join, dirname } from "path";
@@ -396,6 +397,15 @@ async function handleApi(
       return methodNotAllowed(["GET"]);
     }
     return handleListGitLinks(db, url);
+  }
+
+  // G-1113.C.7 — GET /api/git/repositories — repos grouped with branches/PRs/
+  // releases for the software-mode Repositories panel.
+  if (pathname === "/api/git/repositories") {
+    if (req.method !== "GET") {
+      return methodNotAllowed(["GET"]);
+    }
+    return handleListRepositories(db);
   }
 
   if (pathname === "/api/tasks") {

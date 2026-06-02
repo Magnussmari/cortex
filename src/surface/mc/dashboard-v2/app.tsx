@@ -20,10 +20,13 @@ import { useMetrics } from "./hooks/use-metrics";
 import { useWorkingAgents } from "./hooks/use-working-agents";
 import { MetricsPanel } from "./components/metrics-panel";
 import { SourcesView } from "./components/sources-view";
+import { RepositoriesView } from "./components/repositories-view";
 import { Toast } from "./components/toast";
 import { useFocusArea } from "./hooks/use-focus-area";
 import { useTasks } from "./hooks/use-tasks";
 import { useGitLinks } from "./hooks/use-git-links";
+import { useSoftwareMode } from "./hooks/use-software-mode";
+import { useRepositories } from "./hooks/use-repositories";
 import { useTheme } from "./hooks/use-theme";
 import { useWebSocket } from "./hooks/use-websocket";
 import { ApiFailure, postJson } from "./lib/api";
@@ -46,10 +49,12 @@ import type { Command } from "./components/command-palette";
  * may upgrade to a hash route if deep-linking turns out to be
  * principal-requested; for now the in-memory view is sufficient.
  */
-type DashboardView = "default" | "metrics" | "iterations" | "sources" | "kanban-detail";
+type DashboardView = "default" | "metrics" | "iterations" | "sources" | "repositories" | "kanban-detail";
 
 export function App() {
   const { theme, toggle: toggleTheme } = useTheme();
+  // G-1113.C.7 — software mode gates the Repositories panel.
+  const { softwareMode, toggle: toggleSoftwareMode } = useSoftwareMode();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; tone?: "ok" | "error" | "info" } | null>(null);
 
@@ -82,6 +87,13 @@ export function App() {
   // returns to `iterations`).
   const [view, setView] = useState<DashboardView>("default");
   const [selectedIterationId, setSelectedIterationId] = useState<string | null>(null);
+  // G-1113.C.7 — Repositories panel data (fetched only when on its tab).
+  const repos = useRepositories(softwareMode && view === "repositories");
+  // If software mode is toggled OFF while on the Repositories view, the tab +
+  // render both gate off — reset to default so the main area isn't left blank.
+  useEffect(() => {
+    if (!softwareMode && view === "repositories") setView("default");
+  }, [softwareMode, view]);
 
   // Drill-down state — only one open at a time per F-7 Decision 9.
   const [drillId, setDrillId] = useState<string | null>(null);
@@ -200,6 +212,15 @@ export function App() {
           </span>
           <button
             type="button"
+            className={`theme-btn${softwareMode ? " active" : ""}`}
+            onClick={toggleSoftwareMode}
+            aria-pressed={softwareMode}
+            title="Toggle software mode (Repositories panel + Git objects)"
+          >
+            {softwareMode ? "◆ software" : "◇ software"}
+          </button>
+          <button
+            type="button"
             className="theme-btn"
             onClick={toggleTheme}
             aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
@@ -251,6 +272,17 @@ export function App() {
         >
           Sources
         </button>
+        {softwareMode && (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "repositories"}
+            className={`tab${view === "repositories" ? " active" : ""}`}
+            onClick={() => setView("repositories")}
+          >
+            Repositories
+          </button>
+        )}
       </nav>
 
       <main className="scaffold-main">
@@ -396,6 +428,11 @@ export function App() {
         {view === "sources" && (
           /* G-1113.B.4 — provider-neutral Sources config view. */
           <SourcesView />
+        )}
+
+        {view === "repositories" && softwareMode && (
+          /* G-1113.C.7 — per-repository software-mode panel. */
+          <RepositoriesView repositories={repos.repositories} loaded={repos.loaded} />
         )}
 
         {view === "iterations" && (
