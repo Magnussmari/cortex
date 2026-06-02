@@ -12,7 +12,8 @@
  */
 
 import type { Database } from "bun:sqlite";
-import type { AssignmentState, EndpointKind, TaskStatus } from "../types";
+import type { AssignmentState, EndpointKind, TaskStatus, SourceRef } from "../types";
+import { isProvider } from "../types";
 import { normalizeSqliteDatetime } from "./assignments";
 import { SHADOW_AGENT_ID } from "./sessions";
 import {
@@ -89,6 +90,14 @@ export interface TaskListItem {
   source_system: "github" | "internal";
   source_ref: string | null;
   source_url: string | null;
+  /**
+   * G-1113.B.2 — normalized {@link SourceRef} for this task's origin. This is
+   * the provider-neutral shape new code should read; `source_system` /
+   * `source_ref` / `source_url` above are retained for back-compat and are
+   * removed in a later slice once consumers migrate. Produced by
+   * {@link taskRowToSourceRef}.
+   */
+  source: SourceRef;
   assignments: TaskAssignmentRow[];
   /**
    * Aggregate state computed as the worst-case rank across the task's
@@ -111,6 +120,32 @@ export interface TaskListItem {
    * `TaskIterationTag` above for shape rationale.
    */
   iteration: TaskIterationTag | null;
+}
+
+/**
+ * G-1113.B.2 — map a task's legacy `source_*` columns onto a normalized
+ * {@link SourceRef}. The DB still stores `source_system` (`github` | `internal`)
+ * + `source_url` + `source_external_id` (B.2 is additive — columns and the
+ * `source_system` CHECK are unchanged; widening to new providers is B.3+). This
+ * shim is the single boundary that produces the normalized shape, so the rest
+ * of Mission Control stops branching on `source_system === "github"`.
+ *
+ * `provider` falls back to `"custom"` only if the stored value isn't a known
+ * {@link Provider} — today the CHECK guarantees `github`/`internal`, both valid
+ * providers, so the fallback is defensive. `providerNativeType` is null until a
+ * provider-specific adapter (B.3+) populates it.
+ */
+export function taskRowToSourceRef(row: {
+  source_system: string;
+  source_url: string | null;
+  source_external_id: string | null;
+}): SourceRef {
+  return {
+    provider: isProvider(row.source_system) ? row.source_system : "custom",
+    externalId: row.source_external_id,
+    url: row.source_url,
+    providerNativeType: null,
+  };
 }
 
 export interface ListTasksOptions {
@@ -419,6 +454,7 @@ function hydrate(row: TaskRow, assignments: TaskAssignmentRow[]): TaskListItem {
       ? `${row.source_system}:${row.source_external_id}`
       : null,
     source_url: row.source_url,
+    source: taskRowToSourceRef(row),
     assignments,
     aggregate_state:
       row.aggregate_state_rank === null

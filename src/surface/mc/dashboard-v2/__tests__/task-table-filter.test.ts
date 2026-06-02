@@ -34,6 +34,12 @@ function task(over: Partial<TaskListItem> = {}): TaskListItem {
     source_system: over.source_system ?? "internal",
     source_ref: over.source_ref ?? null,
     source_url: over.source_url ?? null,
+    source: over.source ?? {
+      provider: over.source_system ?? "internal",
+      externalId: null,
+      url: over.source_url ?? null,
+      providerNativeType: null,
+    },
     assignments: over.assignments ?? [],
     aggregate_state: over.aggregate_state ?? null,
     shadow_assignment_id: over.shadow_assignment_id ?? null,
