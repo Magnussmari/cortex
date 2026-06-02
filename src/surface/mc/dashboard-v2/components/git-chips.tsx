@@ -25,7 +25,7 @@ export function GitChips({ link }: GitChipsProps) {
   return (
     <span className="git-chips">
       <a
-        className={`git-chip pr ${PR_STATE_KIND[pr.state] ?? ""}`}
+        className={`git-chip pr ${PR_STATE_KIND[pr.state] ?? "pr-unknown"}`}
         href={pr.url}
         target="_blank"
         rel="noopener noreferrer"

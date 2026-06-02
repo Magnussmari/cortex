@@ -17,8 +17,12 @@ export interface GitLink {
   targetBranch: GitBranch | null;
 }
 
-/** Bound the batch — task lists are paged; this caps a pathological query string. */
-const MAX_REFS = 200;
+/**
+ * Bound the batch. Matches the task feed's page size (TASKS_QUERY_LIMIT=500 in
+ * db/tasks.ts) so every visible row can resolve its chips — while still capping
+ * a pathological query string. (If the page limit grows, raise this with it.)
+ */
+const MAX_REFS = 500;
 
 /**
  * Resolve each external ref (`owner/repo#N`) to its {@link GitLink}, or omit it

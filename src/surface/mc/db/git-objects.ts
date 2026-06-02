@@ -324,6 +324,12 @@ export function getPullRequest(db: Database, id: string): PullRequest | null {
  * `owner/repo#N`). This is how a github-sourced task links to its PR until
  * Phase D wires `PullRequest.workItemId`: the task's `source_external_id` (the
  * canonical ref) equals the PR's `externalId`.
+ *
+ * Assumes externalId is unique per PR — true today because the only writer
+ * (adapters/github ingest) derives both `id` and `externalId` from the same
+ * `owner/repo#N`, a bijection. There's no UNIQUE constraint, so if a second
+ * provider ever reuses the `owner/repo#N` shape, add an `AND provider = ?`
+ * filter before relying on this. `LIMIT 1` is the safe-today fallback.
  */
 export function getPullRequestByExternalId(db: Database, externalId: string): PullRequest | null {
   const row = db

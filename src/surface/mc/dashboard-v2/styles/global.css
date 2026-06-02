@@ -329,7 +329,11 @@ html, body {
 .git-chip.pr.pr-merged { color: var(--d); border-color: color-mix(in oklch, var(--d) 30%, transparent); background: color-mix(in oklch, var(--d) 10%, transparent); }
 .git-chip.pr.pr-closed { color: var(--h); border-color: color-mix(in oklch, var(--h) 30%, transparent); background: color-mix(in oklch, var(--h) 10%, transparent); }
 .git-chip.pr.pr-draft { color: var(--fg-faint); }
-.git-chip.branch { font-family: var(--mono); color: var(--fg-faint); }
+.git-chip.branch {
+  font-family: var(--mono); color: var(--fg-faint);
+  display: inline-block; max-width: 240px; overflow: hidden;
+  text-overflow: ellipsis; vertical-align: bottom;
+}
 
 /* Sources view */
 .sources-view .sources-list { list-style: none; margin: 8px 0 0; padding: 0; }
