@@ -1,5 +1,13 @@
 # F-12b — "Add to queue" from GitHub issue (pre-implementation addendum)
 
+> **⚠️ Historical — lifted from grove-v2.** This document predates the Cortex Mission Control Cockpit
+> redesign and describes grove-v2 architecture, module paths, or naming that no longer match current
+> Cortex. It is retained for design lineage and rationale, **not** as current reference. For the
+> canonical cockpit design and vocabulary see
+> [`design-mission-control-cortex-cockpit.md`](./design-mission-control-cortex-cockpit.md) and
+> [`glossary-mission-control.md`](./glossary-mission-control.md) (tracked under
+> [G-1113](https://github.com/the-metafactory/cortex/issues/354)).
+
 <!-- lifted-from-grove-v2-at-MIG-7.11 -->
 <!-- Original location: github.com/the-metafactory/grove-v2 docs/design-mc-f12b-add-to-queue.md -->
 <!-- Lifted: 2026-05-11 — historical references to grove/grove-v2 retained for provenance. -->
