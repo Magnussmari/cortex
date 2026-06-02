@@ -18,6 +18,10 @@ export const TABLE_NAMES = [
   "git_tags",
   "pull_requests",
   "reviews",
+  "checks",
+  "deployments",
+  "artifacts",
+  "releases",
 ] as const;
 
 export const SCHEMA_SQL: string[] = [
@@ -299,6 +303,70 @@ export const SCHEMA_SQL: string[] = [
      ON pull_requests(work_item_id)`,
   `CREATE INDEX IF NOT EXISTS idx_reviews_pull_request
      ON reviews(pull_request_id)`,
+
+  // --- checks / builds (G-1113.C.4 — §3.8 "check / status check" + "build") ---
+  // One entity, `kind` distinguishes; state CHECK-constrained; provider
+  // app-validated via isProvider (no CHECK); FK → repo ON DELETE RESTRICT.
+  `CREATE TABLE IF NOT EXISTS checks (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    commit_sha TEXT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'check' CHECK(kind IN ('check','build')),
+    state TEXT NOT NULL DEFAULT 'pending'
+      CHECK(state IN ('pending','success','failure','error','neutral','cancelled')),
+    provider TEXT NOT NULL,
+    url TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // --- deployments (G-1113.C.4) ---
+  `CREATE TABLE IF NOT EXISTS deployments (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    environment TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending'
+      CHECK(state IN ('pending','in_progress','success','failure','inactive')),
+    provider TEXT NOT NULL,
+    url TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // --- artifacts (G-1113.C.4) ---
+  `CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    url TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // --- releases (G-1113.C.4 — design §6) ---
+  // repository_id is NULLABLE per §6 (FK still holds when present; NULL skips
+  // the check). state CHECK-constrained.
+  `CREATE TABLE IF NOT EXISTS releases (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT REFERENCES git_repositories(id) ON DELETE RESTRICT,
+    provider TEXT NOT NULL,
+    external_id TEXT,
+    name TEXT NOT NULL,
+    tag_name TEXT,
+    url TEXT,
+    state TEXT NOT NULL DEFAULT 'draft'
+      CHECK(state IN ('draft','published','failed','archived')),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  // lookups by repository
+  `CREATE INDEX IF NOT EXISTS idx_checks_repository ON checks(repository_id, commit_sha)`,
+  `CREATE INDEX IF NOT EXISTS idx_deployments_repository ON deployments(repository_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_artifacts_repository ON artifacts(repository_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_releases_repository ON releases(repository_id)`,
 ];
 
 /**
