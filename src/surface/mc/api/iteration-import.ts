@@ -41,7 +41,7 @@ import {
   type IterationRow,
 } from "../db/iterations";
 import { generateId } from "../db/events";
-import { canonicalRef, type GitHubRef } from "./github-ref";
+import { canonicalRef, type GitHubRef } from "../adapters/github";
 
 // ---------------------------------------------------------------------------
 // Configuration

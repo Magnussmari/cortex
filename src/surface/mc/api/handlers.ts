@@ -78,14 +78,14 @@ import {
   isParseError,
   type GitHubRef,
   type ParseDefaults,
-} from "./github-ref";
+} from "../adapters/github";
 import {
   fetchIssueOrPr,
   excerpt,
   isGitHubFetchError,
   type GhSpawnFn,
   type GitHubFetchError,
-} from "./github-fetch";
+} from "../adapters/github";
 import {
   DEFAULT_ITERATION_LABEL,
   importIterationFromMetadata,

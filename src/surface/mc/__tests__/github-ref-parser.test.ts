@@ -12,7 +12,7 @@ import {
   canonicalUrl,
   isParseError,
   type GitHubRef,
-} from "../api/github-ref";
+} from "../adapters/github";
 
 function ok(x: GitHubRef | { error: string }): GitHubRef {
   if (isParseError(x)) {
