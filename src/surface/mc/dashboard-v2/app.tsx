@@ -23,6 +23,7 @@ import { SourcesView } from "./components/sources-view";
 import { Toast } from "./components/toast";
 import { useFocusArea } from "./hooks/use-focus-area";
 import { useTasks } from "./hooks/use-tasks";
+import { useGitLinks } from "./hooks/use-git-links";
 import { useTheme } from "./hooks/use-theme";
 import { useWebSocket } from "./hooks/use-websocket";
 import { ApiFailure, postJson } from "./lib/api";
@@ -60,6 +61,17 @@ export function App() {
   const tasks = useTasks(ws);
   const working = useWorkingAgents(ws);
   const iterations = useIterations(ws);
+
+  // G-1113.C.6 — batch-fetch PR/branch links for the visible github-sourced
+  // tasks so each row can render first-class chips.
+  const gitRefs = useMemo(
+    () =>
+      tasks.visible
+        .filter((t) => t.source.provider === "github" && t.source.externalId)
+        .map((t) => t.source.externalId as string),
+    [tasks.visible]
+  );
+  const gitLinks = useGitLinks(gitRefs);
   const metrics = useMetrics(ws);
   const [focusSelectedIdx, setFocusSelectedIdx] = useState<number>(-1);
 
@@ -280,6 +292,7 @@ export function App() {
               visible={tasks.visible}
               loaded={tasks.loaded}
               error={tasks.error}
+              gitLinks={gitLinks}
               filters={tasks.filters}
               sort={tasks.sort}
               onTogglePriority={tasks.togglePriority}

@@ -20,6 +20,8 @@ import { AddTaskModal } from "./add-task-modal";
 import { DispatchButton } from "./dispatch-button";
 import { Pill } from "./pill";
 import { ProviderBadge } from "./provider-badge";
+import { GitChips } from "./git-chips";
+import type { GitLink } from "../../api/git-links";
 import { DEFAULT_AGENT_DISPLAY_NAME } from "../lib/agent-defaults";
 import {
   chipPillKind,
@@ -123,6 +125,13 @@ export interface TaskTableProps {
   dispatchingTaskIds?: ReadonlySet<string>;
   /** Display name for the agent that will receive the dispatch. Default "Default Agent". */
   dispatchAgentLabel?: string;
+
+  /**
+   * G-1113.C.6 — task → PR/branch links keyed by the task's source ref
+   * (`task.source.externalId`). Rows with a match render PR + branch chips.
+   * Optional; absent map = no chips (table works unchanged).
+   */
+  gitLinks?: Record<string, GitLink>;
 }
 
 export function TaskTable(props: TaskTableProps) {
@@ -136,6 +145,7 @@ export function TaskTable(props: TaskTableProps) {
     onDispatch,
     dispatchingTaskIds,
     dispatchAgentLabel,
+    gitLinks,
   } = props;
 
   const [focusedRowIdx, setFocusedRowIdx] = useState(-1);
@@ -279,6 +289,7 @@ export function TaskTable(props: TaskTableProps) {
                 {...(onDispatch ? { onDispatch } : {})}
                 dispatching={dispatchingTaskIds?.has(t.id) ?? false}
                 dispatchAgentLabel={dispatchAgentLabel ?? DEFAULT_AGENT_DISPLAY_NAME}
+                gitLink={t.source.externalId ? gitLinks?.[t.source.externalId] : undefined}
               />
             ))}
           </tbody>
@@ -320,6 +331,7 @@ function TaskRow({
   onDispatch,
   dispatching,
   dispatchAgentLabel,
+  gitLink,
 }: {
   task: TaskListItem;
   focused: boolean;
@@ -328,6 +340,7 @@ function TaskRow({
   onDispatch?: (task: TaskListItem) => void;
   dispatching: boolean;
   dispatchAgentLabel: string;
+  gitLink?: GitLink;
 }) {
   const closed = task.status === "done" || task.status === "cancelled";
   const cls = [
@@ -366,6 +379,7 @@ function TaskRow({
       </td>
       <td className="title">
         <ProviderBadge provider={task.source.provider} />
+        {gitLink ? <GitChips link={gitLink} /> : null}
         <span className="title-text">{task.title}</span>
       </td>
       <td className="iteration">

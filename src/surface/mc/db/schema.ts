@@ -301,6 +301,9 @@ export const SCHEMA_SQL: string[] = [
      ON pull_requests(repository_id)`,
   `CREATE INDEX IF NOT EXISTS idx_pull_requests_work_item
      ON pull_requests(work_item_id)`,
+  // C.6 — task→PR link lookup is keyed by external_id (the canonical ref).
+  `CREATE INDEX IF NOT EXISTS idx_pull_requests_external_id
+     ON pull_requests(external_id)`,
   `CREATE INDEX IF NOT EXISTS idx_reviews_pull_request
      ON reviews(pull_request_id)`,
 
