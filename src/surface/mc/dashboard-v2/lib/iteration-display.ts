@@ -22,7 +22,7 @@
 
 import type { TaskIterationTag, TaskListItem } from "../../db/tasks";
 import { ITERATION_STATES, type IterationState } from "../../db/iterations";
-import { isProvider } from "../../types";
+import { isSourceRef } from "../../types";
 
 /** Visual truncation cap. Mirrors the F-8 column width budget. */
 export const ITERATION_TITLE_MAX_CHARS = 20;
@@ -206,12 +206,7 @@ export function validateTaskUpdatedPayload(raw: unknown): TaskListItem | null {
   // G-1113.B.4 — `source` (SourceRef) is now a required field a renderer reads
   // (the provider badge). Guard its shape so a malformed source-less broadcast
   // can't land in the cache with `source === undefined` despite the TS cast.
-  const src = t.source;
-  if (!src || typeof src !== "object") return null;
-  const s = src as Record<string, unknown>;
-  if (!isProvider(s.provider)) return null;
-  for (const f of ["externalId", "url", "providerNativeType"] as const) {
-    if (s[f] !== null && typeof s[f] !== "string") return null;
-  }
+  // B.5 — reuse the canonical SourceRef guard (single source of truth).
+  if (!isSourceRef(t.source)) return null;
   return raw as TaskListItem;
 }
