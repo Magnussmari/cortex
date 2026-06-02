@@ -40,7 +40,7 @@ export interface ProviderBadgeProps {
 export function ProviderBadge({ provider }: ProviderBadgeProps) {
   const meta = providerMeta(provider);
   return (
-    <span className="provider-badge" title={`Source: ${meta.label}`}>
+    <span className="provider-badge" title="Source">
       <span className={`dot provider-${provider}`} aria-hidden="true" />
       <span className="provider-label">{meta.label}</span>
     </span>

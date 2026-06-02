@@ -312,6 +312,7 @@ describe("validateTaskUpdatedPayload", () => {
         id: "t-1",
         title: "T",
         iteration: { id: "it-1", title: 42, state: "designing" },
+        source: SRC,
       })
     ).toBeNull();
   });
@@ -322,6 +323,7 @@ describe("validateTaskUpdatedPayload", () => {
         id: "t-1",
         title: "T",
         iteration: { id: "it-1", title: "Alpha", state: "bogus" },
+        source: SRC,
       })
     ).toBeNull();
   });
