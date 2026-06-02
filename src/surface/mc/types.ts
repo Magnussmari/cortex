@@ -117,6 +117,22 @@ export interface SourceRef {
   providerNativeType: string | null;
 }
 
+/**
+ * Runtime guard for {@link SourceRef} — the parity contract every provider
+ * adapter (G-1113.B.3+) must satisfy: `provider` is a known {@link Provider}
+ * and `externalId` / `url` / `providerNativeType` are each `string | null`.
+ * Narrows untrusted input (wire frames, fixtures, future adapter output).
+ */
+export function isSourceRef(value: unknown): value is SourceRef {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  if (!isProvider(v.provider)) return false;
+  for (const field of ["externalId", "url", "providerNativeType"] as const) {
+    if (v[field] !== null && typeof v[field] !== "string") return false;
+  }
+  return true;
+}
+
 export interface Task {
   id: string;
   title: string;
