@@ -360,6 +360,10 @@ CARVEOUT_LINE_PATTERNS=(
   'grove-v2'
   'grove-dashboard'
   'grove-bot'
+  # Historical grove-v2 doc filename whose NAME carries the legacy term; the
+  # file itself is bannered/path-allowlisted. Bare references to it (e.g. the
+  # G-1113 plan's banner-target list) are filename citations, not vocab usage.
+  'design-dm-operator-channel'
   # (6) platform-bot contexts.
   'trustedBotIds'
   'botUserId'
