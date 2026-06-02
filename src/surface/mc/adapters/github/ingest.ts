@@ -48,8 +48,10 @@ export function githubRepositoryFromRef(ref: GitHubRef): GitRepository {
 
 function prState(detail: GitHubPullRequestDetail): PullRequestState {
   if (detail.merged) return "merged";
-  if (detail.draft) return "draft";
+  // closed before draft: a closed (unmerged) PR is "closed" even if it was a
+  // draft — draft only describes an OPEN PR.
   if (detail.state === "closed") return "closed";
+  if (detail.draft) return "draft";
   return "open";
 }
 
@@ -65,7 +67,18 @@ export interface GithubPrModel {
 export function buildGithubPrModel(ref: GitHubRef, detail: GitHubPullRequestDetail): GithubPrModel {
   const rid = repoId(ref.owner, ref.repo);
   const web = repoWebUrl(ref.owner, ref.repo);
-  const mkBranch = (name: string, headSha: string | null): GitBranch => ({
+  // Cross-fork limitation: for a fork PR the source branch lives in the
+  // contributor's fork (headRepoFullName !== base), not the base repo. We use
+  // the fork's web base for the source-branch URL so the link resolves, but the
+  // branch id/repositoryId stay base-namespaced (persisting the fork as its own
+  // GitRepository is deferred to C.5b #571). Same-repo PRs (the metafactory
+  // norm) are fully faithful.
+  const baseFullName = `${ref.owner}/${ref.repo}`;
+  const headWeb =
+    detail.headRepoFullName && detail.headRepoFullName !== baseFullName
+      ? `https://github.com/${detail.headRepoFullName}`
+      : web;
+  const mkBranch = (name: string, headSha: string | null, webBase: string): GitBranch => ({
     id: `${rid}@${name}`,
     repositoryId: rid,
     name,
@@ -73,12 +86,12 @@ export function buildGithubPrModel(ref: GitHubRef, detail: GitHubPullRequestDeta
     headSha,
     provider: PROVIDER,
     externalId: null,
-    url: `${web}/tree/${name}`,
+    url: `${webBase}/tree/${name}`,
   });
   return {
     repository: githubRepositoryFromRef(ref),
-    sourceBranch: mkBranch(detail.headRef, detail.headSha),
-    targetBranch: mkBranch(detail.baseRef, null),
+    sourceBranch: mkBranch(detail.headRef, detail.headSha, headWeb),
+    targetBranch: mkBranch(detail.baseRef, null, web),
     headCommit: {
       id: `${rid}@${detail.headSha}`,
       repositoryId: rid,
@@ -115,11 +128,15 @@ export function buildGithubPrModel(ref: GitHubRef, detail: GitHubPullRequestDeta
  * (all FK → repository ON DELETE RESTRICT). Idempotent (all upserts by id).
  */
 export function persistGithubPrModel(db: Database, model: GithubPrModel): void {
-  upsertRepository(db, model.repository);
-  upsertBranch(db, model.sourceBranch);
-  upsertBranch(db, model.targetBranch);
-  upsertCommit(db, model.headCommit);
-  upsertPullRequest(db, model.pullRequest);
+  // One transaction so repo+branches+commit+PR land atomically — no partial
+  // model if a later upsert throws (matches the task-insert tx in handleCreateTask).
+  db.transaction(() => {
+    upsertRepository(db, model.repository);
+    upsertBranch(db, model.sourceBranch);
+    upsertBranch(db, model.targetBranch);
+    upsertCommit(db, model.headCommit);
+    upsertPullRequest(db, model.pullRequest);
+  })();
 }
 
 /** Persist just the repository (for issue-type tasks — no PR detail). */

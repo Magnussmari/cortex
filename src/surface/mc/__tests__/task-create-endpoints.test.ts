@@ -32,6 +32,7 @@ import { initDatabase } from "../db/init";
 import { DEFAULT_CONFIG } from "../config";
 import { ProcessManager } from "../session/process-manager";
 import type { GhSpawnFn } from "../adapters/github";
+import { getRepository, getBranch, getCommit, getPullRequest } from "../db/git-objects";
 import { SHADOW_AGENT_ID } from "../db/sessions";
 
 interface CannedResponse {
@@ -406,6 +407,49 @@ describe("POST /api/tasks", () => {
       "https://github.com/the-metafactory/grove-v2/issues/42"
     );
     expect(payload.type).toBe("issue");
+  });
+
+  it("G-1113.C.5 — a PR-ref create populates the software-mode Git model (repo+PR+branches+commit)", async () => {
+    // First gh call: fetchIssueOrPr (runPreviewFlow) → PR body.
+    t.gh.push({ exitCode: 0, stdout: HAPPY_PR_BODY, stderr: "" });
+    // Second gh call: fetchPullRequest (/pulls) → head/base/sha. Pinning that
+    // the create path makes exactly this second call, in this order.
+    t.gh.push({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        state: "open",
+        merged: false,
+        draft: false,
+        title: "Refactor session manager",
+        html_url: "https://github.com/the-metafactory/grove-v2/pull/45",
+        number: 45,
+        head: { ref: "feat/session-mgr", sha: "abc1234def", repo: { full_name: "the-metafactory/grove-v2" } },
+        base: { ref: "main" },
+      }),
+      stderr: "",
+    });
+
+    const res = await fetch(`${t.baseUrl}/api/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ref: "the-metafactory/grove-v2#45", priority: 2 }),
+    });
+    expect(res.status).toBe(201);
+
+    const rid = "github:the-metafactory/grove-v2";
+    expect(getRepository(t.db, rid)).not.toBeNull();
+    const pr = getPullRequest(t.db, `${rid}#45`);
+    expect(pr).toMatchObject({
+      repositoryId: rid,
+      numberOrKey: "45",
+      sourceBranch: "feat/session-mgr",
+      targetBranch: "main",
+      state: "open",
+      providerNativeType: "pull_request",
+    });
+    expect(getBranch(t.db, `${rid}@feat/session-mgr`)).toMatchObject({ headSha: "abc1234def" });
+    expect(getBranch(t.db, `${rid}@main`)).not.toBeNull();
+    expect(getCommit(t.db, `${rid}@abc1234def`)).toMatchObject({ sha: "abc1234def" });
   });
 
   it("uses titleOverride when provided", async () => {

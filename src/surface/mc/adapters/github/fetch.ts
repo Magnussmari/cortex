@@ -296,6 +296,8 @@ export interface GitHubPullRequestDetail {
   headRef: string;
   baseRef: string;
   headSha: string;
+  /** Head repo `owner/name` — differs from the base repo for fork PRs; null when absent. */
+  headRepoFullName: string | null;
 }
 
 interface RawGithubPull {
@@ -305,7 +307,7 @@ interface RawGithubPull {
   title?: string;
   html_url?: string;
   number?: number;
-  head?: { ref?: string; sha?: string } | null;
+  head?: { ref?: string; sha?: string; repo?: { full_name?: string } | null } | null;
   base?: { ref?: string } | null;
 }
 
@@ -435,6 +437,10 @@ export async function fetchPullRequest(
     headRef: raw.head.ref,
     baseRef: raw.base.ref,
     headSha: raw.head.sha,
+    headRepoFullName:
+      raw.head.repo && typeof raw.head.repo.full_name === "string"
+        ? raw.head.repo.full_name
+        : null,
   };
 }
 

@@ -34,6 +34,7 @@ const DETAIL: GitHubPullRequestDetail = {
   headRef: "feat/g-1113-c-5-github-ingest",
   baseRef: "main",
   headSha: "abcdef1234567890",
+  headRepoFullName: "the-metafactory/cortex",
 };
 
 // Fake gh spawn returning a fixed stdout/exitCode (mirrors task-create-endpoints).
@@ -123,13 +124,14 @@ describe("github ingest (C.5)", () => {
     const ghJson = JSON.stringify({
       state: "open", merged: false, draft: true, title: "T",
       html_url: "https://github.com/o/r/pull/9", number: 9,
-      head: { ref: "feat", sha: "deadbeef" }, base: { ref: "main" },
+      head: { ref: "feat", sha: "deadbeef", repo: { full_name: "o/r" } }, base: { ref: "main" },
     });
     const res = await fetchPullRequest({ owner: "o", repo: "r", number: 9 }, { spawn: makeSpawn(0, ghJson) });
     expect(res).toEqual({
       state: "open", merged: false, draft: true, title: "T",
       html_url: "https://github.com/o/r/pull/9", number: 9,
       headRef: "feat", baseRef: "main", headSha: "deadbeef",
+      headRepoFullName: "o/r",
     });
   });
 
