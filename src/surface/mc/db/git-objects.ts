@@ -18,6 +18,14 @@ import type {
   PullRequestReviewState,
   Review,
   ReviewState,
+  Check,
+  CheckKind,
+  CheckState,
+  Deployment,
+  DeploymentState,
+  Artifact,
+  Release,
+  ReleaseState,
 } from "../types";
 import { isProvider } from "../types";
 
@@ -363,4 +371,218 @@ export function listReviewsForPullRequest(db: Database, pullRequestId: string): 
     .query(`SELECT * FROM reviews WHERE pull_request_id = ? ORDER BY id`)
     .all(pullRequestId) as ReviewRow[];
   return rows.map(rowToReview);
+}
+
+// --- checks/builds (G-1113.C.4) ---
+
+interface CheckRow {
+  id: string;
+  repository_id: string;
+  commit_sha: string | null;
+  name: string;
+  kind: string;
+  state: string;
+  provider: string;
+  url: string | null;
+}
+
+function rowToCheck(r: CheckRow): Check {
+  return {
+    id: r.id,
+    repositoryId: r.repository_id,
+    commitSha: r.commit_sha,
+    name: r.name,
+    kind: r.kind as CheckKind, // CHECK-constrained
+    state: r.state as CheckState, // CHECK-constrained
+    provider: isProvider(r.provider) ? r.provider : "custom",
+    url: r.url,
+  };
+}
+
+/** Insert or update a check/build by id (idempotent re-ingestion). */
+export function upsertCheck(db: Database, check: Check): void {
+  db.query(
+    `INSERT INTO checks (id, repository_id, commit_sha, name, kind, state, provider, url)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       repository_id = excluded.repository_id,
+       commit_sha = excluded.commit_sha,
+       name = excluded.name,
+       kind = excluded.kind,
+       state = excluded.state,
+       provider = excluded.provider,
+       url = excluded.url,
+       updated_at = unixepoch()`
+  ).run(check.id, check.repositoryId, check.commitSha, check.name, check.kind, check.state, check.provider, check.url);
+}
+
+export function getCheck(db: Database, id: string): Check | null {
+  const row = db.query(`SELECT * FROM checks WHERE id = ?`).get(id) as CheckRow | null;
+  return row ? rowToCheck(row) : null;
+}
+
+export function listChecksForRepository(db: Database, repositoryId: string): Check[] {
+  const rows = db
+    .query(`SELECT * FROM checks WHERE repository_id = ? ORDER BY name`)
+    .all(repositoryId) as CheckRow[];
+  return rows.map(rowToCheck);
+}
+
+// --- deployments (G-1113.C.4) ---
+
+interface DeploymentRow {
+  id: string;
+  repository_id: string;
+  environment: string;
+  state: string;
+  provider: string;
+  url: string | null;
+}
+
+function rowToDeployment(r: DeploymentRow): Deployment {
+  return {
+    id: r.id,
+    repositoryId: r.repository_id,
+    environment: r.environment,
+    state: r.state as DeploymentState, // CHECK-constrained
+    provider: isProvider(r.provider) ? r.provider : "custom",
+    url: r.url,
+  };
+}
+
+/** Insert or update a deployment by id (idempotent re-ingestion). */
+export function upsertDeployment(db: Database, dep: Deployment): void {
+  db.query(
+    `INSERT INTO deployments (id, repository_id, environment, state, provider, url)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       repository_id = excluded.repository_id,
+       environment = excluded.environment,
+       state = excluded.state,
+       provider = excluded.provider,
+       url = excluded.url,
+       updated_at = unixepoch()`
+  ).run(dep.id, dep.repositoryId, dep.environment, dep.state, dep.provider, dep.url);
+}
+
+export function getDeployment(db: Database, id: string): Deployment | null {
+  const row = db.query(`SELECT * FROM deployments WHERE id = ?`).get(id) as DeploymentRow | null;
+  return row ? rowToDeployment(row) : null;
+}
+
+export function listDeploymentsForRepository(db: Database, repositoryId: string): Deployment[] {
+  const rows = db
+    .query(`SELECT * FROM deployments WHERE repository_id = ? ORDER BY environment`)
+    .all(repositoryId) as DeploymentRow[];
+  return rows.map(rowToDeployment);
+}
+
+// --- artifacts (G-1113.C.4) ---
+
+interface ArtifactRow {
+  id: string;
+  repository_id: string;
+  name: string;
+  provider: string;
+  url: string | null;
+}
+
+function rowToArtifact(r: ArtifactRow): Artifact {
+  return {
+    id: r.id,
+    repositoryId: r.repository_id,
+    name: r.name,
+    provider: isProvider(r.provider) ? r.provider : "custom",
+    url: r.url,
+  };
+}
+
+/** Insert or update an artifact by id (idempotent re-ingestion). */
+export function upsertArtifact(db: Database, artifact: Artifact): void {
+  db.query(
+    `INSERT INTO artifacts (id, repository_id, name, provider, url)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       repository_id = excluded.repository_id,
+       name = excluded.name,
+       provider = excluded.provider,
+       url = excluded.url,
+       updated_at = unixepoch()`
+  ).run(artifact.id, artifact.repositoryId, artifact.name, artifact.provider, artifact.url);
+}
+
+export function getArtifact(db: Database, id: string): Artifact | null {
+  const row = db.query(`SELECT * FROM artifacts WHERE id = ?`).get(id) as ArtifactRow | null;
+  return row ? rowToArtifact(row) : null;
+}
+
+export function listArtifactsForRepository(db: Database, repositoryId: string): Artifact[] {
+  const rows = db
+    .query(`SELECT * FROM artifacts WHERE repository_id = ? ORDER BY name`)
+    .all(repositoryId) as ArtifactRow[];
+  return rows.map(rowToArtifact);
+}
+
+// --- releases (G-1113.C.4 — design §6) ---
+
+interface ReleaseRow {
+  id: string;
+  repository_id: string | null;
+  provider: string;
+  external_id: string | null;
+  name: string;
+  tag_name: string | null;
+  url: string | null;
+  state: string;
+}
+
+function rowToRelease(r: ReleaseRow): Release {
+  return {
+    id: r.id,
+    repositoryId: r.repository_id,
+    provider: isProvider(r.provider) ? r.provider : "custom",
+    externalId: r.external_id,
+    name: r.name,
+    tagName: r.tag_name,
+    url: r.url,
+    state: r.state as ReleaseState, // CHECK-constrained
+  };
+}
+
+/** Insert or update a release by id (idempotent re-ingestion). */
+export function upsertRelease(db: Database, release: Release): void {
+  db.query(
+    `INSERT INTO releases (id, repository_id, provider, external_id, name, tag_name, url, state)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       repository_id = excluded.repository_id,
+       provider = excluded.provider,
+       external_id = excluded.external_id,
+       name = excluded.name,
+       tag_name = excluded.tag_name,
+       url = excluded.url,
+       state = excluded.state,
+       updated_at = unixepoch()`
+  ).run(
+    release.id,
+    release.repositoryId,
+    release.provider,
+    release.externalId,
+    release.name,
+    release.tagName,
+    release.url,
+    release.state
+  );
+}
+
+export function getRelease(db: Database, id: string): Release | null {
+  const row = db.query(`SELECT * FROM releases WHERE id = ?`).get(id) as ReleaseRow | null;
+  return row ? rowToRelease(row) : null;
+}
+
+export function listReleasesForRepository(db: Database, repositoryId: string): Release[] {
+  const rows = db
+    .query(`SELECT * FROM releases WHERE repository_id = ? ORDER BY name`)
+    .all(repositoryId) as ReleaseRow[];
+  return rows.map(rowToRelease);
 }

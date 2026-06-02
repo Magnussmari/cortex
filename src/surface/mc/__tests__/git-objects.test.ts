@@ -25,8 +25,31 @@ import {
   upsertReview,
   getReview,
   listReviewsForPullRequest,
+  upsertCheck,
+  getCheck,
+  listChecksForRepository,
+  upsertDeployment,
+  getDeployment,
+  listDeploymentsForRepository,
+  upsertArtifact,
+  getArtifact,
+  listArtifactsForRepository,
+  upsertRelease,
+  getRelease,
+  listReleasesForRepository,
 } from "../db/git-objects";
-import type { GitRepository, GitBranch, GitCommit, GitTag, PullRequest, Review } from "../types";
+import type {
+  GitRepository,
+  GitBranch,
+  GitCommit,
+  GitTag,
+  PullRequest,
+  Review,
+  Check,
+  Deployment,
+  Artifact,
+  Release,
+} from "../types";
 
 describe("git-objects storage (C.1)", () => {
   const paths: string[] = [];
@@ -213,5 +236,83 @@ describe("git-objects storage (C.1)", () => {
     upsertRepository(db, repo);
     expect(() => upsertPullRequest(db, { ...pr, repositoryId: "ghost" })).toThrow();
     expect(() => upsertReview(db, { ...review, pullRequestId: "ghost-pr" })).toThrow();
+  });
+
+  // --- C.4: checks / deployments / artifacts / releases ---
+
+  const check: Check = {
+    id: "check-1",
+    repositoryId: "repo-1",
+    commitSha: "abc1234def",
+    name: "Typecheck",
+    kind: "check",
+    state: "success",
+    provider: "github",
+    url: "https://github.com/the-metafactory/cortex/runs/1",
+  };
+  const deployment: Deployment = {
+    id: "deploy-1",
+    repositoryId: "repo-1",
+    environment: "production",
+    state: "success",
+    provider: "github",
+    url: "https://github.com/the-metafactory/cortex/deployments/1",
+  };
+  const artifact: Artifact = {
+    id: "artifact-1",
+    repositoryId: "repo-1",
+    name: "dashboard-bundle.js",
+    provider: "github",
+    url: null,
+  };
+  const release: Release = {
+    id: "release-1",
+    repositoryId: "repo-1",
+    provider: "github",
+    externalId: "rel-99",
+    name: "Cortex v3.1.0",
+    tagName: "v3.1.0",
+    url: "https://github.com/the-metafactory/cortex/releases/tag/v3.1.0",
+    state: "published",
+  };
+
+  it("round-trips check / deployment / artifact / release + idempotent update", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    upsertCheck(db, check);
+    upsertDeployment(db, deployment);
+    upsertArtifact(db, artifact);
+    upsertRelease(db, release);
+    expect(getCheck(db, "check-1")).toEqual(check);
+    expect(getDeployment(db, "deploy-1")).toEqual(deployment);
+    expect(getArtifact(db, "artifact-1")).toEqual(artifact);
+    expect(getRelease(db, "release-1")).toEqual(release);
+    expect(listChecksForRepository(db, "repo-1")).toEqual([check]);
+    expect(listDeploymentsForRepository(db, "repo-1")).toEqual([deployment]);
+    expect(listArtifactsForRepository(db, "repo-1")).toEqual([artifact]);
+    expect(listReleasesForRepository(db, "repo-1")).toEqual([release]);
+    upsertCheck(db, { ...check, state: "failure", kind: "build" });
+    expect(getCheck(db, "check-1")).toEqual({ ...check, state: "failure", kind: "build" });
+    expect(listChecksForRepository(db, "repo-1")).toHaveLength(1);
+  });
+
+  it("CHECK constraints reject out-of-vocabulary enums", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    expect(() => upsertCheck(db, { ...check, kind: "bogus" as Check["kind"] })).toThrow();
+    expect(() => upsertCheck(db, { ...check, state: "bogus" as Check["state"] })).toThrow();
+    expect(() => upsertDeployment(db, { ...deployment, state: "bogus" as Deployment["state"] })).toThrow();
+    expect(() => upsertRelease(db, { ...release, state: "bogus" as Release["state"] })).toThrow();
+  });
+
+  it("check/deployment/artifact FKs enforced; release accepts null repositoryId", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    expect(() => upsertCheck(db, { ...check, repositoryId: "ghost" })).toThrow();
+    expect(() => upsertDeployment(db, { ...deployment, repositoryId: "ghost" })).toThrow();
+    expect(() => upsertArtifact(db, { ...artifact, repositoryId: "ghost" })).toThrow();
+    // Release.repositoryId is nullable per §6 — null skips the FK check.
+    upsertRelease(db, { ...release, id: "release-2", repositoryId: null });
+    expect(getRelease(db, "release-2")).toEqual({ ...release, id: "release-2", repositoryId: null });
   });
 });
