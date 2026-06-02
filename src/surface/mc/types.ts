@@ -133,6 +133,36 @@ export function isSourceRef(value: unknown): value is SourceRef {
   return true;
 }
 
+// --- Software-mode Git objects (G-1113.C — design §3.8 / §6) ---
+//
+// First-class Git nouns, provider-abstracted (the Git concept is concrete; the
+// provider rides as a field). C.1 lands GitRepository + GitBranch (types +
+// storage); commits/tags (C.2), PRs/reviews (C.3), checks/deployments/artifacts
+// (C.4) follow. Ingestion from the GitHub adapter is C.5; UI is C.6/C.7.
+
+export interface GitRepository {
+  id: string;
+  provider: Provider;
+  /** Owner / org / group segment, when the provider has one. */
+  owner: string | null;
+  name: string;
+  url: string | null;
+  defaultBranch: string | null;
+}
+
+export interface GitBranch {
+  id: string;
+  repositoryId: string;
+  name: string;
+  /** The ref this branch is based on (e.g. the PR's base), when known. */
+  baseRef: string | null;
+  /** Head commit SHA, when known. */
+  headSha: string | null;
+  provider: Provider;
+  externalId: string | null;
+  url: string | null;
+}
+
 export interface Task {
   id: string;
   title: string;
