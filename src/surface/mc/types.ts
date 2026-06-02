@@ -206,7 +206,8 @@ export interface PullRequest {
   workItemId: string | null;
   repositoryId: string;
   provider: Provider;
-  providerNativeType: "pull_request" | "merge_request" | string;
+  /** Provider-native label, e.g. `"pull_request"` (GitHub) or `"merge_request"` (GitLab). */
+  providerNativeType: string;
   externalId: string;
   numberOrKey: string;
   title: string;
