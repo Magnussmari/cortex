@@ -7,6 +7,14 @@
 import { test, expect } from "bun:test";
 import { PROVIDERS, isProvider, type Provider, type SourceRef, type TaskSourceSystem } from "../types";
 
+// Compile-time invariant: every legacy TaskSourceSystem member MUST be a
+// Provider. If someone adds a TaskSourceSystem member without adding it to
+// PROVIDERS, this line fails `tsc` — the superset relationship is enforced by
+// the type-checker, not by remembering to extend the runtime array below.
+type _AssertSourceSystemSubsetOfProvider = TaskSourceSystem extends Provider ? true : never;
+const _sourceSystemIsProviderSubset: _AssertSourceSystemSubsetOfProvider = true;
+void _sourceSystemIsProviderSubset;
+
 test("PROVIDERS lists the expected members", () => {
   expect([...PROVIDERS]).toEqual([
     "internal",

@@ -107,7 +107,13 @@ export interface SourceRef {
   externalId: string | null;
   /** Canonical URL to the backing object, when one exists. */
   url: string | null;
-  /** Provider-native object label preserved on the normalized concept. Null when not applicable. */
+  /**
+   * Provider-native object label preserved on the normalized concept
+   * (e.g. `"issue"`, `"pull_request"`, `"merge_request"`). Null when not
+   * applicable. Deliberately an opaque `string` at the source boundary — the
+   * typed literal union (`"pull_request" | "merge_request" | …`) lives on the
+   * Phase-C `PullRequest` Git concept, not here; don't narrow it in B.2/C.
+   */
   providerNativeType: string | null;
 }
 
