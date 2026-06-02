@@ -187,6 +187,14 @@ ALLOWLIST_PATHS=(
   # Policy converter — emits + reads the legacy `operator:` block and the
   # reserved `operator` role/capability literal. Sibling to migrate-config-lib.
   'src/cli/cortex/commands/migrate-config-policy.ts'
+  # normalize-config — names the legacy key it renames FROM (`home_operator`)
+  # in the UNAMBIGUOUS_RENAME_MAP and in the AMBIGUOUS_KEY_WARNINGS list. Same
+  # class as migrate-config-lib.ts: a migration tool that NAMES the deprecated
+  # terms in order to rename/detect them. RETIRE: with normalize-config removal.
+  'src/cli/cortex/commands/normalize-config.ts'
+  'src/cli/cortex/commands/__tests__/normalize-config.test.ts'
+  # (normalize-config's fixture needs no entry — the dir-level
+  # `__tests__/fixtures/` allowlist above already covers it.)
   # IAW design/plan docs — #510-owned (refreshed); residual hits are
   # code-identifier mentions discussed as prose, tracked on the IAW epic.
   'docs/design-internet-of-agentic-work.md'
