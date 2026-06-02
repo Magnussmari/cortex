@@ -31,7 +31,7 @@ import type { ServerContext } from "../server";
 import { initDatabase } from "../db/init";
 import { DEFAULT_CONFIG } from "../config";
 import { ProcessManager } from "../session/process-manager";
-import type { GhSpawnFn } from "../api/github-fetch";
+import type { GhSpawnFn } from "../adapters/github";
 import { SHADOW_AGENT_ID } from "../db/sessions";
 
 interface CannedResponse {

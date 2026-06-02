@@ -78,14 +78,14 @@ import {
   isParseError,
   type GitHubRef,
   type ParseDefaults,
-} from "./github-ref";
+} from "../adapters/github";
 import {
   fetchIssueOrPr,
   excerpt,
   isGitHubFetchError,
   type GhSpawnFn,
   type GitHubFetchError,
-} from "./github-fetch";
+} from "../adapters/github";
 import {
   DEFAULT_ITERATION_LABEL,
   importIterationFromMetadata,
@@ -1747,8 +1747,8 @@ export async function handleHandoffAssignment(
 //   handleAbandonTask  — POST /api/tasks/:taskId/abandon (task-keyed cancel)
 //
 // Design addendum: `docs/design-mc-f12b-add-to-queue.md`
-//   Decision 3 — gh CLI via Bun.spawn (see ./github-fetch.ts)
-//   Decision 4 — URL parser (see ./github-ref.ts)
+//   Decision 3 — gh CLI via Bun.spawn (see ../adapters/github/fetch.ts)
+//   Decision 4 — URL parser (see ../adapters/github/ref.ts)
 //   Decision 5 — application-level dedup at preview time, 409 response
 //   Decision 6 — endpoint shapes
 //   Decision 8 — task-shadow-{taskId} helper in ../db/sessions.ts

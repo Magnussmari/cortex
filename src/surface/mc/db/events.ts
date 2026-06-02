@@ -243,7 +243,7 @@ export type PrincipalCurationPayload =
   // F-12b Decision 10 — add-to-queue-from-GitHub import event.
   // `source` is a discriminator within `task.imported` so future sources
   // (Linear/Jira) extend via a new `source` value rather than a new `kind`.
-  // `ref` is the canonical "owner/repo#number" string (github-ref.canonicalRef).
+  // `ref` is the canonical "owner/repo#number" string (adapters/github canonicalRef).
   // `url` is the canonical html_url from the GitHub response.
   | {
       kind: "task.imported";
