@@ -19,8 +19,14 @@ import {
   upsertTag,
   getTag,
   listTagsForRepository,
+  upsertPullRequest,
+  getPullRequest,
+  listPullRequestsForRepository,
+  upsertReview,
+  getReview,
+  listReviewsForPullRequest,
 } from "../db/git-objects";
-import type { GitRepository, GitBranch, GitCommit, GitTag } from "../types";
+import type { GitRepository, GitBranch, GitCommit, GitTag, PullRequest, Review } from "../types";
 
 describe("git-objects storage (C.1)", () => {
   const paths: string[] = [];
@@ -143,5 +149,65 @@ describe("git-objects storage (C.1)", () => {
     const db = freshDb();
     expect(getCommit(db, "nope")).toBeNull();
     expect(getTag(db, "nope")).toBeNull();
+  });
+
+  // --- C.3: pull requests + reviews ---
+
+  const pr: PullRequest = {
+    id: "pr-1",
+    workItemId: null,
+    repositoryId: "repo-1",
+    provider: "github",
+    providerNativeType: "pull_request",
+    externalId: "the-metafactory/cortex#556",
+    numberOrKey: "556",
+    title: "G-1113.C.3 — PR/Review",
+    sourceBranch: "feat/g-1113-c-3-pr-review",
+    targetBranch: "main",
+    url: "https://github.com/the-metafactory/cortex/pull/556",
+    state: "open",
+    reviewState: "needs_review",
+  };
+  const review: Review = {
+    id: "review-1",
+    pullRequestId: "pr-1",
+    reviewer: "sage",
+    state: "approved",
+    provider: "github",
+    url: "https://github.com/the-metafactory/cortex/pull/556#pullrequestreview-1",
+  };
+
+  it("round-trips a pull request (upsert → get → list) + idempotent state update", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    upsertPullRequest(db, pr);
+    expect(getPullRequest(db, "pr-1")).toEqual(pr);
+    expect(listPullRequestsForRepository(db, "repo-1")).toEqual([pr]);
+    upsertPullRequest(db, { ...pr, state: "merged", reviewState: "approved" });
+    expect(getPullRequest(db, "pr-1")).toEqual({ ...pr, state: "merged", reviewState: "approved" });
+    expect(listPullRequestsForRepository(db, "repo-1")).toHaveLength(1);
+  });
+
+  it("rejects an out-of-vocabulary PR state / review_state (CHECK enforced)", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    expect(() => upsertPullRequest(db, { ...pr, state: "bogus" as PullRequest["state"] })).toThrow();
+    expect(() => upsertPullRequest(db, { ...pr, reviewState: "bogus" as PullRequest["reviewState"] })).toThrow();
+  });
+
+  it("round-trips a review and lists by pull request", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    upsertPullRequest(db, pr);
+    upsertReview(db, review);
+    expect(getReview(db, "review-1")).toEqual(review);
+    expect(listReviewsForPullRequest(db, "pr-1")).toEqual([review]);
+  });
+
+  it("PR + review FKs enforced (ghost repo / ghost PR throw)", () => {
+    const db = freshDb();
+    upsertRepository(db, repo);
+    expect(() => upsertPullRequest(db, { ...pr, repositoryId: "ghost" })).toThrow();
+    expect(() => upsertReview(db, { ...review, pullRequestId: "ghost-pr" })).toThrow();
   });
 });

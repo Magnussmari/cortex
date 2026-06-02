@@ -187,6 +187,58 @@ export interface GitTag {
   url: string | null;
 }
 
+export type PullRequestState = "draft" | "open" | "merged" | "closed";
+export type PullRequestReviewState =
+  | "none"
+  | "needs_review"
+  | "changes_requested"
+  | "approved";
+
+/**
+ * A pull request (design §6). The normalized concept; provider-native types
+ * (GitHub pull request, GitLab merge request) ride as `providerNativeType`.
+ * `workItemId` links to the owning work item/task (populated by Phase D — null
+ * for now). `reviewState` is the aggregate; individual {@link Review}s are
+ * stored separately.
+ */
+export interface PullRequest {
+  id: string;
+  workItemId: string | null;
+  repositoryId: string;
+  provider: Provider;
+  providerNativeType: "pull_request" | "merge_request" | string;
+  externalId: string;
+  numberOrKey: string;
+  title: string;
+  sourceBranch: string;
+  targetBranch: string;
+  url: string;
+  state: PullRequestState;
+  reviewState: PullRequestReviewState;
+}
+
+export type ReviewState =
+  | "approved"
+  | "changes_requested"
+  | "commented"
+  | "pending"
+  | "dismissed";
+
+/**
+ * An individual review on a {@link PullRequest}. §6 has no dedicated interface
+ * (it carries an aggregate `reviewState` on the PR); this is the minimal shape
+ * for the per-review rows the GitHub adapter (C.5) will populate.
+ */
+export interface Review {
+  id: string;
+  pullRequestId: string;
+  /** Reviewer login / display name, when known. */
+  reviewer: string | null;
+  state: ReviewState;
+  provider: Provider;
+  url: string | null;
+}
+
 export interface Task {
   id: string;
   title: string;
