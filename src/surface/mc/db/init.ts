@@ -14,7 +14,9 @@ import { COLUMN_ADD_MIGRATIONS, REBUILD_MIGRATIONS, SCHEMA_SQL } from "./schema"
  * Creates parent directories if they don't exist.
  */
 export function initDatabase(dbPath: string): Database {
-  mkdirSync(dirname(dbPath), { recursive: true });
+  // TC-4b (cortex#637): the Mission Control SQLite dir holds event rows with
+  // prompt/command/tool previews — owner-only (0o700), never world-readable.
+  mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
 
   const db = new Database(dbPath, { create: true });
   db.run("PRAGMA journal_mode = WAL");

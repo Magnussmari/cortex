@@ -68,7 +68,9 @@ export class EventProcessor {
     // Ensure published directory exists
     const pubDir = dirname(publishedPath);
     if (!existsSync(pubDir)) {
-      mkdirSync(pubDir, { recursive: true, mode: 0o755 });
+      // TC-4b (cortex#637): published/ JSONL holds prompt/command/tool
+      // previews — owner-only (0o700) to match the EventLogger raw/ dir.
+      mkdirSync(pubDir, { recursive: true, mode: 0o700 });
     }
 
     let published = 0;
