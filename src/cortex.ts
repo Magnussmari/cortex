@@ -26,6 +26,7 @@ import type { TextChannel } from "discord.js";
 import { loadConfigWithAgents, loadAgentsDirectory, expandTilde, FragmentLoadError } from "./common/config/loader";
 import { ConfigWatcher } from "./common/config/watcher";
 import { type AgentConfig, getAllRepos } from "./common/types/config";
+import { resolveSigningKnobs } from "./common/security-posture";
 import { fetchWithTimeout } from "./common/timeout";
 import { UsageMonitor } from "./common/usage/monitor";
 import { AgentRegistry } from "./common/agents/registry";
@@ -477,6 +478,25 @@ export async function startCortex(
   // Load failures are non-fatal — the daemon keeps starting and the
   // runtime publishes unsigned. The error surfaces to principal logs
   // so they can fix the seed file and restart.
+  // TC-0 (#628) — resolve the security posture's `signing` toggle to its
+  // concrete boot knobs ONCE here, then apply at each verifier/signer site
+  // below (signer attach, runtime signFailureMode, review-consumer verifier,
+  // runner dispatch-listener, bus-dispatch-listener). DRY: one resolver,
+  // applied at every site. `config.security` is always populated (schema
+  // default `off` + transform), so this is safe for legacy bot.yaml input too.
+  //
+  // Backward-compat invariant (load-bearing): with `security` absent (default
+  // `signing: "off"`) AND no `stack.nkey_seed_path`, these knobs are
+  // non-rejecting (`rejectEmpty: false`, `signFailureMode: "fallback"`) — byte-
+  // identical to today's unsigned dev-stack boot. See
+  // `src/common/__tests__/security-posture.test.ts`.
+  const signingKnobs = resolveSigningKnobs(config.security.signing);
+  console.log(
+    `cortex: security posture — signing=${config.security.signing} ` +
+      `(attachSigner=${signingKnobs.attachSigner} rejectEmpty=${signingKnobs.rejectEmpty} ` +
+      `signFailureMode=${signingKnobs.signFailureMode})`,
+  );
+
   let signer: BusEnvelopeSigner | undefined;
   // cortex#480 — receiving stack's NKey public key for the chain
   // verifier's own-stack short-circuit (structural) + crypto-registry
@@ -485,7 +505,18 @@ export async function startCortex(
   // split-brain hazard where signer.publish stamps with key A but the
   // verifier short-circuits on declared-but-stale key B.
   let stackNKeyPubForVerifier: string | undefined;
-  if (options.stack?.nkey_seed_path) {
+  if (options.stack?.nkey_seed_path && !signingKnobs.attachSigner) {
+    // TC-0 (#628) — a stack seed is configured, but `security.signing` is
+    // `off` (the schema default). Posture wins: do NOT attach the signer;
+    // publish unsigned. This is the DECISION-FOR-REVIEW behaviour change vs
+    // pre-TC-0 (which signed whenever a seed was present). Seed-configured
+    // stacks must set `signing: permissive` (or `enforce`) to retain signing.
+    console.log(
+      "cortex: stack signing key present but security.signing=off — " +
+        "NOT attaching signer; outbound envelopes will be unsigned " +
+        "(set security.signing: permissive to retain signing)",
+    );
+  } else if (options.stack?.nkey_seed_path) {
     try {
       // `expandTilde` matches `NatsLink.connect`'s treatment of
       // `credsPath` + the agents.d/ fallback below — principals writing
@@ -620,6 +651,12 @@ export async function startCortex(
         // in explicitly so subscribe-side `{principal}` substitution
         // stays symmetric with publish-side `envelope.source`.
         principal: principalId,
+        // TC-0 (#628) — `signFailureMode` from the security posture:
+        // `enforce` → "drop" (a sign failure becomes a silent-downgrade
+        // attack surface once peers reject unsigned), else "fallback"
+        // (publish unsigned on transient sign failure). Ignored by the
+        // runtime when no signer is attached.
+        signFailureMode: signingKnobs.signFailureMode,
       });
     } catch (err) {
       console.error("cortex: myelin runtime startup error (non-fatal):", err instanceof Error ? err.message : err);
@@ -1012,7 +1049,14 @@ export async function startCortex(
               const r = await verifySignedByChain(envelope, {
                 resolver: trustResolver,
                 receivingAgentId: agent.id,
-                cryptoVerify: true,
+                cryptoVerify: signingKnobs.cryptoVerify,
+                // TC-0 (#628) — posture-gated empty-chain rejection. `off`/
+                // `permissive` → `false` (verify but never reject empty
+                // adapter-originated chains); `enforce` → `true`. Pre-TC-0
+                // this relied on the `verifySignedByChain` default
+                // (`rejectEmpty: true`); the posture now sets it explicitly
+                // so seed-less / off stacks stay non-rejecting.
+                rejectEmpty: signingKnobs.rejectEmpty,
                 principalId: verifyPrincipalId,
                 // cortex#535 (TC-1a) — implicit own-stack trust, mirroring
                 // the bus-dispatch-listener wiring below. Pilot review-
@@ -1216,6 +1260,10 @@ export async function startCortex(
   // verify once every trusted peer has an `nkey_pub` declared. The
   // flag is a small follow-up plumbing (cortex.yaml flag → option) once
   // the rollout window closes.
+  //
+  // TC-0 (#628) — `rejectEmpty` is now posture-gated: `enforce` → reject
+  // unsigned peer dispatches; `off`/`permissive` → surface but do not
+  // reject. The listener's default (`true`) is preserved under `enforce`.
   let busDispatchListener: BusDispatchListener | undefined;
   const firstAgent = mergedAgents[0];
   if (firstAgent !== undefined) {
@@ -1227,6 +1275,8 @@ export async function startCortex(
       // and createDispatchListener below use. PR-R2a (cortex#439)
       // renamed the constructor parameter to `principalId`.
       principalId,
+      // TC-0 (#628) — posture-gated empty-chain rejection for peer dispatch.
+      rejectEmpty: signingKnobs.rejectEmpty,
       source: systemEventSource,
       // cortex#480 — implicit own-stack trust. When the stack has a
       // signing key staged (signer !== undefined), pass the DID and
@@ -2020,7 +2070,12 @@ export async function startCortex(
     stack: derivedStack.stack,
     ...(policyEngine !== undefined && { policyEngine }),
     trustResolver,
-    cryptoVerify: true,
+    // TC-0 (#628) — verifier knobs resolved from `security.signing`. `off`/
+    // `permissive` → verify but never reject empty adapter chains
+    // (`rejectEmpty: false`); `enforce` → reject unsigned (`rejectEmpty:
+    // true`). `cryptoVerify` stays `true` across all postures (cheap).
+    cryptoVerify: signingKnobs.cryptoVerify,
+    rejectEmpty: signingKnobs.rejectEmpty,
     principalId,
     ...(firstAgent !== undefined && { receivingAgentId: firstAgent.id }),
     // cortex#480 — implicit own-stack trust. Adapter-originated

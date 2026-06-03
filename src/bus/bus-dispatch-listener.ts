@@ -91,6 +91,14 @@ export interface BusDispatchListenerOpts {
    */
   cryptoVerify?: boolean;
   /**
+   * TC-0 (#628) — whether an unsigned (empty `signed_by[]`) peer dispatch
+   * is REJECTED. Default `true` preserves the historical behaviour: a
+   * peer dispatch arriving on the bus with no chain is a misconfig and is
+   * dropped. `cortex.ts` sets this from the security posture — `enforce`
+   * → `true`, `off`/`permissive` → `false` (surface but do not reject).
+   */
+  rejectEmpty?: boolean;
+  /**
    * cortex#480 — the receiving stack's signing DID
    * (e.g. `did:mf:andreas-meta-factory`). When supplied, stamps whose
    * `identity` matches short-circuit the agent-registry / trust-list
@@ -117,6 +125,7 @@ export class BusDispatchListener {
   private readonly principalId: string;
   private readonly source: SystemEventSource;
   private readonly cryptoVerify: boolean;
+  private readonly rejectEmpty: boolean;
   private readonly stackIdentity: string | undefined;
   private readonly stackNKeyPub: string | undefined;
 
@@ -137,6 +146,7 @@ export class BusDispatchListener {
     this.principalId = opts.principalId;
     this.source = opts.source;
     this.cryptoVerify = opts.cryptoVerify ?? false;
+    this.rejectEmpty = opts.rejectEmpty ?? true;
     this.stackIdentity = opts.stackIdentity;
     this.stackNKeyPub = opts.stackNKeyPub;
   }
@@ -241,9 +251,12 @@ export class BusDispatchListener {
     const verification = await verifySignedByChain(envelope, {
       resolver: this.resolver,
       receivingAgentId: this.receivingAgentId,
-      // Peer dispatches MUST be signed — an unsigned dispatch envelope
-      // arriving on the bus is a misconfig we want surfaced.
-      rejectEmpty: true,
+      // Peer dispatches are normally signed — an unsigned dispatch envelope
+      // arriving on the bus is a misconfig we want surfaced. TC-0 (#628):
+      // `rejectEmpty` is now posture-gated (`enforce` → reject; `off`/
+      // `permissive` → surface but do not reject). Default `true` preserves
+      // the historical reject-unsigned-peer-dispatch behaviour.
+      rejectEmpty: this.rejectEmpty,
       cryptoVerify: this.cryptoVerify,
       principalId: this.principalId,
       ...(this.stackIdentity !== undefined && {
