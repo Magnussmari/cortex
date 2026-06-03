@@ -3,11 +3,23 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { writeFileSync, unlinkSync, existsSync } from "fs";
+import { writeFileSync, unlinkSync, existsSync, chmodSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { ConfigWatcher } from "../watcher";
 import type { AgentConfig } from "../../types/config";
+
+/**
+ * Write a single-file config fixture at 0600. TC-4a (cortex#636): the
+ * single-file config read enforces chmod 600 (it carries platform bot
+ * tokens), so the watcher's reload path rejects looser modes. `chmodSync`
+ * (not the writeFileSync `mode` option) because reload tests rewrite an
+ * existing fixture in place, and the `mode` option only applies on creation.
+ */
+function writeConfigFixture(path: string, yaml: string): void {
+  writeFileSync(path, yaml, "utf-8");
+  chmodSync(path, 0o600);
+}
 
 const TEST_CONFIG: AgentConfig = {
   agent: {
@@ -131,7 +143,7 @@ paths:
   publishedEventsDir: "~/.claude/events/published"
   logDir: "~/.config/grove/logs"
 `;
-    writeFileSync(testConfigPath, yaml, "utf-8");
+    writeConfigFixture(testConfigPath, yaml);
   });
 
   afterEach(() => {
@@ -195,7 +207,7 @@ paths:
 `;
 
     watcher.start();
-    writeFileSync(testConfigPath, updatedYaml, "utf-8");
+    writeConfigFixture(testConfigPath, updatedYaml);
 
     // Wait for debounced reload
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -261,7 +273,7 @@ paths:
 `;
 
     watcher.start();
-    writeFileSync(testConfigPath, updatedYaml, "utf-8");
+    writeConfigFixture(testConfigPath, updatedYaml);
 
     // Wait for debounced reload
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -326,7 +338,7 @@ paths:
 `;
   beforeEach(() => {
     testConfigPath = join(tmpdir(), `cortex-c135-${Date.now()}-${Math.random().toString(36).slice(2)}.yaml`);
-    writeFileSync(testConfigPath, INITIAL_YAML, "utf-8");
+    writeConfigFixture(testConfigPath, INITIAL_YAML);
   });
   afterEach(() => {
     if (existsSync(testConfigPath)) unlinkSync(testConfigPath);
@@ -387,7 +399,7 @@ paths:
 `;
 
     watcher.start();
-    writeFileSync(testConfigPath, updatedYaml, "utf-8");
+    writeConfigFixture(testConfigPath, updatedYaml);
     await new Promise((resolve) => setTimeout(resolve, 300));
     watcher.stop();
 
@@ -462,7 +474,7 @@ paths:
 `;
 
     watcher.start();
-    writeFileSync(testConfigPath, updatedYaml, "utf-8");
+    writeConfigFixture(testConfigPath, updatedYaml);
     await new Promise((resolve) => setTimeout(resolve, 300));
     watcher.stop();
 

@@ -157,7 +157,9 @@ function surfacesBlock(): Record<string, unknown> {
 function writeSingleFile(dir: string, config: Record<string, unknown>): string {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "cortex.yaml");
-  writeFileSync(path, stringify(config));
+  // TC-4a (cortex#636): single-file config read enforces chmod 600 (it
+  // carries platform bot tokens). Write 0600 so the gate passes.
+  writeFileSync(path, stringify(config), { mode: 0o600 });
   return path;
 }
 
@@ -351,6 +353,7 @@ describe("GW.3b.2a.4 — legacy bot.yaml input: surfaces is always undefined", (
     const dir = join(testDir, "legacy");
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "bot.yaml");
+    // TC-4a (cortex#636): single-file config read enforces chmod 600.
     writeFileSync(
       path,
       stringify({
@@ -358,6 +361,7 @@ describe("GW.3b.2a.4 — legacy bot.yaml input: surfaces is always undefined", (
         claude: { timeoutMs: 120000 },
         networksDir: "./networks",
       }),
+      { mode: 0o600 },
     );
     const loaded = loadConfigWithAgents(path);
     expect(loaded.surfaces).toBeUndefined();
