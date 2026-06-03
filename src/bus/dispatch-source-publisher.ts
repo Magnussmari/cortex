@@ -39,6 +39,28 @@ export interface InboundChatDispatchPublishOpts {
   entity: string | undefined;
   principal: string | undefined;
   /**
+   * cortex#651 (F-1b) — **routing** principal for the publish SUBJECT, distinct
+   * from {@link principal} (which is author/identity metadata stamped into the
+   * payload body, e.g. the per-stack path passes `msg.authorName`).
+   *
+   * The surface gateway serves MULTIPLE principals on one shared bus. A
+   * cross-principal binding's inbound request must land on the BOUND stack's
+   * runner subscription at `local.{bindingPrincipal}.{stack}.tasks.*`
+   * (dispatch-listener.ts), NOT on the gateway principal's subject. The
+   * gateway sink sets this to the binding's parsed principal
+   * (`match.principal`).
+   *
+   * When `undefined`, the subject falls back to `source.principal` — the
+   * EXACT pre-F-1b behaviour. The per-stack `dispatch-handler` path never sets
+   * this field, so its subject derivation is byte-for-byte unchanged. Gap-4
+   * gateway bindings (no parsed principal) leave this `undefined` and thus
+   * fall back to the gateway principal, which is the intended gap-4 default.
+   *
+   * F-1 (#629) wired the OUTBOUND (reply) leg per-principal; this field
+   * completes the INBOUND (request) leg, closing #629's cross-principal goal.
+   */
+  subjectPrincipal?: string;
+  /**
    * cortex#486 — PolicyEngine consulted at publish time to resolve the
    * inbound `(platform, authorId)` tuple to a registered principal id.
    * The adapter is the right layer for this lookup per
@@ -145,10 +167,17 @@ export async function publishInboundChatDispatchEnvelope(
   }
 
   const targetDid = `did:mf:${opts.agentName}`;
+  // cortex#651 (F-1b) — derive the SUBJECT principal. Cross-principal gateway
+  // bindings set `subjectPrincipal` to the binding's parsed principal so the
+  // request lands on the BOUND stack's subscription. Absent (per-stack path,
+  // gap-4 gateway bindings, same-principal) → fall back to `source.principal`,
+  // the exact pre-F-1b behaviour. Note: this is distinct from the payload
+  // `principal` field, which carries author/identity metadata.
+  const subjectPrincipal = opts.subjectPrincipal ?? opts.source.principal;
   let subject: string;
   try {
     subject = buildDirectTaskPublishSubject(
-      opts.source.principal,
+      subjectPrincipal,
       targetDid,
       opts.stack,
       "chat",

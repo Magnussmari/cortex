@@ -357,4 +357,61 @@ describe("BusInboundSink", () => {
 
     expect(calls[0]?.msg.threadId).toBe("thread-xyz-789");
   });
+
+  // ── Test 13 (F-1b, cortex#651): subjectPrincipal = match.principal ───────────
+  //
+  // The gateway serves MULTIPLE principals on one shared bus. The inbound
+  // request SUBJECT must be derived from the BINDING's parsed principal so a
+  // cross-principal binding lands on the BOUND stack's runner subscription
+  // (`local.{bindingPrincipal}.{stack}.tasks.*`), not the gateway principal.
+  // The sink threads `match.principal` into the OPT-IN `subjectPrincipal` field;
+  // the publisher derives the subject from it (fallback: source.principal).
+
+  test("cross-principal binding → subjectPrincipal = match.principal (differs from gateway principal)", async () => {
+    const { sink, calls } = makeSink();
+    // STUB_SOURCE.principal is "andreas" (the gateway principal). The binding's
+    // parsed principal is "holly" → a CROSS-principal binding.
+    const decision = makeDecision({
+      match: {
+        platform: "discord",
+        agent: "luna",
+        principal: "holly",
+        stack: "research",
+        instance: "discord:111222333",
+      },
+    });
+
+    await sink.publish(decision, makeMsg());
+
+    const opts = calls[0];
+    if (opts === undefined) throw new Error("expected publishFn to have been called");
+    // The routing principal for the subject is the BINDING principal, not the gateway.
+    expect(opts.subjectPrincipal).toBe("holly");
+    // The payload `principal` field carries the same binding principal (F-1 behaviour).
+    expect(opts.principal).toBe("holly");
+  });
+
+  test("same-principal binding → subjectPrincipal = match.principal (equals gateway principal)", async () => {
+    const { sink, calls } = makeSink();
+    // Default decision: match.principal === "andreas" === gateway principal.
+    await sink.publish(makeDecision(), makeMsg());
+
+    expect(calls[0]?.subjectPrincipal).toBe("andreas");
+  });
+
+  test("gap-4 binding (no principal) → subjectPrincipal undefined → publisher falls back to gateway principal", async () => {
+    const { sink, calls } = makeSink();
+    const decision = makeDecision();
+    decision.match = {
+      ...decision.match,
+      stack: undefined,
+      principal: undefined,
+    };
+
+    await sink.publish(decision, makeMsg());
+
+    // undefined threads through; the publisher's `?? source.principal` yields
+    // the gateway principal — the intended gap-4 default.
+    expect(calls[0]?.subjectPrincipal).toBeUndefined();
+  });
 });

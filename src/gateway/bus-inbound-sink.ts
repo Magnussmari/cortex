@@ -151,6 +151,15 @@ export class BusInboundSink implements GatewayInboundSink {
       // harness's responsibility (design §2.2/§4).
       prompt: msg.content,
       principal: match.principal,
+      // cortex#651 (F-1b) — route the inbound request SUBJECT under the
+      // binding's parsed principal so a cross-principal binding lands on the
+      // BOUND stack's runner subscription (local.{bindingPrincipal}.{stack}.tasks.*),
+      // not the gateway principal. Gap-4 bindings have match.principal === undefined
+      // → the publisher falls back to source.principal (the gateway principal),
+      // which is the intended gap-4 default. Same-principal bindings set this to
+      // the gateway principal → identical subject, no behaviour change.
+      // F-1 (#629) did the outbound (reply) leg; this completes the inbound leg.
+      subjectPrincipal: match.principal,
       // The publisher derives response_routing from msg.instanceId directly via
       // responseRoutingFromMessage() — consistent with decision.responseRouting.
       // We do NOT double-stamp it here.
