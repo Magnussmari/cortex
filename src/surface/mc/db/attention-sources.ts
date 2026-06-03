@@ -45,6 +45,15 @@ export interface ReconcileAttentionOptions {
   nowEpochSec?: number;
 }
 
+export interface ReconcileResult {
+  /** The full set of items currently open after this reconcile. */
+  open: AttentionItem[];
+  /** Items that transitioned absent → open this run (notify "opened"). */
+  opened: AttentionItem[];
+  /** Items that transitioned open → resolved this run (notify "resolved"). */
+  resolved: AttentionItem[];
+}
+
 /** Map a block reason to its attention kind + severity. Exhaustive over BlockReason. */
 function blockReasonToAttention(reason: BlockReason): { kind: AttentionKind; severity: AttentionSeverity } {
   switch (reason.kind) {
@@ -62,9 +71,21 @@ function blockReasonToAttention(reason: BlockReason): { kind: AttentionKind; sev
  * any previously-open reconciled item whose condition has cleared. Idempotent.
  * Returns the items currently derived as open.
  */
-export function reconcileAttention(db: Database, opts: ReconcileAttentionOptions): { open: AttentionItem[] } {
+export function reconcileAttention(db: Database, opts: ReconcileAttentionOptions): ReconcileResult {
   const nowSec = opts.nowEpochSec ?? Math.floor(Date.now() / 1000);
   const staleBeforeSec = nowSec - Math.floor((opts.staleAfterMs ?? DEFAULT_STALE_AFTER_MS) / 1000);
+
+  // Snapshot the prior NON-resolved set (open + dismissed) BEFORE mutating, to
+  // compute the open/resolve delta (ML.3 — what to notify on) AND to respect
+  // dismiss. A dismissed item is "seen" — re-deriving it must NOT reopen it or
+  // re-notify (the principal said "stop showing me this"). Only an item absent
+  // from BOTH open and dismissed (i.e. genuinely new, or previously *resolved*
+  // and now recurring) counts as newly opened.
+  const priorRows = db
+    .query(`SELECT id, status FROM attention_items WHERE status IN ('open', 'dismissed')`)
+    .all() as { id: string; status: string }[];
+  const dismissedIds = new Set(priorRows.filter((r) => r.status === "dismissed").map((r) => r.id));
+  const seenBefore = new Set(priorRows.map((r) => r.id)); // open ∪ dismissed
 
   const derived = new Map<string, AttentionItem>();
 
@@ -111,16 +132,29 @@ export function reconcileAttention(db: Database, opts: ReconcileAttentionOptions
     });
   }
 
-  // Upsert everything derived as open (idempotent by id).
-  for (const item of derived.values()) upsertAttentionItem(db, item);
+  // Upsert derived items as open — but NEVER resurrect a dismissed one (skip it,
+  // leaving its 'dismissed' status intact so it neither reopens nor re-notifies).
+  for (const item of derived.values()) {
+    if (dismissedIds.has(item.id)) continue;
+    upsertAttentionItem(db, item);
+  }
+
+  // newly-opened = derived now but not seen before (not open, not dismissed).
+  const opened = [...derived.values()].filter((i) => !seenBefore.has(i.id));
 
   // Resolve previously-open RECONCILED items whose condition no longer holds
   // (assignment unblocked / work item touched or terminal). Only our own
   // prefixes — never touch items produced by other sources.
+  const resolved: AttentionItem[] = [];
   for (const open of listOpenAttention(db)) {
     const reconciled = open.id.startsWith(BLOCK_PREFIX) || open.id.startsWith(STALE_PREFIX);
-    if (reconciled && !derived.has(open.id)) resolveAttentionItem(db, open.id);
+    if (reconciled && !derived.has(open.id)) {
+      resolveAttentionItem(db, open.id);
+      resolved.push(open);
+    }
   }
 
-  return { open: [...derived.values()] };
+  // `open` reflects what's actually open: derived minus the dismissed (skipped) ones.
+  const open = [...derived.values()].filter((i) => !dismissedIds.has(i.id));
+  return { open, opened, resolved };
 }
