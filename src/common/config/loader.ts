@@ -707,6 +707,12 @@ function loadCortexShape(
     execution: cortexConfig.execution,
     github: cortexConfig.github,
     paths: cortexConfig.paths,
+    // TC-0 (#628) — carry the principal-declared security posture through to
+    // the synthesized AgentConfig so `resolveSigningKnobs` at boot reads the
+    // cortex.yaml `security:` block. Always defined (schema transform fills
+    // defaults), so this is a plain passthrough — omitting it would silently
+    // default the posture to `off` for every cortex-shape deployment.
+    security: cortexConfig.security,
     ...(cortexConfig.nats !== undefined && { nats: cortexConfig.nats }),
   };
 

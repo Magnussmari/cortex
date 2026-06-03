@@ -461,6 +461,35 @@ describe("MIG-7.2e — cortex-shape detection + transform", () => {
     );
   });
 
+  test("TC-0 (#628): carries the cortex.yaml security block through to AgentConfig.security", () => {
+    // Regression guard for the silent-strip bug: pre-fix, `security:` was not
+    // a field on CortexConfigSchema, so a principal-declared block was stripped
+    // and `resolveSigningKnobs` silently defaulted to `off` — a fail-OPEN
+    // downgrade for every cortex-shape deployment. This pins the passthrough.
+    const cfg = minimalCortex();
+    cfg.security = {
+      signing: "enforce",
+      encryption: { payload: "require", at_rest: "on" },
+      transport: { mtls: "require" },
+    };
+    const path = writeCortexConfig(testDir, cfg);
+    const { config } = loadConfigWithAgents(path);
+    expect(config.security.signing).toBe("enforce");
+    expect(config.security.encryption.payload).toBe("require");
+    expect(config.security.encryption.at_rest).toBe("on");
+    expect(config.security.transport.mtls).toBe("require");
+  });
+
+  test("TC-0 (#628): security absent on a cortex-shape config → all-off default (backward-compat)", () => {
+    const path = writeCortexConfig(testDir, minimalCortex());
+    const { config } = loadConfigWithAgents(path);
+    expect(config.security).toEqual({
+      signing: "off",
+      encryption: { payload: "off", at_rest: "off" },
+      transport: { mtls: "off" },
+    });
+  });
+
   test("passes bus.review provisioning knobs through with defaults applied", () => {
     const cfg = minimalCortex();
     cfg.bus = {

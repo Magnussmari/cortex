@@ -39,6 +39,7 @@ import {
   NetworkClaudeSchema,
   NetworkCloudSchema,
   NetworkFileSchema,
+  SecurityPostureSchema,
 } from "./config";
 import { NKEY_PUBKEY_REGEX } from "./nkey";
 import { NatsSubjectsSchema } from "./nats-subjects";
@@ -1917,6 +1918,21 @@ export const CortexConfigSchema = z.object({
    * `policyEngineFromConfig` factory for callers that opt in.
    */
   policy: PolicySchema.optional(),
+
+  /**
+   * TC-0 (Trust & Confidentiality, #628): unified security posture toggles
+   * (`signing` / `encryption.*` / `transport.mtls`), all default OFF, ramping
+   * `off → permissive → enforce` independently.
+   *
+   * Shares `SecurityPostureSchema` with `AgentConfigSchema.security` so the
+   * loader's `loadCortexShape` synthesis carries the principal-declared posture
+   * straight through to the boot path's `resolveSigningKnobs`. Without this
+   * field a `security:` block in cortex.yaml would be silently stripped by
+   * Zod's strip-by-default and the resolver would fall back to `off` — a
+   * fail-OPEN silent downgrade. The transform guarantees a fully-populated
+   * shape even when the block is absent, matching the legacy bot.yaml default.
+   */
+  security: SecurityPostureSchema,
 
   /** First-class agents — the canonical list. */
   agents: z.array(AgentSchema).min(1, "at least one agent is required"),

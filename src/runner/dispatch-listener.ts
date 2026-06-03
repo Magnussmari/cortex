@@ -332,6 +332,14 @@ export interface DispatchListenerOptions {
    */
   cryptoVerify?: boolean;
   /**
+   * TC-0 (#628) — whether an empty `signed_by[]` chain is REJECTED.
+   * Default `false` (the historical hard-coded value): adapter-originated
+   * dispatches arrive with no chain and fall through to the policy gate.
+   * `cortex.ts` sets this from the security posture — `enforce` →
+   * `true` (reject unsigned adapter traffic), `off`/`permissive` → `false`.
+   */
+  rejectEmpty?: boolean;
+  /**
    * Principal id (e.g. `andreas`). Required by `verifySignedByChain`'s
    * crypto layer (when `cryptoVerify: true`) to thread into each
    * constructed myelin Principal. When the verifier is enabled in
@@ -641,6 +649,10 @@ export function createDispatchListener(
   // Adapter-originated dispatches arrive with empty `signed_by[]` and
   // fall through `rejectEmpty: false`; signed bus traffic MUST verify.
   const cryptoVerify = opts.cryptoVerify ?? true;
+  // TC-0 (#628) — empty-chain rejection. Default `false` preserves the
+  // historical hard-coded behaviour (adapter dispatches fall through);
+  // `cortex.ts` flips it to `true` under `security.signing: enforce`.
+  const rejectEmpty = opts.rejectEmpty ?? false;
   // cortex#492 — resolve the trace toggle once at construction: explicit
   // option wins, else fall back to the `CORTEX_TRACE_DISPATCH` env var.
   // Off by default → the trace helper short-circuits to a no-op.
@@ -701,6 +713,7 @@ export function createDispatchListener(
         stack: opts.stack,
         trustResolver,
         cryptoVerify,
+        rejectEmpty,
         principalId,
         receivingAgentId,
         stackIdentity,
@@ -1014,6 +1027,8 @@ interface DispatchHandlerContext {
    */
   trustResolver: TrustResolver | undefined;
   cryptoVerify: boolean;
+  /** TC-0 (#628) — posture-gated empty-chain rejection. */
+  rejectEmpty: boolean;
   principalId: string | undefined;
   receivingAgentId: string | undefined;
   /** cortex#480 — receiving stack's signing DID for own-stack trust. */
@@ -1043,6 +1058,7 @@ async function handleDispatchEnvelope(
     stack,
     trustResolver,
     cryptoVerify,
+    rejectEmpty,
     principalId,
     receivingAgentId,
     stackIdentity,
@@ -1124,10 +1140,13 @@ async function handleDispatchEnvelope(
   // trust-check every ed25519 stamp and, by default, also cryptographically
   // verify each stamp's signature over the JCS-canonical envelope bytes.
   //
-  // **`rejectEmpty: false`** — adapter-originated dispatches
+  // **`rejectEmpty`** — adapter-originated dispatches
   // (Discord/Mattermost/Slack/cc-events) arrive with no `signed_by[]`.
-  // Empty chains are legitimate and fall through to the existing
-  // PolicyEngine path; only signed chains must verify.
+  // By default (`off`/`permissive` posture) empty chains are legitimate
+  // and fall through to the existing PolicyEngine path; only signed
+  // chains must verify. TC-0 (#628): under `security.signing: enforce`
+  // the resolved `rejectEmpty: true` is threaded here so unsigned
+  // adapter dispatches are rejected at the chain gate.
   //
   // **Fail-closed when `trustResolver` is wired but `receivingAgentId`
   // is not.** PR #322 round-1 caught this: `cortex.ts:mergedAgents` is
@@ -1190,7 +1209,7 @@ async function handleDispatchEnvelope(
       verification = await verifySignedByChain(envelope, {
         resolver: trustResolver,
         receivingAgentId,
-        rejectEmpty: false,
+        rejectEmpty,
         cryptoVerify,
         ...(cryptoVerify && principalId !== undefined && { principalId }),
         // cortex#480 — own-stack trust short-circuit + crypto registry
