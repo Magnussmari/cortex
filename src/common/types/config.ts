@@ -517,6 +517,46 @@ export const AgentConfigSchema = z.object({
     /* eslint-enable @typescript-eslint/no-unnecessary-condition */
   })),
 
+  /**
+   * TC-0 (Trust & Confidentiality, #628): unified security posture toggles.
+   * Every layer defaults OFF so the stack runs unsigned/cleartext for dev;
+   * each ramps independently `off → permissive → enforce`.
+   * See docs/design-trust-confidentiality.md §Phase 0.
+   *
+   * - `signing`: off = no signer · permissive = sign + verify but NEVER reject
+   *   (cryptoVerify:true, rejectEmpty:false, signFailureMode:"fallback") ·
+   *   enforce = reject unsigned/invalid (rejectEmpty:true, signFailureMode:"drop").
+   * - `encryption.payload`: off = cleartext · opt-in = seal when the recipient
+   *   advertises an enc_pub (both accepted) · require = reject cleartext.
+   * - `encryption.at_rest`: off | on (field-encrypt high-sensitivity columns).
+   * - `transport.mtls`: off | on (offer client cert) | require (refuse non-mTLS).
+   *
+   * The `emptyDefault()` + transform idiom mirrors the `cockpit` block above:
+   * `.default(emptyDefault())` returns `{}` without re-parsing inner defaults,
+   * so the transform re-applies them — callers always get the populated shape.
+   */
+  security: z.object({
+    signing: z.enum(["off", "permissive", "enforce"]).default("off"),
+    encryption: z.object({
+      payload: z.enum(["off", "opt-in", "require"]).default("off"),
+      at_rest: z.enum(["off", "on"]).default("off"),
+    }).default(emptyDefault()),
+    transport: z.object({
+      mtls: z.enum(["off", "on", "require"]).default("off"),
+    }).default(emptyDefault()),
+  }).default(emptyDefault()).transform((val) => ({
+    /* eslint-disable @typescript-eslint/no-unnecessary-condition */
+    signing: val.signing ?? "off",
+    encryption: {
+      payload: val.encryption?.payload ?? "off",
+      at_rest: val.encryption?.at_rest ?? "off",
+    },
+    transport: {
+      mtls: val.transport?.mtls ?? "off",
+    },
+    /* eslint-enable @typescript-eslint/no-unnecessary-condition */
+  })),
+
   /** G-500: Directory containing per-network YAML files */
   networksDir: z.string().default("./networks"),
 

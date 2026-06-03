@@ -29,6 +29,11 @@ const TEST_CONFIG: AgentConfig = {
   discord: [],
   mattermost: [],
   slack: [],
+  security: {
+    signing: "off",
+    encryption: { payload: "off", at_rest: "off" },
+    transport: { mtls: "off" },
+  },
   claude: {
     timeoutMs: 120_000,
     asyncTimeoutMs: 900_000,
