@@ -19,7 +19,8 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { epochSecondsToIso } from "./tasks";
+import type { SourceRef } from "../types";
+import { epochSecondsToIso, taskRowToSourceRef } from "./tasks";
 import {
   ITERATION_STATES,
   TRANSITIONS,
@@ -163,6 +164,14 @@ export interface InboxItem {
   title: string;
   priority: number;
   status: string;
+  /**
+   * Provider-neutral origin (G-1113.D.7a) — the shape new code should read,
+   * mirroring the task DTO's `source` (B.2). `source_system` / `source_url` /
+   * `source_external_id` remain as the raw storage columns (relaxing their
+   * CHECK to provider-neutral is D.7c); consumers should branch on
+   * `source.provider`, not the raw `source_system`.
+   */
+  source: SourceRef;
   source_system: string;
   source_url: string | null;
   source_external_id: string | null;
@@ -321,6 +330,9 @@ export function listInboxItems(
     title: r.title,
     priority: r.priority,
     status: r.status,
+    // Provider-neutral origin (D.7a): reuse the task DTO's single normalization
+    // boundary (B.2) so the inbox + task mappers can't drift. Unknown → "custom".
+    source: taskRowToSourceRef(r),
     source_system: r.source_system,
     source_url: r.source_url,
     source_external_id: r.source_external_id,
