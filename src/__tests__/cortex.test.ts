@@ -24,7 +24,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { mkdtempSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { AgentConfigSchema, type AgentConfig } from "../common/types/config";
@@ -731,6 +731,10 @@ describe("runDryRun — config validator (cortex#88 item 2)", () => {
       ].join("\n"),
       "utf-8",
     );
+    // TC-4a (cortex#636): the single-file config read enforces chmod 600
+    // (it carries platform bot tokens). Set 0600 so the gate passes and the
+    // dry-run exercises its real validation path, not the permission error.
+    chmodSync(cfgPath, 0o600);
     const result = runDryRun(cfgPath);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/cortex config validation OK/);
@@ -767,6 +771,10 @@ describe("runDryRun — config validator (cortex#88 item 2)", () => {
       ].join("\n"),
       "utf-8",
     );
+    // TC-4a (cortex#636): the single-file config read enforces chmod 600
+    // (it carries platform bot tokens). Set 0600 so the gate passes and the
+    // dry-run exercises its real validation path, not the permission error.
+    chmodSync(cfgPath, 0o600);
     const result = runDryRun(cfgPath);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/NATS=\(disabled\)/);
@@ -791,6 +799,10 @@ describe("runDryRun — config validator (cortex#88 item 2)", () => {
       ].join("\n"),
       "utf-8",
     );
+    // TC-4a (cortex#636): the single-file config read enforces chmod 600
+    // (it carries platform bot tokens). Set 0600 so the gate passes and the
+    // dry-run exercises its real validation path, not the permission error.
+    chmodSync(cfgPath, 0o600);
     const result = runDryRun(cfgPath);
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toMatch(/cortex config validation FAILED/);
@@ -820,6 +832,10 @@ describe("runDryRun — config validator (cortex#88 item 2)", () => {
       ].join("\n"),
       "utf-8",
     );
+    // TC-4a (cortex#636): the single-file config read enforces chmod 600
+    // (it carries platform bot tokens). Set 0600 so the gate passes and the
+    // dry-run exercises its real validation path, not the permission error.
+    chmodSync(cfgPath, 0o600);
     const result = runDryRun(cfgPath);
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toMatch(/has no agents — config invalid/);

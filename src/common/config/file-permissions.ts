@@ -11,6 +11,9 @@
  * Callers:
  *   - `account-signing-key.ts` (operator account signing key, SA-prefix)
  *   - `bus/nats/connection.ts` (NATS user `.creds`, JWT + NKey seed)
+ *   - `stack-signing-key.ts` (stack signing key, SU-prefix nkey seed)
+ *   - `loader.ts` (single-file `cortex.yaml` — carries platform bot tokens;
+ *     TC-4a / cortex#636)
  */
 
 import { statSync } from "fs";

@@ -86,7 +86,9 @@ function fullCortexConfig(): Record<string, unknown> {
 /** Write a single-file `cortex.yaml` in `dir`, return its path. */
 function writeSingleFile(dir: string, config: Record<string, unknown>): string {
   const path = join(dir, "cortex.yaml");
-  writeFileSync(path, stringify(config));
+  // TC-4a (cortex#636): single-file config read enforces chmod 600 (it
+  // carries platform bot tokens). Write 0600 so the gate passes.
+  writeFileSync(path, stringify(config), { mode: 0o600 });
   return path;
 }
 
