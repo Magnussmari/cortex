@@ -55,7 +55,12 @@ import {
   type GatewayAdapterFactory,
 } from "./gateway-adapters";
 import { BusInboundSink } from "./bus-inbound-sink";
-import { distinctBoundStacks, crossPrincipalBindings } from "./binding-resolver";
+import {
+  distinctBoundStacks,
+  distinctBoundPrincipalStacks,
+  crossPrincipalBindings,
+  type BoundPrincipalStack,
+} from "./binding-resolver";
 import type { SurfaceGateway } from "./surface-gateway";
 import type { Surfaces } from "../common/types/surfaces";
 import type { MyelinRuntime } from "../bus/myelin/runtime";
@@ -124,8 +129,22 @@ export interface StartedGateway {
   /**
    * Distinct bound-stack leaves (`undefined` = a gap-4 no-stack binding) for
    * the outbound sink's subscribe subjects. See {@link distinctBoundStacks}.
+   *
+   * Single-principal: these pair with the gateway's own principal. Prefer
+   * {@link StartedGateway.principalStacks} for the multi-principal sink subjects
+   * (F-1 — cortex#629); `stacks` is retained for back-compat / single-principal
+   * callers.
    */
   stacks: readonly (string | undefined)[];
+  /**
+   * F-1 (cortex#629) — distinct `(principal, stack)` pairs across every
+   * binding, each carrying its OWN parsed principal (gap-4 bindings fall back
+   * to the gateway principal). The outbound dispatch sink builds one subscribe
+   * subject per pair so a multi-principal gateway sees every bound stack's
+   * replies on the right principal namespace. See
+   * {@link distinctBoundPrincipalStacks}.
+   */
+  principalStacks: readonly BoundPrincipalStack[];
 }
 
 /** Count the total bindings across all platforms in a `Surfaces` map. */
@@ -179,19 +198,28 @@ export async function startGatewayIfEnabled(
 
   // ── Path 3: flag on + bindings → build, construct, start. ─────────────────
   //
-  // a.3d review (single-principal v1 enforcement): the inbound publisher and
-  // the outbound dispatch sink both key off the gateway's OWN principal and
-  // discard each binding's parsed principal. Reject any cross-principal binding
-  // LOUDLY at boot rather than silently absorbing it into the gateway
-  // principal's namespace (the latent cross-principal leak single-principal v1
-  // excludes). Same loud-validation stance as `buildBindingIndex`.
+  // F-1 (cortex#629) — multi-principal, UNSIGNED. The gateway now serves
+  // bindings spanning MORE THAN ONE principal on a shared bus so cross-principal
+  // collaboration works. The outbound dispatch sink subscribes per distinct
+  // `(principal, stack)` pair (see `principalStacks` below) — each binding's
+  // reply lands on ITS OWN principal namespace, no longer absorbed into the
+  // gateway principal's.
+  //
+  // a.3d shipped a HARD THROW here (single-principal v1). F-1 RELAXES that to a
+  // non-fatal WARNING: cross-principal bindings are allowed but are
+  // UNSIGNED/UNAUTHENTICATED, so the inbound publish hop carries no per-stack
+  // signature. That is fine for a dev/trusted shared bus but MUST NOT face
+  // untrusted peers until signing is layered on (cortex#552 / cortex#635).
+  // `crossPrincipalBindings` stays the detector — only this consumer changed
+  // from throw→warn.
   const crossPrincipal = crossPrincipalBindings(surfaces, opts.principal);
   if (crossPrincipal.length > 0) {
-    throw new Error(
-      `gateway: cross-principal surface bindings are not supported in single-principal v1 — ` +
-        `${crossPrincipal.map((s) => `"${s}"`).join(", ")} ` +
-        `declare a principal other than "${opts.principal}". ` +
-        `Either move them under "${opts.principal}/…" or run a separate gateway for that principal.`,
+    process.stderr.write(
+      `[surface-gateway] WARNING: cross-principal surface bindings are UNSIGNED/UNAUTHENTICATED ` +
+        `— dev/trusted only; enable signing before untrusted peers. ` +
+        `Bindings ${crossPrincipal.map((s) => `"${s}"`).join(", ")} ` +
+        `declare a principal other than the gateway principal "${opts.principal}". ` +
+        `Allowing (F-1, cortex#629); signing is layered on later (cortex#552 / cortex#635).\n`,
     );
   }
 
@@ -252,13 +280,17 @@ export async function startGatewayIfEnabled(
 
   // a.3d (cortex#524) — hand the boot path the adapters + bound stacks the
   // OUTBOUND dispatch sink needs. The sink itself is constructed in cortex.ts
-  // (it owns the `runtime`), but the bound-stack subject set is derived HERE,
-  // where `surfaces` is parsed, so subject-shape logic stays in the gateway
-  // layer. Single-principal v1: the sink's principal segment is the gateway
-  // principal (supplied at the boot site).
+  // (it owns the `runtime`), but the subject set is derived HERE, where
+  // `surfaces` is parsed, so subject-shape logic stays in the gateway layer.
+  //
+  // F-1 (cortex#629) — also derive `principalStacks`: distinct `(principal,
+  // stack)` pairs carrying each binding's OWN parsed principal, so a
+  // multi-principal gateway sink subscribes per principal namespace. `stacks`
+  // is retained for back-compat (single-principal callers / the legacy shape).
   return {
     gateway: gw,
     adapters,
     stacks: distinctBoundStacks(surfaces),
+    principalStacks: distinctBoundPrincipalStacks(surfaces, opts.principal),
   };
 }
