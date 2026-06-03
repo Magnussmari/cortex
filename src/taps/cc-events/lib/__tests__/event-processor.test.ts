@@ -111,6 +111,10 @@ describe("EventProcessor", () => {
     expect(existsSync(newPubDir)).toBe(true);
     // Mask to the low 9 permission bits; assert rwx------ (0o700).
     expect(statSync(newPubDir).mode & 0o777).toBe(0o700);
+    // The published JSONL file itself must be owner-only (0o600), matching the
+    // EventLogger raw/ files — defense-in-depth if the file is copied out of
+    // the 0o700 dir. (rw-------)
+    expect(statSync(pubFile).mode & 0o777).toBe(0o600);
   });
 
   test("returns 0 for empty raw file", () => {

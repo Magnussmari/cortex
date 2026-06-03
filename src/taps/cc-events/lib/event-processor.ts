@@ -78,7 +78,11 @@ export class EventProcessor {
       const result = processEvent(raw, this.policy);
       if (result) {
         appendFileSync(publishedPath, JSON.stringify(result) + "\n");
-        chmodSync(publishedPath, 0o644);
+        // TC-4b (cortex#637): the published JSONL holds prompt/command/tool
+        // previews — owner-only (0o600) to match the EventLogger raw/ files,
+        // not world-readable. The 0o700 dir guards traversal; the 0o600 file
+        // mode is defense-in-depth if the file is ever copied out of the dir.
+        chmodSync(publishedPath, 0o600);
         published++;
 
         // MIG-5b: Best-effort bus tap. JSONL append above is the primary
