@@ -196,6 +196,46 @@ Each stage is independently revertible: revert a binding flip and the stack re-o
 
 ---
 
+## 7a. Multi-principal bindings (F-1 / F-2 — cross-principal, unsigned)
+
+> **Status:** shipped. F-1 (`cortex#629`) + F-1b (`cortex#651`) wired the routing; F-2 (`cortex#630`) proved it end-to-end. Resolves OQ3 below for the **unsigned, dev/trusted** case.
+
+The gateway is no longer single-principal. One gateway can hold bindings for **more than one principal** on the same bus, so two principals collaborate through a single surface edge. Each binding's `stack: {principal}/{stack}` field carries its OWN principal:
+
+- **Inbound (request leg, F-1b):** an inbound message on a binding publishes its canonical `tasks.@{assistant}.chat` envelope on **that binding's** principal subject — `local.{bindingPrincipal}.{stack}.tasks.@{assistant}.chat` — so it lands on the BOUND stack's runner subscription, not the gateway principal's. The gateway sink threads the binding's parsed principal through `subjectPrincipal` (`bus-inbound-sink.ts`); a gap-4 binding (no `stack` field) falls back to the gateway principal.
+- **Outbound (reply leg, F-1):** the gateway's dispatch sink subscribes to one lifecycle subject per distinct `(principal, stack)` pair (`startGatewayIfEnabled` → `principalStacks` → `createDispatchSink`), so each bound stack's `dispatch.task.*` reply is seen on its OWN principal namespace and routed back to the originating adapter instance. The `adapter_instance` filter remains the sole delivery gate — replies never cross-post between principals.
+- **Guard relaxation (F-1):** a cross-principal binding (principal ≠ gateway principal) previously threw at boot (a.3d single-principal guard). It now emits a non-fatal **WARN** and starts. The binding is **UNSIGNED / UNAUTHENTICATED** — fine for a dev/trusted shared bus, but signing (`cortex#552` / `cortex#635`) MUST be on before untrusted peers.
+
+### Example — two principals, one gateway
+
+```yaml
+# surfaces.yaml — two principals bound to ONE gateway on ONE bus.
+# The gateway principal is "andreas"; "joel/production" is a CROSS-principal
+# binding (starts with a WARN — UNSIGNED, dev/trusted only).
+surfaces:
+  discord:
+    - agent: luna
+      stack: andreas/research          # intra-principal (the gateway principal)
+      binding:
+        token: REPLACE_WITH_DISCORD_BOT_TOKEN_A
+        guildId: "111111111111111111"
+        agentChannelId: "000000000000000001"
+        logChannelId: "000000000000000002"
+    - agent: sage
+      stack: joel/production           # CROSS-principal — second principal, unsigned
+      binding:
+        token: REPLACE_WITH_DISCORD_BOT_TOKEN_B
+        guildId: "222222222222222222"
+        agentChannelId: "000000000000000003"
+        logChannelId: "000000000000000004"
+```
+
+With this map, an inbound on guild `111…` publishes on `local.andreas.research.tasks.@…luna.chat` and an inbound on guild `222…` on `local.joel.production.tasks.@…sage.chat`; each principal's reply routes back to its own adapter instance, with no cross-posting. End-to-end coverage: `src/gateway/__tests__/cross-principal-routing.integration.test.ts`.
+
+> ⚠️ **Unsigned caveat.** Cross-principal routing here runs with `security.signing: off` (the gateway publishes originator-stamped + unsigned on the cross-principal hop; `CONTEXT.md` §Dispatch-source). A peer can claim any principal. Use only on a dev / trusted-party bus. Flip `signing: enforce` (and, for cross-org peers, encryption) before any untrusted peer — see `docs/iteration-trust-confidentiality.md`.
+
+---
+
 ## 8. Vocabulary compliance
 
 Per the live whole-tree vocabulary gate (`CONTEXT.md`), this design uses: **principal** (the human, root of trust), **stack** (one running cortex deployment), **assistant** (the named being, e.g. Luna), **agent** (the stack-local runtime hosting an assistant), **dispatch source / dispatch sink** (the gateway's two roles), **response routing** (the wire-level reply address), **Offer / Direct / Delegate** (dispatch modes; GW publishes **Direct** chat envelopes), and **scope** `local` / `federated` / `public` (GW v1 is `local` within one principal; cross-principal is `federated`, deferred — OQ3). No bare "operator" is used; where the NSC/NATS operator account is meant it is qualified ("NSC operator account" — not relevant to GW's data path).
@@ -206,7 +246,7 @@ Per the live whole-tree vocabulary gate (`CONTEXT.md`), this design uses: **prin
 
 1. **Connection dedup key** — `(platform, token)` (operational truth today, `cortex.ts:1274-1281`), `(platform, bot_user_id)`, or `(platform, assistant)`? They diverge when one assistant runs under two tokens.
 2. **Who signs the inbound envelope?** GW as a separate process is a dispatch source but `CONTEXT.md` makes the **stack** the cryptographic signer. Options: (a) gateway holds a delegated per-stack signing key; (b) gateway publishes originator-stamped, bound stack re-signs on ingest; (c) gateway IS a minimal stack. **Blocks GW.f.** (See §4.)
-3. **Cross-principal bindings** — is GW v1 single-principal (all bound stacks share one principal, all `local.`), with shared-channel cross-principal traffic (`federated.`, `CONTEXT.md` Network) deferred to a federation-aware gateway?
+3. ~~**Cross-principal bindings** — is GW v1 single-principal (all bound stacks share one principal, all `local.`), with shared-channel cross-principal traffic (`federated.`, `CONTEXT.md` Network) deferred to a federation-aware gateway?~~ **RESOLVED (F-1/F-2, see §7a):** the gateway is now multi-principal on a shared bus, UNSIGNED (dev/trusted only). Each binding routes on its OWN principal's `local.{principal}.{stack}` subjects (inbound + outbound). The cross-org/`federated.` + signing case is still deferred to the trust-confidentiality harden phases (`cortex#552` / `cortex#635`).
 4. **`response_routing` schema promotion** — is promoting `response_routing` to a first-class wire field GW's PR, or a CFG/myelin-schema prerequisite GW depends on? (See §3.3.)
 5. **Outbound replay on reconnect** — durable re-drain of `dispatch.task.*` (recover blast-radius, risk duplicate edits) vs fire-and-forget (match today, drop on disconnect)? (See §6.2.)
 6. **Shared outbound rate-limiting** — one connection now carries summed volume of all bound stacks against one identity's per-route quota; does GW need a shared route-keyed limiter + bus backpressure contract?
