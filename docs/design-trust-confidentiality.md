@@ -12,16 +12,16 @@ Child of #110 (META: Internet of Agentic Work); cross-links #117 (Phase E) and #
 
 ## 1. Goal
 
-Remove the **unsigned-intra-operator trust crutch** and the **single-operator boundary**, and add
+Remove the **unsigned-intra-principal trust crutch** and the **single-principal boundary**, and add
 confidentiality at every layer. Concretely, move from today's posture —
 
 - gateway→stack envelopes published **unsigned** (D1 "Shape A"), trusted only because they share one
-  host/NATS account (single operator);
-- **single-principal** `IdentityRegistry` (cross-operator verification not wired);
+  host/NATS account (single principal);
+- **single-principal** `IdentityRegistry` (cross-principal verification not wired);
 - **no payload confidentiality** on the bus, **no at-rest encryption**, **no mTLS** —
 
 to a posture where every bus envelope is **attributable (signed)** and optionally **confidential
-(encrypted)**, cross-operator flows are **cryptographically verifiable**, and data at rest and in
+(encrypted)**, cross-principal flows are **cryptographically verifiable**, and data at rest and in
 transit is **encrypted**.
 
 ## 2. Non-goals & invariants (inherited — must not be contradicted)
@@ -57,7 +57,7 @@ transit is **encrypted**.
 | **#535 blocker** | review-consumer verifier built **without** `stackIdentity`/`stackNKeyPub` → stack-signed requests hit `principal_has_no_nkey_pub` | `cortex.ts:1008-1019` (cf. listener `1223-1225`) |
 | Identity | 3-tier principal→stack→agent; `did:mf:<principal>-<stack>`; Ed25519 NKeys only | `cortex.ts:474-476`; `stack.ts:86-133` |
 | Registry | `network-registry` Worker stores `operator_pubkey` + stacks; signed assertions; **not wired into cortex runtime yet** | `services/network-registry/src/routes/principals.ts:33,141` |
-| Federation | `policy.federated.networks[]` + accept/deny + hop-budget gating exist; **cross-operator pubkey verify NOT wired**; peer pubkeys static in yaml | `cortex-config.ts:1359,1429`; `engine.ts:176-184,253-285` |
+| Federation | `policy.federated.networks[]` + accept/deny + hop-budget gating exist; **cross-principal pubkey verify NOT wired**; peer pubkeys static in yaml | `cortex-config.ts:1359,1429`; `engine.ts:176-184,253-285` |
 | Single-principal | one boot `principalId` stamps every agent's `Identity.network`; no cross-principal verify path | `cortex.ts:395,853`; `verify-signed-by-chain.ts:438-443` |
 | Encryption keys | **none** — only Ed25519 signing. No x25519/NaCl in `src/`. myelin has unused AES-256-GCM at-rest primitive | `package.json`; `myelin/src/agent-identity/encryption.ts` |
 | At-rest | local SQLite (`dashboard.db`, `mission-control.db`, learning), event JSONL — **no encryption**; D1 CF-managed only | `mc/db/init.ts:20`; `cc-events` JSONL |
@@ -104,7 +104,7 @@ reuses the existing `cryptoVerify`/`rejectEmpty`/`signFailureMode` knobs rather 
 cleartext, NKey-auth). Flipping any single layer's mode changes only that layer. A dev can run the full
 gateway round-trip with zero crypto, then enable signing-permissive without touching any other config.
 
-### Phase 1 — Make signing real (single-operator) · removes the unsigned-trust crutch
+### Phase 1 — Make signing real (single-principal) · removes the unsigned-trust crutch
 
 - **1a. Fix #535 (quick, unblocks the review loop).** Thread `stackIdentity: signer.principal` +
   `stackNKeyPub` into the review-consumer's `signatureVerifier` closure (`cortex.ts:1008-1019`),
@@ -122,7 +122,7 @@ gateway round-trip with zero crypto, then enable signing-permissive without touc
   inbound path toward `rejectEmpty: true` once subscribe-side verification is enforcing. **Gate:** one
   of the #552 revisit triggers (below) must hold.
 
-### Phase 2 — Federation trust · removes the single-operator boundary
+### Phase 2 — Federation trust · removes the single-principal boundary
 
 - **2a. Registry client (Phase D.4).** Wire a cortex-side `RegistryClient` that resolves peer
   `operator_pubkey` from `GET /principals/{id}` (registry-signed assertion, pinned registry pubkey)
@@ -229,6 +229,6 @@ orthogonal — no dependency on 1–3.
 - **OD-1:** X25519 derivation — RFC-8032 ed25519→x25519, or independent X25519 keypair co-stored?
   (#369 leans derive; confirm with JC.)
 - **OD-2:** At-rest key custody — derive a DB-encryption key from the stack seed, or a separate
-  operator-held key? (Disk theft + seed theft are correlated if same root.)
+  principal-held key? (Disk theft + seed theft are correlated if same root.)
 - **OD-3:** mTLS vs NKey/JWT — complement or replace? (NATS supports both; pick posture.)
 - **OD-4:** Enforcement cutover timing for 1d/#210 — which #552 trigger fires first.
