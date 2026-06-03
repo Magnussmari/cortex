@@ -475,3 +475,150 @@ describe("dispatch-sink — gateway multi-stack subscription (a.3d)", () => {
     expect(adapterB.progressSent).toHaveLength(0);
   });
 });
+
+// ─── F-1 multi-principal subscription (cortex#629) ───────────────────────────
+
+describe("dispatch-sink — gateway multi-principal subscription (F-1, cortex#629)", () => {
+  test("`principalStacks` builds one subject per (principal, stack) pair, own principal in each", async () => {
+    const { runtime, subscribedPatterns } = fakeRuntime();
+    const sink = createDispatchSink({
+      runtime,
+      adapters: [],
+      // the gateway's own principal is irrelevant when principalStacks is set;
+      // each subject carries its OWN principal segment.
+      principal: "gateway-principal",
+      principalStacks: [
+        { principal: "andreas", stack: "meta-factory" },
+        { principal: "robin", stack: "research" },
+      ],
+    });
+    await sink.start();
+    expect(sink.subjects).toEqual([
+      "local.andreas.meta-factory.dispatch.task.>",
+      "local.robin.research.dispatch.task.>",
+    ]);
+    expect(subscribedPatterns).toEqual([...sink.subjects]);
+  });
+
+  test("`undefined` stack → the 5-segment subject under THAT pair's principal", async () => {
+    const { runtime } = fakeRuntime();
+    const sink = createDispatchSink({
+      runtime,
+      adapters: [],
+      principal: "gateway-principal",
+      principalStacks: [
+        { principal: "andreas", stack: "meta-factory" },
+        { principal: "andreas" }, // gap-4: no stack
+      ],
+    });
+    await sink.start();
+    expect(sink.subjects).toEqual([
+      "local.andreas.meta-factory.dispatch.task.>",
+      "local.andreas.dispatch.task.>",
+    ]);
+  });
+
+  test("duplicate (principal, stack) pairs collapse; same leaf under different principals does NOT", async () => {
+    const { runtime } = fakeRuntime();
+    const sink = createDispatchSink({
+      runtime,
+      adapters: [],
+      principal: "gateway-principal",
+      principalStacks: [
+        { principal: "andreas", stack: "research" },
+        { principal: "andreas", stack: "research" }, // exact dup → collapses
+        { principal: "robin", stack: "research" }, // same leaf, diff principal → kept
+        { principal: "andreas" }, // gap-4 undefined → its own bucket
+        { principal: "andreas" }, // dup undefined → collapses
+      ],
+    });
+    await sink.start();
+    expect(sink.subjects).toEqual([
+      "local.andreas.research.dispatch.task.>",
+      "local.robin.research.dispatch.task.>",
+      "local.andreas.dispatch.task.>",
+    ]);
+  });
+
+  test("`principalStacks` (non-empty) takes precedence over both `stacks` and `stack`", async () => {
+    const { runtime } = fakeRuntime();
+    const sink = createDispatchSink({
+      runtime,
+      adapters: [],
+      principal: "gateway-principal",
+      stack: "ignored-single",
+      stacks: ["ignored-multi"],
+      principalStacks: [{ principal: "robin", stack: "research" }],
+    });
+    await sink.start();
+    expect(sink.subjects).toEqual(["local.robin.research.dispatch.task.>"]);
+  });
+
+  test("EMPTY `principalStacks: []` falls back to `stacks` (no silent zero-subscribe)", async () => {
+    const { runtime, subscribedPatterns } = fakeRuntime();
+    const sink = createDispatchSink({
+      runtime,
+      adapters: [],
+      principal: "andreas",
+      stacks: ["meta-factory"],
+      principalStacks: [],
+    });
+    await sink.start();
+    expect(sink.subjects).toEqual(["local.andreas.meta-factory.dispatch.task.>"]);
+    expect(subscribedPatterns).toEqual([...sink.subjects]);
+  });
+
+  test("EMPTY `principalStacks` and no `stacks` falls back to the single `stack`", async () => {
+    const { runtime } = fakeRuntime();
+    const sink = createDispatchSink({
+      runtime,
+      adapters: [],
+      principal: "andreas",
+      stack: "meta-factory",
+      principalStacks: [],
+    });
+    await sink.start();
+    expect(sink.subjects).toEqual(["local.andreas.meta-factory.dispatch.task.>"]);
+  });
+
+  test("delivers across principals keyed by adapter_instance — ONE handler, no double-deliver", async () => {
+    const { runtime, trigger } = fakeRuntime();
+    const adapterA = new MockAdapter("discord:guild-A"); // andreas/meta-factory
+    const adapterB = new MockAdapter("discord:guild-B"); // robin/research
+    const sink = createDispatchSink({
+      runtime,
+      adapters: [adapterA, adapterB],
+      principal: "andreas",
+      principalStacks: [
+        { principal: "andreas", stack: "meta-factory" },
+        { principal: "robin", stack: "research" },
+      ],
+    });
+    await sink.start();
+
+    trigger(
+      lifecycleEnvelope("dispatch.task.completed", {
+        agent_id: "luna",
+        chat_response: "andreas reply",
+        response_routing: routing("discord:guild-A", "C-A"),
+      }),
+    );
+    trigger(
+      lifecycleEnvelope("dispatch.task.completed", {
+        agent_id: "robin",
+        chat_response: "robin reply",
+        response_routing: routing("discord:guild-B", "C-B"),
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Each reply delivered exactly once to its own instance — the single
+    // onEnvelope handler + adapter_instance filter prevents any double-deliver
+    // across the two principal subjects.
+    expect(adapterA.sentMessages).toHaveLength(1);
+    expect(adapterA.sentMessages[0]!.text).toBe("andreas reply");
+    expect(adapterB.sentMessages).toHaveLength(1);
+    expect(adapterB.sentMessages[0]!.text).toBe("robin reply");
+  });
+});
