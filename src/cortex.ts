@@ -1014,6 +1014,19 @@ export async function startCortex(
                 receivingAgentId: agent.id,
                 cryptoVerify: true,
                 principalId: verifyPrincipalId,
+                // cortex#535 (TC-1a) — implicit own-stack trust, mirroring
+                // the bus-dispatch-listener wiring below. Pilot review-
+                // requests are signed with the STACK identity
+                // (`did:mf:<principal>-<stack>`), NOT an agent identity, so
+                // without `stackIdentity` the stack DID misses the cortex#480
+                // own-stack short-circuit and gets rejected as
+                // `principal_has_no_nkey_pub`. Thread the SAME conditional-
+                // spread options the dispatch-listener passes so self-signed
+                // review-requests verify cleanly instead of being dropped.
+                ...(signer !== undefined && { stackIdentity: signer.principal }),
+                ...(stackNKeyPubForVerifier !== undefined && {
+                  stackNKeyPub: stackNKeyPubForVerifier,
+                }),
               });
               if (r.valid) return { valid: true } as const;
               return { valid: false, reason: r.reason.kind } as const;
