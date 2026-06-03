@@ -1,28 +1,28 @@
 # Iteration Plan: Trust & Confidentiality
 
-Tracks `docs/design-trust-confidentiality.md`. Umbrella: **#TBD** (child of #110; cross-links #117, #524).
+Tracks `docs/design-trust-confidentiality.md`. Umbrella: **#627** (child of #110; cross-links #117, #524).
 Each slice is a sub-issue. `folds #N` = an existing issue this slice subsumes/reuses (don't recreate).
 Status: ☐ planned · ◐ in-progress · ☑ done.
 
 | Slice | Title | Phase | Folds / New | Status | Issue |
 |-------|-------|-------|-------------|--------|-------|
-| **TC-0** | Security posture config — unified `security:` toggles (signing/encryption/at-rest/mTLS), all default OFF; ramp `off→permissive→enforce` | 0 Posture | new | ☐ | — |
-| **TC-1a** | Fix #535 — thread `stackIdentity`/`stackNKeyPub` into review-consumer verifier | 1 Signing | folds #535 | ☐ | — |
-| **TC-1b** | Stack-identity provisioning + boot `verifier-self-check` on every stack | 1 Signing | new | ☐ | — |
-| **TC-1c** | Shape B — bound stack re-signs gateway-injected envelopes on ingest | 1 Signing | folds #552 | ☐ | — |
-| **TC-1d** | Enforce — `signFailureMode` → `drop`; tighten `rejectEmpty` on `tasks.chat` | 1 Signing | folds #210 | ☐ | — |
-| **TC-2c** | **F-1:** Relax single-principal guard + multi-principal subject derivation | **F Routing** (priority) | new | ☐ | — |
-| **TC-F2** | **F-2:** Cross-principal routing on a shared bus (two principals, one NATS, `federated.*`, unsigned) | **F Routing** (priority) | new | ☐ | — |
-| **TC-F3** | **F-3:** Multi-link / multi-network runtime — one NATS leaf per network/deployment | **F Routing** | new (E.1 / #348) | ☐ | — |
-| **TC-2a** | Registry client — resolve peer pubkeys via `GET /principals/{id}` (Phase D.4) | 2-verify (harden) | new | ☐ | — |
-| **TC-2b** | Multi-principal `IdentityRegistry` (peer-stamped, not single boot principal) | 2-verify (harden) | new | ☐ | — |
-| **TC-2d** | `federated.*` crypto-verify wiring against registry-resolved peer pubkeys | 2-verify (harden) | new | ☐ | — |
-| **TC-3** | Payload encryption — sealed `extensions.enc`, X25519-from-ed25519, encrypt-then-sign | 3 Encryption | folds #369 | ☐ | — |
-| **TC-4a** | `cortex.yaml` chmod-600 gate (bot tokens) — **immediate quick win** | 4 At-rest/mTLS | new | ☐ | — |
-| **TC-4b** | File-mode hardening (event `published/` 0755→0700; mode audit) | 4 At-rest/mTLS | new | ☐ | — |
-| **TC-4c** | At-rest field encryption (high-sensitivity columns; local SQLite + D1) | 4 At-rest/mTLS | new | ☐ | — |
-| **TC-4d** | NATS mTLS — `tls` surface on `NatsLink` + cortex.yaml/relay plumbing | 4 At-rest/mTLS | new | ☐ | — |
-| **TC-4e** | Cloud-publisher mTLS + non-TLS `federated` leaf-node warning | 4 At-rest/mTLS | new | ☐ | — |
+| **TC-0** | Security posture config — unified `security:` toggles (signing/encryption/at-rest/mTLS), all default OFF; ramp `off→permissive→enforce` | 0 Posture | new | ☐ | #628 |
+| **TC-1a** | Fix #535 — thread `stackIdentity`/`stackNKeyPub` into review-consumer verifier | 1 Signing | folds #535 | ☐ | #535 |
+| **TC-1b** | Stack-identity provisioning + boot `verifier-self-check` on every stack | 1 Signing | new | ☐ | #632 |
+| **TC-1c** | Shape B — bound stack re-signs gateway-injected envelopes on ingest | 1 Signing | folds #552 | ☐ | #552 |
+| **TC-1d** | Enforce — `signFailureMode` → `drop`; tighten `rejectEmpty` on `tasks.chat` | 1 Signing | folds #210 | ☐ | #210 |
+| **TC-2c** | **F-1:** Relax single-principal guard + multi-principal subject derivation | **F Routing** (priority) | new | ☐ | #629 |
+| **TC-F2** | **F-2:** Cross-principal routing on a shared bus (two principals, one NATS, `federated.*`, unsigned) | **F Routing** (priority) | new | ☐ | #630 |
+| **TC-F3** | **F-3:** Multi-link / multi-network runtime — one NATS leaf per network/deployment | **F Routing** | new (E.1 / #348) | ☐ | #631 |
+| **TC-2a** | Registry client — resolve peer pubkeys via `GET /principals/{id}` (Phase D.4) | 2-verify (harden) | new | ☐ | #633 |
+| **TC-2b** | Multi-principal `IdentityRegistry` (peer-stamped, not single boot principal) | 2-verify (harden) | new | ☐ | #634 |
+| **TC-2d** | `federated.*` crypto-verify wiring against registry-resolved peer pubkeys | 2-verify (harden) | new | ☐ | #635 |
+| **TC-3** | Payload encryption — sealed `extensions.enc`, X25519-from-ed25519, encrypt-then-sign | 3 Encryption | folds #369 | ☐ | #369 |
+| **TC-4a** | `cortex.yaml` chmod-600 gate (bot tokens) — **immediate quick win** | 4 At-rest/mTLS | new | ☐ | #636 |
+| **TC-4b** | File-mode hardening (event `published/` 0755→0700; mode audit) | 4 At-rest/mTLS | new | ☐ | #637 |
+| **TC-4c** | At-rest field encryption (high-sensitivity columns; local SQLite + D1) | 4 At-rest/mTLS | new | ☐ | #638 |
+| **TC-4d** | NATS mTLS — `tls` surface on `NatsLink` + cortex.yaml/relay plumbing | 4 At-rest/mTLS | new | ☐ | #639 |
+| **TC-4e** | Cloud-publisher mTLS + non-TLS `federated` leaf-node warning | 4 At-rest/mTLS | new | ☐ | #640 |
 
 ## Drive order — federation-FIRST (unsigned), crypto layered on after
 
