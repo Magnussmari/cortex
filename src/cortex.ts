@@ -2362,7 +2362,13 @@ export async function startCortex(
         runtime,
         adapters: startedGateway.adapters,
         principal: principalId,
+        // F-1 (cortex#629) — subscribe per distinct `(principal, stack)` pair so
+        // a multi-principal gateway sees every bound stack's replies on the
+        // right principal namespace. `principalStacks` takes precedence over
+        // `stacks` in the sink; `stacks` is still passed for the
+        // single-principal back-compat path / readability.
         stacks: startedGateway.stacks,
+        principalStacks: startedGateway.principalStacks,
       })
     : undefined;
   if (gatewayDispatchSink !== undefined) {

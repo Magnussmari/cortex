@@ -201,6 +201,11 @@ describe("startGatewayIfEnabled — flag on", () => {
     ]);
     // the one binding's stack leaf (parsed from "andreas/meta-factory")
     expect(gw?.stacks).toEqual(["meta-factory"]);
+    // F-1 (cortex#629) — the distinct (principal, stack) pair for the multi-
+    // principal sink subjects. Single-principal stays under the gateway principal.
+    expect(gw?.principalStacks).toEqual([
+      { principal: "andreas", stack: "meta-factory" },
+    ]);
   });
 
   test("multi-stack bindings → distinct bound stacks (a.3d outbound subjects)", async () => {
@@ -250,7 +255,71 @@ describe("startGatewayIfEnabled — flag on", () => {
     ]);
   });
 
-  test("cross-principal binding → throws loudly at boot (single-principal v1)", async () => {
+  test("multi-principal bindings → WARNS, starts, exposes per-principal pairs (F-1, cortex#629)", async () => {
+    const started: string[] = [];
+    const { factory } = makeCountingFactory(started);
+    const multiPrincipal: Surfaces = {
+      discord: [
+        {
+          agent: "luna",
+          stack: "andreas/meta-factory",
+          binding: {
+            token: "tok-1",
+            guildId: "111",
+            agentChannelId: "aaa000000000000001",
+            logChannelId: "bbb000000000000002",
+          },
+        },
+        {
+          agent: "robin",
+          // a SECOND principal on the shared bus
+          stack: "robin/research",
+          binding: {
+            token: "tok-2",
+            guildId: "222",
+            agentChannelId: "ccc000000000000003",
+            logChannelId: "ddd000000000000004",
+          },
+        },
+      ],
+    };
+
+    const origWrite = process.stderr.write.bind(process.stderr);
+    const stderr: string[] = [];
+    process.stderr.write = (chunk: string | Uint8Array): boolean => {
+      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+      return true;
+    };
+
+    let gw;
+    try {
+      gw = await startGatewayIfEnabled({
+        env: { CORTEX_GATEWAY: "1" },
+        surfaces: multiPrincipal,
+        // gateway principal "andreas" — "robin" is cross-principal
+        principal: "andreas",
+        runtime: RUNTIME_STUB,
+        source: SOURCE_STUB,
+        policyEngine: POLICY_ENGINE_STUB,
+        factory,
+      });
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    // ALLOWED + WARNED.
+    expect(gw?.gateway).toBeInstanceOf(SurfaceGateway);
+    expect(stderr.join("")).toMatch(/UNSIGNED/);
+
+    // F-1 — one (principal, stack) pair per principal, each carrying its OWN
+    // parsed principal (NOT collapsed onto the gateway principal).
+    expect(gw?.principalStacks).toEqual([
+      { principal: "andreas", stack: "meta-factory" },
+      { principal: "robin", stack: "research" },
+    ]);
+  });
+
+  test("cross-principal binding → WARNS (stderr) and ALLOWS the gateway to start (F-1, cortex#629)", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
     const crossPrincipal: Surfaces = {
@@ -268,8 +337,20 @@ describe("startGatewayIfEnabled — flag on", () => {
         },
       ],
     };
-    await expect(
-      startGatewayIfEnabled({
+
+    // Capture stderr to assert the UNSIGNED/dev-only warning fired.
+    const origWrite = process.stderr.write.bind(process.stderr);
+    const stderr: string[] = [];
+    process.stderr.write = (chunk: string | Uint8Array): boolean => {
+      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+      return true;
+    };
+
+    let gw;
+    try {
+      // F-1 (cortex#629): a cross-principal binding is no longer a hard throw —
+      // the gateway starts and the binding is allowed (UNSIGNED/dev-only).
+      gw = await startGatewayIfEnabled({
         env: { CORTEX_GATEWAY: "1" },
         surfaces: crossPrincipal,
         principal: "andreas",
@@ -277,11 +358,28 @@ describe("startGatewayIfEnabled — flag on", () => {
         source: SOURCE_STUB,
         policyEngine: POLICY_ENGINE_STUB,
         factory,
-      }),
-    ).rejects.toThrow(/cross-principal/i);
-    // Fails BEFORE building or starting any adapter.
-    expect(constructed).toEqual([]);
-    expect(started).toEqual([]);
+      });
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    // ALLOWED: the gateway started over the cross-principal binding.
+    expect(gw?.gateway).toBeInstanceOf(SurfaceGateway);
+    expect(constructed).toEqual(["discord:111222333444555666"]);
+    expect(started).toEqual(["discord:111222333444555666"]);
+
+    // WARNED: a clear UNSIGNED/dev-only stderr warning fired, naming the
+    // offending binding.
+    const warning = stderr.join("");
+    expect(warning).toMatch(/cross-principal/i);
+    expect(warning).toMatch(/UNSIGNED/);
+    expect(warning).toMatch(/someone-else\/meta-factory/);
+
+    // F-1 — the cross-principal binding's OWN principal flows through to the
+    // outbound sink subjects (not absorbed into the gateway principal).
+    expect(gw?.principalStacks).toEqual([
+      { principal: "someone-else", stack: "meta-factory" },
+    ]);
   });
 
   test("flag on but surfaces undefined → returns undefined (graceful degrade)", async () => {

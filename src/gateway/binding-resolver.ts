@@ -234,6 +234,86 @@ export function distinctBoundStacks(
 }
 
 // =============================================================================
+// distinctBoundPrincipalStacks  (F-1 multi-principal subjects — cortex#629)
+// =============================================================================
+
+/**
+ * One distinct `(principal, stack)` pair the gateway's outbound dispatch sink
+ * must subscribe to. The bound stack's OWN runner republishes
+ * `dispatch.task.*` on `local.{principal}.{stack}.dispatch.task.>`, stamping
+ * its own runtime principal + stack leaf — so the sink needs one subscribe
+ * subject per distinct `(principal, stack)` pair across every binding.
+ */
+export interface BoundPrincipalStack {
+  /**
+   * Principal segment of the lifecycle subject. Parsed from the binding's
+   * `{principal}/{stack}` field; falls back to the gateway's own principal for
+   * a gap-4 binding (no `stack` field — §4 above), which publishes on the
+   * gateway principal's namespace.
+   */
+  principal: string;
+  /**
+   * Stack leaf, or `undefined` for a gap-4 binding (the 5-segment legacy
+   * subject `local.{principal}.dispatch.task.>`).
+   */
+  stack: string | undefined;
+}
+
+/**
+ * The distinct set of `(principal, stack)` pairs across every surface binding.
+ *
+ * **F-1 (cortex#629) — multi-principal subjects.** {@link distinctBoundStacks}
+ * collapses every binding onto the gateway's single principal (single-principal
+ * v1). When the gateway serves MULTIPLE principals on a shared bus (F-1, with
+ * signing OFF), each binding's reply lands on ITS OWN principal's namespace —
+ * `local.{thatPrincipal}.{stack}.dispatch.task.>` — not the gateway principal's.
+ * The outbound sink therefore needs one subscribe subject per distinct
+ * `(principal, stack)` pair, derived HERE from each binding's PARSED principal.
+ *
+ * Derivation (re-uses `parseStack`, the single `{principal}/{stack}` source —
+ * no drift):
+ *   - A binding with a `stack` field yields `{ principal: <parsed>, stack:
+ *     <parsed leaf> }`.
+ *   - A gap-4 binding (no `stack` field, §4 above) carries no principal, so it
+ *     falls back to the gateway's own `principal` with `stack: undefined` — the
+ *     5-segment legacy subject it publishes on.
+ *
+ * Pairs are deduped on `(principal, stack)` (with `undefined` stack as its own
+ * bucket per principal), preserving binding iteration order across discord →
+ * slack → mattermost.
+ *
+ * Cross-principal bindings are UNSIGNED/UNAUTHENTICATED in F-1 (dev/trusted
+ * only); the boot path WARNS rather than throwing ({@link
+ * crossPrincipalBindings} stays the detector — only the consumer changed from
+ * throw→warn). Signing is layered on later (cortex#552 / cortex#635).
+ */
+export function distinctBoundPrincipalStacks(
+  surfaces: Surfaces,
+  gatewayPrincipal: string,
+): BoundPrincipalStack[] {
+  const seen = new Set<string>();
+  const out: BoundPrincipalStack[] = [];
+  const add = (raw: string | undefined): void => {
+    const parsed = parseStack(raw);
+    // Gap-4 (no stack field) → the binding has no principal of its own and
+    // publishes on the gateway principal's 5-segment legacy subject.
+    const principal = parsed.principal ?? gatewayPrincipal;
+    const stack = parsed.stack;
+    // Dedup key: a ` ` separator keeps the principal/stack boundary
+    // unambiguous, and a distinct sentinel for the undefined-stack bucket so it
+    // never collides with a real stack name.
+    const key = `${principal} ${stack ?? "undefined"}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ principal, stack });
+  };
+  for (const e of surfaces.discord ?? []) add(e.stack);
+  for (const e of surfaces.slack ?? []) add(e.stack);
+  for (const e of surfaces.mattermost ?? []) add(e.stack);
+  return out;
+}
+
+// =============================================================================
 // crossPrincipalBindings  (single-principal v1 enforcement — a.3d review)
 // =============================================================================
 

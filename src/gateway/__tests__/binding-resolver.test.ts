@@ -20,6 +20,7 @@ import {
   buildBindingIndex,
   resolveBinding,
   distinctBoundStacks,
+  distinctBoundPrincipalStacks,
   crossPrincipalBindings,
   type GatewayBindingIndex,
   type GatewayBindingMatch,
@@ -571,6 +572,142 @@ describe("distinctBoundStacks — gateway outbound subject derivation", () => {
 
   test("no bindings → empty list", () => {
     expect(distinctBoundStacks({})).toEqual([]);
+  });
+});
+
+// ─── 13b. distinctBoundPrincipalStacks (F-1 multi-principal — cortex#629) ──────
+
+describe("distinctBoundPrincipalStacks — multi-principal subject derivation", () => {
+  test("single binding → one (principal, stack) pair from its parsed stack", () => {
+    expect(distinctBoundPrincipalStacks(DISCORD_SURFACES, "andreas")).toEqual([
+      { principal: "andreas", stack: "meta-factory" },
+    ]);
+  });
+
+  test("bindings under DIFFERENT principals → one pair each, own principal preserved", () => {
+    const surfaces: Surfaces = {
+      discord: [
+        {
+          agent: "luna",
+          stack: "andreas/meta-factory",
+          binding: { token: "t1", guildId: "G1", agentChannelId: "a", logChannelId: "b" },
+        },
+        {
+          agent: "robin",
+          // a second principal on the shared bus
+          stack: "robin/research",
+          binding: { token: "t2", guildId: "G2", agentChannelId: "c", logChannelId: "d" },
+        },
+      ],
+    };
+    // gateway principal "andreas"; the "robin" binding keeps its OWN principal
+    // (NOT collapsed onto the gateway principal).
+    expect(distinctBoundPrincipalStacks(surfaces, "andreas")).toEqual([
+      { principal: "andreas", stack: "meta-factory" },
+      { principal: "robin", stack: "research" },
+    ]);
+  });
+
+  test("same (principal, stack) across platforms → deduped to one pair", () => {
+    const surfaces: Surfaces = {
+      discord: [
+        {
+          agent: "luna",
+          stack: "andreas/meta-factory",
+          binding: { token: "t1", guildId: "G1", agentChannelId: "a", logChannelId: "b" },
+        },
+      ],
+      slack: [
+        {
+          agent: "luna",
+          // identical (principal, stack) → collapses
+          stack: "andreas/meta-factory",
+          binding: { botToken: "xoxb", appToken: "xapp", workspaceId: "W1" },
+        },
+      ],
+    };
+    expect(distinctBoundPrincipalStacks(surfaces, "andreas")).toEqual([
+      { principal: "andreas", stack: "meta-factory" },
+    ]);
+  });
+
+  test("same stack LEAF under different principals → two distinct pairs (not collapsed)", () => {
+    const surfaces: Surfaces = {
+      discord: [
+        {
+          agent: "luna",
+          stack: "andreas/research",
+          binding: { token: "t1", guildId: "G1", agentChannelId: "a", logChannelId: "b" },
+        },
+        {
+          agent: "robin",
+          // SAME leaf "research", DIFFERENT principal → must NOT dedup
+          stack: "robin/research",
+          binding: { token: "t2", guildId: "G2", agentChannelId: "c", logChannelId: "d" },
+        },
+      ],
+    };
+    expect(distinctBoundPrincipalStacks(surfaces, "andreas")).toEqual([
+      { principal: "andreas", stack: "research" },
+      { principal: "robin", stack: "research" },
+    ]);
+  });
+
+  test("gap-4 binding (no stack field) → gateway principal + undefined stack", () => {
+    const noStack: Surfaces = {
+      discord: [
+        {
+          agent: "luna",
+          binding: { token: "t", guildId: "G", agentChannelId: "a", logChannelId: "b" },
+        },
+      ],
+    };
+    expect(distinctBoundPrincipalStacks(noStack, "andreas")).toEqual([
+      { principal: "andreas", stack: undefined },
+    ]);
+  });
+
+  test("mixed: stacked cross-principal + gap-4 → pair plus the gateway-principal undefined bucket", () => {
+    const mixed: Surfaces = {
+      discord: [
+        {
+          agent: "robin",
+          stack: "robin/meta-factory",
+          binding: { token: "t1", guildId: "G1", agentChannelId: "a", logChannelId: "b" },
+        },
+        {
+          agent: "luna",
+          // gap-4 → gateway principal "andreas", undefined stack
+          binding: { token: "t2", guildId: "G2", agentChannelId: "c", logChannelId: "d" },
+        },
+      ],
+    };
+    expect(distinctBoundPrincipalStacks(mixed, "andreas")).toEqual([
+      { principal: "robin", stack: "meta-factory" },
+      { principal: "andreas", stack: undefined },
+    ]);
+  });
+
+  test("two gap-4 bindings → a single gateway-principal undefined bucket (dedup)", () => {
+    const twoGap4: Surfaces = {
+      discord: [
+        {
+          agent: "luna",
+          binding: { token: "t1", guildId: "G1", agentChannelId: "a", logChannelId: "b" },
+        },
+        {
+          agent: "ivy",
+          binding: { token: "t2", guildId: "G2", agentChannelId: "c", logChannelId: "d" },
+        },
+      ],
+    };
+    expect(distinctBoundPrincipalStacks(twoGap4, "andreas")).toEqual([
+      { principal: "andreas", stack: undefined },
+    ]);
+  });
+
+  test("no bindings → empty list", () => {
+    expect(distinctBoundPrincipalStacks({}, "andreas")).toEqual([]);
   });
 });
 

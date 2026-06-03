@@ -114,6 +114,22 @@ export interface DispatchSinkOptions {
    * envelope; the `adapter_instance` filter remains the sole delivery gate.
    */
   stacks?: readonly (string | undefined)[];
+  /**
+   * F-1 (cortex#629) — MULTIPLE `(principal, stack)` pairs. When the shared
+   * surface gateway serves MORE THAN ONE principal on a shared bus (signing
+   * OFF — dev/trusted only), each bound stack's reply lands on ITS OWN
+   * principal's namespace, not the gateway principal's. `stacks` (above) is
+   * single-principal — it pairs every leaf with the one `principal`. This
+   * generalises it: one subscribe subject per DISTINCT `(principal, stack)`
+   * pair (`local.{principal}.{stack}.dispatch.task.>`, or the 5-segment
+   * `local.{principal}.dispatch.task.>` when `stack` is `undefined`).
+   *
+   * When provided and non-empty, `principalStacks` takes precedence over BOTH
+   * `stacks` and `stack`. The single delivery invariant is unchanged: still
+   * exactly ONE `onEnvelope` handler, so multiple subjects never double-deliver
+   * — the `adapter_instance` filter remains the sole delivery gate.
+   */
+  principalStacks?: readonly { principal: string; stack?: string }[];
 }
 
 export interface DispatchSink {
@@ -167,6 +183,28 @@ function distinctStacks(
 }
 
 /**
+ * De-duplicate a `(principal, stack)` pair list, preserving order. The
+ * `undefined` stack (gap-4 / 5-segment case) is its own bucket PER principal —
+ * keyed on a ` `-separated `principal stack` string so it never collides with a
+ * real stack name or with another principal's undefined bucket. Used to fold
+ * the gateway's per-binding `(principal, stack)` pairs into one subscribe-subject
+ * set (F-1 multi-principal — cortex#629).
+ */
+function distinctPrincipalStacks(
+  pairs: readonly { principal: string; stack?: string }[],
+): { principal: string; stack?: string }[] {
+  const seen = new Set<string>();
+  const out: { principal: string; stack?: string }[] = [];
+  for (const p of pairs) {
+    const key = `${p.principal} ${p.stack ?? "undefined"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return out;
+}
+
+/**
  * Create a dispatch sink. Wires nothing until `start()` is called.
  */
 export function createDispatchSink(opts: DispatchSinkOptions): DispatchSink {
@@ -175,13 +213,24 @@ export function createDispatchSink(opts: DispatchSinkOptions): DispatchSink {
   const adapterByInstance = new Map<string, PlatformAdapter>(
     adapters.map((a) => [a.instanceId, a]),
   );
-  // a.3d — `stacks` (gateway multi-stack) takes precedence over the single
-  // `stack` when present: one subscribe subject per distinct bound stack.
-  // Otherwise the single-stack (per-stack caller) path is unchanged.
+  // Subject precedence (most → least specific):
+  //   1. `principalStacks` (F-1 multi-principal — cortex#629): one subject per
+  //      distinct `(principal, stack)` pair. Each pair carries its OWN principal
+  //      segment, so the gateway can subscribe across principals on a shared bus.
+  //   2. `stacks` (a.3d gateway multi-stack): many stacks under the ONE
+  //      `principal`.
+  //   3. `stack` (per-stack `cortex.ts` wiring): the single-subject default.
+  // Whichever path is taken, there is exactly ONE `onEnvelope` handler, so the
+  // subject COUNT never affects delivery — the `adapter_instance` filter is the
+  // sole delivery gate (no double-deliver).
   const subjects =
-    opts.stacks !== undefined && opts.stacks.length > 0
-      ? distinctStacks(opts.stacks).map((s) => lifecycleSubject(principal, s))
-      : [lifecycleSubject(principal, stack)];
+    opts.principalStacks !== undefined && opts.principalStacks.length > 0
+      ? distinctPrincipalStacks(opts.principalStacks).map((p) =>
+          lifecycleSubject(p.principal, p.stack),
+        )
+      : opts.stacks !== undefined && opts.stacks.length > 0
+        ? distinctStacks(opts.stacks).map((s) => lifecycleSubject(principal, s))
+        : [lifecycleSubject(principal, stack)];
 
   let registration: { unregister: () => void } | null = null;
   let subscribers: MyelinSubscriber[] = [];
