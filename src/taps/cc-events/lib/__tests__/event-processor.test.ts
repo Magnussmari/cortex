@@ -1,7 +1,7 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { EventProcessor } from "../event-processor";
 import { JsonlReader } from "../jsonl-reader";
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, appendFileSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, appendFileSync, statSync } from "fs";
 import { join } from "path";
 import type { RelayPolicy } from "../policy-schema";
 
@@ -93,6 +93,28 @@ describe("EventProcessor", () => {
 
     expect(existsSync(newPubDir)).toBe(true);
     expect(existsSync(pubFile)).toBe(true);
+  });
+
+  test("TC-4b (cortex#637): creates published directory at 0o700 (owner-only)", () => {
+    // published/ JSONL holds prompt/command/tool previews — the dir must be
+    // owner-only, never world-readable. POSIX-gated: NTFS uses ACLs, not modes.
+    if (process.platform === "win32") return;
+
+    const rawFile = join(RAW_DIR, "s-mode.jsonl");
+    const newPubDir = join(TEST_DIR, "mode-published");
+    const pubFile = join(newPubDir, "s-mode.jsonl");
+    const processor = new EventProcessor(testPolicy);
+
+    writeEvent(rawFile, sampleRawEvent(1));
+    processor.processFile(rawFile, pubFile);
+
+    expect(existsSync(newPubDir)).toBe(true);
+    // Mask to the low 9 permission bits; assert rwx------ (0o700).
+    expect(statSync(newPubDir).mode & 0o777).toBe(0o700);
+    // The published JSONL file itself must be owner-only (0o600), matching the
+    // EventLogger raw/ files — defense-in-depth if the file is copied out of
+    // the 0o700 dir. (rw-------)
+    expect(statSync(pubFile).mode & 0o777).toBe(0o600);
   });
 
   test("returns 0 for empty raw file", () => {
