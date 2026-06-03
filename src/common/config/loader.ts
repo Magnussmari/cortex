@@ -23,6 +23,7 @@ import {
   type StackConfig,
 } from "../types/cortex-config";
 import { foldSurfaceBindings, SurfacesSchema, type Surfaces } from "../types/surfaces";
+import { enforceChmod600 } from "./file-permissions";
 
 /**
  * Hardening cap on a single fragment file's size. Echo M3 on cortex#62 —
@@ -379,6 +380,17 @@ function composeRawConfigWithSurfaces(configPath: string): {
     // CFG.a.2 — single-file fallback. Capture any `surfaces:` block BEFORE
     // the fold so `LoadedConfig.surfaces` is populated symmetrically with the
     // directory-layout path (CFG.c design: both ingestion paths are symmetric).
+    //
+    // TC-4a (cortex#636) — the single `cortex.yaml` carries platform BOT
+    // TOKENS (Discord/Slack/Mattermost) inline, so it gets the same
+    // chmod-600 gate the nkey-seed (`stack-signing-key.ts`) and NATS
+    // `.creds` (`bus/nats/connection.ts`) loaders already enforce via the
+    // shared `enforceChmod600` helper. Sync `statSync` keeps the
+    // stat-then-read TOCTOU window as tight as the sibling loaders'; the
+    // daemon owns its config dir, so the practical risk is near zero — an
+    // attacker who can swap files there has already won. The helper skips
+    // the gate on win32 (NTFS ACLs are the principal's responsibility).
+    enforceChmod600(expandedPath);
     const content = readFileSync(expandedPath, "utf-8");
     const single = (parseYaml(content) ?? {}) as Record<string, unknown>;
     const surfaces = parseSurfaces(single.surfaces);

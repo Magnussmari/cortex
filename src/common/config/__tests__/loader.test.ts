@@ -4,7 +4,7 @@
  */
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync, existsSync } from "fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, chmodSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { stringify } from "yaml";
@@ -26,7 +26,9 @@ function setupTestDir(): string {
 function writeCentralConfig(dir: string, config: Record<string, unknown>): string {
 
   const path = join(dir, "bot.yaml");
-  writeFileSync(path, stringify(config));
+  // TC-4a (cortex#636): the single-file config read enforces chmod 600
+  // (it carries platform bot tokens). Write fixtures 0600 so the gate passes.
+  writeFileSync(path, stringify(config), { mode: 0o600 });
   return path;
 }
 
@@ -359,7 +361,9 @@ import { loadConfigWithAgents } from "../loader";
 describe("MIG-7.2e — cortex-shape detection + transform", () => {
   function writeCortexConfig(dir: string, config: Record<string, unknown>): string {
     const path = join(dir, "cortex.yaml");
-    writeFileSync(path, stringify(config));
+    // TC-4a (cortex#636): the single-file config read enforces chmod 600
+  // (it carries platform bot tokens). Write fixtures 0600 so the gate passes.
+  writeFileSync(path, stringify(config), { mode: 0o600 });
     return path;
   }
 
@@ -854,5 +858,69 @@ describe("MIG-7.2e — cortex-shape detection + transform", () => {
     };
     const path = writeCortexConfig(testDir, cfg);
     expect(() => loadConfigWithAgents(path)).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TC-4a (cortex#636) — chmod-600 gate on the single-file cortex.yaml read.
+//
+// The single `cortex.yaml` carries platform BOT TOKENS (Discord/Slack/
+// Mattermost) inline, so the single-file load path enforces the same
+// chmod-600 gate the nkey-seed and `.creds` loaders already apply. The gate
+// is POSIX-only (the shared helper skips win32, where NTFS uses ACLs).
+// ---------------------------------------------------------------------------
+
+describe("TC-4a — chmod-600 gate on single-file cortex.yaml (cortex#636)", () => {
+  // Minimal valid cortex-shape config (mirrors the MIG-7.2e fixtures) — its
+  // own copy so this block is independent of the cortex-shape describe scope.
+  function minimalCortexConfig(): Record<string, unknown> {
+    return {
+      principal: { id: "jc", displayName: "JC", discordId: "1" },
+      agents: [
+        {
+          id: "ivy",
+          displayName: "Ivy",
+          persona: "./personas/ivy.md",
+          roles: [],
+          trust: [],
+          presence: {
+            discord: {
+              token: "fake-token-ivy",
+              guildId: "1",
+              agentChannelId: "2",
+              logChannelId: "3",
+            },
+          },
+        },
+      ],
+      claude: {},
+    };
+  }
+
+  // The gate is a no-op on win32 (NTFS ACLs are the principal's
+  // responsibility — see file-permissions.ts), so skip there.
+  const itPosix = process.platform === "win32" ? test.skip : test;
+
+  itPosix("rejects a cortex.yaml with looser-than-0600 perms", () => {
+    const path = join(testDir, "cortex.yaml");
+    writeFileSync(path, stringify(minimalCortexConfig()));
+    chmodSync(path, 0o644); // group/world-readable — must be rejected
+    expect(() => loadConfigWithAgents(path)).toThrow(/must be chmod 600/);
+  });
+
+  itPosix("rejects a group/world-writable cortex.yaml (0660)", () => {
+    const path = join(testDir, "cortex.yaml");
+    writeFileSync(path, stringify(minimalCortexConfig()));
+    chmodSync(path, 0o660);
+    expect(() => loadConfigWithAgents(path)).toThrow(/must be chmod 600/);
+  });
+
+  itPosix("loads a cortex.yaml that is exactly chmod 600", () => {
+    const path = join(testDir, "cortex.yaml");
+    writeFileSync(path, stringify(minimalCortexConfig()));
+    chmodSync(path, 0o600);
+    const loaded = loadConfigWithAgents(path);
+    expect(loaded.inlineAgents).toHaveLength(1);
+    expect(loaded.principal?.id).toBe("jc");
   });
 });
