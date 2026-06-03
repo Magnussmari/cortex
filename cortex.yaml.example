@@ -84,6 +84,33 @@ stack:
   nkey_pub: UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  # <REPLACE_ME>: paste the U-prefixed pubkey from the seed
 
 # -----------------------------------------------------------------------------
+# security — TC-0 unified posture toggles (#628). OPTIONAL; every layer
+# defaults OFF, so omitting this whole block runs the stack exactly as it does
+# today (unsigned/cleartext dev mode). Each layer ramps INDEPENDENTLY through
+# off → permissive → enforce so you can harden one concern at a time.
+# -----------------------------------------------------------------------------
+# security:
+#   # signing — ed25519 envelope signing + signed_by[] chain verification.
+#   #   off        : never attach a signer (publish unsigned); verify but
+#   #                NEVER reject. Identical to pre-TC-0 dev behaviour.
+#   #   permissive : attach the signer IF `stack.nkey_seed_path` is set; verify
+#   #                but never reject. Use this to KEEP signing when a seed is
+#   #                configured (under `off`, a configured seed is NOT used).
+#   #   enforce    : attach signer AND reject unsigned/invalid envelopes
+#   #                (rejectEmpty + drop-on-sign-failure). Flip here only once
+#   #                every peer on the bus signs, or you will drop their traffic.
+#   signing: off
+#   encryption:
+#     # payload — per-message sealing to the recipient's advertised enc_pub.
+#     #   off | opt-in (seal when recipient advertises a key) | require (reject cleartext)
+#     payload: off
+#     # at_rest — field-encrypt high-sensitivity DB columns. off | on
+#     at_rest: off
+#   transport:
+#     # mtls — client-cert offer on the NATS link. off | on (offer) | require (refuse non-mTLS)
+#     mtls: off
+
+# -----------------------------------------------------------------------------
 # capabilities — STACK CATALOG (source of truth for capability-dispatch)
 # -----------------------------------------------------------------------------
 # Each entry is a constrained-schema declaration with `id`, `description`,

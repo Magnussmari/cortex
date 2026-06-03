@@ -118,6 +118,15 @@ function cortexConfigFixture(agents: Agent[]): CortexConfig {
     // include it explicitly. Registry tests don't exercise capabilities; an
     // empty array is the right zero-value.
     capabilities: [],
+    // TC-0 (#628) — same `.default()`-but-required-on-output story as
+    // `capabilities` above: `SecurityPostureSchema` fills defaults after parse,
+    // so the inferred OUTPUT type lists `security` as required. Registry tests
+    // don't exercise the posture; the all-`off` default is the right zero-value.
+    security: {
+      signing: "off",
+      encryption: { payload: "off", at_rest: "off" },
+      transport: { mtls: "off" },
+    },
   };
 }
 

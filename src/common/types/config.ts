@@ -39,6 +39,55 @@ function emptyDefault<T>(): T {
 // =============================================================================
 
 // =============================================================================
+// TC-0 (Trust & Confidentiality, #628): unified security-posture schema.
+//
+// Extracted to a single exported schema so BOTH config shapes reference the
+// same source of truth — `AgentConfigSchema.security` (legacy bot.yaml) and
+// `CortexConfigSchema.security` (cortex.yaml) — exactly as `NatsSubjectsSchema`
+// is shared. Without this, a `security:` block written in a cortex.yaml is
+// silently stripped by `CortexConfigSchema` and the resolver falls back to the
+// `off` default — a fail-OPEN silent downgrade (a principal who writes
+// `signing: enforce` would unknowingly run unsigned/non-rejecting).
+//
+// Every layer defaults OFF so the stack runs unsigned/cleartext for dev; each
+// ramps independently `off → permissive → enforce`.
+// See docs/design-trust-confidentiality.md §Phase 0 (part of #627).
+//
+// - `signing`: off = no signer · permissive = sign + verify but NEVER reject
+//   (cryptoVerify:true, rejectEmpty:false, signFailureMode:"fallback") ·
+//   enforce = reject unsigned/invalid (rejectEmpty:true, signFailureMode:"drop").
+// - `encryption.payload`: off = cleartext · opt-in = seal when the recipient
+//   advertises an enc_pub (both accepted) · require = reject cleartext.
+// - `encryption.at_rest`: off | on (field-encrypt high-sensitivity columns).
+// - `transport.mtls`: off | on (offer client cert) | require (refuse non-mTLS).
+//
+// The `emptyDefault()` + transform idiom mirrors the `cockpit` block below:
+// `.default(emptyDefault())` returns `{}` without re-parsing inner defaults,
+// so the transform re-applies them — callers always get the populated shape.
+// =============================================================================
+export const SecurityPostureSchema = z.object({
+  signing: z.enum(["off", "permissive", "enforce"]).default("off"),
+  encryption: z.object({
+    payload: z.enum(["off", "opt-in", "require"]).default("off"),
+    at_rest: z.enum(["off", "on"]).default("off"),
+  }).default(emptyDefault()),
+  transport: z.object({
+    mtls: z.enum(["off", "on", "require"]).default("off"),
+  }).default(emptyDefault()),
+}).default(emptyDefault()).transform((val) => ({
+  /* eslint-disable @typescript-eslint/no-unnecessary-condition */
+  signing: val.signing ?? "off",
+  encryption: {
+    payload: val.encryption?.payload ?? "off",
+    at_rest: val.encryption?.at_rest ?? "off",
+  },
+  transport: {
+    mtls: val.transport?.mtls ?? "off",
+  },
+  /* eslint-enable @typescript-eslint/no-unnecessary-condition */
+}));
+
+// =============================================================================
 // Instance schemas (new: each platform entry is an instance)
 // =============================================================================
 
@@ -519,43 +568,12 @@ export const AgentConfigSchema = z.object({
 
   /**
    * TC-0 (Trust & Confidentiality, #628): unified security posture toggles.
-   * Every layer defaults OFF so the stack runs unsigned/cleartext for dev;
-   * each ramps independently `off → permissive → enforce`.
-   * See docs/design-trust-confidentiality.md §Phase 0.
-   *
-   * - `signing`: off = no signer · permissive = sign + verify but NEVER reject
-   *   (cryptoVerify:true, rejectEmpty:false, signFailureMode:"fallback") ·
-   *   enforce = reject unsigned/invalid (rejectEmpty:true, signFailureMode:"drop").
-   * - `encryption.payload`: off = cleartext · opt-in = seal when the recipient
-   *   advertises an enc_pub (both accepted) · require = reject cleartext.
-   * - `encryption.at_rest`: off | on (field-encrypt high-sensitivity columns).
-   * - `transport.mtls`: off | on (offer client cert) | require (refuse non-mTLS).
-   *
-   * The `emptyDefault()` + transform idiom mirrors the `cockpit` block above:
-   * `.default(emptyDefault())` returns `{}` without re-parsing inner defaults,
-   * so the transform re-applies them — callers always get the populated shape.
+   * Shared schema (`SecurityPostureSchema`) so the cortex.yaml shape
+   * (`CortexConfigSchema.security`) and this legacy-bot.yaml shape stay in
+   * lockstep — same source of truth, no silent-strip drift. See the schema's
+   * own docstring above for the per-toggle semantics.
    */
-  security: z.object({
-    signing: z.enum(["off", "permissive", "enforce"]).default("off"),
-    encryption: z.object({
-      payload: z.enum(["off", "opt-in", "require"]).default("off"),
-      at_rest: z.enum(["off", "on"]).default("off"),
-    }).default(emptyDefault()),
-    transport: z.object({
-      mtls: z.enum(["off", "on", "require"]).default("off"),
-    }).default(emptyDefault()),
-  }).default(emptyDefault()).transform((val) => ({
-    /* eslint-disable @typescript-eslint/no-unnecessary-condition */
-    signing: val.signing ?? "off",
-    encryption: {
-      payload: val.encryption?.payload ?? "off",
-      at_rest: val.encryption?.at_rest ?? "off",
-    },
-    transport: {
-      mtls: val.transport?.mtls ?? "off",
-    },
-    /* eslint-enable @typescript-eslint/no-unnecessary-condition */
-  })),
+  security: SecurityPostureSchema,
 
   /** G-500: Directory containing per-network YAML files */
   networksDir: z.string().default("./networks"),
