@@ -12,7 +12,7 @@ Status: ☐ planned · ◐ in-progress · ☑ done.
 | **TC-1c** | Shape B — bound stack re-signs gateway-injected envelopes on ingest | 1 Signing | folds #552 | ☐ | #552 |
 | **TC-1d** | Enforce — `signFailureMode` → `drop`; tighten `rejectEmpty` on `tasks.chat` | 1 Signing | folds #210 | ☐ | #210 |
 | **TC-2c** | **F-1:** Relax single-principal guard + multi-principal subject derivation | **F Routing** (priority) | new | ☐ | #629 |
-| **TC-F2** | **F-2:** Cross-principal routing on a shared bus (two principals, one NATS, `federated.*`, unsigned) | **F Routing** (priority) | new | ☐ | #630 |
+| **TC-F2** | **F-2:** Cross-principal routing on a shared bus (two principals, one NATS, `federated.*`, unsigned) | **F Routing** (priority) | new | ☑ | #630 |
 | **TC-F3** | **F-3:** Multi-link / multi-network runtime — one NATS leaf per network/deployment | **F Routing** | new (E.1 / #348) | ☐ | #631 |
 | **TC-2a** | Registry client — resolve peer pubkeys via `GET /principals/{id}` (Phase D.4) | 2-verify (harden) | new | ☐ | #633 |
 | **TC-2b** | Multi-principal `IdentityRegistry` (peer-stamped, not single boot principal) | 2-verify (harden) | new | ☐ | #634 |
