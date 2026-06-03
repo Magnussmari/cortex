@@ -104,7 +104,9 @@ function ensureDir(dir: string, mode: number): void {
 }
 
 ensureDir(RAW_DIR, 0o700);
-ensureDir(join(EVENTS_DIR, "published"), 0o755);
+// TC-4b (cortex#637): published/ JSONL holds prompt/command/tool previews —
+// owner-only (0o700) to match raw/, not world-readable.
+ensureDir(join(EVENTS_DIR, "published"), 0o700);
 
 // =============================================================================
 // H-004: HTTP POST ingestion (primary), JSONL fallback (secondary)

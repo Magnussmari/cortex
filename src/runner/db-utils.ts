@@ -16,7 +16,9 @@ import { dirname } from "path";
 export function initDatabase(dbPath: string): Database {
   const dir = dirname(dbPath);
   if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+    // TC-4b (cortex#637): runner SQLite dir holds session + worklog rows
+    // (prompts, commands) — owner-only (0o700), never world-readable.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
   const db = new Database(dbPath);
