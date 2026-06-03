@@ -184,9 +184,23 @@ describe("startCortex — stack-signing boot warning (cortex#324)", () => {
 
     try {
       const runtime = createRecordingRuntime();
+      // TC-0 (#628): `security.signing` defaults to `off`, under which a
+      // seed-configured stack does NOT attach the signer (the documented
+      // DECISION-FOR-REVIEW behaviour change). This test asserts the
+      // staged-signer happy path, so it opts into `permissive` to retain
+      // the pre-TC-0 "sign-when-seed-present" behaviour. The default-`off`
+      // suppression path is pinned in `cortex.security-posture-boot.test.ts`.
+      const cfg: AgentConfig = {
+        ...minimalConfig(),
+        security: {
+          signing: "permissive",
+          encryption: { payload: "off", at_rest: "off" },
+          transport: { mtls: "off" },
+        },
+      };
       const { result: bootResult, stderr } = await withCapturedStderr(() =>
         withCapturedConsoleLog(() =>
-          startCortex(minimalConfig(), {
+          startCortex(cfg, {
             stack: { id: "test-op/research", nkey_seed_path: seedPath },
             disableConfigWatcher: true,
             disableDashboard: true,
