@@ -72,7 +72,8 @@ import {
   getTargetAssistant,
 } from "../bus/myelin/envelope-validator";
 import { encodeDidSegment } from "@the-metafactory/myelin/subjects";
-import type { MyelinRuntime } from "../bus/myelin/runtime";
+import type { MyelinRuntime, BusEnvelopeSigner } from "../bus/myelin/runtime";
+import { signEnvelope } from "@the-metafactory/myelin/identity";
 import {
   emitFederationDenied,
   evaluateFederationGate,
@@ -376,6 +377,43 @@ export interface DispatchListenerOptions {
    */
   stackNKeyPub?: string;
   /**
+   * TC-1c (#552) — **Shape B re-sign on ingest.** The receiving stack's
+   * envelope signer (`{ rawSeedBytes, principal }`, the SAME
+   * {@link BusEnvelopeSigner} `cortex.ts` hands to `startMyelinRuntime`).
+   * When supplied, an inbound dispatch that arrived with an **empty
+   * `signed_by[]`** (a gateway Shape-A injection or an adapter-originated
+   * dispatch) is re-stamped IN PLACE with the stack NKey — right after
+   * `verifySignedByChain` accepts it and BEFORE the policy gate — so the
+   * downstream `system.access.*` audit envelopes (and any further
+   * processing) are cryptographically attributable to the stack. The
+   * stack vouches for the gateway-injected request; the gateway stays a
+   * pure transport that never touches identity (CONTEXT.md §Dispatch-
+   * source, decision 2026-06-02).
+   *
+   * **Posture-gated.** `cortex.ts` supplies this ONLY when
+   * `security.signing` resolves `attachSigner: true` (`permissive` /
+   * `enforce`) AND a stack seed loaded. Under `signing: off` (the default)
+   * the field is `undefined` → no re-sign → byte-identical to today's pure
+   * Shape A. This is the load-bearing back-compat invariant.
+   *
+   * **In-place, not re-publish.** Re-publishing on the same
+   * `tasks.@{agent}.chat` subject the listener subscribes to would loop;
+   * the same dispatch must carry the stamp before the harness runs, so we
+   * append via myelin `signEnvelope` and continue the handler with the
+   * re-stamped envelope.
+   *
+   * **Empty-chain-only.** Only an envelope with NO existing chain is
+   * re-stamped — never double-stamp an already-signed envelope (a real
+   * signed dispatch, or our own re-stamped traffic), which also keeps the
+   * own-stack short-circuit and the loop-safety invariant intact. Policy
+   * attribution is unaffected: `resolvePrincipalId` reads
+   * `originator.identity` first (the gateway stamps it), only falling back
+   * to `signed_by[0]` when no originator exists — appending a stack stamp
+   * to a previously-empty chain does NOT change the policy-resolved
+   * principal.
+   */
+  resignSigner?: BusEnvelopeSigner;
+  /**
    * cortex#492 — dispatch-stage tracing toggle. When `true`, the
    * inbound path emits a `system.dispatch.stage` envelope (via
    * `runtime.publish`) AND a structured stderr line at each pipeline
@@ -643,6 +681,7 @@ export function createDispatchListener(
     principalId,
     stackIdentity,
     stackNKeyPub,
+    resignSigner,
     adapterId = "runner-dispatch-listener",
   } = opts;
   // v2.0.2 default: structural trust + ed25519 crypto verification.
@@ -718,6 +757,7 @@ export function createDispatchListener(
         receivingAgentId,
         stackIdentity,
         stackNKeyPub,
+        resignSigner,
         traceDispatch,
       });
     } catch (err) {
@@ -1036,6 +1076,13 @@ interface DispatchHandlerContext {
   /** cortex#480 — receiving stack's NKey pubkey for crypto-verify pass. */
   stackNKeyPub: string | undefined;
   /**
+   * TC-1c (#552) — Shape B re-sign signer. When supplied (posture
+   * `permissive`/`enforce` + a loaded stack seed), an empty-chain inbound
+   * envelope is re-stamped with the stack NKey on ingest. See
+   * {@link DispatchListenerOptions.resignSigner}.
+   */
+  resignSigner: BusEnvelopeSigner | undefined;
+  /**
    * cortex#492 — when `true`, emit a `system.dispatch.stage` trace at
    * each gate inside the handler. Resolved by `createDispatchListener`
    * from the explicit option or `CORTEX_TRACE_DISPATCH`; the handler
@@ -1063,6 +1110,7 @@ async function handleDispatchEnvelope(
     receivingAgentId,
     stackIdentity,
     stackNKeyPub,
+    resignSigner,
     traceDispatch,
   } = ctx;
   // cortex#492 — pre-parse trace context. Refined to the trusted payload
@@ -1284,6 +1332,82 @@ async function handleDispatchEnvelope(
       "pass",
       traceCtx,
     );
+  }
+
+  // TC-1c (#552) — Shape B re-sign on ingest. The shared surface gateway
+  // (cortex#524) injects inbound dispatches UNSIGNED + `originator`-stamped
+  // (Shape A): it runs in a separate process with a signer-less runtime and
+  // cannot call `runtime.publish` to sign. When this stack has its own
+  // signer (posture `permissive`/`enforce` + a loaded stack seed; `cortex.ts`
+  // only passes `resignSigner` then), we re-stamp the envelope HERE — just
+  // after the chain verifier accepted it, before the policy gate and the
+  // harness — so the stack becomes the cryptographic origin for
+  // gateway-injected traffic and the downstream `system.access.*` audit
+  // envelopes carry a stack `signed_by[]` stamp (CONTEXT.md §Dispatch-source,
+  // decision 2026-06-02). The stack vouches for the request; the gateway
+  // stays a pure transport that never touches identity.
+  //
+  // Gated on an EMPTY chain only. An envelope that already carries a stamp
+  // (a real signed dispatch, or our own re-stamped traffic that re-entered
+  // the listener) is left untouched — we never double-stamp, which also
+  // closes any re-consume loop and preserves the own-stack short-circuit.
+  // Policy attribution is unaffected: `resolvePrincipalId`/`getActorPrincipal`
+  // read `originator.identity` FIRST (the gateway stamps it) and only fall
+  // back to `signed_by[0]` when no originator exists, so appending a stack
+  // stamp to a previously-empty chain does not change the resolved principal.
+  //
+  // In-place (not a bus re-publish): re-publishing on the same
+  // `tasks.@{agent}.chat` subject the listener subscribes to would loop, and
+  // the SAME dispatch must carry the stamp before the harness runs. We reuse
+  // myelin's append-mode `signEnvelope` (the same primitive
+  // `MyelinRuntime.signAndPublishOnSubject` uses) and continue with the
+  // re-stamped envelope. A sign failure is non-fatal: log + fall through with
+  // the original (unsigned) envelope, mirroring the runtime's `fallback`
+  // posture — a transient crypto failure must not drop the dispatch.
+  if (
+    resignSigner !== undefined &&
+    getSignedByChain(envelope).length === 0
+  ) {
+    try {
+      const reSignerSeedBase64 = Buffer.from(
+        resignSigner.rawSeedBytes,
+      ).toString("base64");
+      envelope = await signEnvelope(
+        envelope as Parameters<typeof signEnvelope>[0],
+        reSignerSeedBase64,
+        resignSigner.principal,
+      );
+      trace(
+        traceDispatch,
+        runtime,
+        source,
+        "resigned-on-ingest",
+        "pass",
+        traceCtx,
+        resignSigner.principal,
+      );
+    } catch (err) {
+      // Non-fatal — see the `signFailureMode: "fallback"` rationale in
+      // `MyelinRuntime.signAndPublishOnSubject`. We deliberately omit
+      // `err.message` interpolation: myelin's `signEnvelope` builds error
+      // strings from seed inputs, and we don't want partial seed-shape facts
+      // landing in logs. The error class + envelope id is enough to triage.
+      const reason = err instanceof Error ? err.name : "unknown";
+      trace(
+        traceDispatch,
+        runtime,
+        source,
+        "resigned-on-ingest",
+        "fail",
+        traceCtx,
+        reason,
+      );
+      process.stderr.write(
+        `[runner/dispatch-listener] re-sign on ingest failed for envelope ` +
+          `${envelope.id} (correlation_id=${envelope.correlation_id ?? "<none>"}) ` +
+          `reason=${reason} — continuing with unsigned envelope (Shape A fallback)\n`,
+      );
+    }
   }
 
   // IAW Phase C.3.1 — policy gate. The engine resolves the originating

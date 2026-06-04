@@ -2087,6 +2087,18 @@ export async function startCortex(
     ...(stackNKeyPubForVerifier !== undefined && {
       stackNKeyPub: stackNKeyPubForVerifier,
     }),
+    // TC-1c (#552) — Shape B re-sign on ingest. Hand the dispatch-listener
+    // the SAME stack signer the runtime uses, so an empty-chain inbound
+    // envelope (a gateway Shape-A injection or adapter-originated dispatch)
+    // is re-stamped with the stack NKey on ingest and becomes
+    // cryptographically attributable to this stack. `signer` is non-undefined
+    // ONLY when `security.signing` resolved `attachSigner: true`
+    // (`permissive`/`enforce`) AND a stack seed loaded — so under
+    // `signing: off` (the default) `resignSigner` is omitted entirely and
+    // ingest stays pure Shape A (byte-identical to today). The empty-chain
+    // gate inside the listener prevents double-stamping already-signed
+    // traffic.
+    ...(signer !== undefined && { resignSigner: signer }),
   });
   await dispatchListener.start();
 
