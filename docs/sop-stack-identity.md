@@ -119,3 +119,4 @@ When everything is verified working, delete `cortex.nk.old`.
 - **`scripts/lib/stack-identity-provision.sh`** — arc upgrade auto-provisioner
 - **`docs/design-policy-cutover.md`** — policy-side cutover that consumes the signed envelopes
 - **`docs/design-internet-of-agentic-work.md`** §3.1 — IAW federation context
+- **`docs/sop-network-registry.md`** — the cross-principal side: provisioning, deploying, and pinning the network-registry that lets peers resolve EACH OTHER's pubkeys
