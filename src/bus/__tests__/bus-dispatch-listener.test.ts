@@ -23,6 +23,7 @@ import type {
 import type { Envelope, SignedBy } from "../myelin/envelope-validator";
 import type { Agent } from "../../common/types/cortex-config";
 import { BusDispatchListener } from "../bus-dispatch-listener";
+import { resolveSigningKnobs } from "../../common/security-posture";
 
 // =============================================================================
 // Fixtures (mirrors verify-signed-by-chain.test.ts patterns)
@@ -404,6 +405,204 @@ describe("BusDispatchListener — verification gate", () => {
     );
     await drain();
 
+    expect(published).toHaveLength(1);
+    expect(published[0]?.type).toBe("system.bus.peer_dispatch_received");
+
+    await listener.stop();
+  });
+});
+
+// =============================================================================
+// TC-1d (Trust & Confidentiality, #210) — `signing: enforce` rejects unsigned
+// traffic END-TO-END, posture-driven.
+//
+// This is the closing slice of the signing track. TC-0 (#628) wired the
+// `signing` → boot-knob mapping (`resolveSigningKnobs`); TC-1c (#552) added
+// the Shape-B re-sign-on-ingest. #210's original "flip `signFailureMode`
+// `fallback`→`drop`" is NO LONGER a code change — it is the per-deployment
+// `security.signing: enforce` flip. These cases pin that contract through the
+// REAL resolver and the REAL `verifySignedByChain` reject path:
+//
+//   - `enforce`            ⇒ rejectEmpty:true  ⇒ unsigned (empty-chain) dropped
+//   - `off` / `permissive` ⇒ rejectEmpty:false ⇒ same unsigned dispatch accepted
+//   - `enforce` + signFailureMode === "drop"  (publish-side fail-closed)
+//   - gateway composition: a stack-RE-SIGNED envelope (TC-1c) carries a
+//     non-empty chain and PASSES the reject gate under `enforce` — legitimate
+//     gateway-injected traffic is NOT collateral-dropped.
+//
+// `rejectEmpty` is sourced from `resolveSigningKnobs(posture).rejectEmpty`
+// rather than a hardcoded boolean — so a regression in TC-0's mapping breaks
+// these tests, which is the whole point of an end-to-end pin.
+// =============================================================================
+
+describe("BusDispatchListener — signing posture (TC-1d / #210)", () => {
+  // An UNSIGNED peer dispatch: no `signerPrincipal` ⇒ empty `signed_by[]`.
+  function unsignedPeerDispatch(id: string): Envelope {
+    return peerDispatchEnvelope({ id });
+  }
+
+  test("enforce → unsigned (empty-chain) peer dispatch is REJECTED end-to-end", async () => {
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const resolver = resolverWith(luna, echo);
+    const { runtime, published, deliverInbound, drain } = fakeRuntime();
+
+    const enforce = resolveSigningKnobs("enforce");
+    // enforce is the ONLY posture that rejects + drops on sign failure.
+    expect(enforce.rejectEmpty).toBe(true);
+    expect(enforce.signFailureMode).toBe("drop");
+
+    const stderrLines: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk: string | Uint8Array): boolean => {
+      stderrLines.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    };
+
+    try {
+      const listener = new BusDispatchListener({
+        runtime,
+        resolver,
+        receivingAgentId: "luna",
+        principalId: "test-principal",
+        source: SOURCE,
+        // The posture drives the gate — NOT a hardcoded boolean.
+        rejectEmpty: enforce.rejectEmpty,
+      });
+      listener.start();
+
+      deliverInbound(
+        unsignedPeerDispatch("00000000-0000-4000-8000-0000000e0001"),
+      );
+      await drain();
+
+      // Rejected: no visibility event, stderr carries the empty_chain reason.
+      expect(published).toHaveLength(0);
+      await listener.stop();
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    const stderrOutput = stderrLines.join("");
+    expect(stderrOutput).toContain("bus-dispatch-listener:luna");
+    expect(stderrOutput).toContain("empty_chain");
+  });
+
+  test("off → the SAME unsigned dispatch is ACCEPTED (falls through, surfaced)", async () => {
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const resolver = resolverWith(luna, echo);
+    const { runtime, published, deliverInbound, drain } = fakeRuntime();
+
+    const off = resolveSigningKnobs("off");
+    expect(off.rejectEmpty).toBe(false);
+
+    const listener = new BusDispatchListener({
+      runtime,
+      resolver,
+      receivingAgentId: "luna",
+      principalId: "test-principal",
+      source: SOURCE,
+      rejectEmpty: off.rejectEmpty,
+    });
+    listener.start();
+
+    deliverInbound(unsignedPeerDispatch("00000000-0000-4000-8000-0000000e0002"));
+    await drain();
+
+    // Accepted: the unsigned empty-chain envelope falls through, the listener
+    // surfaces exactly one visibility event.
+    expect(published).toHaveLength(1);
+    expect(published[0]?.type).toBe("system.bus.peer_dispatch_received");
+
+    await listener.stop();
+  });
+
+  test("permissive → the SAME unsigned dispatch is ACCEPTED (shadow mode)", async () => {
+    const luna = agentFixture({ id: "luna", trust: ["echo"] });
+    const echo = agentFixture({
+      id: "echo",
+      displayName: "Echo",
+      nkey_pub: NKEY_ECHO,
+    });
+    const resolver = resolverWith(luna, echo);
+    const { runtime, published, deliverInbound, drain } = fakeRuntime();
+
+    const permissive = resolveSigningKnobs("permissive");
+    expect(permissive.rejectEmpty).toBe(false);
+
+    const listener = new BusDispatchListener({
+      runtime,
+      resolver,
+      receivingAgentId: "luna",
+      principalId: "test-principal",
+      source: SOURCE,
+      rejectEmpty: permissive.rejectEmpty,
+    });
+    listener.start();
+
+    deliverInbound(unsignedPeerDispatch("00000000-0000-4000-8000-0000000e0003"));
+    await drain();
+
+    expect(published).toHaveLength(1);
+    expect(published[0]?.type).toBe("system.bus.peer_dispatch_received");
+
+    await listener.stop();
+  });
+
+  test("enforce + gateway composition → a stack-RE-SIGNED envelope PASSES the reject gate", async () => {
+    // TC-1c re-signs gateway-injected (originally unsigned) envelopes on
+    // ingest with the bound stack's identity BEFORE the reject gate runs.
+    // Under `enforce` (rejectEmpty:true) that re-signed envelope carries a
+    // NON-empty `signed_by[]` (the stack stamp), so it must pass the
+    // empty-chain gate — legitimate gateway traffic is not collateral-dropped.
+    // We model the post-re-sign envelope: a stamp by the stack identity, with
+    // the own-stack short-circuit wired (cortex#480) exactly as cortex.ts does.
+    const stackIdentity = "did:mf:andreas-meta-factory";
+    const stackNKeyPub = "U" + "D".repeat(55);
+    const luna = agentFixture({ id: "luna", trust: [] });
+    const resolver = resolverWith(luna);
+    const { runtime, published, deliverInbound, drain } = fakeRuntime();
+
+    const enforce = resolveSigningKnobs("enforce");
+    expect(enforce.rejectEmpty).toBe(true);
+
+    const listener = new BusDispatchListener({
+      runtime,
+      resolver,
+      receivingAgentId: "luna",
+      principalId: "andreas",
+      source: SOURCE,
+      // Enforce: the empty-chain gate is ARMED — but the re-signed envelope
+      // below carries a stack stamp, so it is non-empty and passes.
+      rejectEmpty: enforce.rejectEmpty,
+      // Structural own-stack short-circuit (cryptoVerify default false here),
+      // matching the dispatch-listener self-trust wiring for adapter/gateway
+      // originated dispatches.
+      stackIdentity,
+      stackNKeyPub,
+    });
+    listener.start();
+
+    deliverInbound(
+      peerDispatchEnvelope({
+        // The stack re-sign stamp (TC-1c) → non-empty chain under enforce.
+        signerPrincipal: stackIdentity,
+        source: "andreas.meta-factory.local",
+        id: "00000000-0000-4000-8000-0000000e0004",
+      }),
+    );
+    await drain();
+
+    // Passed the reject gate despite enforce: re-signed traffic surfaces.
     expect(published).toHaveLength(1);
     expect(published[0]?.type).toBe("system.bus.peer_dispatch_received");
 
