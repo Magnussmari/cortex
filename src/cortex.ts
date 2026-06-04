@@ -64,7 +64,10 @@ import {
   provisionReviewStream,
   provisionReviewConsumer,
 } from "./bus/jetstream/provision";
-import { verifySignedByChain } from "./bus/verify-signed-by-chain";
+import {
+  verifySignedByChain,
+  nkeyToBase64Pubkey,
+} from "./bus/verify-signed-by-chain";
 import { runVerifierSelfCheck } from "./bus/verifier-self-check";
 import { CCSession, type CCSessionOpts } from "./runner/cc-session";
 import { makePiDevPipelineRunner } from "./runner/substrate/pi-dev-runner";
@@ -105,8 +108,15 @@ import { createDispatchListener, type DispatchListener } from "./runner/dispatch
 import { WorklogManager } from "./runner/worklog-manager";
 
 import { CloudPublisher } from "./taps/cc-events/cloud-publisher";
-import { RegistryClient } from "./common/registry";
-import type { RegistryClientReader } from "./common/registry";
+import {
+  RegistryClient,
+  PrincipalPubkeyResolver,
+  MultiPrincipalIdentityRegistry,
+} from "./common/registry";
+import type {
+  RegistryClientReader,
+  FederatedPeerResolution,
+} from "./common/registry";
 import { JsonlReader } from "./taps/cc-events/lib/jsonl-reader";
 import { PublishedEventSchema } from "./taps/cc-events/hooks/lib/event-types";
 import { formatEventForDiscord } from "./adapters/discord/event-formatter";
@@ -1275,6 +1285,87 @@ export async function startCortex(
   // TC-0 (#628) — `rejectEmpty` is now posture-gated: `enforce` → reject
   // unsigned peer dispatches; `off`/`permissive` → surface but do not
   // reject. The listener's default (`true`) is preserved under `enforce`.
+
+  // TC-2d (cortex#635) — federated.* crypto-verify seam. The CAPSTONE of
+  // the cross-principal trust chain: it lets THIS node verify an envelope
+  // signed by a PEER principal (not just the local boot principal) by
+  // resolving the peer's Ed25519 pubkey from the network registry (TC-2a
+  // `PrincipalPubkeyResolver`) into a multi-principal `IdentityRegistry`
+  // (TC-2b) the `federated.*` verify path consumes. Built ONCE here and
+  // threaded into every inbound verify call site (bus-dispatch-listener,
+  // dispatch-listener, review-consumer) so they share one resolver cache.
+  //
+  // ⚠️ LOAD-BEARING #635 GATE — `enabled` is driven by
+  // `signing === "enforce"`, NOT by `signingKnobs.cryptoVerify`.
+  // `resolveSigningKnobs` sets `cryptoVerify: true` for ALL postures
+  // (off/permissive/enforce) as cheap observability; deriving the gate
+  // from it would make OFF/permissive dev stacks reach out to the registry
+  // on every inbound federated envelope — the regression the #635 wiring
+  // note forbids. Under `off`/`permissive` the seam stays `undefined` and
+  // the verify path NEVER constructs a resolver: ZERO registry I/O.
+  //
+  // Construction requires (a) `signing === "enforce"`, (b) a federation
+  // registry URL, and (c) a derivable local boot `Identity` (the stack
+  // signer staged above → its NKey pubkey). Missing any → seam stays
+  // `undefined` and federated envelopes fall through to the local-only
+  // verify exactly as today (single-principal path untouched).
+  let resolveFederatedPeer:
+    | ((peerPrincipal: string) => Promise<FederatedPeerResolution>)
+    | undefined;
+  const federationRegistryConfig = options.policy?.federated?.registry;
+  const federationVerifyEnabled = config.security.signing === "enforce";
+  if (
+    federationVerifyEnabled &&
+    federationRegistryConfig !== undefined &&
+    signer !== undefined &&
+    stackNKeyPubForVerifier !== undefined
+  ) {
+    const bootPublicKey = nkeyToBase64Pubkey(stackNKeyPubForVerifier);
+    if (bootPublicKey === undefined) {
+      // The stack NKey already passed the AgentSchema/StackConfig regex on
+      // load, so a decode failure here is defensive-only — log and leave
+      // the seam unwired (federated envelopes verify local-only, as today)
+      // rather than crash boot.
+      process.stderr.write(
+        "cortex: TC-2d federated-verify seam NOT wired — could not decode " +
+          `stack NKey pubkey ${stackNKeyPubForVerifier} to base64 ed25519\n`,
+      );
+    } else {
+      const peerResolver = new PrincipalPubkeyResolver({
+        enabled: federationVerifyEnabled,
+        baseUrl: federationRegistryConfig.url,
+        ...(federationRegistryConfig.pubkey !== undefined && {
+          registryPubkey: federationRegistryConfig.pubkey,
+        }),
+      });
+      const peerRegistry = new MultiPrincipalIdentityRegistry({
+        bootPrincipal: {
+          principalId,
+          identity: {
+            id: signer.principal,
+            display_name: signer.principal,
+            network: principalId,
+            public_key: bootPublicKey,
+            type: "agent",
+            created_at: new Date(0).toISOString(),
+          },
+        },
+        resolver: peerResolver,
+      });
+      resolveFederatedPeer =
+        peerRegistry.resolveFederatedPeer.bind(peerRegistry);
+      console.log(
+        `cortex: TC-2d federated-verify seam wired (signing=enforce, registry=${federationRegistryConfig.url}) — ` +
+          `inbound federated.* envelopes verify against registry-resolved peer pubkeys`,
+      );
+    }
+  } else if (federationVerifyEnabled && federationRegistryConfig === undefined) {
+    console.log(
+      "cortex: security.signing=enforce but no policy.federated.registry configured — " +
+        "federated.* envelopes verify local-only (no peer-pubkey resolution)",
+    );
+  }
+
   let busDispatchListener: BusDispatchListener | undefined;
   const firstAgent = mergedAgents[0];
   if (firstAgent !== undefined) {
@@ -1298,6 +1389,9 @@ export async function startCortex(
       ...(stackNKeyPubForVerifier !== undefined && {
         stackNKeyPub: stackNKeyPubForVerifier,
       }),
+      // TC-2d (cortex#635) — federated.* peer-pubkey resolution seam.
+      // `undefined` unless `signing === "enforce"` + registry configured.
+      ...(resolveFederatedPeer !== undefined && { resolveFederatedPeer }),
     });
     busDispatchListener.start();
     console.log(
@@ -2110,6 +2204,9 @@ export async function startCortex(
     // gate inside the listener prevents double-stamping already-signed
     // traffic.
     ...(signer !== undefined && { resignSigner: signer }),
+    // TC-2d (cortex#635) — federated.* peer-pubkey resolution seam.
+    // Inert for local.* dispatches; `undefined` under off/permissive.
+    ...(resolveFederatedPeer !== undefined && { resolveFederatedPeer }),
   });
   await dispatchListener.start();
 

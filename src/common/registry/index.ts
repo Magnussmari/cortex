@@ -27,6 +27,7 @@ export type {
 export { MultiPrincipalIdentityRegistry } from "./identity-registry";
 export type {
   EntryProvenance,
+  FederatedPeerResolution,
   MultiPrincipalIdentityRegistryOptions,
   PrincipalEntry,
   RegistryResolveOutcome,

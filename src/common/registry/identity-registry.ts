@@ -82,6 +82,20 @@ import {
 import type { PrincipalPubkeyResolver } from "./resolve-pubkey";
 
 /**
+ * TC-2d (cortex#635) — outcome of {@link
+ * MultiPrincipalIdentityRegistry.resolveFederatedPeer}, the adapter the
+ * `federated.*` crypto-verify path (`verifySignedByChain`) consumes.
+ *
+ * Structurally identical to the verifier's `FederatedPeerResolution` so the
+ * registry method can be handed directly as the verify seam without an
+ * adapter layer — kept defined HERE (not imported from `src/bus/`) so the
+ * registry module stays free of a back-edge into the bus layer.
+ */
+export type FederatedPeerResolution =
+  | { resolved: true; identity: Identity }
+  | { resolved: false; reason: string };
+
+/**
  * Where an entry's verified pubkey came from. Stamped onto every entry so
  * TC-2d / audit can distinguish the boot trust anchor from a registry-
  * resolved peer.
@@ -322,6 +336,34 @@ export class MultiPrincipalIdentityRegistry {
         return { resolved: true, entry };
       }
     }
+  }
+
+  /**
+   * TC-2d (cortex#635) — verify-path adapter. Resolve `peerPrincipal` and
+   * project the {@link RegistryResolveOutcome} onto the shape the
+   * `federated.*` crypto-verify seam (`verifySignedByChain`'s
+   * `resolveFederatedPeer`) consumes: a positive carries the peer's myelin
+   * `Identity` to merge into the verify registry; every negative carries a
+   * grep-friendly `reason` string (`disabled` / `not_found` / `unresolved`)
+   * the verifier surfaces as `federated_peer_unresolved`.
+   *
+   * `disabled` (resolver inert — federation verify not engaged) is mapped to
+   * a negative here on purpose: if this adapter is ever invoked under a
+   * disabled resolver (it should not be — `cortex.ts` only wires the seam
+   * under `signing === "enforce"`), the verifier rejects rather than admits.
+   * NEVER throws (delegates to {@link resolve}, which never throws).
+   *
+   * Bind this method (`registry.resolveFederatedPeer.bind(registry)`) when
+   * handing it to the verifier so `this` stays the registry instance.
+   */
+  async resolveFederatedPeer(
+    peerPrincipal: string,
+  ): Promise<FederatedPeerResolution> {
+    const outcome = await this.resolve(peerPrincipal);
+    if (outcome.resolved) {
+      return { resolved: true, identity: outcome.entry.identity };
+    }
+    return { resolved: false, reason: outcome.reason };
   }
 
   /**

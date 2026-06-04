@@ -48,6 +48,7 @@ import type { Envelope } from "./myelin/envelope-validator";
 import type { MyelinRuntime } from "./myelin/runtime";
 import type { TrustResolver } from "../common/agents/trust-resolver";
 import { verifySignedByChain } from "./verify-signed-by-chain";
+import type { FederatedPeerResolution } from "../common/registry";
 import {
   createSystemBusPeerDispatchReceivedEvent,
   type SystemEventSource,
@@ -112,6 +113,18 @@ export interface BusDispatchListenerOpts {
    * check has a registered Principal to verify against.
    */
   stackNKeyPub?: string;
+  /**
+   * TC-2d (cortex#635) — federated.* peer-pubkey resolution seam. When
+   * supplied AND `cryptoVerify: true`, an inbound `federated.*` peer
+   * dispatch has its **signer peer principal** resolved to a verified
+   * Ed25519 identity before the crypto-verify pass. `cortex.ts` wires
+   * this ONLY under `signing === "enforce"`; `off`/`permissive` leave it
+   * `undefined` (ZERO registry I/O — federated envelopes verify
+   * local-only, as today). See `verify-signed-by-chain.ts` JSDoc.
+   */
+  resolveFederatedPeer?: (
+    peerPrincipal: string,
+  ) => Promise<FederatedPeerResolution>;
 }
 
 // =============================================================================
@@ -128,6 +141,9 @@ export class BusDispatchListener {
   private readonly rejectEmpty: boolean;
   private readonly stackIdentity: string | undefined;
   private readonly stackNKeyPub: string | undefined;
+  private readonly resolveFederatedPeer:
+    | ((peerPrincipal: string) => Promise<FederatedPeerResolution>)
+    | undefined;
 
   private registration: { unregister: () => void } | undefined;
   /**
@@ -149,6 +165,7 @@ export class BusDispatchListener {
     this.rejectEmpty = opts.rejectEmpty ?? true;
     this.stackIdentity = opts.stackIdentity;
     this.stackNKeyPub = opts.stackNKeyPub;
+    this.resolveFederatedPeer = opts.resolveFederatedPeer;
   }
 
   /**
@@ -264,6 +281,12 @@ export class BusDispatchListener {
       }),
       ...(this.stackNKeyPub !== undefined && {
         stackNKeyPub: this.stackNKeyPub,
+      }),
+      // TC-2d (cortex#635) — federated.* peer-pubkey resolution. Inert for
+      // local.* dispatches (verify ignores the seam unless the envelope is
+      // `federated.*`). `undefined` under `off`/`permissive` (no I/O).
+      ...(this.resolveFederatedPeer !== undefined && {
+        resolveFederatedPeer: this.resolveFederatedPeer,
       }),
     });
 
