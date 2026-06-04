@@ -366,7 +366,63 @@ export interface MyelinRuntimeOptions {
    * deterministically.
    */
   onRoutingError?: (info: RoutingError) => void;
+  /**
+   * IAW Phase F-3c (cortex#662) — background-reconnect backoff tuning for
+   * leaf links that are down at boot (or drop later). Per the RATIFIED
+   * degrade-don't-crash contract (OD-F3-2), a federated leaf that fails to
+   * connect must NOT crash cortex: the network goes dark / fails closed, the
+   * primary link governs `enabled`, and the runtime retries the leaf in the
+   * BACKGROUND with a bounded exponential backoff. When the leaf comes up the
+   * pool re-attaches it and routing to that network resumes.
+   *
+   * `NatsLink` already sets `reconnect: true`, so an ESTABLISHED leaf that
+   * drops mid-flight is reconnected by nats.js itself — F-3c owns the
+   * boot-time-unreachable + pool re-attach gap (nats.js can't reconnect a
+   * connection that never connected).
+   *
+   * Defaults (when omitted) give a gentle, bounded ladder that never spins:
+   *   - `initialMs`: 1_000  (first retry after 1s)
+   *   - `maxMs`:     30_000 (cap the doubling at 30s)
+   *   - `factor`:    2      (exponential)
+   *
+   * **Back-compat:** purely additive. With ZERO leaf links (no per-network
+   * `nats:`), no lifecycle machinery engages and this field is never read —
+   * the runtime is byte-identical to the pre-F-3b single-link path.
+   *
+   * @internal — tuning surface for tests (inject a tiny `initialMs` so the
+   *             reconnect fires deterministically without real wall-clock
+   *             waits) and for principals who need a faster/slower ladder.
+   */
+  reconnectBackoff?: {
+    initialMs?: number;
+    maxMs?: number;
+    factor?: number;
+  };
+  /**
+   * IAW Phase F-3c (cortex#662) — test-only timer seam. When set, the
+   * background-reconnect scheduler calls `setTimer(cb, ms)` instead of the
+   * global `setTimeout`, and `clearTimer(handle)` instead of `clearTimeout`.
+   * Lets tests drive the backoff deterministically (run the pending timer
+   * synchronously) AND assert that `stop()` cancels a pending reconnect (no
+   * leaked timer / no post-stop reconnect). Production omits this and the
+   * runtime uses the real timers.
+   *
+   * @internal — not for production use.
+   */
+  reconnectTimer?: {
+    setTimer: (cb: () => void, ms: number) => ReconnectTimerHandle;
+    clearTimer: (handle: ReconnectTimerHandle) => void;
+  };
 }
+
+/**
+ * IAW Phase F-3c (cortex#662) — opaque, non-null handle for a scheduled
+ * background-reconnect timer. The real timer seam returns the Node/Bun
+ * `setTimeout` handle; the test seam returns its own bookkeeping object.
+ * Modelled as a non-null `object` so a `reconnectHandle !== null` check
+ * (the "is a retry pending?" predicate) is meaningful and lint-clean.
+ */
+export type ReconnectTimerHandle = object;
 
 /**
  * IAW Phase F-3b (cortex#659) — structured publish-routing error surfaced
@@ -558,10 +614,50 @@ export async function startMyelinRuntime(
   // closed over the single `link`; the dedupe and JetStream-manager caching
   // are per-physical-link (a double-bind is per-link; a JSM round-trip is
   // per-connection), so they belong on the link, not the runtime.
+  //
+  // IAW Phase F-3c (cortex#662) — the degrade-don't-crash lifecycle. A leaf
+  // that is DOWN at boot is no longer simply absent from the pool (F-3b);
+  // it becomes a TRACKED entry with `link: null` + `status: "disconnected"`
+  // and a background-reconnect timer. `selectLink` fails closed on a down
+  // leaf (its network's `federated.*` publishes skip via the routing-error
+  // sink), the PRIMARY link is unaffected, and `enabled` stays true. When
+  // the leaf's connection becomes available the reconnect attaches it and
+  // flips `status` to `"connected"`, resuming routing. The `primary` link is
+  // never down-tracked here — its failure governs `enabled` and short-
+  // circuits boot above (F-3b contract preserved).
+  type LeafStatus = "connected" | "disconnected" | "retrying";
   interface PoolLink {
     /** Pool key — `'primary'` for `config.nats`; `leaf_node` for a leaf. */
     readonly linkId: string;
-    readonly link: NatsLink;
+    /**
+     * The live `NatsLink`, or `null` for a leaf that is currently down
+     * (boot-unreachable, or dropped and not yet reconnected). Always
+     * non-null for `primary`.
+     */
+    link: NatsLink | null;
+    /**
+     * IAW Phase F-3c — up/down lifecycle state. `primary` is always
+     * `"connected"` (its down-state ends the runtime). A leaf cycles
+     * `disconnected` → `retrying` → `connected` (or back to `disconnected`
+     * on a failed retry) under the background-reconnect scheduler.
+     */
+    status: LeafStatus;
+    /**
+     * The leaf's connect options, retained so the background-reconnect
+     * scheduler can re-attempt `NatsLink.connect` with the same parameters.
+     * `null` for `primary` (never reconnected by this machinery).
+     */
+    readonly connectOpts: Parameters<typeof NatsLink.connect>[0] | null;
+    /**
+     * Handle for a pending background-reconnect timer (test-seam or real),
+     * or `null` when no retry is scheduled. `stop()` clears this so no timer
+     * leaks and no reconnect fires after shutdown. Typed as
+     * {@link ReconnectTimerHandle} (a non-null opaque handle) so the
+     * `!== null` "a timer is pending" check is meaningful.
+     */
+    reconnectHandle: ReconnectTimerHandle | null;
+    /** Current backoff delay (ms) for the NEXT reconnect attempt. */
+    backoffMs: number;
     /** This link's own bound push subscriptions (cortex#491 dedupe is per-link). */
     readonly subscribers: MyelinSubscriber[];
     readonly boundByPattern: Map<string, MyelinSubscriber>;
@@ -574,8 +670,13 @@ export async function startMyelinRuntime(
   // The primary link backs `local.*` / `public.*` and every back-compat
   // case (zero per-network `nats:` ⇒ this is the ONLY link in the pool).
   let primary: PoolLink;
+  // F-3c: hold the primary `NatsLink` in a non-null binding so the
+  // back-compat `link` alias, the JSM helper, and any other primary-only
+  // reference avoid a forbidden non-null assertion on the now-nullable
+  // `PoolLink.link`. Primary is the ONE link guaranteed live past this block.
+  let primaryLink: NatsLink;
   try {
-    const primaryLink = await NatsLink.connect({
+    primaryLink = await NatsLink.connect({
       url: nats.url,
       token: nats.token,
       // cortex#86: operator-mode auth path. NatsLink loader expands ~/
@@ -588,6 +689,12 @@ export async function startMyelinRuntime(
     primary = {
       linkId: "primary",
       link: primaryLink,
+      // F-3c: primary is always connected; its down-state ends the runtime
+      // (the catch below), so it never enters the leaf reconnect lifecycle.
+      status: "connected",
+      connectOpts: null,
+      reconnectHandle: null,
+      backoffMs: 0,
       subscribers: [],
       boundByPattern: new Map(),
       jsmCache: null,
@@ -621,6 +728,100 @@ export async function startMyelinRuntime(
   const pool = new Map<string, PoolLink>();
   pool.set(primary.linkId, primary);
 
+  // IAW Phase F-3c (cortex#662) — background-reconnect machinery. Resolved
+  // ONCE here; never engaged when zero leaf links exist (the loop below adds
+  // nothing to retry), keeping the zero-network back-compat path untouched.
+  //
+  // `stopped` is declared further down (after PASS 2) for the publish/
+  // subscribe guards; the reconnect scheduler also checks it so a timer that
+  // fires mid-shutdown is a no-op. Hoist a forward-readable flag here so the
+  // scheduler closure can see it; the later `let stopped = false` is replaced
+  // by this single declaration.
+  const reconnectInitialMs = options?.reconnectBackoff?.initialMs ?? 1_000;
+  const reconnectMaxMs = options?.reconnectBackoff?.maxMs ?? 30_000;
+  const reconnectFactor = options?.reconnectBackoff?.factor ?? 2;
+  // Test seam: deterministic timers. Production uses real setTimeout/
+  // clearTimeout — both Node and Bun return an OBJECT handle from
+  // `setTimeout`, satisfying the non-null `ReconnectTimerHandle`.
+  const setReconnectTimer: (cb: () => void, ms: number) => ReconnectTimerHandle =
+    options?.reconnectTimer?.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
+  const clearReconnectTimer: (handle: ReconnectTimerHandle) => void =
+    options?.reconnectTimer?.clearTimer ??
+    ((handle) => {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    });
+
+  let stopped = false;
+  // Read `stopped` through a function in async closures so TS doesn't narrow
+  // the captured `let` to its pre-`await` value — `stop()` can flip it mid-
+  // reconnect (the shutdown race the leaf-reconnect guards exist to catch).
+  const isStopped = (): boolean => stopped;
+
+  /**
+   * IAW Phase F-3c (cortex#662) — re-attempt one DOWN leaf's connection in
+   * the background with bounded exponential backoff. On success the leaf's
+   * `NatsLink` is attached to its existing `PoolLink` entry (so `selectLink`
+   * resolves it and `federated.{net}.*` publishes resume) and its status
+   * flips to `"connected"`. On failure the delay doubles (capped at
+   * `reconnectMaxMs`) and another retry is scheduled — bounded, never a
+   * spin. A reconnect timer that fires after `stop()` is a no-op (the
+   * `stopped` guard) and `stop()` clears any pending handle so no timer
+   * leaks.
+   *
+   * Up/down transitions log via the routing-error sink's sibling channel
+   * (`console.*` per the F-3b seam — no `SystemEventSource` in the runtime).
+   */
+  const scheduleReconnect = (entry: PoolLink): void => {
+    if (stopped) return; // shutting down — do not schedule.
+    // Capture the (post-guard non-null) connect opts in a local so the inner
+    // async closure doesn't re-narrow `entry.connectOpts` — primary's null
+    // connectOpts never reaches here (it's never down-scheduled).
+    const connectOpts = entry.connectOpts;
+    if (connectOpts === null) return; // primary never reconnects here.
+    entry.status = "retrying";
+    const delay = entry.backoffMs;
+    entry.reconnectHandle = setReconnectTimer(() => {
+      // Clear the handle first: this timer has fired, so it no longer needs
+      // cancelling, and a re-schedule below installs a fresh one.
+      entry.reconnectHandle = null;
+      if (stopped) return; // raced with stop() — abandon.
+      // Fire-and-forget the async attempt; the closure owns its own retry
+      // scheduling so a rejected promise can't escape into an unhandled
+      // rejection (we await + catch inside).
+      void (async () => {
+        try {
+          const leafLink = await NatsLink.connect(connectOpts);
+          // Re-read `stopped` THROUGH a function so TS's control-flow
+          // analysis doesn't narrow it to the pre-`await` value: `stop()`
+          // may have flipped it WHILE this connect was in flight (the
+          // shutdown race this guard exists to catch).
+          if (isStopped()) {
+            // Connected during shutdown — close immediately, don't attach.
+            await leafLink.close().catch(() => {
+              // best-effort close on the shutdown race; ignore.
+            });
+            return;
+          }
+          entry.link = leafLink;
+          entry.status = "connected";
+          entry.backoffMs = reconnectInitialMs; // reset for any future drop.
+          console.log(
+            `myelin-runtime: leaf "${entry.linkId}" reconnected — routing to its network resumes`,
+          );
+        } catch (err) {
+          // Still down — double the backoff (capped) and try again.
+          entry.status = "disconnected";
+          entry.backoffMs = Math.min(entry.backoffMs * reconnectFactor, reconnectMaxMs);
+          console.error(
+            `myelin-runtime: leaf "${entry.linkId}" reconnect failed; retrying in ${entry.backoffMs}ms:`,
+            err instanceof Error ? err.message : String(err),
+          );
+          scheduleReconnect(entry);
+        }
+      })();
+    }, delay);
+  };
+
   // IAW Phase F-3b — build one leaf link per DISTINCT federated network
   // `leaf_node` that declared an inline `nats:` block (F-3a, Option B). The
   // `leaf_node` is the de-dup key: two networks sharing a `leaf_node` share
@@ -651,16 +852,23 @@ export async function startMyelinRuntime(
     if (network.nats === undefined) continue; // rides primary — resolved in PASS 2.
     const leafId = network.leaf_node;
     if (pool.has(leafId)) continue; // already built by an earlier sharing network.
+    // The connect options retained on the PoolLink so the F-3c background-
+    // reconnect scheduler can re-attempt with the SAME parameters.
+    const leafConnectOpts: Parameters<typeof NatsLink.connect>[0] = {
+      url: network.nats.url,
+      ...(network.nats.credsPath ? { credsPath: network.nats.credsPath } : {}),
+      name: network.nats.name,
+      ...(options?.connectImpl ? { connectImpl: options.connectImpl } : {}),
+    };
     try {
-      const leafLink = await NatsLink.connect({
-        url: network.nats.url,
-        ...(network.nats.credsPath ? { credsPath: network.nats.credsPath } : {}),
-        name: network.nats.name,
-        ...(options?.connectImpl ? { connectImpl: options.connectImpl } : {}),
-      });
+      const leafLink = await NatsLink.connect(leafConnectOpts);
       pool.set(leafId, {
         linkId: leafId,
         link: leafLink,
+        status: "connected",
+        connectOpts: leafConnectOpts,
+        reconnectHandle: null,
+        backoffMs: reconnectInitialMs,
         subscribers: [],
         boundByPattern: new Map(),
         jsmCache: null,
@@ -669,45 +877,54 @@ export async function startMyelinRuntime(
         `myelin-runtime: connected to ${safeUrlOf(network.nats.url)} as "${network.nats.name}" (link=${leafId}, network=${network.id})`,
       );
     } catch (err) {
-      // F-3b SEAM → F-3c (design §3.4, OD-F3-2 "degrade, don't crash"):
-      // a per-network leaf being down at boot must NOT take the daemon
-      // down. F-3b constructs the leaf links and logs a leaf-construction
-      // failure here; the FULL degraded-boot lifecycle (mark-disabled +
-      // background nats.js retry + the OD-F3-2 boot-contract semantics) is
-      // F-3c. For F-3b the `leaf_node` whose construction failed simply has
-      // no pool entry, so PASS 2 leaves networks pointing at it UNMAPPED,
-      // and their publishes resolve to a `federated.{unknown}` routing
-      // error + skip (fail-closed: a dark network routes nothing). The
-      // primary link governs `enabled` and is unaffected.
+      // IAW Phase F-3c (cortex#662) — RATIFIED degrade-don't-crash (design
+      // §3.4, OD-F3-2). A per-network leaf being down at boot must NOT take
+      // the daemon down. Pre-F-3c (F-3b) the failed `leaf_node` was simply
+      // ABSENT from the pool; F-3c instead inserts a TRACKED entry in the
+      // `disconnected` state with `link: null` and schedules a background
+      // reconnect. The network still fails closed — `selectLink` skips a
+      // down leaf's `federated.*` publishes (routing-error sink), the
+      // PRIMARY link governs `enabled` (stays true), and primary traffic is
+      // unaffected. When the leaf becomes reachable the reconnect attaches
+      // it and routing to that network resumes.
       console.error(
-        `myelin-runtime: failed to connect leaf "${leafId}" (network=${network.id}) at ${safeUrlOf(network.nats.url)} — that network is dark; primary unaffected (F-3c hardens this):`,
+        `myelin-runtime: failed to connect leaf "${leafId}" (network=${network.id}) at ${safeUrlOf(network.nats.url)} — that network is dark; primary unaffected; scheduling background reconnect:`,
         err instanceof Error ? err.message : String(err),
       );
+      const downEntry: PoolLink = {
+        linkId: leafId,
+        link: null,
+        status: "disconnected",
+        connectOpts: leafConnectOpts,
+        reconnectHandle: null,
+        backoffMs: reconnectInitialMs,
+        subscribers: [],
+        boundByPattern: new Map(),
+        jsmCache: null,
+      };
+      pool.set(leafId, downEntry);
+      scheduleReconnect(downEntry);
     }
   }
 
   // PASS 2 — map each network id to its target `linkId`:
-  //   - its `leaf_node`, IF a leaf link for that `leaf_node` exists in the
-  //     pool (it declared `nats:`, OR a sibling sharing the `leaf_node`
-  //     did, and the connect succeeded);
+  //   - its `leaf_node`, IF a pool entry for that `leaf_node` exists (it
+  //     declared `nats:`, OR a sibling sharing the `leaf_node` did). Under
+  //     F-3c a leaf that FAILED to connect at boot is now a TRACKED pool
+  //     entry (status `"disconnected"`, `link: null`) rather than absent —
+  //     so it maps to its `leaf_node` here too. `selectLink` reads the
+  //     entry's live/down state and fails closed (skip + routing error)
+  //     while the link is null, then routes normally once the background
+  //     reconnect attaches it. This is the F-3c change from F-3b, where a
+  //     failed leaf was UNMAPPED and could never recover its routing.
   //   - else `'primary'` (no `nats:` anywhere for this `leaf_node` ⇒ rides
   //     primary, today's behaviour).
-  // A network whose `leaf_node` had a leaf that FAILED to connect is left
-  // UNMAPPED on purpose — `selectLink` then skips its publishes (dead
-  // network fails closed) rather than silently leaking onto primary.
   const networkIdToLinkId = new Map<string, string>();
-  const leafNodeDeclaredNats = new Set<string>();
-  for (const network of federatedNetworks) {
-    if (network.nats !== undefined) leafNodeDeclaredNats.add(network.leaf_node);
-  }
   for (const network of federatedNetworks) {
     if (pool.has(network.leaf_node)) {
-      // Leaf link is live — route this network to it.
+      // A pool entry exists for this `leaf_node` (live OR down-tracked) —
+      // route this network to it. `selectLink` gates on the entry's status.
       networkIdToLinkId.set(network.id, network.leaf_node);
-    } else if (leafNodeDeclaredNats.has(network.leaf_node)) {
-      // A `nats:` block WAS declared for this `leaf_node` but the leaf
-      // failed to connect — leave UNMAPPED so the network fails closed.
-      // (skip the set: `networkIdToLinkId.get(id)` returns undefined.)
     } else {
       // No `nats:` anywhere for this `leaf_node` — ride the primary link.
       networkIdToLinkId.set(network.id, primary.linkId);
@@ -719,7 +936,12 @@ export async function startMyelinRuntime(
   // below stay bound to `primary` (design §3.5 — `subscribePull` and the
   // boot-time push subscribers are primary-only in F-3b; per-network
   // subscribe is F-3d inbound attribution).
-  const link = primary.link;
+  //
+  // F-3c (cortex#662): `PoolLink.link` is now `NatsLink | null` to model a
+  // down leaf, but PRIMARY is always connected here (its connect succeeded
+  // above; a primary failure short-circuited the whole runtime). Reuse the
+  // non-null `primaryLink` binding rather than asserting on `primary.link`.
+  const link = primaryLink;
   // `subscribers` / `boundByPattern` for the boot-time push loop + the
   // self-subscribe path are the PRIMARY link's (design §3.5). Leaf links
   // carry their own empty sets (publish-only in F-3b).
@@ -819,11 +1041,26 @@ export async function startMyelinRuntime(
     // primary — leaf links opened above must not leak when the runtime
     // collapses back to disabled. `allSettled` so one link's close error
     // doesn't block another's.
+    //
+    // F-3c (cortex#662): also flip `stopped` and cancel any pending
+    // background-reconnect timers a down leaf scheduled in PASS 1 — this
+    // disabled-fallback path is a shutdown, so no reconnect must fire and no
+    // timer must leak. A leaf with `link: null` (down at boot, never
+    // attached) has nothing to close; skip its close.
+    stopped = true;
+    for (const p of pool.values()) {
+      if (p.reconnectHandle !== null) {
+        clearReconnectTimer(p.reconnectHandle);
+        p.reconnectHandle = null;
+      }
+    }
     await Promise.allSettled(
       [...pool.values()].map((p) =>
-        p.link.close().catch(() => {
-          // best-effort close on no-subscribers path; ignore errors
-        }),
+        p.link === null
+          ? Promise.resolve()
+          : p.link.close().catch(() => {
+              // best-effort close on no-subscribers path; ignore errors
+            }),
       ),
     );
     return {
@@ -836,8 +1073,6 @@ export async function startMyelinRuntime(
       stop: stopDisabled,
     };
   }
-
-  let stopped = false;
 
   // `publishEnabled` is async because we await `signEnvelope` when a
   // signer is configured (B.3). `NatsLink.publish` itself is fire-and-
@@ -952,11 +1187,26 @@ export async function startMyelinRuntime(
     const linkId = networkIdToLinkId.get(networkId);
     const target = linkId === undefined ? undefined : pool.get(linkId);
     if (target === undefined) {
-      // Unknown network (no such network id) OR a network whose declared
-      // leaf failed to connect at boot (left UNMAPPED in PASS 2) — both
-      // fail closed: signal + skip, NEVER leak onto primary. A network
-      // configured WITHOUT any `nats:` maps to `'primary'` and resolves
-      // here normally.
+      // Unknown network (no such network id) — fail closed: signal + skip,
+      // NEVER leak onto primary. A network configured WITHOUT any `nats:`
+      // maps to `'primary'` and resolves here normally.
+      onRoutingError({
+        reason: "unknown_network_in_publish_subject",
+        subject,
+        networkId,
+        envelopeId,
+      });
+      return null;
+    }
+    // IAW Phase F-3c (cortex#662) — the target leaf is KNOWN but currently
+    // DOWN (boot-unreachable, or dropped and not yet reconnected). Fail
+    // closed exactly like an unknown network: a dark network routes nothing,
+    // and the publish must NEVER fall back onto primary or another leaf
+    // (design §5 — no cross-network leakage). The background-reconnect
+    // scheduler will attach `target.link` when the leaf returns, after which
+    // this same path routes the network's traffic normally. F-3b left such a
+    // leaf UNMAPPED so it could never recover; F-3c tracks it down + retries.
+    if (target.link === null) {
       onRoutingError({
         reason: "unknown_network_in_publish_subject",
         subject,
@@ -1005,6 +1255,18 @@ export async function startMyelinRuntime(
     // subject must never leak onto the wrong link).
     const target = selectLink(subject, envelope.id);
     if (target === null) {
+      return;
+    }
+    // F-3c (cortex#662): `selectLink` only ever returns a `PoolLink` whose
+    // `link` is live (primary is always up; a down leaf fails closed inside
+    // `selectLink`). Capture the non-null link in a local so the publish
+    // below avoids a forbidden non-null assertion on the nullable
+    // `PoolLink.link`. The guard documents the invariant explicitly.
+    const targetLink = target.link;
+    if (targetLink === null) {
+      // Unreachable in practice (selectLink's contract), but a typed guard
+      // beats an assertion — and if a future selectLink path ever returned a
+      // down link, this fails closed (skip) rather than dereferencing null.
       return;
     }
 
@@ -1077,7 +1339,10 @@ export async function startMyelinRuntime(
     // F-3b (cortex#659): publish on the SELECTED link, not the module
     // singleton — `federated.{network_id}.…` lands on that network's leaf,
     // `local.*` / `public.*` on primary.
-    target.link.publish(subject, JSON.stringify(envelopeToPublish));
+    //
+    // F-3c (cortex#662): publish on the captured non-null `targetLink`
+    // (narrowed above) — a down leaf never reaches here.
+    targetLink.publish(subject, JSON.stringify(envelopeToPublish));
   };
 
   const publishEnabled = async (envelope: Envelope): Promise<void> => {
@@ -1228,7 +1493,10 @@ export async function startMyelinRuntime(
   // (design §3.5 — no per-network JetStream durables in F-3). The cache
   // lives on the primary `PoolLink` (`primary.jsmCache`).
   const jetstreamManagerEnabled = (): Promise<import("nats").JetStreamManager> => {
-    primary.jsmCache ??= primary.link.raw.jetstreamManager();
+    // F-3c (cortex#662): primary is always connected here (a primary failure
+    // short-circuits the runtime above) — use the non-null `primaryLink`
+    // binding rather than asserting on the now-nullable `primary.link`.
+    primary.jsmCache ??= primaryLink.raw.jetstreamManager();
     return primary.jsmCache;
   };
 
@@ -1243,6 +1511,18 @@ export async function startMyelinRuntime(
     stop: async () => {
       if (stopped) return;
       stopped = true;
+      // IAW Phase F-3c (cortex#662) — cancel any pending background-reconnect
+      // timers FIRST, before draining, so no leaf reconnect fires during or
+      // after teardown (no leaked timer, no post-stop reconnect). Setting
+      // `stopped` above also makes any reconnect callback that races past the
+      // clear a no-op (it re-checks `stopped`). This is the load-bearing
+      // "stop() cancels pending reconnect timers" guarantee.
+      for (const p of pool.values()) {
+        if (p.reconnectHandle !== null) {
+          clearReconnectTimer(p.reconnectHandle);
+          p.reconnectHandle = null;
+        }
+      }
       // F-3b (cortex#659): drain EVERY pool link's subscribers, then close
       // EVERY link. `allSettled` throughout so one link's drain/close
       // failure does not block another's (design §3.4). Leaf links carry
@@ -1252,14 +1532,19 @@ export async function startMyelinRuntime(
       await Promise.allSettled(
         [...pool.values()].flatMap((p) => p.subscribers.map((s) => s.stop())),
       );
+      // F-3c (cortex#662): a DOWN leaf has `link: null` (never connected) —
+      // nothing to close; skip it. Live links (primary + reconnected leaves)
+      // close best-effort.
       await Promise.allSettled(
         [...pool.values()].map((p) =>
-          p.link.close().catch((err: unknown) => {
-            console.error(
-              `myelin-runtime: close error (link=${p.linkId}):`,
-              err instanceof Error ? err.message : String(err),
-            );
-          }),
+          p.link === null
+            ? Promise.resolve()
+            : p.link.close().catch((err: unknown) => {
+                console.error(
+                  `myelin-runtime: close error (link=${p.linkId}):`,
+                  err instanceof Error ? err.message : String(err),
+                );
+              }),
         ),
       );
       console.log("myelin-runtime: stopped");
