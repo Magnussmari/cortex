@@ -126,6 +126,55 @@ For dev, substitute `--env dev`. Local-only iteration uses `bunx wrangler dev` (
 
 ---
 
+## Public-internet edge hardening (dev = prod) — #680 / #681
+
+**Parity principle (load-bearing).** `network-dev.meta-factory.ai` and `network.meta-factory.ai` are **both public internet endpoints**. Every protective control below is **identical** on dev and prod — **dev is not a laxer posture**. Anything applied to prod is applied to dev, byte-for-byte. The only legitimate per-environment difference is the CF rate-limit **namespace id** (Cloudflare requires a distinct namespace per environment); the **limit values, periods, and which endpoints are guarded are the same**. If you change a limit, change it in **both** `[env.dev]` and `[env.production]` blocks in `wrangler.toml` — there are parity-guard comments at both.
+
+This layer is **volumetric / abuse hardening only**. Correctness is already cryptographic and is unchanged: reads return registry-signed assertions of **public** keys (nothing secret), and writes require proof-of-possession (±5 min skew + nonce-replay 409 + Ed25519 verify 401 + rotation guard). No CF Access gate is added — federation peers are external and cannot authenticate; that is the correct posture for a public pubkey directory.
+
+### App-layer rate limiting (#680)
+
+Enforced with the Cloudflare Workers **native rate-limit binding** (`env.RL.limit({ key })` → `{ success }`), declared as `[[unsafe.bindings]]` of `type = "ratelimit"` in `wrangler.toml` — two bindings, present **identically** in `[env.dev]` and `[env.production]`:
+
+| Binding | Guards | Limit | Keyed by | Response when exceeded |
+|---|---|---|---|---|
+| `RL_REGISTER` | `POST /principals/:id/register` | **5 / 60 s** (strict) | `CF-Connecting-IP` **+** `principal_id` | `429 { "error": "rate_limited" }` |
+| `RL_READ` | `GET /principals/:id`, `GET /networks/:id/roster`, `GET /capabilities` | **120 / 60 s** (loose) | `CF-Connecting-IP` | `429 { "error": "rate_limited" }` |
+
+- **Strictest on register** because it is the mutation + Ed25519-verify compute path. Keying by `(IP, principal_id)` means one principal hammering register can't hide behind a shared/NAT egress IP, and one IP can't exhaust the budget across many principals.
+- **Looser on reads** because resolve (`GET /principals/:id`) is the **load-bearing federation primitive** — a peer fanning out to refresh many principals on a schedule must not be choked. 120 / 60 s (~2 req/s/IP sustained) is comfortable for a legitimate peer and hostile to a bulk enumerator.
+- **`GET /api/health` and `GET /registry/pubkey` are NOT rate-limited** — liveness and pin probes must stay cheap and always-answerable.
+- **The limit values are also code constants** (`src/rate-limit.ts` → `RATE_LIMITS`). The same constants drive an in-Worker token-bucket **fallback** used where the native binding is absent (`wrangler dev`, `bun test` — CF ships no local emulator for the binding). Because the limits live in code, dev and prod cannot drift even in the fallback path. ⚠️ The fallback bucket is **per-isolate / in-memory** — not colo-coordinated — exactly like the in-memory store and nonce cache; the durable backing ties to the D1 follow-up (`README.md` §Roadmap, #682). In production the **native binding** (durable, colo-coordinated) is the active path.
+
+**Ordering — rate-limit BEFORE signature verify (deliberate).** On `POST /principals/:id/register`, the `RL_REGISTER` check runs **after** the cheap path validation but **before** the JSON parse and the expensive Ed25519 verify. A flood of bad-signature registers is therefore **shed early at the 429 gate** rather than burning verify compute. The crypto gates still run for any request under the limit — the rate limiter is a guard in front of the wall, not the wall. (A native-binding error **fails open** so a limiter blip can't take the directory down; the crypto gates remain the hard correctness boundary.)
+
+**Provisioning the rate-limit namespaces.** The `[[unsafe.bindings]]` blocks reference `namespace_id` values per environment. These are CF account-scoped ratelimit namespace ids; set distinct ids for dev vs prod (the values in `wrangler.toml` are placeholders — replace with the ids your CF account assigns). The `limit`/`period` must stay identical across the two blocks.
+
+### Bot-fight-mode / WAF (zone-level — principal step, dev = prod)
+
+Bot-fight-mode and WAF managed rules are **zone/dashboard-level** Cloudflare controls — they are **not** Worker code and cannot live in `wrangler.toml`. They are configured by the principal in the Cloudflare dashboard (or via the CF API) for the `meta-factory.ai` zone, scoped to the registry routes. Because `network-dev` and `network` are routes in the **same** `meta-factory.ai` zone, a zone-level managed ruleset applies to both uniformly; if you scope a rule to a specific hostname, **apply the identical rule to both `network-dev.meta-factory.ai` and `network.meta-factory.ai`** — same parity principle as the in-code controls. Recommended baseline:
+
+- **Bot Fight Mode** (or Super Bot Fight Mode if on a paid plan) enabled for the zone — challenges obvious automated/abusive clients before they reach the Worker.
+- **WAF managed rules** (Cloudflare Managed Ruleset) deployed on the registry routes.
+
+These complement, not replace, the app-layer rate limiting above: the rate-limit binding caps request *volume per key*; bot-fight/WAF shed *malicious/automated* traffic shape. Note the registry's M2M clients are legitimate automation (cortex peers polling resolve on a schedule), so verify any bot rule doesn't challenge the federation's own peer traffic — prefer rules that target known-bad signatures over blanket "block all automation".
+
+### Public-exposure policy (dev = prod) — #681
+
+The registry deliberately exposes **federation-membership metadata** on its read surface. This is a **conscious, documented decision**, identical on dev and prod:
+
+| Endpoint | Exposure | Decision |
+|---|---|---|
+| `GET /principals/:id` (by-id resolve) | **PUBLIC, unauthenticated** | **Keep public.** This is the load-bearing federation primitive: a peer must resolve any principal's pubkey to verify its `signed_by[]` stamp. Gating it would break cross-principal verify. |
+| `GET /networks/:id/roster` (LIST members) | **PUBLIC, rate-limited** | **Keep functional** for federation discovery. Rate-limited via `RL_READ`. Returns only already-public fields: `principal_id`, `principal_pubkey`, matched `capabilities[]` (ids). |
+| `GET /capabilities?query=…` (LIST hits) | **PUBLIC, rate-limited** | **Keep functional** for capability discovery. Rate-limited via `RL_READ`. Returns only already-public fields: `capability_id`, `principal_id`, `networks[]`, `description`. |
+
+**Rationale.** Everything the list endpoints surface is **already published, public data**: a principal pubkey is public by definition (it's how peers verify), and capabilities are **open-announce** for discovery (any principal announces into any `network_id`; attribution is visible without a join handshake — see `README.md` §"Discovery vs. traffic gating"). The list endpoints expose **no internal-only detail**, so no response trimming is required. **No auth-gating is added** — federation peers are external and cannot authenticate; an auth gate would break discovery without protecting anything that isn't already public. Membership privacy is therefore **explicitly out of scope for v1**: the controls are (a) rate-limiting (so the surface can't be cheaply bulk-scraped) and (b) this documented decision. A sealed-network join handshake (membership privacy) remains a follow-up; *traffic* gating already lives in `accept_subjects` / `deny_subjects`, not in the directory.
+
+**Parity statement.** This exposure policy and its enforcement (the `RL_READ` limit on all three read paths) are **identical on `network-dev` and `network`**. No divergence.
+
+---
+
 ## Register a principal
 
 Registration is the principal flow that publishes a stack's **public** key into the registry so peers can resolve it. It is **proof-of-possession**: the registration claim is signed with the stack's own signing key, and the registry verifies that signature against the pubkey being claimed.

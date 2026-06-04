@@ -33,12 +33,20 @@
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { createMiddleware } from "hono/factory";
 import { principalRoutes } from "./routes/principals";
 import { networkRoutes } from "./routes/networks";
 import { capabilityRoutes } from "./routes/capabilities";
 import { pubkeyFromPkcs8 } from "./signing";
+import type { RateLimitEnv } from "./rate-limit";
+import {
+  checkRateLimit,
+  clientKey,
+  retryAfterSeconds,
+  TOO_MANY_REQUESTS_BODY,
+} from "./rate-limit";
 
-export interface Env {
+export interface Env extends RateLimitEnv {
   /**
    * Base64-encoded PKCS#8 Ed25519 private key used to sign GET
    * responses. Provisioned via `wrangler secret put` per the
@@ -160,6 +168,34 @@ app.get("/registry/pubkey", (c) => {
   }
   return c.json({ algorithm: "Ed25519", public_key: pub });
 });
+
+// ---------------------------------------------------------------------------
+// Read rate-limit (#680) — looser IP-keyed limit on the load-bearing GET
+// surface. Applied to the resolve / roster / capabilities reads, NOT to
+// /api/health or /registry/pubkey (liveness + pin probes must stay cheap and
+// always-answerable; throttling a health check would be counterproductive).
+//
+// The register mutation has its OWN, stricter limit enforced inside the handler
+// (rate-limit BEFORE signature verify — see routes/principals.ts) so the gate
+// can fold principal_id into the key and shed bad-sig floods before the
+// expensive Ed25519 path.
+//
+// Limits are byte-identical on dev and prod (code constants in rate-limit.ts).
+// ---------------------------------------------------------------------------
+
+const readLimited = createMiddleware<{ Bindings: Env }>(async (c, next) => {
+  const allowed = await checkRateLimit(c.env, "read", clientKey(c.req.raw));
+  if (!allowed) {
+    return c.json(TOO_MANY_REQUESTS_BODY, 429, {
+      "Retry-After": String(retryAfterSeconds("read")),
+    });
+  }
+  await next();
+});
+
+app.use("/principals/:principal_id", readLimited);
+app.use("/networks/:network_id/roster", readLimited);
+app.use("/capabilities", readLimited);
 
 // ---------------------------------------------------------------------------
 // Mount route groups
