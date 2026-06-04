@@ -37,8 +37,39 @@ import { signEnvelope } from "@the-metafactory/myelin/identity";
  * subscription, with the actual NATS subject (so wildcard-pattern
  * subscribers can route on the concrete subject — see
  * `src/bus/surface-router.ts`, G-1111.A).
+ *
+ * IAW Phase F-3d (cortex#666) — `sourceLink` ADDITIVELY tags WHICH pool
+ * link (and therefore which federation network) delivered an inbound
+ * envelope. It is the delivering link's `linkId`:
+ *
+ *   - `"primary"` — the `config.nats` link (local/public + every back-compat
+ *     case: zero per-network `nats:` ⇒ the only link ⇒ always `"primary"`).
+ *   - a `leaf_node` name — a per-network federated leaf (F-3a Option B).
+ *
+ * The value is the pool's de-dup key for the delivering link, which is the
+ * `leaf_node` the F-3d anti-spoof + surface-router federated gate cross-check
+ * the subject's `{network_id}` segment against (a subject claiming
+ * `federated.{X}.…` that arrived on a link NOT owning network X is a spoof,
+ * per design §3.3 / §5). `undefined` when the delivery site has no link
+ * context (test-only direct `dispatch` calls, and disabled-runtime handlers
+ * that never fire).
+ *
+ * **Back-compat:** the third arg is optional + trailing, so every existing
+ * `(envelope, subject)` handler keeps its byte-identical shape — TypeScript
+ * permits a 2-arg function where a 3-arg type is expected (parameter
+ * bivariance on the extra trailing param). Single-link deployments always see
+ * `sourceLink === "primary"`, which is exactly the pre-F-3d behaviour with one
+ * extra, ignorable fact attached.
+ *
+ * This slice provides the HOOK; per-network signed-federation verify
+ * (TC-2d, cortex#635) is the consumer that turns the attribution into a
+ * cryptographic peer-pubkey lookup keyed off the delivering network.
  */
-export type EnvelopeHandler = (envelope: Envelope, subject: string) => void;
+export type EnvelopeHandler = (
+  envelope: Envelope,
+  subject: string,
+  sourceLink?: string,
+) => void;
 
 /** Lifecycle handle so cortex can clean up on shutdown. */
 export interface MyelinRuntime {
@@ -971,61 +1002,166 @@ export async function startMyelinRuntime(
   // once: whichever path runs first creates the subscriber; the second
   // returns the SAME handle instead of double-binding.
   //
-  // F-3b (cortex#659): the dedupe map is now PER-LINK — it lives on the
-  // primary `PoolLink` (`primary.boundByPattern`). Boot-time push
-  // subscribers + the `runtime.subscribe` self-subscribe path are
-  // primary-only in F-3b (design §3.5), so they share the primary link's
-  // map. Leaf links carry their own (empty) `boundByPattern` for when
-  // per-network subscribe lands (F-3d).
-  const boundByPattern = primary.boundByPattern;
+  // F-3b (cortex#659): the dedupe map is now PER-LINK — it lives on each
+  // `PoolLink` (`poolLink.boundByPattern`). Boot-time `nats.subjects` push
+  // subscribers + the `runtime.subscribe` self-subscribe path bind on the
+  // PRIMARY link's map (design §3.5); F-3d (cortex#666) per-leaf inbound
+  // subscriptions bind on each leaf's own map. `bindPushPattern` now takes the
+  // target `PoolLink` explicitly rather than closing over a single map.
+
   /**
-   * Bind one resolved push pattern idempotently. Returns the already-bound
-   * subscriber on a duplicate, or `null` if `MyelinSubscriber.start` threw.
-   * Shared by the boot loop and `subscribePushEnabled`.
+   * IAW Phase F-3d (cortex#666) — fan an inbound envelope out to every
+   * registered handler, tagging the delivering link's `linkId` as
+   * `sourceLink`. Each handler runs in its own try/catch so one slow/failing
+   * consumer can't poison the others (router-level isolation lives in the
+   * surface-router; this is the defensive last line).
+   *
+   * `sourceLink` is the `PoolLink.linkId` of whichever link's subscriber
+   * delivered the envelope — `"primary"` for the `config.nats` link, the
+   * `leaf_node` for a federated leaf. The anti-spoof assertion (§3.3 / §5)
+   * runs at the per-link subscriber site (`bindPushPattern`) BEFORE this
+   * fan-out, so a `federated.{X}.…` subject that arrived on a link not owning
+   * network X never reaches handlers at all. The `sourceLink` carried here is
+   * the surplus attribution TC-2d (cortex#635) keys its per-network verify
+   * off — F-3d is the structural prerequisite, not the verify itself.
    */
-  const bindPushPattern = (pattern: string): MyelinSubscriber | null => {
-    const existing = boundByPattern.get(pattern);
+  const fanOut = (env: Envelope, subject: string, sourceLink: string): void => {
+    for (const handler of handlers) {
+      try {
+        handler(env, subject, sourceLink);
+      } catch (err) {
+        console.error(
+          "myelin-runtime: onEnvelope handler threw:",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    }
+  };
+
+  /**
+   * IAW Phase F-3d (cortex#666) — anti-spoof source-link assertion (design
+   * §3.3 / §5, isolation layer 2). For a `federated.{network_id}.…` subject
+   * delivered on a leaf link, the subject's `{network_id}` segment MUST map to
+   * a network whose `leaf_node` equals the delivering `linkId`; an envelope
+   * claiming network X that arrived on a link NOT owning X is a cross-network
+   * spoof and is DROPPED + logged. The PRIMARY link carries `local.*` /
+   * `public.*` plus every network WITHOUT a `nats:` block (those ride
+   * primary), so primary-delivered traffic is never spoof-checked here — its
+   * legitimacy is governed by the surface-router federation gate, not by link
+   * attribution. Non-`federated.*` subjects are never checked.
+   *
+   * Returns `true` when the envelope is allowed to fan out, `false` when it
+   * was dropped as a spoof.
+   *
+   * **Back-compat:** with zero leaf links the primary subscriber is the only
+   * one bound and `linkId === "primary"`, so this returns `true` for every
+   * subject — byte-identical to the pre-F-3d single-link delivery path.
+   */
+  const passesSourceLinkCheck = (subject: string, linkId: string): boolean => {
+    // Only leaf-delivered federated subjects are spoof-checked. Primary
+    // delivery + non-federated subjects pass through (see docblock).
+    if (linkId === primary.linkId) return true;
+    if (!subject.startsWith("federated.")) return true;
+    const claimedNetworkId = subject.split(".")[1];
+    // The link that delivered this owns these network ids (built once at boot
+    // — the inverse of `networkIdToLinkId`, scoped to THIS leaf). A subject
+    // whose `{network_id}` doesn't resolve to a network on this exact leaf is
+    // a spoof.
+    const owningLinkId =
+      claimedNetworkId === undefined || claimedNetworkId.length === 0
+        ? undefined
+        : networkIdToLinkId.get(claimedNetworkId);
+    if (owningLinkId === linkId) return true;
+    console.error(
+      `myelin-runtime: DROPPING spoofed envelope subject=${subject} — claimed network "${claimedNetworkId ?? "<malformed>"}" did not arrive on its own leaf (delivered on link="${linkId}", network maps to link="${owningLinkId ?? "<unknown>"}")`,
+    );
+    return false;
+  };
+
+  /**
+   * Bind one resolved push pattern idempotently ON A SPECIFIC POOL LINK.
+   * Returns the already-bound subscriber on a duplicate, or `null` if
+   * `MyelinSubscriber.start` threw. Shared by the boot loop (primary +
+   * per-leaf F-3d subscriptions) and `subscribePushEnabled`.
+   *
+   * IAW Phase F-3d (cortex#666): the dedupe map + `subscribers[]` are the
+   * TARGET link's own (per-link, per design §3.5 / the cortex#491 per-link
+   * dedupe), and the fan-out tags `poolLink.linkId` as `sourceLink`. A leaf
+   * subscriber additionally runs `passesSourceLinkCheck` before fanning out
+   * (anti-spoof). Primary keeps its pre-F-3d behaviour exactly (the check is
+   * a no-op for `linkId === "primary"`).
+   */
+  const bindPushPattern = (
+    poolLink: PoolLink,
+    pattern: string,
+  ): MyelinSubscriber | null => {
+    const existing = poolLink.boundByPattern.get(pattern);
     if (existing !== undefined) {
       console.log(
-        `myelin-runtime: skipping duplicate subscribe to "${pattern}" (already bound)`,
+        `myelin-runtime: skipping duplicate subscribe to "${pattern}" on link="${poolLink.linkId}" (already bound)`,
       );
       return existing;
     }
+    // A down leaf (link === null) cannot bind a subscription; the background
+    // reconnect re-binds the leaf's interest when it attaches (F-3c/F-3d).
+    const targetLink = poolLink.link;
+    if (targetLink === null) {
+      console.error(
+        `myelin-runtime: cannot subscribe to "${pattern}" on down link="${poolLink.linkId}" — skipping (background reconnect will re-bind)`,
+      );
+      return null;
+    }
     try {
-      const sub = MyelinSubscriber.start(link, {
+      const sub = MyelinSubscriber.start(targetLink, {
         pattern,
         onEnvelope: (env, subject) => {
           logEnvelope(env, subject);
-          // Fan out to registered handlers. Each handler runs in its
-          // own try/catch so one slow/failing consumer can't poison
-          // the others (router-level isolation lives in the
-          // surface-router; this is a defensive last line).
-          for (const handler of handlers) {
-            try {
-              handler(env, subject);
-            } catch (err) {
-              console.error(
-                "myelin-runtime: onEnvelope handler threw:",
-                err instanceof Error ? err.message : String(err),
-              );
-            }
-          }
+          // Anti-spoof BEFORE fan-out (leaf links only; no-op for primary).
+          if (!passesSourceLinkCheck(subject, poolLink.linkId)) return;
+          fanOut(env, subject, poolLink.linkId);
         },
       });
-      subscribers.push(sub);
-      boundByPattern.set(pattern, sub);
-      console.log(`myelin-runtime: subscribed to "${pattern}"`);
+      poolLink.subscribers.push(sub);
+      poolLink.boundByPattern.set(pattern, sub);
+      console.log(
+        `myelin-runtime: subscribed to "${pattern}" on link="${poolLink.linkId}"`,
+      );
       return sub;
     } catch (err) {
       console.error(
-        `myelin-runtime: failed to subscribe to "${pattern}":`,
+        `myelin-runtime: failed to subscribe to "${pattern}" on link="${poolLink.linkId}":`,
         err instanceof Error ? err.message : String(err),
       );
       return null;
     }
   };
+  // Boot-time push subscribers from `nats.subjects[]` bind on the PRIMARY link
+  // (design §3.5 — broad-pattern push is primary-only; leaf links carry
+  // network-scoped subscriptions wired just below).
   for (const pattern of subjects) {
-    bindPushPattern(pattern);
+    bindPushPattern(primary, pattern);
+  }
+
+  // IAW Phase F-3d (cortex#666) — per-leaf inbound subscriptions. Each leaf
+  // link subscribes to the federated subjects of EVERY network mapped to it,
+  // so an inbound envelope on that leaf fans out tagged with the leaf's
+  // `linkId` as `sourceLink` (design §3.3 — "each subscriber binds to exactly
+  // one link and tags `sourceLink`"). The pattern is `federated.{network_id}.>`
+  // per network on the leaf — the same `{network_id}`-keyed grammar the
+  // surface-router gate + `selectLink` already use, so inbound attribution and
+  // outbound routing agree on a federated subject's network segment.
+  //
+  // **Back-compat:** with zero leaf links this loop binds nothing — the pool
+  // is primary-only and delivery is byte-identical to pre-F-3d. A DOWN leaf
+  // (link === null) is skipped by `bindPushPattern`; the F-3c background
+  // reconnect attaches the link but re-binding its interest on reconnect is
+  // deferred (the leaf comes back publish-capable; inbound re-bind is a TC-2d-
+  // adjacent follow-up, noted in the PR).
+  for (const [networkId, linkId] of networkIdToLinkId) {
+    if (linkId === primary.linkId) continue; // rides primary — no leaf sub.
+    const leaf = pool.get(linkId);
+    if (leaf === undefined) continue; // defensive — mapping invariant holds.
+    bindPushPattern(leaf, `federated.${networkId}.>`);
   }
 
   // cortex#337 — pre-#337 a non-empty `subjects[]` that ALL failed to
@@ -1474,7 +1610,11 @@ export async function startMyelinRuntime(
     // an earlier self-subscribe of the same pattern) returns the EXISTING
     // subscriber instead of double-binding the shared `handlers` Set. The
     // binder owns its own try/catch + logging; `null` means start() threw.
-    const sub = bindPushPattern(pattern);
+    // F-3d (cortex#666): the self-subscribe path stays bound to the PRIMARY
+    // link (design §3.5 — broad-pattern push is primary-only; per-network
+    // inbound is the boot-time per-leaf loop above). Primary delivery is never
+    // spoof-checked, so a self-subscribed handler sees `sourceLink: "primary"`.
+    const sub = bindPushPattern(primary, pattern);
     if (sub === null) return null;
     // Await readiness on every call (including the deduped return): the
     // already-bound subscriber's `ready` promise resolves immediately when
