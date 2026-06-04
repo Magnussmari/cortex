@@ -15,6 +15,7 @@
 
 import type { ConnectionOptions, NatsConnection } from "nats";
 import type { AgentConfig } from "../../common/types/config";
+import type { PolicyFederatedNetwork } from "../../common/types/cortex-config";
 import { NatsLink } from "../nats/connection";
 import {
   MyelinSubscriber,
@@ -332,6 +333,57 @@ export interface MyelinRuntimeOptions {
    * runtime no-op semantics.
    */
   principal?: string;
+  /**
+   * IAW Phase F-3b (cortex#659) — the federation networks the runtime
+   * builds its `LinkPool` from. Sourced from `policy.federated.networks[]`
+   * (which already flows through `cortex.ts` boot, separate from the
+   * `AgentConfig` this function takes). Each network that declares an
+   * inline `nats:` block (F-3a, Option B — `docs/design-multi-network.md`
+   * §2) contributes one leaf `NatsLink`, keyed by `leaf_node` (the pool /
+   * de-dup key: two networks sharing a `leaf_node` share one physical
+   * link). Networks WITHOUT a `nats:` block ride the `primary` link.
+   *
+   * **Back-compat:** when undefined or empty — or when no network declares
+   * a `nats:` block — the pool contains ONLY the `primary` link and every
+   * publish routes to it, byte-identical to the pre-F-3b single-link
+   * runtime. This is the load-bearing zero-network no-op invariant
+   * (design §3, §7.4).
+   */
+  federatedNetworks?: readonly PolicyFederatedNetwork[];
+  /**
+   * IAW Phase F-3b (cortex#659) — sink for publish-routing errors. The
+   * design (§3.2) calls for a `system.error`
+   * (`unknown_network_in_publish_subject`) + skip when a publish resolves
+   * to a `federated.{unknown}.*` subject (a network with no leaf in the
+   * pool). The runtime has no `SystemEventSource` wired and publishing a
+   * system envelope from inside the publish-routing path would itself need
+   * to route (back to `primary`) with a recursion hazard — so F-3b
+   * surfaces the signal through this structured callback (defaulting to a
+   * `console.error` with the canonical reason) rather than a typed bus
+   * envelope. A later slice (F-3c / inbound attribution, design §3.3/§8)
+   * can promote it to a real `system.error` audit envelope by wiring a
+   * source here. Tests use this seam to capture the routing error
+   * deterministically.
+   */
+  onRoutingError?: (info: RoutingError) => void;
+}
+
+/**
+ * IAW Phase F-3b (cortex#659) — structured publish-routing error surfaced
+ * via {@link MyelinRuntimeOptions.onRoutingError}. Today the only `reason`
+ * is `unknown_network_in_publish_subject` (a `federated.{network_id}.*`
+ * publish whose `{network_id}` has no link in the pool); the discriminated
+ * shape leaves room for additional routing failure modes without breaking
+ * the callback contract.
+ */
+export interface RoutingError {
+  reason: "unknown_network_in_publish_subject";
+  /** The resolved subject the publish targeted. */
+  subject: string;
+  /** The `{network_id}` segment that failed to resolve to a pool link. */
+  networkId: string;
+  /** The envelope id, for joinability with the audit/event stream. */
+  envelopeId: string;
 }
 
 /**
@@ -500,10 +552,30 @@ export async function startMyelinRuntime(
     );
   }
 
-  let link: NatsLink;
-  const safeUrl = nats.url.replace(/\/\/[^@/]+@/, "//***@");
+  // IAW Phase F-3b (cortex#659) — the LinkPool. A `PoolLink` bundles one
+  // `NatsLink` with its OWN subscriber set, `boundByPattern` dedupe map,
+  // and lazily-built `jsmCache`. Pre-F-3b these were module-singletons
+  // closed over the single `link`; the dedupe and JetStream-manager caching
+  // are per-physical-link (a double-bind is per-link; a JSM round-trip is
+  // per-connection), so they belong on the link, not the runtime.
+  interface PoolLink {
+    /** Pool key — `'primary'` for `config.nats`; `leaf_node` for a leaf. */
+    readonly linkId: string;
+    readonly link: NatsLink;
+    /** This link's own bound push subscriptions (cortex#491 dedupe is per-link). */
+    readonly subscribers: MyelinSubscriber[];
+    readonly boundByPattern: Map<string, MyelinSubscriber>;
+    /** Lazily-resolved JetStreamManager for this link (cortex#338). */
+    jsmCache: Promise<import("nats").JetStreamManager> | null;
+  }
+
+  const safeUrlOf = (url: string): string => url.replace(/\/\/[^@/]+@/, "//***@");
+
+  // The primary link backs `local.*` / `public.*` and every back-compat
+  // case (zero per-network `nats:` ⇒ this is the ONLY link in the pool).
+  let primary: PoolLink;
   try {
-    link = await NatsLink.connect({
+    const primaryLink = await NatsLink.connect({
       url: nats.url,
       token: nats.token,
       // cortex#86: operator-mode auth path. NatsLink loader expands ~/
@@ -513,10 +585,21 @@ export async function startMyelinRuntime(
       name: nats.name,
       ...(options?.connectImpl ? { connectImpl: options.connectImpl } : {}),
     });
+    primary = {
+      linkId: "primary",
+      link: primaryLink,
+      subscribers: [],
+      boundByPattern: new Map(),
+      jsmCache: null,
+    };
     console.log(
-      `myelin-runtime: connected to ${safeUrl} as "${nats.name}"`,
+      `myelin-runtime: connected to ${safeUrlOf(nats.url)} as "${nats.name}" (link=primary)`,
     );
   } catch (err) {
+    // Primary down ⇒ runtime disabled, exactly as the pre-F-3b single-link
+    // path. The primary link governs `enabled` (design §3.4, OD-F3-2):
+    // per-network leaf degradation is F-3c — F-3b keeps the primary-down
+    // contract identical so the back-compat case is byte-for-byte.
     console.error(
       "myelin-runtime: failed to connect — continuing without NATS:",
       err instanceof Error ? err.message : String(err),
@@ -532,7 +615,115 @@ export async function startMyelinRuntime(
     };
   }
 
-  const subscribers: MyelinSubscriber[] = [];
+  // The pool, keyed by `linkId`. `primary` is always present; leaf links
+  // are added below. `pool.get('primary')` is the back-compat default for
+  // every selection path.
+  const pool = new Map<string, PoolLink>();
+  pool.set(primary.linkId, primary);
+
+  // IAW Phase F-3b — build one leaf link per DISTINCT federated network
+  // `leaf_node` that declared an inline `nats:` block (F-3a, Option B). The
+  // `leaf_node` is the de-dup key: two networks sharing a `leaf_node` share
+  // ONE physical link (the F-3a cross-validator guarantees their `nats:`
+  // blocks are consistent, so the first declaration wins and the second is
+  // a no-op). Networks WITHOUT a `nats:` block contribute nothing here —
+  // they ride the primary link.
+  //
+  // `network_id → linkId` is the publish-routing resolution map, built once
+  // here (no per-message Map rebuild — design §3.2, mirrors
+  // `network-resolver.ts` cached-lookup discipline). A network whose
+  // `leaf_node` has no leaf link resolves to `'primary'` (rides primary),
+  // preserving the back-compat default.
+  //
+  // NAME-COLLISION (design §3.2): this keys off
+  // `options.federatedNetworks` (← `policy.federated.networks[]`), NEVER
+  // `config.networks[]` (the legacy grove Discord-guild → cloud-publish
+  // table owned by `network-resolver.ts`). The two must never cross.
+  const federatedNetworks = options?.federatedNetworks ?? [];
+
+  // PASS 1 — build one leaf link per DISTINCT `leaf_node` that some network
+  // declared a `nats:` block for. The first network with a given
+  // `leaf_node` defines the connection; later networks sharing it reuse the
+  // link (the F-3a cross-validator guarantees their `nats:` blocks agree,
+  // so we don't re-read them). A `leaf_node` whose construction throws is
+  // simply absent from the pool (the degrade-don't-crash seam below).
+  for (const network of federatedNetworks) {
+    if (network.nats === undefined) continue; // rides primary — resolved in PASS 2.
+    const leafId = network.leaf_node;
+    if (pool.has(leafId)) continue; // already built by an earlier sharing network.
+    try {
+      const leafLink = await NatsLink.connect({
+        url: network.nats.url,
+        ...(network.nats.credsPath ? { credsPath: network.nats.credsPath } : {}),
+        name: network.nats.name,
+        ...(options?.connectImpl ? { connectImpl: options.connectImpl } : {}),
+      });
+      pool.set(leafId, {
+        linkId: leafId,
+        link: leafLink,
+        subscribers: [],
+        boundByPattern: new Map(),
+        jsmCache: null,
+      });
+      console.log(
+        `myelin-runtime: connected to ${safeUrlOf(network.nats.url)} as "${network.nats.name}" (link=${leafId}, network=${network.id})`,
+      );
+    } catch (err) {
+      // F-3b SEAM → F-3c (design §3.4, OD-F3-2 "degrade, don't crash"):
+      // a per-network leaf being down at boot must NOT take the daemon
+      // down. F-3b constructs the leaf links and logs a leaf-construction
+      // failure here; the FULL degraded-boot lifecycle (mark-disabled +
+      // background nats.js retry + the OD-F3-2 boot-contract semantics) is
+      // F-3c. For F-3b the `leaf_node` whose construction failed simply has
+      // no pool entry, so PASS 2 leaves networks pointing at it UNMAPPED,
+      // and their publishes resolve to a `federated.{unknown}` routing
+      // error + skip (fail-closed: a dark network routes nothing). The
+      // primary link governs `enabled` and is unaffected.
+      console.error(
+        `myelin-runtime: failed to connect leaf "${leafId}" (network=${network.id}) at ${safeUrlOf(network.nats.url)} — that network is dark; primary unaffected (F-3c hardens this):`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  // PASS 2 — map each network id to its target `linkId`:
+  //   - its `leaf_node`, IF a leaf link for that `leaf_node` exists in the
+  //     pool (it declared `nats:`, OR a sibling sharing the `leaf_node`
+  //     did, and the connect succeeded);
+  //   - else `'primary'` (no `nats:` anywhere for this `leaf_node` ⇒ rides
+  //     primary, today's behaviour).
+  // A network whose `leaf_node` had a leaf that FAILED to connect is left
+  // UNMAPPED on purpose — `selectLink` then skips its publishes (dead
+  // network fails closed) rather than silently leaking onto primary.
+  const networkIdToLinkId = new Map<string, string>();
+  const leafNodeDeclaredNats = new Set<string>();
+  for (const network of federatedNetworks) {
+    if (network.nats !== undefined) leafNodeDeclaredNats.add(network.leaf_node);
+  }
+  for (const network of federatedNetworks) {
+    if (pool.has(network.leaf_node)) {
+      // Leaf link is live — route this network to it.
+      networkIdToLinkId.set(network.id, network.leaf_node);
+    } else if (leafNodeDeclaredNats.has(network.leaf_node)) {
+      // A `nats:` block WAS declared for this `leaf_node` but the leaf
+      // failed to connect — leave UNMAPPED so the network fails closed.
+      // (skip the set: `networkIdToLinkId.get(id)` returns undefined.)
+    } else {
+      // No `nats:` anywhere for this `leaf_node` — ride the primary link.
+      networkIdToLinkId.set(network.id, primary.linkId);
+    }
+  }
+
+  // Back-compat alias: every existing reference to the single `link` now
+  // targets the primary link's `NatsLink`. The subscribe/pull/jsm helpers
+  // below stay bound to `primary` (design §3.5 — `subscribePull` and the
+  // boot-time push subscribers are primary-only in F-3b; per-network
+  // subscribe is F-3d inbound attribution).
+  const link = primary.link;
+  // `subscribers` / `boundByPattern` for the boot-time push loop + the
+  // self-subscribe path are the PRIMARY link's (design §3.5). Leaf links
+  // carry their own empty sets (publish-only in F-3b).
+  const subscribers = primary.subscribers;
   // cortex#491 — idempotent push-subscribe per RESOLVED pattern. Core-NATS
   // push subscriptions are independent: if two subscribers bind to patterns
   // that both match a subject, the broker delivers the envelope to BOTH, and
@@ -557,7 +748,14 @@ export async function startMyelinRuntime(
   // so a config pattern that collides with a self-subscribe binds exactly
   // once: whichever path runs first creates the subscriber; the second
   // returns the SAME handle instead of double-binding.
-  const boundByPattern = new Map<string, MyelinSubscriber>();
+  //
+  // F-3b (cortex#659): the dedupe map is now PER-LINK — it lives on the
+  // primary `PoolLink` (`primary.boundByPattern`). Boot-time push
+  // subscribers + the `runtime.subscribe` self-subscribe path are
+  // primary-only in F-3b (design §3.5), so they share the primary link's
+  // map. Leaf links carry their own (empty) `boundByPattern` for when
+  // per-network subscribe lands (F-3d).
+  const boundByPattern = primary.boundByPattern;
   /**
    * Bind one resolved push pattern idempotently. Returns the already-bound
    * subscriber on a duplicate, or `null` if `MyelinSubscriber.start` threw.
@@ -617,9 +815,17 @@ export async function startMyelinRuntime(
   // is the new path; failed push subscribers are still treated as a
   // boot failure for that configuration shape.
   if (pushSubscribersConfigured && subscribers.length === 0) {
-    await link.close().catch(() => {
-      // best-effort close on no-subscribers path; ignore errors
-    });
+    // F-3b: close EVERY pool link on this disabled-fallback path, not just
+    // primary — leaf links opened above must not leak when the runtime
+    // collapses back to disabled. `allSettled` so one link's close error
+    // doesn't block another's.
+    await Promise.allSettled(
+      [...pool.values()].map((p) =>
+        p.link.close().catch(() => {
+          // best-effort close on no-subscribers path; ignore errors
+        }),
+      ),
+    );
     return {
       enabled: false,
       onEnvelope,
@@ -655,6 +861,113 @@ export async function startMyelinRuntime(
     ? Buffer.from(signer.rawSeedBytes).toString("base64")
     : undefined;
 
+  // IAW Phase F-3b (cortex#659) — the routing-error sink (design §3.2).
+  // Defaults to a structured `console.error` carrying the canonical
+  // `unknown_network_in_publish_subject` reason; a later slice can wire a
+  // real `system.error` audit envelope via `options.onRoutingError`.
+  const onRoutingError =
+    options?.onRoutingError ??
+    ((info: RoutingError) => {
+      console.error(
+        `myelin-runtime: ${info.reason} subject=${info.subject} network=${info.networkId} id=${info.envelopeId} — SKIPPING publish (no link in pool for this federated network)`,
+      );
+    });
+
+  /**
+   * IAW Phase F-3b (cortex#659) — PURE link selection from the RESOLVED
+   * subject (design §3.2). No global mutable routing state, no per-message
+   * Map rebuild: reads `network_id → linkId` (built once at boot) and the
+   * `pool`.
+   *
+   *   | resolved subject            | target link                         |
+   *   |-----------------------------|-------------------------------------|
+   *   | `local.…`                   | `primary`                           |
+   *   | `public.…`                  | `primary` (public mesh deferred §3.5)|
+   *   | `federated.{network_id}.…`  | the pool link owning `{network_id}` |
+   *   | `federated.{unknown}.…`     | none → routing error + skip         |
+   *
+   * Returns the selected `PoolLink`, or `null` to signal "skip the
+   * publish" (the only `null` case today is an unknown federated network,
+   * which also fires `onRoutingError`). `{network_id}` is the subject's
+   * SECOND segment — the same grammar the inbound surface-router federation
+   * gate already keys off (`evaluateFederationGate`, `surface-router.ts`)
+   * and the design (`docs/design-multi-network.md` §3.2) mandates, so
+   * publish/subscribe routing agree on what a federated subject's network
+   * segment is.
+   *
+   * KNOWN EMIT-SITE ASYMMETRY (cortex#661, deferred to F-3c/E.2 — NOT a
+   * back-compat hazard). `deriveNatsSubject` currently emits federated
+   * subjects as `federated.{principal}.{stack}.{type}` — segment[1] is the
+   * PRINCIPAL, not the network_id this function (correctly, per §3.2) keys
+   * off. Consequence: a REAL federated publish routed through the derive
+   * path (`runtime.publish` with `classification: "federated"`) WHILE a leaf
+   * link exists resolves segment[1]=`{principal}` and — unless a network is
+   * coincidentally named after the principal — hits the unknown-network skip
+   * and is DROPPED (or mis-routes on that coincidence). This is harmless
+   * today only because (1) the zero-leaf back-compat case short-circuits to
+   * primary below before any segment is read, and (2) F-3b scopes the
+   * federated emit/relay enablement (E.2/E.3/E.7) OUT — no production site
+   * emits a `classification: "federated"` envelope through the derive path
+   * with a leaf present yet. The fix lands at the EMIT site under cortex#661,
+   * not here: `selectLink` already implements the design grammar. The
+   * regression test `(f)` in `runtime-linkpool.test.ts` PINS this current
+   * derive-path-with-leaf behaviour so the seam is explicit, not silent.
+   *
+   * BACK-COMPAT (the load-bearing zero-leaf invariant): with zero leaf
+   * links (no per-network `nats:`) the pool is primary-only, so the
+   * `pool.size === 1` short-circuit below returns `primary` for EVERY
+   * subject — including any stray `federated.*` — WITHOUT reading
+   * segment[1] at all. The unknown-network skip is therefore a
+   * multi-link-ONLY concept and never engages in the zero-leaf case; a
+   * `federated.*` subject for an un-configured segment was already not
+   * separately routable pre-F-3b (it just published on the single link),
+   * and that is preserved byte-for-byte. NOTE this short-circuit is also
+   * what makes the cortex#661 emit-site asymmetry above invisible today —
+   * it only surfaces once a leaf link exists.
+   */
+  const selectLink = (subject: string, envelopeId: string): PoolLink | null => {
+    // Non-federated subjects (`local.*`, `public.*`, and anything that
+    // isn't a federated subject) always go to primary.
+    if (!subject.startsWith("federated.")) {
+      return primary;
+    }
+    // Primary-only pool ⇒ federated traffic rides primary, exactly as the
+    // single-link runtime did pre-F-3b. No routing error in this case: the
+    // unknown-network skip is a multi-link-only concept.
+    if (pool.size === 1) {
+      return primary;
+    }
+    // `federated.{network_id}.…` — segment[1] is the network id.
+    const networkId = subject.split(".")[1];
+    if (networkId === undefined || networkId.length === 0) {
+      // Malformed `federated.` / `federated..…` — treat as unknown network.
+      onRoutingError({
+        reason: "unknown_network_in_publish_subject",
+        subject,
+        networkId: "<malformed>",
+        envelopeId,
+      });
+      return null;
+    }
+    const linkId = networkIdToLinkId.get(networkId);
+    const target = linkId === undefined ? undefined : pool.get(linkId);
+    if (target === undefined) {
+      // Unknown network (no such network id) OR a network whose declared
+      // leaf failed to connect at boot (left UNMAPPED in PASS 2) — both
+      // fail closed: signal + skip, NEVER leak onto primary. A network
+      // configured WITHOUT any `nats:` maps to `'primary'` and resolves
+      // here normally.
+      onRoutingError({
+        reason: "unknown_network_in_publish_subject",
+        subject,
+        networkId,
+        envelopeId,
+      });
+      return null;
+    }
+    return target;
+  };
+
   /**
    * Shared sign + wire-publish core. `publishEnabled` derives the
    * subject from `envelope.type` via `deriveNatsSubject`; the
@@ -662,6 +975,11 @@ export async function startMyelinRuntime(
    * subject built from `directTaskSubject`-style helpers. Both then
    * share the post-stop guard, signer wiring, and stderr-logged
    * link.publish below.
+   *
+   * F-3b (cortex#659): selects the target `PoolLink` from the resolved
+   * subject FIRST (pure `selectLink`), then signs + publishes on THAT
+   * link. An unknown federated network skips the publish (returns after
+   * `onRoutingError` already fired inside `selectLink`).
    */
   const signAndPublishOnSubject = async (
     envelope: Envelope,
@@ -677,6 +995,16 @@ export async function startMyelinRuntime(
       // drain-safe, but short-circuiting at this layer keeps the contract
       // explicit ("publish-after-stop is a no-op") and saves a JSON.stringify
       // of the envelope on the shutdown path.
+      return;
+    }
+
+    // F-3b (cortex#659): select the target link from the resolved subject
+    // BEFORE signing. An unknown federated network returns null —
+    // `selectLink` already fired `onRoutingError`; skip the publish (do
+    // NOT fall back to primary, per design §3.2: a misrouted federated
+    // subject must never leak onto the wrong link).
+    const target = selectLink(subject, envelope.id);
+    if (target === null) {
       return;
     }
 
@@ -745,7 +1073,11 @@ export async function startMyelinRuntime(
     // can fall through to the legacy in-process path (silent drops
     // here would mean inbound chat dispatches are lost when the bus
     // is unreachable).
-    link.publish(subject, JSON.stringify(envelopeToPublish));
+    //
+    // F-3b (cortex#659): publish on the SELECTED link, not the module
+    // singleton — `federated.{network_id}.…` lands on that network's leaf,
+    // `local.*` / `public.*` on primary.
+    target.link.publish(subject, JSON.stringify(envelopeToPublish));
   };
 
   const publishEnabled = async (envelope: Envelope): Promise<void> => {
@@ -891,10 +1223,13 @@ export async function startMyelinRuntime(
   // provision streams + per-agent durables before `ReviewConsumer.start`
   // binds to them. Cached on first call so the boot path doesn't pay a
   // server round-trip per per-agent provisioning call.
-  let jsmCache: Promise<import("nats").JetStreamManager> | null = null;
+  //
+  // F-3b (cortex#659): `jetstreamManager` stays bound to the PRIMARY link
+  // (design §3.5 — no per-network JetStream durables in F-3). The cache
+  // lives on the primary `PoolLink` (`primary.jsmCache`).
   const jetstreamManagerEnabled = (): Promise<import("nats").JetStreamManager> => {
-    jsmCache ??= link.raw.jetstreamManager();
-    return jsmCache;
+    primary.jsmCache ??= primary.link.raw.jetstreamManager();
+    return primary.jsmCache;
   };
 
   return {
@@ -908,15 +1243,25 @@ export async function startMyelinRuntime(
     stop: async () => {
       if (stopped) return;
       stopped = true;
-      // Drain subscribers first so they exit cleanly; then close the
-      // underlying link.
-      await Promise.allSettled(subscribers.map((s) => s.stop()));
-      await link.close().catch((err: unknown) => {
-        console.error(
-          "myelin-runtime: close error:",
-          err instanceof Error ? err.message : String(err),
-        );
-      });
+      // F-3b (cortex#659): drain EVERY pool link's subscribers, then close
+      // EVERY link. `allSettled` throughout so one link's drain/close
+      // failure does not block another's (design §3.4). Leaf links carry
+      // empty subscriber sets in F-3b (publish-only) but are drained +
+      // closed uniformly so F-3c/F-3d can add per-link subscribers without
+      // touching this teardown.
+      await Promise.allSettled(
+        [...pool.values()].flatMap((p) => p.subscribers.map((s) => s.stop())),
+      );
+      await Promise.allSettled(
+        [...pool.values()].map((p) =>
+          p.link.close().catch((err: unknown) => {
+            console.error(
+              `myelin-runtime: close error (link=${p.linkId}):`,
+              err instanceof Error ? err.message : String(err),
+            );
+          }),
+        ),
+      );
       console.log("myelin-runtime: stopped");
     },
   };
