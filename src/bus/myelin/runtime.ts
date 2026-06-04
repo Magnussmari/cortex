@@ -1151,6 +1151,25 @@ export async function startMyelinRuntime(
   // surface-router gate + `selectLink` already use, so inbound attribution and
   // outbound routing agree on a federated subject's network segment.
   //
+  // KNOWN EMIT-SITE ASYMMETRY (cortex#661 — the SAME seam `selectLink`
+  // documents on the OUTBOUND side, here on the INBOUND side; NOT a
+  // back-compat hazard). `deriveNatsSubject` currently emits federated
+  // subjects as `federated.{principal}.{stack}.{type}` — segment[1] is the
+  // PRINCIPAL, not the `network_id` this subscription pattern (correctly, per
+  // §3.2) keys off. Consequence: until #661 fixes the emit site, a REAL
+  // federated envelope produced through the derive path won't match a leaf's
+  // `federated.{network_id}.>` interest (unless a principal is coincidentally
+  // named after a network). Harmless today for the same reason as the outbound
+  // seam: no production site emits a `classification: "federated"` envelope
+  // through the derive path with a leaf present yet (E.2/E.3/E.7 federated
+  // emit/relay enablement is OUT of scope here). Publish (`selectLink`) and
+  // subscribe (this loop) are INTERNALLY CONSISTENT — both use the
+  // `{network_id}` grammar — so when #661 corrects emit, both ends start
+  // matching together. The anti-spoof check (`passesSourceLinkCheck`) only
+  // ever runs on subjects that actually arrived here, which are
+  // `federated.{network_id}.…` by construction of this very pattern, so
+  // segment[1] is genuinely the network_id at the check site — no false-drop.
+  //
   // **Back-compat:** with zero leaf links this loop binds nothing — the pool
   // is primary-only and delivery is byte-identical to pre-F-3d. A DOWN leaf
   // (link === null) is skipped by `bindPushPattern`; the F-3c background
