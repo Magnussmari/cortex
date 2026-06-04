@@ -125,7 +125,7 @@ gateway round-trip with zero crypto, then enable signing-permissive without touc
   TC-1c (#552) added the Shape-B re-sign-on-ingest so gateway-injected dispatches carry a stack
   `signed_by[]` stamp BEFORE the reject gate runs. Under `enforce` an unsigned (empty-chain) inbound
   is dropped (`empty_chain`); a re-signed gateway envelope is non-empty and passes. There is **no
-  global default flip** — the default posture stays `off` (backward-compatible), and an operator opts
+  global default flip** — the default posture stays `off` (backward-compatible), and a principal opts
   a deployment into fail-closed by setting `signing: enforce` in that stack's `cortex.yaml`.
   **Gate (per-deployment):** the stack must have signing provisioned (1b) and the Shape-B re-sign in
   place (1c) before flipping `enforce`, else legitimate gateway/adapter traffic would be dropped at the
@@ -163,15 +163,28 @@ Implement `docs/design-envelope-encryption.md` (E.7) as-specified:
 
 ### Phase 4 — At-rest + mTLS (NEW) · defense-in-depth, **parallel from the start**
 
+> **⚠️ At-rest encryption status (2026-06-04): NOT IMPLEMENTED / descoped.**
+> cortex does **not** encrypt application data at rest. We deliberately rely on, in order:
+> (a) the **observability platform** to govern the detailed signal/observability data (the richest at-rest
+> target — event payloads with prompt/command/tool I/O); (b) **OS full-disk encryption** as the host
+> baseline; and (c) the file-permission hardening already shipped — `cortex.yaml` chmod-600 (#636),
+> event `published/` dir `0700` (#637), nkey-seed/`.creds` `0600`.
+> The `security.encryption.at_rest` toggle exists in the schema (TC-0) but is **reserved / a NO-OP** —
+> setting it `on` does **not** currently encrypt anything; **do not rely on it for confidentiality**.
+> Field-level at-rest encryption (4c below) is the plan-of-record *if revived*; tracked at **#638**
+> (design #649 closed). Revival key-custody decision: principal-held KEK **uncorrelated** from the stack
+> seed (so one disk theft can't grab both ciphertext and key).
+
 - **4a. `cortex.yaml` chmod-600 gate (immediate quick win).** Add `enforceChmod600` to the config
   load path (`loader.ts:255`) — bot tokens are currently unprotected, unlike nkey/creds. Standalone fix.
+  **(✅ shipped, #636.)**
 - **4b. File-mode hardening.** Tighten the event `published/` dir `0755`→`0700`
-  (`EventLogger.hook.ts:107`); audit dir/file modes across stores.
-- **4c. At-rest field encryption.** App-level field encryption of high-sensitivity columns —
-  local SQLite `events.payload`, `tasks.description`, `iterations.body`; D1 `github_events.payload`,
-  `audit_log.detail/ip`, `users.email`. Indexed/ID/principal columns stay cleartext for dashboard
-  slicing. Reuse myelin's AES-256-GCM primitive; key derived from the stack identity. OS-FDE as the
-  baseline. (D1 cannot run SQLCipher — field-level is the only app-controlled option.)
+  (`EventLogger.hook.ts:107`); audit dir/file modes across stores. **(✅ shipped, #637.)**
+- **4c. At-rest field encryption.** *(DESCOPED — see status box above.)* The plan if revived: app-level
+  field encryption of high-sensitivity columns — local SQLite `events.payload`, `tasks.description`,
+  `iterations.body`; D1 `github_events.payload`, `audit_log.detail/ip`, `users.email`. Indexed/ID/principal
+  columns stay cleartext for dashboard slicing. AES-256-GCM; KEK uncorrelated from the stack seed. OS-FDE
+  as the baseline. (D1 cannot run SQLCipher — field-level is the only app-controlled option.)
 - **4d. NATS mTLS.** Extend `NatsLinkOptions` (`connection.ts:27`) with a `tls?: { ca, cert, key,
   keyPath }` block; load cert/key with the chmod-600 pattern; set `ConnectionOptions.tls`. Plumb
   `nats.tls.*` into cortex.yaml + the relay CLI (relay's `NatsLink` is token-only today).
