@@ -37,12 +37,13 @@ ENVIRONMENT = "local"
 name = "cortex-network-registry-dev"
 workers_dev = false
 
-# Routes for dev are TBD — typically network-dev.meta-factory.ai once
-# DNS is provisioned. Listed here as placeholder; uncomment + tune at
-# deploy time. Same-zone TLS + CF Access still apply.
-# routes = [
-#   { pattern = "network-dev.meta-factory.ai/*", zone_name = "meta-factory.ai" }
-# ]
+# Dev route. The principal must create the proxied DNS record for
+# network-dev.meta-factory.ai in the meta-factory.ai zone, then
+# `wrangler deploy --env dev`. Same-zone TLS + CF Access still apply.
+# Additional TLDs (.dev/.io) can be added analogously if multi-TLD is wanted.
+routes = [
+  { pattern = "network-dev.meta-factory.ai/*", zone_name = "meta-factory.ai" }
+]
 
 [env.dev.vars]
 ENVIRONMENT = "development"
@@ -54,19 +55,28 @@ ENVIRONMENT = "development"
 name = "cortex-network-registry"
 workers_dev = false
 
-# routes = [
-#   { pattern = "network.meta-factory.ai/*", zone_name = "meta-factory.ai" }
-# ]
+# Production route. The principal must create the proxied DNS record for
+# network.meta-factory.ai in the meta-factory.ai zone, then
+# `wrangler deploy --env production`. Same-zone TLS + CF Access still apply.
+# Additional TLDs (.dev/.io) can be added analogously if multi-TLD is wanted.
+routes = [
+  { pattern = "network.meta-factory.ai/*", zone_name = "meta-factory.ai" }
+]
 
 [env.production.vars]
 ENVIRONMENT = "production"
 
 # Secrets (set via `wrangler secret put --env production`):
-#   REGISTRY_SIGNING_KEY  — base64-encoded Ed25519 private key used to
-#                           sign GET responses (registry assertions).
-#                           Generate with:
+#   REGISTRY_SIGNING_KEY  — base64-encoded PKCS#8 Ed25519 private key used
+#                           to sign GET responses (registry assertions).
+#                           Format: base64 PKCS#8 Ed25519 private key — the
+#                           exact shape the Worker derives its pubkey from via
+#                           pubkeyFromPkcs8() (src/signing.ts) at boot. (NOT a
+#                           raw seed+pubkey concatenation — #677.)
+#                           Generate one with:
+#                             bun run gen-key            # in this directory
+#                           then paste the printed REGISTRY_SIGNING_KEY value:
 #                             bunx wrangler secret put REGISTRY_SIGNING_KEY
-#                           Format: 64 raw bytes (seed + pubkey),
-#                           base64-encoded. The corresponding public key
-#                           is exposed at GET /registry/pubkey so peers
-#                           can pin it at config time.
+#                           The corresponding public key is exposed at
+#                           GET /registry/pubkey so peers can pin it at
+#                           config time (and is printed by `gen-key`).
