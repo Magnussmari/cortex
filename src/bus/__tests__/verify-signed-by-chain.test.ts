@@ -800,6 +800,45 @@ describe("verifySignedByChain — TC-2d federated.* peer verify (cortex#635)", (
     }
   });
 
+  test("federated envelope, valid signature by the WRONG key → REJECTED (crypto_verify_failed)", async () => {
+    // The sharpest statement of the threat: the attacker produces a fully
+    // VALID ed25519 signature — just with THEIR OWN key — while stamping the
+    // peer's DID and setting source to the peer. The registry resolves the
+    // peer's REAL (different) pubkey, and the bytes-check verifies the stamp
+    // against THAT key, not the attacker's → rejected. Distinct from the
+    // byte-tamper case above: nothing is malformed; only the signing key is
+    // wrong, which is exactly the cross-principal forgery the resolved-key
+    // bytes-check exists to defeat.
+    const peer = "bravo";
+    const { nkeyPub: peerRealNKey } = generateEd25519KeyPair(); // bravo's real key (in registry)
+    const { privateKeyBase64: attackerSeed } = generateEd25519KeyPair(); // attacker's key
+    const luna = agentFixture({ id: "luna", trust: [] });
+    const resolver = resolverWith(luna);
+
+    // Attacker signs with THEIR seed but stamps bravo's DID + bravo's source.
+    const base = federatedEnvelopeFrom(peer) as Parameters<
+      typeof signEnvelope
+    >[0];
+    const forged = await signEnvelope(base, attackerSeed, `did:mf:${peer}`);
+
+    const result = await verifySignedByChain(forged, {
+      resolver,
+      receivingAgentId: "luna",
+      cryptoVerify: true,
+      principalId: "alpha",
+      // Registry returns bravo's REAL pubkey — not the attacker's.
+      resolveFederatedPeer: async () => ({
+        resolved: true,
+        identity: peerIdentity(peer, peerRealNKey),
+      }),
+    });
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason.kind).toBe("crypto_verify_failed");
+    }
+  });
+
   test("federated envelope, peer NOT in registry (not_found) → REJECTED + logged", async () => {
     const peer = "ghost";
     const { privateKeyBase64: peerSeed } = generateEd25519KeyPair();
