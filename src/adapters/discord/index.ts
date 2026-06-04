@@ -347,6 +347,40 @@ export class DiscordAdapter implements PlatformAdapter {
       void (async () => {
       if (!this.client) return;
 
+      // cortex#704 — cross-stack isolation filter. MUST run before every
+      // other check so a foreign-guild event is dropped as early as
+      // possible.
+      //
+      // The "one bot token per assistant across stacks" model means the
+      // SAME bot token is configured in N cortex processes, each binding a
+      // DIFFERENT `presence.guildId` (e.g. meta-factory guild + halden
+      // guild). One token → N gateway connections → the bot is a member of
+      // every bound guild, so discord.js delivers a guild-B `messageCreate`
+      // to process A's connection too. Without this gate, adapter A would
+      // run a FULL CC session for a guild-B message using process A's
+      // config / NATS / allowedDirs — a hard cross-stack isolation breach
+      // (and duplicate responses).
+      //
+      // Semantics:
+      //   - `message.guildId` is `string | null`. It is `null` ONLY for DMs
+      //     (and group DMs); it is a non-null guild id for every channel and
+      //     THREAD message (threads inherit their parent guild's id). So
+      //     gating on a truthy `guildId` covers threads without a separate
+      //     check, and leaves the DM path (handled below) untouched.
+      //   - `this.presence.guildId` is schema-validated as a required,
+      //     non-empty string (`DiscordPresenceSchema`: `z.coerce.string()
+      //     .min(1)`), so a constructed adapter always has a concrete guild
+      //     to compare against. We still treat a falsy own-guildId as
+      //     fail-safe: if it were ever unset we'd rather drop guild traffic
+      //     (the conservative isolation default) than fan a foreign-guild
+      //     message into the wrong stack — but in practice the schema makes
+      //     that branch unreachable.
+      //   - String compare (no coercion games): both sides are Discord
+      //     snowflake strings post-schema; `!==` is exact.
+      if (message.guildId && message.guildId !== this.presence.guildId) {
+        return;
+      }
+
       // Deduplicate — skip if we've already seen this message ID
       if (recentMessageIds.has(message.id)) return;
       recentMessageIds.add(message.id);
