@@ -9,6 +9,10 @@
  *   - `PrincipalPubkeyResolver` (TC-2a, cortex#633) — on-demand,
  *     posture-gated peer-pubkey resolver for the federation crypto-verify
  *     chain (TC-2b/TC-2d). Default-OFF; inert unless `signing: enforce`.
+ *   - `MultiPrincipalIdentityRegistry` (TC-2b, cortex#634) — multi-principal,
+ *     peer-stamped registry: a pinned local boot principal plus peers
+ *     resolved on demand via the TC-2a resolver. Materialises the myelin
+ *     `IdentityRegistry` the `federated.*` crypto-verify path (TC-2d) reads.
  */
 
 export { RegistryClient } from "./client";
@@ -20,6 +24,13 @@ export type {
   PrincipalPubkeyResolverOptions,
   ResolveResult,
 } from "./resolve-pubkey";
+export { MultiPrincipalIdentityRegistry } from "./identity-registry";
+export type {
+  EntryProvenance,
+  MultiPrincipalIdentityRegistryOptions,
+  PrincipalEntry,
+  RegistryResolveOutcome,
+} from "./identity-registry";
 export type {
   Capability,
   PrincipalRecord,
