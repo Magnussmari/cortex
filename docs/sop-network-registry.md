@@ -52,13 +52,27 @@ The registry signs that bound triple with `REGISTRY_SIGNING_KEY` (`signAssertion
 
 **Where the pubkey comes from:** the Worker derives the public key from `REGISTRY_SIGNING_KEY` at boot (`ensurePublicKey` → `pubkeyFromPkcs8` in `src/index.ts`), unless `REGISTRY_PUBLIC_KEY` is set explicitly. Principals obtain it by querying `GET /registry/pubkey`, which returns `{ "algorithm": "Ed25519", "public_key": "<base64>" }`.
 
-> **⚠️ Not yet implemented — registry-keypair provisioning command.** There is **no** CLI or script in the repo that *generates* the registry's keypair. `wrangler.toml` and `README.md` instruct the principal to `wrangler secret put REGISTRY_SIGNING_KEY` and paste a base64-encoded Ed25519 private key, but neither supplies the generation command. **You must generate it by hand, out-of-band, and there is a format discrepancy to resolve first** (see the next callout). This is the single biggest manual gap in the registry-provisioning story.
+### Generate the registry keypair
 
-> **⚠️ Format discrepancy in the source — confirm before generating.** The key format is described inconsistently:
-> - `src/index.ts` (`Env.REGISTRY_SIGNING_KEY` JSDoc) and `README.md` say **"base64-encoded PKCS#8 Ed25519 private key"**, and the Worker derives the pubkey via `pubkeyFromPkcs8(...)`.
-> - `wrangler.toml`'s secrets comment says **"64 raw bytes (seed + pubkey), base64-encoded"**.
->
-> These are two *different* encodings. The code path that actually runs (`pubkeyFromPkcs8` in `src/index.ts`) consumes **PKCS#8**, so the PKCS#8 description is the authoritative one and the `wrangler.toml` comment appears stale. Verify against `src/services/network-registry/src/signing.ts` before generating a key, and do not assume the `wrangler.toml` "raw 64 bytes" wording.
+Generate the registry's signing keypair with the registry's own tool:
+
+```bash
+cd src/services/network-registry
+bun install
+bun run gen-key            # → scripts/generate-registry-keypair.ts
+```
+
+`gen-key` mints a fresh Ed25519 keypair via WebCrypto and prints:
+
+- **`REGISTRY_SIGNING_KEY`** — the base64 **PKCS#8** Ed25519 private key (the single SECRET line; paste it into `wrangler secret put`).
+- the base64 **raw** public key (pin it as `policy.federated.registry.pubkey` — see [§5](#5-wire-a-cortex-to-use-the-registry)).
+- a short fingerprint for log-safe reference.
+
+Before it emits anything, the tool asserts the generated PKCS#8 key round-trips through the registry's **own** `pubkeyFromPkcs8()` to exactly the raw pubkey it prints — so the key is guaranteed consumable by the Worker (if it didn't, the tool refuses and exits non-zero). Flags: `--json` (machine-readable envelope), `--out <path>` (also write the private key chmod 600, O_EXCL refuse-clobber), `--force` (deliberate rotation overwrite), `--help`.
+
+> **Secrets discipline:** the private key is printed once, clearly labelled `REGISTRY_SIGNING_KEY (SECRET …)`, because you need it for `wrangler secret put`. It is never logged, and is only written to disk with `--out` (chmod 600).
+
+**Key format (resolved — #677).** The secret is unambiguously a **base64-encoded PKCS#8 Ed25519 private key**. The Worker derives its pubkey from it via `pubkeyFromPkcs8(...)` (`src/signing.ts`), and `index.ts`, `README.md`, `wrangler.toml`, and `gen-key` now all agree on PKCS#8. (The old `wrangler.toml` "64 raw bytes (seed + pubkey)" wording was stale and has been corrected.)
 
 ### Trust-anchor warning — pin, don't TOFU
 
@@ -92,9 +106,11 @@ bun install
 **Provision the signing secret, then deploy** (from `README.md` §Deploy):
 
 ```bash
-# One-time per environment: provision the signing key.
+# One-time per environment: generate the keypair (see "Generate the
+# registry keypair" above), then provision the signing key.
+bun run gen-key                                          # prints the secret + pubkey
 bunx wrangler secret put REGISTRY_SIGNING_KEY --env production
-# Paste the base64-encoded Ed25519 private key (PKCS#8 — see the format callout above).
+# Paste the base64 PKCS#8 Ed25519 private key printed by gen-key.
 
 # Deploy
 bunx wrangler deploy --env production
@@ -102,7 +118,7 @@ bunx wrangler deploy --env production
 
 For dev, substitute `--env dev`. Local-only iteration uses `bunx wrangler dev` (the `dev` script in `package.json`), which runs without a signing key — the Worker then degrades to the "unconfigured" path (see [§4](#the-unconfigured-sentinel)).
 
-> **⚠️ Not yet implemented — DNS / routes.** Both `[env.dev]` and `[env.production]` have their `routes = [...]` blocks **commented out** in `wrangler.toml` ("Routes for dev are TBD…", "finalised at deploy time"). The plan names `network.meta-factory.ai` (prod) and `network-dev.meta-factory.ai` (dev), but DNS is not provisioned in-repo. You must uncomment + tune the route and provision DNS at first deploy. Until then a deploy produces a Worker with no public hostname.
+> **⚠️ Principal step — provision DNS, then deploy.** The `routes = [...]` blocks in `wrangler.toml` are now **set**: `[env.production]` → `network.meta-factory.ai/*` and `[env.dev]` → `network-dev.meta-factory.ai/*`, both in the `meta-factory.ai` zone (same `{ pattern, zone_name }` shape as the gh-webhook + mc-worker Workers). The remaining steps the principal takes are: **(a)** create the matching **proxied DNS record** in the `meta-factory.ai` zone (`network` / `network-dev`), and **(b)** `bunx wrangler deploy --env production|dev`. DNS provisioning is not done in-repo — until the record exists the route has nothing to resolve to. Additional TLDs (`.dev`/`.io`) can be added analogously if multi-TLD reach is wanted.
 
 > **⚠️ Not yet implemented — durable persistence.** Per `README.md` §Storage, the store is **in-memory per-isolate** (`InMemoryRegistryStore`). Registrations do **not** survive isolate recycling, and different isolates may hold different state. D1 / KV persistence is an explicit follow-up (`README.md` §Roadmap items 1–2), as is durable nonce-replay storage. **Do not treat a v1 registry as a durable directory** — a principal may need to re-register after an isolate cycles.
 
