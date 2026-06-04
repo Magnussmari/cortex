@@ -114,7 +114,7 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
     }
 
     // Replay check.
-    const nonceCache = getNonceCache();
+    const nonceCache = getNonceCache(c.env);
     const fresh = await nonceCache.recordIfFresh(claim.nonce, now);
     if (!fresh) {
       return c.json({ error: "nonce_replayed" }, 409);
@@ -138,7 +138,7 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
     //     of trust peers have already cached. Rotation comes back in
     //     a follow-up that accepts a transition claim co-signed by
     //     the previous key.
-    const store = getStore();
+    const store = getStore(c.env);
     const existing = await store.getPrincipal(principalId);
     if (existing && existing.principal_pubkey !== claim.principal_pubkey) {
       return c.json(
@@ -168,7 +168,7 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
     if (!isValidPrincipalId(principalId)) {
       return c.json({ error: "invalid principal_id in path" }, 400);
     }
-    const store = getStore();
+    const store = getStore(c.env);
     const record = await store.getPrincipal(principalId);
     if (!record) {
       return c.json({ error: "not_found" }, 404);

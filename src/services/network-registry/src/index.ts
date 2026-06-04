@@ -39,6 +39,7 @@ import { networkRoutes } from "./routes/networks";
 import { capabilityRoutes } from "./routes/capabilities";
 import { pubkeyFromPkcs8 } from "./signing";
 import type { RateLimitEnv } from "./rate-limit";
+import type { StoreEnv } from "./store";
 import {
   checkRateLimit,
   clientKey,
@@ -46,7 +47,7 @@ import {
   TOO_MANY_REQUESTS_BODY,
 } from "./rate-limit";
 
-export interface Env extends RateLimitEnv {
+export interface Env extends RateLimitEnv, StoreEnv {
   /**
    * Base64-encoded PKCS#8 Ed25519 private key used to sign GET
    * responses. Provisioned via `wrangler secret put` per the
