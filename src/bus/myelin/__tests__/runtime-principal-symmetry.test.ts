@@ -77,14 +77,17 @@ describe("MyelinRuntime — subscribe/publish {principal} symmetry (cortex#130 i
 });
 
 // =============================================================================
-// IAW Phase F-3d (cortex#666) — per-link {network_id} symmetry (design §7.8).
+// IAW Phase F-3d (cortex#666) — per-leaf inbound subscription, ADR 0001 grammar.
 // =============================================================================
 //
-// For each federated leaf link the SUBSCRIBE pattern is `federated.{network_id}.>`
-// (the inbound-attribution per-leaf subscription) and the PUBLISH routing keys
-// off the same `{network_id}` segment (subject[1]) in `selectLink`. The
-// invariant: subscribe-`{network_id}` === publish-`{network_id}` per leaf, so a
-// federated round-trip lands on (and is attributed to) the SAME link both ways.
+// ADR 0001 (supersedes cortex#661): the network is NEVER on the wire. Each
+// federated leaf link subscribes to the traffic addressed to THIS stack —
+// `federated.{my-principal}.{my-stack}.>` (the receiving stack's own identity,
+// the SAME grammar as the `local.*` subscribe patterns), NOT the per-network
+// `federated.{network_id}.>` of cortex#661. Each distinct leaf carries the same
+// inbound interest (the stack's identity), and `sourceLink` attribution records
+// which leaf delivered an envelope so the verify layer (TC-2d) can do its
+// per-network peer-pubkey lookup.
 
 function makeConfig(natsBlock: AgentConfig["nats"]): AgentConfig {
   return {
@@ -193,7 +196,15 @@ function makeEnvelope() {
   };
 }
 
-describe("MyelinRuntime — per-link {network_id} symmetry (F-3d, cortex#666 §7.8)", () => {
+function makePeer(principalId: string): PolicyFederatedNetwork["peers"][number] {
+  return {
+    principal_id: principalId,
+    stack_id: `${principalId}/home`,
+    principal_pubkey: "U" + "A".repeat(55),
+  };
+}
+
+describe("MyelinRuntime — per-leaf inbound subscription + publish routing (F-3d, ADR 0001)", () => {
   let restore: () => void;
   beforeEach(() => {
     const o = { log: console.log, info: console.info, error: console.error };
@@ -208,7 +219,7 @@ describe("MyelinRuntime — per-link {network_id} symmetry (F-3d, cortex#666 §7
   });
   afterEach(() => restore());
 
-  test("subscribe-{network_id} === publish-{network_id} per leaf link", async () => {
+  test("each leaf subscribes to federated.{my-principal}.{my-stack}.> and publish routes by target principal via peers[]", async () => {
     const reg = makeFakeRegistry();
     const RESEARCH_URL = "nats://research:4222";
     const JV_URL = "nats://jv:4222";
@@ -216,43 +227,53 @@ describe("MyelinRuntime — per-link {network_id} symmetry (F-3d, cortex#666 §7
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
       makeNetwork({
         id: "jv-collab",
         leaf_node: "nats-leaf-jv",
+        peers: [makePeer("partner")],
         nats: { url: JV_URL, name: "cortex" },
       }),
     ];
     const runtime = await startMyelinRuntime(
       makeConfig({ url: "nats://localhost:4222", name: "cortex", subjects: [] }),
-      { connectImpl: reg.connectImpl, federatedNetworks: networks },
+      {
+        connectImpl: reg.connectImpl,
+        federatedNetworks: networks,
+        // The receiving stack's own identity — ADR 0001 inbound subscribe key.
+        principal: "metafactory",
+        stack: "default",
+      },
     );
     expect(runtime.enabled).toBe(true);
 
     const research = reg.forUrl(RESEARCH_URL)!;
     const jv = reg.forUrl(JV_URL)!;
 
-    // SUBSCRIBE side: each leaf subscribes to its OWN network's segment.
-    expect(research.subscribePatterns).toEqual(["federated.research-collab.>"]);
-    expect(jv.subscribePatterns).toEqual(["federated.jv-collab.>"]);
+    // SUBSCRIBE side (ADR 0001): EVERY leaf subscribes to the SAME inbound
+    // interest — federated traffic addressed to THIS stack's own identity,
+    // `federated.{my-principal}.{my-stack}.>`. The network is NOT on the wire.
+    expect(research.subscribePatterns).toEqual(["federated.metafactory.default.>"]);
+    expect(jv.subscribePatterns).toEqual(["federated.metafactory.default.>"]);
 
-    // PUBLISH side: a `federated.{network_id}.…` publish routes to the SAME
-    // leaf whose subscribe pattern carries that `{network_id}` — and ONLY that
-    // leaf (no cross-network leakage).
+    // PUBLISH side: a `federated.{target-principal}.{stack}.…` publish routes to
+    // the leaf hosting that target principal (resolved from peers[]) — and ONLY
+    // that leaf (no cross-network leakage). jcfischer ⇒ research; partner ⇒ jv.
     await runtime.publishOnSubject!(
       makeEnvelope(),
-      "federated.research-collab.system.adapter.degraded",
+      "federated.jcfischer.host.system.adapter.degraded",
     );
     await runtime.publishOnSubject!(
       makeEnvelope(),
-      "federated.jv-collab.system.adapter.degraded",
+      "federated.partner.host.system.adapter.degraded",
     );
     expect(research.publishes.map((p) => p.subject)).toEqual([
-      "federated.research-collab.system.adapter.degraded",
+      "federated.jcfischer.host.system.adapter.degraded",
     ]);
     expect(jv.publishes.map((p) => p.subject)).toEqual([
-      "federated.jv-collab.system.adapter.degraded",
+      "federated.partner.host.system.adapter.degraded",
     ]);
 
     await runtime.stop();

@@ -449,14 +449,15 @@ describe("cc-events classification parameterisation (IAW A.3)", () => {
     expect(validateEnvelope(env).ok).toBe(true);
   });
 
-  test("createCcEventPublisher: federated classification yields federated.{network_id}.{type} subject (from event.network_id)", () => {
+  test("createCcEventPublisher: federated classification yields federated.{principal}.{type} subject (from envelope.source, identical to local)", () => {
     // The end-to-end federation unblock for the cc-events tap. Prior code
     // hardcoded `local.{principal}.{type}` regardless of classification, leaving
     // the relay unable to emit on `federated.*` even if the caller wanted it.
-    // cortex#661 — federated subjects are NETWORK-scoped: segment[1] is the
-    // TARGET network id (from `extensions.network_id`, stamped from
-    // `event.network_id`), NOT the source principal. The fixture's
-    // `network_id: "metafactory"` therefore lands at segment[1] here.
+    // ADR 0001 (supersedes cortex#661) — federated subjects carry the SAME
+    // identity segments as local.*: segment[1] is the SOURCE principal (from
+    // `envelope.source`, here `metafactory`), NOT a target network id. The
+    // network is never on the wire; `extensions.network_id` MAY travel as a
+    // routing HINT but does not affect the subject.
     const link = makeLink();
     const pub = createCcEventPublisher({
       link: link.stub,
@@ -466,28 +467,30 @@ describe("cc-events classification parameterisation (IAW A.3)", () => {
     pub(makeEvent({ event_type: "tool.bash.executed", network_id: "research-collab" }));
     expect(link.calls).toHaveLength(1);
     expect(link.calls[0]!.subject).toBe(
-      "federated.research-collab.tool.bash.executed",
+      "federated.metafactory.tool.bash.executed",
     );
     const env = JSON.parse(link.calls[0]!.payload);
     expect(env.sovereignty.classification).toBe("federated");
+    // The network_id hint still travels in extensions (routing hint only).
     expect(env.extensions.network_id).toBe("research-collab");
   });
 
-  test("createCcEventPublisher: federated classification without event.network_id → throws (no silent principal fallback, cortex#661)", () => {
-    // A federated cc-event that names no target network cannot be routed to
-    // any leaf — `deriveNatsSubject` throws rather than emitting an
-    // un-routable `federated.{principal}.…` subject (the pre-#661 bug).
+  test("createCcEventPublisher: federated classification without event.network_id → derives a valid subject (no throw, ADR 0001)", () => {
+    // ADR 0001 — a federated cc-event no longer needs a network id to derive a
+    // subject: the network is not on the wire. `deriveNatsSubject` derives
+    // `federated.{principal}.{type}` from `envelope.source`; an absent network
+    // hint is NOT an emit error (cortex#661's fail-loud throw is retired).
     const link = makeLink();
     const pub = createCcEventPublisher({
       link: link.stub,
       principal: "metafactory",
       classification: "federated",
     });
-    // network_id explicitly cleared so extensions.network_id is absent.
-    expect(() => pub(makeEvent({ event_type: "tool.bash.executed", network_id: undefined }))).toThrow(
-      /no extensions\.network_id/i,
+    pub(makeEvent({ event_type: "tool.bash.executed", network_id: undefined }));
+    expect(link.calls).toHaveLength(1);
+    expect(link.calls[0]!.subject).toBe(
+      "federated.metafactory.tool.bash.executed",
     );
-    expect(link.calls).toHaveLength(0);
   });
 
   test("createCcEventPublisher: public classification yields public.{type} subject (no org)", () => {

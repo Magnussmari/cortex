@@ -10,8 +10,13 @@
  *   (b) inbound on the PRIMARY  → handler receives sourceLink = "primary";
  *   (c) single-link deployment  → unchanged: a 2-arg `(env, subject)` handler
  *       still works (the third arg is optional + trailing);
- *   (d) anti-spoof: a `federated.{A}.*` subject delivered on leaf B is DROPPED
- *       + logged before fan-out (§3.3 / §5 isolation layer 2).
+ *   (d) ADR 0001 (supersedes cortex#661): leaf-delivered federated traffic fans
+ *       out tagged with the delivering leaf's `sourceLink`. The network is no
+ *       longer on the wire (subjects carry `federated.{principal}.{stack}.…`),
+ *       so the cortex#661 network→leaf anti-spoof drop is retired; the
+ *       cross-principal TRUST decision (was the SENDER a legitimate peer on a
+ *       network owning this leaf?) is the verify layer's job (TC-2d, keyed off
+ *       `sourceLink`), not the runtime's.
  *
  * Unlike `runtime-linkpool.test.ts` (publish routing — its fake subscribe
  * blocks forever), this file uses a DELIVERABLE fake connection whose
@@ -231,6 +236,8 @@ describe("MyelinRuntime inbound sourceLink attribution (F-3d, cortex#666)", () =
   afterEach(() => restore());
 
   // (a) Inbound on a LEAF link → sourceLink = that leaf's leaf_node.
+  //     ADR 0001: the leaf subscribes to THIS stack's own identity,
+  //     `federated.{my-principal}.{my-stack}.>` (not the per-network segment).
   test("(a) inbound on a leaf link tags sourceLink = the leaf's leaf_node", async () => {
     const reg = makeFakeRegistry();
     const networks = [
@@ -242,7 +249,12 @@ describe("MyelinRuntime inbound sourceLink attribution (F-3d, cortex#666)", () =
     ];
     const runtime = await startMyelinRuntime(
       makeConfig({ url: PRIMARY_URL, name: "cortex", subjects: [] }),
-      { connectImpl: reg.connectImpl, federatedNetworks: networks },
+      {
+        connectImpl: reg.connectImpl,
+        federatedNetworks: networks,
+        principal: "metafactory",
+        stack: "default",
+      },
     );
     expect(runtime.enabled).toBe(true);
 
@@ -252,12 +264,13 @@ describe("MyelinRuntime inbound sourceLink attribution (F-3d, cortex#666)", () =
     });
 
     const research = reg.forUrl(RESEARCH_URL)!;
-    // The leaf subscribes to `federated.{network_id}.>` for its network.
-    expect(research.subscribePatterns).toContain("federated.research-collab.>");
+    // ADR 0001 — the leaf subscribes to traffic addressed to THIS stack:
+    // `federated.{my-principal}.{my-stack}.>`.
+    expect(research.subscribePatterns).toContain("federated.metafactory.default.>");
 
     research.deliver(
-      "federated.research-collab.>",
-      "federated.research-collab.system.adapter.degraded",
+      "federated.metafactory.default.>",
+      "federated.metafactory.default.system.adapter.degraded",
       makeEnvelope(),
     );
     // Let the async consume loop + validate + fan-out settle.
@@ -265,7 +278,7 @@ describe("MyelinRuntime inbound sourceLink attribution (F-3d, cortex#666)", () =
 
     expect(seen).toEqual([
       {
-        subject: "federated.research-collab.system.adapter.degraded",
+        subject: "federated.metafactory.default.system.adapter.degraded",
         sourceLink: "nats-leaf-research",
       },
     ]);
@@ -351,8 +364,16 @@ describe("MyelinRuntime inbound sourceLink attribution (F-3d, cortex#666)", () =
     await runtime.stop();
   });
 
-  // (d) Anti-spoof: a federated.{A}.* subject delivered on leaf B is dropped.
-  test("(d) anti-spoof: a subject naming network A delivered on leaf B is dropped + logged", async () => {
+  // (d) ADR 0001 (supersedes cortex#661) — leaf-delivered federated traffic
+  //     fans out tagged with the DELIVERING leaf's sourceLink. The network is no
+  //     longer on the wire, so the cortex#661 network→leaf "spoof drop" is
+  //     retired: every leaf subscribes to THIS stack's own identity
+  //     (`federated.{my-principal}.{my-stack}.>`), and the cross-principal TRUST
+  //     decision (was the SENDER a legitimate peer on a network owning this
+  //     leaf?) belongs to the verify layer (TC-2d, keyed off `sourceLink`), NOT
+  //     the runtime. This test pins that the runtime attributes (never drops)
+  //     leaf-delivered federated traffic and tags the correct leaf.
+  test("(d) ADR 0001: leaf-delivered federated traffic fans out tagged with the delivering leaf's sourceLink (no network-spoof drop)", async () => {
     const reg = makeFakeRegistry();
     const networks = [
       makeNetwork({
@@ -368,7 +389,12 @@ describe("MyelinRuntime inbound sourceLink attribution (F-3d, cortex#666)", () =
     ];
     const runtime = await startMyelinRuntime(
       makeConfig({ url: PRIMARY_URL, name: "cortex", subjects: [] }),
-      { connectImpl: reg.connectImpl, federatedNetworks: networks },
+      {
+        connectImpl: reg.connectImpl,
+        federatedNetworks: networks,
+        principal: "metafactory",
+        stack: "default",
+      },
     );
     expect(runtime.enabled).toBe(true);
 
@@ -377,43 +403,39 @@ describe("MyelinRuntime inbound sourceLink attribution (F-3d, cortex#666)", () =
       seen.push({ subject, sourceLink });
     });
 
+    const research = reg.forUrl(RESEARCH_URL)!;
     const jv = reg.forUrl(JV_URL)!;
-    // Spoof: deliver a `federated.research-collab.*` subject on the JV leaf's
-    // OWN subscription. (We push it into the jv leaf's `federated.jv-collab.>`
-    // channel, simulating a leaf that delivered a subject for a different
-    // network — the cardinal cross-network leak the assertion guards.)
+    // Both leaves carry the SAME inbound interest — this stack's own identity.
+    expect(research.subscribePatterns).toContain("federated.metafactory.default.>");
+    expect(jv.subscribePatterns).toContain("federated.metafactory.default.>");
+
+    // Deliver the SAME stack-addressed subject on each leaf. Each fans out with
+    // the DELIVERING leaf's sourceLink — the attribution TC-2d keys its
+    // per-network peer-pubkey lookup off. No drop.
+    research.deliver(
+      "federated.metafactory.default.>",
+      "federated.metafactory.default.system.adapter.degraded",
+      makeEnvelope(),
+    );
     jv.deliver(
-      "federated.jv-collab.>",
-      "federated.research-collab.system.adapter.degraded",
+      "federated.metafactory.default.>",
+      "federated.metafactory.default.system.adapter.degraded",
       makeEnvelope(),
     );
     await new Promise((r) => setTimeout(r, 5));
 
-    // Dropped — no handler saw it.
-    expect(seen).toEqual([]);
-    // And it was logged as a spoof drop.
-    expect(
-      logs.some(
-        (l) =>
-          l.kind === "error" &&
-          l.msg.includes("DROPPING spoofed envelope") &&
-          l.msg.includes("research-collab"),
-      ),
-    ).toBe(true);
-
-    // Sanity: a CORRECTLY-attributed subject on the JV leaf DOES fan out.
-    jv.deliver(
-      "federated.jv-collab.>",
-      "federated.jv-collab.system.adapter.degraded",
-      makeEnvelope(),
-    );
-    await new Promise((r) => setTimeout(r, 5));
     expect(seen).toEqual([
       {
-        subject: "federated.jv-collab.system.adapter.degraded",
+        subject: "federated.metafactory.default.system.adapter.degraded",
+        sourceLink: "nats-leaf-research",
+      },
+      {
+        subject: "federated.metafactory.default.system.adapter.degraded",
         sourceLink: "nats-leaf-jv",
       },
     ]);
+    // No spoof-drop logging under ADR 0001.
+    expect(logs.some((l) => l.msg.includes("DROPPING spoofed envelope"))).toBe(false);
 
     await runtime.stop();
   });

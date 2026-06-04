@@ -215,17 +215,18 @@ export function createCcEventEnvelope(
     },
   });
   envelope.timestamp = event.timestamp;
-  // cortex#661 — federated subjects key segment[1] on the TARGET network id,
-  // which `deriveNatsSubject` reads from `extensions.network_id` (NOT the source
-  // principal, NOT `payload.network_id`). A federated cc-event MUST carry its
-  // network id in `extensions` or the publish throws (`networkIdFromEnvelope`).
-  // Stamp it here from `event.network_id` so the cc-events tap matches the
-  // canonical federated emit pattern (pilot's `buildReviewRequestedEnvelope`,
-  // which sets `extensions.network_id`). Harmless for the default `local`/
-  // `public` classifications — those derivation paths never read `extensions`;
-  // `network_id` also remains mirrored in `payload` above for legacy consumers
-  // that index it there (back-compat preserved). Mutation-after-build is safe
-  // for the same reason the originator block below is: `buildBaseEnvelope`
+  // ADR 0001 (supersedes cortex#661) — federated subjects carry
+  // `federated.{principal}.{stack}.…` (segment[1] is the SOURCE principal, the
+  // same identity grammar as local.*), derived by `deriveNatsSubject` from
+  // `envelope.source`. The network is NEVER on the wire; it is resolved from the
+  // target principal at the routing layer (`selectLink` → `peers[]`).
+  // `extensions.network_id` MAY still travel as a deployment-topology HINT but is
+  // NOT load-bearing for subject derivation — an absent hint is no longer an emit
+  // error. Stamp it here from `event.network_id` when present so downstream
+  // routing/audit consumers that want the hint have it; harmless for the default
+  // `local`/`public` classifications. `network_id` also remains mirrored in
+  // `payload` above for legacy consumers that index it there. Mutation-after-build
+  // is safe for the same reason the originator block below is: `buildBaseEnvelope`
   // returns a fresh object per call (no aliasing) and the field is top-level.
   if (event.network_id !== undefined) {
     envelope.extensions = { network_id: event.network_id };

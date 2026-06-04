@@ -44,7 +44,7 @@ import {
 import { NKEY_PUBKEY_REGEX } from "./nkey";
 import { NatsSubjectsSchema } from "./nats-subjects";
 import { LETTER_PREFIX_ID_REGEX } from "./id";
-import { StackConfigSchema } from "./stack";
+import { StackConfigSchema, deriveStackId } from "./stack";
 
 // =============================================================================
 // Helper — Zod v4 empty-default workaround
@@ -1819,30 +1819,20 @@ export const PolicySchema = z.object({
         seenNetwork.set(n.id, networkIdx);
       }
 
-      // Subject-pattern scope: every accept/deny pattern MUST begin
-      // with `federated.{network.id}.` so the network can't
-      // accidentally subscribe to or block out-of-scope subjects.
-      // Echo cortex#223 round 1 — without this guard, a typo like
-      // `accept_subjects: ["internal.private.>"]` parses cleanly
-      // and the surface-router gate (D.2) has to defend against it.
-      // Enforce at parse time instead.
-      const expectedSubjectPrefix = `federated.${n.id}.`;
-      const validateSubjectScope = (
-        list: readonly string[],
-        listName: "accept_subjects" | "deny_subjects",
-      ) => {
-        list.forEach((pattern, patternIdx) => {
-          if (!pattern.startsWith(expectedSubjectPrefix)) {
-            ctx.addIssue({
-              code: "custom",
-              message: `${listName}[${patternIdx}] "${pattern}" must begin with "federated.${n.id}." — the network's own subject scope`,
-              path: ["federated", "networks", networkIdx, listName, patternIdx],
-            });
-          }
-        });
-      };
-      validateSubjectScope(n.accept_subjects, "accept_subjects");
-      validateSubjectScope(n.deny_subjects, "deny_subjects");
+      // Subject-pattern scope cross-validation moved to the top-level
+      // `CortexConfigSchema.superRefine` (ADR 0001, supersedes cortex#661).
+      //
+      // Pre-ADR (cortex#223 round 1) every accept/deny pattern had to begin
+      // with `federated.{network.id}.` — the network id on the wire. ADR 0001
+      // removes the network from the wire entirely: federated subjects carry
+      // `federated.{principal}.{stack}.…` (the RECEIVING stack's own identity,
+      // same grammar as `local.*`). The correct scope prefix is therefore
+      // `federated.{my-principal}.{my-stack}.`, which depends on the top-level
+      // `principal:` + `stack:` blocks the PolicySchema does NOT see. The check
+      // lives in `CortexConfigSchema.superRefine` where the full config
+      // (principal + stack + policy) is in scope. The typo-guard intent (a
+      // pattern like `internal.private.>` must fail at load, not silently in
+      // the surface-router gate) is preserved there.
 
       // IAW Phase F-3a (cortex#657) — `leaf_node` connection consistency.
       // Networks sharing a `leaf_node` share one physical link, so an
@@ -2224,6 +2214,58 @@ export const CortexConfigSchema = z.object({
         }
       }
     }
+  })
+  // ADR 0001 (supersedes cortex#661) — federated accept/deny subject scope.
+  //
+  // Every `policy.federated.networks[].accept_subjects[]` / `deny_subjects[]`
+  // pattern MUST begin with `federated.{my-principal}.{my-stack}.` — the
+  // RECEIVING stack's own identity. ADR 0001 removed the network from the wire:
+  // a stack accepts federated traffic addressed to its own principal/stack
+  // (`federated.{principal}.{stack}.…`, the same identity grammar as `local.*`),
+  // so the accept/deny lists scope to that identity, NOT to a `federated.{network_id}.`
+  // prefix (the cortex#661 grammar `CONTEXT.md` forbids).
+  //
+  // This check lives at the top level (not in `PolicySchema.superRefine`)
+  // because the receiving principal + stack come from the `principal:` + `stack:`
+  // blocks, which the policy sub-schema does not see. `deriveStackId` resolves
+  // `{principal}/{stack}` exactly as the runtime does at boot (no `stack:` block
+  // ⇒ `{principal}/default`), so the validated prefix matches the subject the
+  // runtime emits and subscribes on. The typo-guard intent is preserved: a
+  // pattern like `internal.private.>` (or one scoped to a stale network id) fails
+  // at config load rather than silently in the surface-router gate.
+  .superRefine((config, ctx) => {
+    if (config.policy?.federated === undefined) return;
+    const { principal, stack } = deriveStackId(config);
+    const expectedSubjectPrefix = `federated.${principal}.${stack}.`;
+    config.policy.federated.networks.forEach((network, networkIdx) => {
+      const validateSubjectScope = (
+        list: readonly string[],
+        listName: "accept_subjects" | "deny_subjects",
+      ) => {
+        list.forEach((pattern, patternIdx) => {
+          if (!pattern.startsWith(expectedSubjectPrefix)) {
+            ctx.addIssue({
+              code: "custom",
+              message:
+                `policy.federated.networks[${networkIdx}].${listName}[${patternIdx}] ` +
+                `"${pattern}" must begin with "${expectedSubjectPrefix}" — the receiving ` +
+                `stack's own federated subject scope (ADR 0001: federated subjects carry ` +
+                `{principal}.{stack}, the network is never on the wire).`,
+              path: [
+                "policy",
+                "federated",
+                "networks",
+                networkIdx,
+                listName,
+                patternIdx,
+              ],
+            });
+          }
+        });
+      };
+      validateSubjectScope(network.accept_subjects, "accept_subjects");
+      validateSubjectScope(network.deny_subjects, "deny_subjects");
+    });
   });
 
 export type CortexConfig = z.infer<typeof CortexConfigSchema>;

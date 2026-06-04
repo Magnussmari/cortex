@@ -912,3 +912,108 @@ describe("MIRROR sync — cortex cross-cutting schemas vs AgentConfigSchema", ()
     expect(bot.paths.logDir).toBe("~/.config/grove/logs");
   });
 });
+
+// =============================================================================
+// ADR 0001 (supersedes cortex#661) — federated accept/deny subject scope.
+//
+// Every `policy.federated.networks[].accept_subjects[]` / `deny_subjects[]`
+// pattern MUST begin with `federated.{my-principal}.{my-stack}.` — the RECEIVING
+// stack's own identity. The network is never on the wire (federated subjects
+// carry `{principal}.{stack}`), so the scope is the stack's identity, NOT a
+// `federated.{network_id}.` prefix (the cortex#661 grammar). The check lives at
+// the top level because the principal + stack come from the `principal:` +
+// `stack:` blocks, which the `policy:` sub-schema does not see.
+// =============================================================================
+
+describe("CortexConfigSchema — federated accept/deny subject scope (ADR 0001)", () => {
+  // `minConfig()` has principal `andreas` and NO `stack:` block, so
+  // `deriveStackId` resolves `andreas/default` → expected prefix
+  // `federated.andreas.default.`.
+  function withFederated(network: Record<string, unknown>) {
+    return {
+      ...minConfig(),
+      policy: {
+        federated: {
+          networks: [
+            {
+              id: "research-collab",
+              leaf_node: "leaf",
+              peers: [],
+              accept_subjects: [],
+              deny_subjects: [],
+              announce_capabilities: [],
+              max_hop: 0,
+              ...network,
+            },
+          ],
+        },
+      },
+    };
+  }
+
+  test("rejects accept_subjects[] not prefixed with federated.{my-principal}.{my-stack}.", () => {
+    // Out-of-scope subject (a stale network-id prefix is just as wrong now).
+    expect(() =>
+      CortexConfigSchema.parse(
+        withFederated({ accept_subjects: ["federated.research-collab.>"] }),
+      ),
+    ).toThrow(/must begin with.*federated\.andreas\.default\./);
+  });
+
+  test("rejects accept_subjects[] with a non-federated prefix (typo guard preserved)", () => {
+    expect(() =>
+      CortexConfigSchema.parse(
+        withFederated({ accept_subjects: ["internal.private.>"] }),
+      ),
+    ).toThrow(/must begin with.*federated\.andreas\.default\./);
+  });
+
+  test("rejects deny_subjects[] not prefixed with federated.{my-principal}.{my-stack}.", () => {
+    expect(() =>
+      CortexConfigSchema.parse(
+        withFederated({
+          accept_subjects: ["federated.andreas.default.>"],
+          deny_subjects: ["local.andreas.>"],
+        }),
+      ),
+    ).toThrow(/must begin with.*federated\.andreas\.default\./);
+  });
+
+  test("accepts patterns within the receiving stack's own federated.{principal}.{stack}. scope", () => {
+    const parsed = CortexConfigSchema.parse(
+      withFederated({
+        accept_subjects: [
+          "federated.andreas.default.tasks.code-review.*",
+          "federated.andreas.default.>",
+        ],
+        deny_subjects: ["federated.andreas.default.tasks.*.private.*"],
+      }),
+    );
+    expect(parsed.policy?.federated?.networks[0]?.accept_subjects).toHaveLength(2);
+  });
+
+  test("scope follows an explicit stack: block (federated.{principal}.{stack}.)", () => {
+    // With `stack: { id: "andreas/research" }`, the expected prefix becomes
+    // `federated.andreas.research.` — a topology-independent identity scope.
+    const parsed = CortexConfigSchema.parse({
+      ...minConfig(),
+      stack: { id: "andreas/research" },
+      policy: {
+        federated: {
+          networks: [
+            {
+              id: "research-collab",
+              leaf_node: "leaf",
+              peers: [],
+              accept_subjects: ["federated.andreas.research.>"],
+              deny_subjects: [],
+              announce_capabilities: [],
+              max_hop: 0,
+            },
+          ],
+        },
+      },
+    });
+    expect(parsed.policy?.federated?.networks[0]?.accept_subjects).toHaveLength(1);
+  });
+});

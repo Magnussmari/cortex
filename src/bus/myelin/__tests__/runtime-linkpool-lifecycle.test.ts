@@ -130,6 +130,19 @@ function makeNetwork(
   };
 }
 
+/**
+ * ADR 0001 — a federated peer fixture. Routing keys off the TARGET PRINCIPAL
+ * (`peers[].principal_id`), so federated publishes below address `jcfischer`
+ * (a peer on research-collab) and `selectLink` resolves it to the leaf.
+ */
+function makePeer(principalId: string): PolicyFederatedNetwork["peers"][number] {
+  return {
+    principal_id: principalId,
+    stack_id: `${principalId}/home`,
+    principal_pubkey: "U" + "A".repeat(55),
+  };
+}
+
 function makeEnvelope(
   overrides: Partial<{ id: string; type: string; classification: string }> = {},
 ) {
@@ -246,6 +259,7 @@ describe("MyelinRuntime LinkPool lifecycle (F-3c, cortex#662)", () => {
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
     ];
@@ -275,17 +289,19 @@ describe("MyelinRuntime LinkPool lifecycle (F-3c, cortex#662)", () => {
       "local.metafactory.system.x",
     ]);
 
-    // The down network's federated publish FAILS CLOSED — routing error, no
-    // publish anywhere (never leaks onto primary).
+    // A federated publish to a principal hosted on the DOWN leaf FAILS CLOSED —
+    // routing error, no publish anywhere (never leaks onto primary). ADR 0001:
+    // the subject addresses the TARGET PRINCIPAL (`jcfischer`), which maps to the
+    // down research leaf; the (legacy-named) `networkId` field carries it.
     await runtime.publishOnSubject!(
       makeEnvelope({ classification: "federated", id: "down-leaf-id" }),
-      "federated.research-collab.system.y",
+      "federated.jcfischer.host.system.y",
     );
     expect(routingErrors).toEqual([
       {
         reason: "unknown_network_in_publish_subject",
-        subject: "federated.research-collab.system.y",
-        networkId: "research-collab",
+        subject: "federated.jcfischer.host.system.y",
+        networkId: "jcfischer",
         envelopeId: "down-leaf-id",
       },
     ]);
@@ -321,6 +337,7 @@ describe("MyelinRuntime LinkPool lifecycle (F-3c, cortex#662)", () => {
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
     ];
@@ -347,14 +364,15 @@ describe("MyelinRuntime LinkPool lifecycle (F-3c, cortex#662)", () => {
       logs.some((l) => l.msg.includes('leaf "nats-leaf-research" reconnected')),
     ).toBe(true);
 
-    // The leaf is now in the pool — its federated publishes route to it.
+    // The leaf is now in the pool — federated publishes to a principal hosted on
+    // it route there (ADR 0001: addressed by target principal `jcfischer`).
     const research = byUrl.get(RESEARCH_URL)!;
     await runtime.publishOnSubject!(
       makeEnvelope({ classification: "federated" }),
-      "federated.research-collab.system.z",
+      "federated.jcfischer.host.system.z",
     );
     expect(research.publishes.map((p) => p.subject)).toEqual([
-      "federated.research-collab.system.z",
+      "federated.jcfischer.host.system.z",
     ]);
     // No NEW routing error for that network after recovery.
     expect(routingErrors).toEqual([]);
