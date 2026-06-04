@@ -1151,21 +1151,18 @@ export async function startMyelinRuntime(
   // surface-router gate + `selectLink` already use, so inbound attribution and
   // outbound routing agree on a federated subject's network segment.
   //
-  // KNOWN EMIT-SITE ASYMMETRY (cortex#661 — the SAME seam `selectLink`
-  // documents on the OUTBOUND side, here on the INBOUND side; NOT a
-  // back-compat hazard). `deriveNatsSubject` currently emits federated
-  // subjects as `federated.{principal}.{stack}.{type}` — segment[1] is the
-  // PRINCIPAL, not the `network_id` this subscription pattern (correctly, per
-  // §3.2) keys off. Consequence: until #661 fixes the emit site, a REAL
-  // federated envelope produced through the derive path won't match a leaf's
-  // `federated.{network_id}.>` interest (unless a principal is coincidentally
-  // named after a network). Harmless today for the same reason as the outbound
-  // seam: no production site emits a `classification: "federated"` envelope
-  // through the derive path with a leaf present yet (E.2/E.3/E.7 federated
-  // emit/relay enablement is OUT of scope here). Publish (`selectLink`) and
-  // subscribe (this loop) are INTERNALLY CONSISTENT — both use the
-  // `{network_id}` grammar — so when #661 corrects emit, both ends start
-  // matching together. The anti-spoof check (`passesSourceLinkCheck`) only
+  // EMIT-SITE ASYMMETRY — RESOLVED (cortex#661 — the SAME seam `selectLink`
+  // documents on the OUTBOUND side, here on the INBOUND side). `deriveNatsSubject`
+  // now emits federated subjects as `federated.{network_id}.{stack}.{type}` —
+  // segment[1] is the TARGET network_id (from `extensions.network_id`), matching
+  // the `network_id` this subscription pattern (per §3.2) keys off. A REAL
+  // federated envelope produced through the derive path now matches the leaf's
+  // `federated.{network_id}.>` interest — inbound (this loop) and outbound
+  // (`selectLink`) agree on the network segment end to end. Both ends already
+  // used the `{network_id}` grammar; #661 corrected the emit side so they match
+  // together (round-trip proven in `runtime-linkpool.test.ts` test `(f)` and the
+  // per-leaf `{network_id}` symmetry test in `runtime-principal-symmetry.test.ts`).
+  // The anti-spoof check (`passesSourceLinkCheck`) only
   // ever runs on subjects that actually arrived here, which are
   // `federated.{network_id}.…` by construction of this very pattern, so
   // segment[1] is genuinely the network_id at the check site — no false-drop.
@@ -1285,23 +1282,21 @@ export async function startMyelinRuntime(
    * publish/subscribe routing agree on what a federated subject's network
    * segment is.
    *
-   * KNOWN EMIT-SITE ASYMMETRY (cortex#661, deferred to F-3c/E.2 — NOT a
-   * back-compat hazard). `deriveNatsSubject` currently emits federated
-   * subjects as `federated.{principal}.{stack}.{type}` — segment[1] is the
-   * PRINCIPAL, not the network_id this function (correctly, per §3.2) keys
-   * off. Consequence: a REAL federated publish routed through the derive
-   * path (`runtime.publish` with `classification: "federated"`) WHILE a leaf
-   * link exists resolves segment[1]=`{principal}` and — unless a network is
-   * coincidentally named after the principal — hits the unknown-network skip
-   * and is DROPPED (or mis-routes on that coincidence). This is harmless
-   * today only because (1) the zero-leaf back-compat case short-circuits to
-   * primary below before any segment is read, and (2) F-3b scopes the
-   * federated emit/relay enablement (E.2/E.3/E.7) OUT — no production site
-   * emits a `classification: "federated"` envelope through the derive path
-   * with a leaf present yet. The fix lands at the EMIT site under cortex#661,
-   * not here: `selectLink` already implements the design grammar. The
-   * regression test `(f)` in `runtime-linkpool.test.ts` PINS this current
-   * derive-path-with-leaf behaviour so the seam is explicit, not silent.
+   * EMIT-SITE ASYMMETRY — RESOLVED (cortex#661). `deriveNatsSubject` now
+   * emits federated subjects as `federated.{network_id}.{stack}.{type}` —
+   * segment[1] is the TARGET network_id (read from `extensions.network_id`),
+   * matching what this function (per §3.2) keys off. A REAL federated publish
+   * routed through the derive path (`runtime.publish` with
+   * `classification: "federated"`) WHILE a leaf link exists now resolves
+   * segment[1]=`{network_id}` and routes to that network's leaf — emit and
+   * route agree end to end. (Pre-#661 the emit site slotted the source
+   * principal into segment[1], so such a publish hit the unknown-network skip
+   * below and was DROPPED; a federated envelope that names no network is now
+   * an emit error that throws in `deriveNatsSubject` rather than routing
+   * anywhere.) The round-trip is proven by test `(f)` in
+   * `runtime-linkpool.test.ts` (federated derive-path publish lands on its
+   * network's leaf) and the per-leaf `{network_id}` symmetry test in
+   * `runtime-principal-symmetry.test.ts`.
    *
    * BACK-COMPAT (the load-bearing zero-leaf invariant): with zero leaf
    * links (no per-network `nats:`) the pool is primary-only, so the

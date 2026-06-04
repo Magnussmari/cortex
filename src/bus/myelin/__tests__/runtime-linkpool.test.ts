@@ -8,12 +8,17 @@
  * network.md` §7) matrix:
  *
  *   (a) zero networks → single primary link, publishes route to primary
- *       (back-compat proof).
+ *       (back-compat proof). local.* is byte-identical pre/post cortex#661.
+ *   (a') cortex#661: a federated envelope with NO network_id throws (no
+ *       silent principal fallback).
  *   (b) a `federated.{net}.*` publish routes to that net's leaf link
  *       (per-link publish capture).
  *   (c) `local.*` / `public.*` always → primary even with leaves present.
  *   (d) `federated.{unknown}.*` → routing error + NO publish.
  *   (e) per-link dedupe (the cortex#491 `boundByPattern` is per-link).
+ *   (f) cortex#661: emit↔route round-trip — `runtime.publish` of a federated
+ *       envelope (network_id in extensions) routes to its leaf via the derive
+ *       path. Pre-#661 this was the emit-site asymmetry drop-pin; now RESOLVED.
  *   (+) negative leakage (§5 cardinal): `federated.{B}.*` never on link A.
  *   (+) `stop()` drains + closes ALL pool links.
  *
@@ -155,7 +160,14 @@ function makeNetwork(
 
 /** Federated envelope whose derived subject we control via an explicit publishOnSubject. */
 function makeEnvelope(
-  overrides: Partial<{ id: string; type: string; classification: string }> = {},
+  overrides: Partial<{
+    id: string;
+    type: string;
+    classification: string;
+    // cortex#661 — federated envelopes carry their target network in
+    // extensions.network_id; deriveNatsSubject reads segment[1] from it.
+    networkId: string;
+  }> = {},
 ) {
   return {
     id: overrides.id ?? "11111111-1111-4111-8111-111111111111",
@@ -172,6 +184,9 @@ function makeEnvelope(
       frontier_ok: true,
       model_class: "any" as const,
     },
+    ...(overrides.networkId !== undefined
+      ? { extensions: { network_id: overrides.networkId } }
+      : {}),
     payload: { adapter_id: "discord-luna" },
   };
 }
@@ -217,24 +232,53 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     expect(primary).toBeDefined();
 
     // local.* publish → primary, with the SAME subject the pre-F-3b runtime
-    // produced (`local.{principal-from-source}.{stack}.{type}`).
+    // produced (`local.{principal-from-source}.{stack}.{type}`). BACK-COMPAT
+    // PROOF: this assertion is byte-identical pre/post cortex#661 — the
+    // network_id grammar change touches ONLY the federated.* branch.
     await runtime.publish(makeEnvelope({ type: "system.adapter.degraded" }));
     expect(primary.publishes.map((p) => p.subject)).toEqual([
       "local.metafactory.default.system.adapter.degraded",
     ]);
 
-    // A federated envelope with NO leaf in the pool still rides primary —
-    // byte-identical to the single-link runtime (no routing error, no skip)
-    // because the primary-only pool has no separate federated routing.
+    // cortex#661 — a federated envelope with a network_id rides primary in the
+    // zero-leaf pool (the `pool.size === 1` short-circuit in selectLink), and
+    // its subject now carries the network_id at segment[1] (not the principal).
+    // No routing error: the unknown-network skip is a multi-link-only concept.
     await runtime.publish(
-      makeEnvelope({ classification: "federated", type: "system.adapter.degraded" }),
+      makeEnvelope({
+        classification: "federated",
+        type: "system.adapter.degraded",
+        networkId: "research-collab",
+      }),
     );
     expect(primary.publishes.map((p) => p.subject)).toEqual([
       "local.metafactory.default.system.adapter.degraded",
-      "federated.metafactory.default.system.adapter.degraded",
+      "federated.research-collab.default.system.adapter.degraded",
     ]);
     // No routing error was logged in the back-compat case.
     expect(logs.some((l) => l.msg.includes("unknown_network_in_publish_subject"))).toBe(false);
+
+    await runtime.stop();
+  });
+
+  // cortex#661 — a federated envelope that names NO target network
+  // (no extensions.network_id) is an emit error: deriveNatsSubject throws
+  // rather than silently slotting the principal into segment[1] (the pre-#661
+  // bug that produced un-routable subjects). publishEnabled derives the
+  // subject OUTSIDE its try/catch, so the throw surfaces to the caller.
+  test("(a') back-compat: a federated envelope with NO network_id throws (no silent principal fallback)", async () => {
+    const reg = makeFakeRegistry();
+    const runtime = await startMyelinRuntime(
+      makeConfig({ url: PRIMARY_URL, name: "cortex", subjects: [] }),
+      { connectImpl: reg.connectImpl, stack: "default" },
+    );
+    const primary = reg.forUrl(PRIMARY_URL)!;
+
+    await expect(
+      runtime.publish(makeEnvelope({ classification: "federated" })),
+    ).rejects.toThrow(/no extensions\.network_id/i);
+    // Nothing was published — the throw aborts before any link.publish.
+    expect(primary.publishes).toEqual([]);
 
     await runtime.stop();
   });
@@ -459,19 +503,17 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     await runtime.stop();
   });
 
-  // (f) KNOWN EMIT-SITE ASYMMETRY PIN (cortex#661). `deriveNatsSubject`
-  //     emits `federated.{principal}.{stack}.{type}` — segment[1] is the
-  //     PRINCIPAL, whereas selectLink (per design §3.2) keys segment[1] as
-  //     the network_id. This test PINS the current behaviour of the derive
-  //     path (`runtime.publish`, NOT publishOnSubject) for a federated
-  //     envelope WHILE a leaf link exists: segment[1] = the source principal
-  //     ("metafactory"), which matches no network id ("research-collab"), so
-  //     the publish hits the unknown-network skip and is DROPPED. This is the
-  //     documented seam deferred to F-3c/E.2 — the fix lands at the EMIT
-  //     site (cortex#661), not in selectLink. When that fix lands this test
-  //     is expected to CHANGE (the federated envelope should land on the
-  //     leaf); until then it guards against silent drift in the routing path.
-  test("(f) KNOWN SEAM (cortex#661): runtime.publish() of a federated envelope WITH a leaf present hits the unknown-network skip (emit-site asymmetry, deferred to F-3c)", async () => {
+  // (f) EMIT↔ROUTE ROUND-TRIP (cortex#661 — asymmetry RESOLVED). Pre-#661
+  //     `deriveNatsSubject` emitted `federated.{principal}.{stack}.{type}` —
+  //     segment[1] was the PRINCIPAL, whereas selectLink (per design §3.2)
+  //     keys segment[1] as the network_id, so a real federated publish through
+  //     the derive path was DROPPED at the unknown-network skip. #661 fixes the
+  //     EMIT site: deriveNatsSubject now reads segment[1] from
+  //     extensions.network_id. This test proves the derive path
+  //     (`runtime.publish`, NOT publishOnSubject) for a federated envelope WITH
+  //     a leaf present now routes to that network's leaf — emit, selectLink, and
+  //     the per-leaf subscribe agree on the network segment, end to end.
+  test("(f) EMIT↔ROUTE round-trip (cortex#661): runtime.publish() of a federated envelope routes to its network's leaf via the derive path", async () => {
     const reg = makeFakeRegistry();
     const routingErrors: RoutingError[] = [];
     const networks = [
@@ -493,24 +535,23 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     const primary = reg.forUrl(PRIMARY_URL)!;
     const research = reg.forUrl(RESEARCH_URL)!;
 
-    // DERIVE path: source principal = "metafactory" → derived subject is
-    // `federated.metafactory.default.<type>` (segment[1] = principal).
+    // DERIVE path: extensions.network_id = "research-collab" → derived subject
+    // is `federated.research-collab.default.<type>` (segment[1] = network_id).
     await runtime.publish(
-      makeEnvelope({ classification: "federated", id: "seam-661-id" }),
+      makeEnvelope({
+        classification: "federated",
+        id: "seam-661-id",
+        networkId: "research-collab",
+      }),
     );
 
-    // selectLink reads segment[1]="metafactory", finds no network with
-    // id==="metafactory" → unknown-network skip. Nothing published anywhere.
-    expect(routingErrors).toEqual([
-      {
-        reason: "unknown_network_in_publish_subject",
-        subject: "federated.metafactory.default.system.adapter.degraded",
-        networkId: "metafactory",
-        envelopeId: "seam-661-id",
-      },
+    // selectLink reads segment[1]="research-collab", resolves the leaf, and the
+    // envelope lands on the research leaf ONLY. No routing error, no leak to primary.
+    expect(routingErrors).toEqual([]);
+    expect(research.publishes.map((p) => p.subject)).toEqual([
+      "federated.research-collab.default.system.adapter.degraded",
     ]);
     expect(primary.publishes).toEqual([]);
-    expect(research.publishes).toEqual([]);
 
     await runtime.stop();
   });

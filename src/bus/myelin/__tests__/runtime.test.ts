@@ -440,12 +440,17 @@ describe("MyelinRuntime", () => {
       await runtime.stop();
     });
 
-    test("enabled runtime: publish derives federated.{principal}.{type} subject", async () => {
+    test("enabled runtime: publish derives federated.{network_id}.{type} subject", async () => {
       // IAW Phase A.3 — federation unblock. When an emit site opts into
       // `classification: "federated"`, the envelope's sovereignty AND the
       // runtime-derived subject move in lockstep onto the `federated.*`
       // namespace. This is what makes cortex able to emit federated
       // envelopes for the first time.
+      //
+      // cortex#661 — segment[1] of a federated subject is the TARGET
+      // network_id (from extensions.network_id), NOT the source principal.
+      // This aligns the emit site with selectLink + the federation gate +
+      // the per-leaf subscribe (design §3.2).
       const fake = makeFakeNatsConnection();
       const runtime = await startMyelinRuntime(
         makeConfig({
@@ -459,11 +464,12 @@ describe("MyelinRuntime", () => {
       const env = {
         ...baseEnv,
         sovereignty: { ...baseEnv.sovereignty, classification: "federated" as const },
+        extensions: { network_id: "research-collab" },
       };
       await runtime.publish(env);
       expect(fake.publish).toHaveBeenCalledTimes(1);
       expect(fake.publishes[0]?.subject).toBe(
-        "federated.metafactory.system.adapter.degraded",
+        "federated.research-collab.system.adapter.degraded",
       );
       await runtime.stop();
     });

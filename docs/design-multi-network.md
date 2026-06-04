@@ -43,8 +43,12 @@ The runtime is structurally single-link. One `NatsLink`, one subscriber set, one
 - The single `link` is captured at closure-init; `signAndPublishOnSubject(envelope, subject)`
   (`runtime.ts:666-749`) closes over it and calls `link.publish(subject, …)` (`runtime.ts:748`).
 - `publishEnabled` derives the subject via `deriveNatsSubject(envelope, stack)` (`runtime.ts:771`).
-  The A.3/A.5 work already lets a single link emit `federated.{principal}.{stack}.{type}` — what it
-  **cannot** do is route different `federated.*` traffic out of different *physical* links.
+  Post-cortex#661 a federated envelope emits `federated.{network_id}.{stack}.{type}` — segment[1] is
+  the TARGET `network_id`, read from `extensions.network_id` (the routing-hint a federated emit site
+  stamps), aligning the emit site with §3.2 routing. (Pre-#661 it emitted `federated.{principal}.…`,
+  which matched no leaf's network id and was dropped at the unknown-network skip — see #661.) What a
+  single link still **cannot** do is route different `federated.*` traffic out of different *physical*
+  links; that is what the link pool below provides.
 - `subscribePull` (`runtime.ts:816`), `subscribe` (push, `runtime.ts:869`), `jetstreamManager`
   (`runtime.ts:895`), and `stop` (`runtime.ts:908`) are all bound to the one captured `link`.
 - Boot degradation today is all-or-nothing: a connect failure returns a fully-disabled runtime

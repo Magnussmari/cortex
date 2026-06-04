@@ -807,6 +807,7 @@ describe("deriveNatsSubject (IAW A.3)", () => {
     classification: Envelope["sovereignty"]["classification"],
     source = "metafactory.cortex.local",
     type = "system.adapter.degraded",
+    extensions?: Record<string, unknown>,
   ): Envelope {
     return {
       ...(validEnvelope as unknown as Envelope),
@@ -816,6 +817,7 @@ describe("deriveNatsSubject (IAW A.3)", () => {
         ...(validEnvelope as unknown as Envelope).sovereignty,
         classification,
       },
+      ...(extensions !== undefined ? { extensions } : {}),
     };
   }
 
@@ -826,10 +828,41 @@ describe("deriveNatsSubject (IAW A.3)", () => {
     );
   });
 
-  test("federated classification → federated.{principal}.{type}", () => {
-    const env = envWithClassification("federated");
+  // cortex#661 — federated subjects are NETWORK-scoped: segment[1] is the
+  // target network_id from extensions.network_id, NOT the source principal.
+  // This aligns the emit site with selectLink + the federation gate + the
+  // per-leaf subscribe, which all key segment[1] as the network id (§3.2).
+  test("federated classification → federated.{network_id}.{type} (from extensions.network_id)", () => {
+    const env = envWithClassification(
+      "federated",
+      "metafactory.cortex.local",
+      "system.adapter.degraded",
+      { network_id: "research-collab" },
+    );
     expect(deriveNatsSubject(env)).toBe(
-      "federated.metafactory.system.adapter.degraded",
+      "federated.research-collab.system.adapter.degraded",
+    );
+  });
+
+  // cortex#661 — a federated envelope that names no target network is an emit
+  // error: it cannot be routed to any leaf. Fail loudly, NEVER fall back to
+  // the principal segment (the pre-#661 bug that produced un-routable subjects).
+  test("federated classification without extensions.network_id → throws (no silent principal fallback)", () => {
+    const env = envWithClassification("federated");
+    expect(() => deriveNatsSubject(env)).toThrow(
+      /federated envelope.*no extensions\.network_id/i,
+    );
+  });
+
+  test("federated classification with empty extensions.network_id → throws", () => {
+    const env = envWithClassification(
+      "federated",
+      "metafactory.cortex.local",
+      "system.adapter.degraded",
+      { network_id: "" },
+    );
+    expect(() => deriveNatsSubject(env)).toThrow(
+      /no extensions\.network_id/i,
     );
   });
 
@@ -855,10 +888,17 @@ describe("deriveNatsSubject (IAW A.3)", () => {
     );
   });
 
-  test("federated + stack → federated.{principal}.{stack}.{type}", () => {
-    const env = envWithClassification("federated");
+  // cortex#661 — segment[1] is the network_id (from extensions.network_id);
+  // the stack segment still lands at segment[2] in the stack-aware form.
+  test("federated + stack → federated.{network_id}.{stack}.{type}", () => {
+    const env = envWithClassification(
+      "federated",
+      "metafactory.cortex.local",
+      "system.adapter.degraded",
+      { network_id: "research-collab" },
+    );
     expect(deriveNatsSubject(env, "security")).toBe(
-      "federated.metafactory.security.system.adapter.degraded",
+      "federated.research-collab.security.system.adapter.degraded",
     );
   });
 
