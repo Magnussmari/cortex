@@ -14,6 +14,7 @@
 
 import { describe, test, expect } from "bun:test";
 import { spawnSync } from "child_process";
+import { statSync } from "fs";
 import { join } from "path";
 import {
   parseGrantList,
@@ -144,6 +145,20 @@ describe("decideSkill — allow/deny decision", () => {
 // Process behaviour (the actual hook contract Claude Code sees)
 // ---------------------------------------------------------------------------
 
+describe("skill-guard.hook — install posture", () => {
+  test("hook file is executable (owner +x) — bare-path hook command must run", () => {
+    // cortex#710 fail-open root cause: the hook was committed 100644 (no +x).
+    // arc installs the symlink preserving source mode, and the curated
+    // settings invoke it by BARE PATH (`${claudeDir}/hooks/CortexSkillGuard.hook.ts`),
+    // not `bun <path>`. A non-executable bare-path hook fails to run → the
+    // broad `Skill` allow stands → every un-granted skill executes. Every
+    // other cortex hook is committed 100755; this asserts skill-guard stays so.
+    const mode = statSync(HOOK_PATH).mode;
+    // owner execute bit
+    expect(mode & 0o100).toBe(0o100);
+  });
+});
+
 describe("skill-guard.hook — process behaviour", () => {
   test("granted skill → exit 0, {continue:true}", () => {
     const r = runHook(
@@ -204,5 +219,83 @@ describe("skill-guard.hook — process behaviour", () => {
     );
     expect(granted.status).toBe(0);
     expect(other.status).toBe(2);
+  });
+
+  test("Skill call with no resolvable name → deny (fail-closed)", () => {
+    // tool_name IS Skill but tool_input carries no `skill` — we cannot
+    // identify the skill and the bare Skill tool is broadly allowed, so this
+    // MUST fail closed (it used to fall through to allow via decideSkill(null)).
+    const r = runHook({ tool_name: "Skill", tool_input: {} }, '["code-review"]');
+    expect(r.status).toBe(2);
+    expect(JSON.parse(r.stdout.trim()).hookSpecificOutput.permissionDecision).toBe(
+      "deny",
+    );
+  });
+
+  test("empty stdin → deny (fail-closed, NOT allow)", () => {
+    // cortex#710 fail-open regression: an empty read means we failed to
+    // capture the payload, not "this isn't a Skill call". Must deny.
+    const r = runHook("", '["code-review"]');
+    expect(r.status).toBe(2);
+    expect(JSON.parse(r.stdout.trim()).hookSpecificOutput.permissionDecision).toBe(
+      "deny",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live fail-open regression (cortex#710): stdin arriving AFTER the hook spawns
+//
+// The hook used to race the stdin read against a 200ms timeout and then treat
+// an empty buffer as "not a Skill call" → allow. Under live Claude Code the
+// payload routinely arrives >200ms after spawn, so a granted-but-restricted
+// session launched EVERY un-granted skill (proven live). The fix reads stdin
+// to EOF (5s hang-stop cap) and fails CLOSED on empty/timeout. These tests
+// pipe a DELAYED payload through a shell so the hook process is already
+// running before the JSON shows up — the exact race that failed live.
+// ---------------------------------------------------------------------------
+
+describe("skill-guard.hook — delayed-stdin fail-open regression", () => {
+  /** Run the hook with the payload written to stdin after `delayMs`. */
+  function runHookDelayed(
+    payload: Record<string, unknown>,
+    grants: string,
+    delayMs: number,
+  ): RunResult {
+    const merged: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined && k !== "CORTEX_SKILL_GRANTS") merged[k] = v;
+    }
+    merged.CORTEX_SKILL_GRANTS = grants;
+    const json = JSON.stringify(payload);
+    // `sleep` then `printf` the payload — the hook is spawned and reading
+    // before the JSON arrives, reproducing the live pipe-delay race.
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        `sleep ${(delayMs / 1000).toFixed(3)}; printf %s ${JSON.stringify(json)} | bun ${JSON.stringify(HOOK_PATH)}`,
+      ],
+      { encoding: "utf-8", env: merged },
+    );
+    return { status: result.status, stdout: result.stdout };
+  }
+
+  test("delayed un-granted skill → still DENY (no fail-open)", () => {
+    const r = runHookDelayed(
+      { tool_name: "Skill", tool_input: { skill: "simplify" } },
+      '["code-review"]',
+      300,
+    );
+    expect(r.status).toBe(2);
+  });
+
+  test("delayed granted skill → still ALLOW", () => {
+    const r = runHookDelayed(
+      { tool_name: "Skill", tool_input: { skill: "code-review" } },
+      '["code-review"]',
+      300,
+    );
+    expect(r.status).toBe(0);
   });
 });

@@ -150,19 +150,57 @@ function deny(reason: string): void {
   );
 }
 
+/**
+ * Read the PreToolUse payload from stdin to EOF.
+ *
+ * ## Why this MUST read to EOF (cortex#710 fail-open fix)
+ *
+ * An earlier version raced the read against a 200ms timeout (copied from
+ * bash-guard). That is sound for bash-guard — the Bash tool is allow-by-
+ * default, so a timed-out guard that falls through to `allow()` merely
+ * declines to block one Bash command. It is **catastrophic here**: the whole
+ * skill model is "the bare `Skill` tool is broadly ALLOWED and THIS hook is
+ * the only gate". If the read abandons before Claude Code has finished piping
+ * the JSON payload (observed live, CLI 2.1.158: the payload routinely arrives
+ * >200ms after the hook process spawns), `raw` is empty → the caller's
+ * empty-input branch ran `allow()` → **every un-granted skill executed**
+ * (proven live: a session granted only `code-review` launched `simplify`).
+ *
+ * So we read to EOF with a generous hard cap purely as a hang-stop (a wedged
+ * pipe must not hang the session forever). On the cap firing we throw, and the
+ * caller treats a throw as fail-CLOSED (deny) — never allow.
+ */
+const STDIN_READ_CAP_MS = 5_000;
+
 async function readStdin(): Promise<string> {
-  const reader = Bun.stdin.stream().getReader();
-  let raw = "";
-  const readLoop = (async () => {
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      raw += new TextDecoder().decode(value, { stream: true });
-    }
-  })();
-  await Promise.race([readLoop, new Promise<void>((r) => setTimeout(r, 200))]);
-  return raw;
+  // `Bun.stdin.text()` consumes the stream to EOF and resolves with the FULL
+  // payload — the correct primitive for a hook that MUST see the whole JSON
+  // before deciding (it was verified live to deliver the complete Claude Code
+  // PreToolUse payload, where the old 200ms-race reader returned empty). We
+  // still bound it with a hang-stop cap: a wedged/never-closing pipe must not
+  // hang the session forever. On the cap firing we reject → the caller treats
+  // a throw as fail-CLOSED (deny), never allow. This is the opposite posture
+  // from the old race, which returned partial/empty input and let the
+  // empty-input branch fail OPEN.
+  const timedOut = Symbol("timedOut");
+  // Hold the timer id so we can clear it the instant the read wins. A pending
+  // setTimeout keeps the event loop alive, so on the ALLOW path (which falls
+  // off the end of `main()` rather than `process.exit`ing) an uncleared timer
+  // would block process exit for the full cap — the hook would appear to hang.
+  let capTimer: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    Bun.stdin.text(),
+    new Promise<typeof timedOut>((r) => {
+      capTimer = setTimeout(() => {
+        r(timedOut);
+      }, STDIN_READ_CAP_MS);
+    }),
+  ]);
+  if (capTimer !== undefined) clearTimeout(capTimer);
+  if (outcome === timedOut) {
+    throw new Error("skill-guard: stdin read exceeded cap before EOF");
+  }
+  return outcome;
 }
 
 async function main(): Promise<void> {
@@ -170,16 +208,25 @@ async function main(): Promise<void> {
   try {
     const raw = await readStdin();
     if (!raw.trim()) {
-      // No payload — nothing to gate. Allow (the hook is only registered for
-      // the Skill matcher; an empty payload is not a Skill invocation).
-      allow();
-      return;
+      // Empty payload. Claude Code ONLY fires this hook on the `Skill`
+      // matcher, so an empty read means we failed to capture the payload
+      // (e.g. the read ended before the JSON was piped) — NOT "this isn't a
+      // Skill call". We cannot identify the skill, and the bare `Skill` tool
+      // is broadly allowed, so allowing here would let an un-granted skill
+      // run. Fail CLOSED. (cortex#710 — this branch used to `allow()`, which
+      // was a live-proven fail-open under the old 200ms stdin race.)
+      const reason =
+        "[Cortex Skill Guard] Blocked: empty Skill tool input — could not " +
+        "identify the skill; denying to stay fail-closed.";
+      deny(reason);
+      process.exit(2);
     }
     input = JSON.parse(raw) as HookInput;
   } catch {
-    // Can't parse the payload. We CANNOT confirm which skill is being
-    // invoked, so the only safe posture is to deny — a malformed payload
-    // must not slip an un-named skill past the gate. Fail closed.
+    // Can't read or parse the payload. We CANNOT confirm which skill is being
+    // invoked, so the only safe posture is to deny — a malformed (or
+    // never-fully-read) payload must not slip an un-named skill past the
+    // gate. Fail closed.
     const reason =
       "[Cortex Skill Guard] Blocked: could not parse the Skill tool input — " +
       "denying to stay fail-closed.";
@@ -189,6 +236,25 @@ async function main(): Promise<void> {
 
   const skillName = extractSkillName(input);
   const grants = parseGrantList(process.env.CORTEX_SKILL_GRANTS);
+
+  // cortex#710 fail-closed disambiguation. `extractSkillName` returns `null`
+  // for TWO different cases; only ONE of them is safe to allow:
+  //   (a) the tool_name is NOT a Skill call → genuinely not ours to gate
+  //       (Claude Code shouldn't fire us here, but if it does, pass through).
+  //   (b) the tool_name IS `Skill`/`skill` but the name is missing/empty/
+  //       unparseable → we CANNOT identify the skill. The bare `Skill` tool is
+  //       broadly allowed, so passing through would run an un-identified skill.
+  //       That must fail CLOSED.
+  const isSkillCall =
+    input.tool_name !== undefined && SKILL_TOOL_NAMES.has(input.tool_name);
+  if (skillName === null && isSkillCall) {
+    const reason =
+      "[Cortex Skill Guard] Blocked: Skill invocation with no resolvable " +
+      "skill name — denying to stay fail-closed.";
+    deny(reason);
+    process.exit(2);
+  }
+
   const decision = decideSkill(skillName, grants);
 
   if (decision.allow) {
@@ -202,12 +268,22 @@ async function main(): Promise<void> {
   process.exit(2);
 }
 
-main().catch(() => {
-  // An unexpected failure in the gate must fail CLOSED, not open: if we
-  // can't run the check, deny. Mirrors the malformed-input path above.
-  deny(
-    "[Cortex Skill Guard] Blocked: internal hook error — denying to stay " +
-      "fail-closed.",
-  );
-  process.exit(2);
-});
+// Only execute the gate when run AS a script (the production hook path).
+// Guard with `import.meta.main` so unit tests can `import` the pure helpers
+// (parseGrantList / extractSkillName / decideSkill) WITHOUT triggering
+// `main()` — which now reads stdin to EOF and `process.exit(2)`s on an empty
+// read (the fail-closed fix). Without this guard, importing the module from
+// the test runner would hang on stdin or kill the runner with exit 2 before
+// the suite summary prints. The installed hook is always invoked as a script,
+// so `import.meta.main` is true there and the gate runs exactly as before.
+if (import.meta.main) {
+  main().catch(() => {
+    // An unexpected failure in the gate must fail CLOSED, not open: if we
+    // can't run the check, deny. Mirrors the malformed-input path above.
+    deny(
+      "[Cortex Skill Guard] Blocked: internal hook error — denying to stay " +
+        "fail-closed.",
+    );
+    process.exit(2);
+  });
+}
