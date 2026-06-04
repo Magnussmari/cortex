@@ -259,8 +259,16 @@ export function buildHttpsMtlsMaterial(
     const cert = readFileSync(expandedCert, "utf-8");
     const key = readFileSync(expandedKey, "utf-8");
     const ca = caPath !== undefined ? readFileSync(expandTilde(caPath), "utf-8") : undefined;
+    // TC-4e (review FIX-FIRST): do NOT claim "presenting client cert" here —
+    // loading the cert and ATTACHING it to a request init is not, by itself,
+    // proof the runtime puts it on the wire. That a Bun `fetch` with
+    // `tls: { cert, key, ca }` actually PRESENTS the client cert to a real
+    // mTLS-enforcing server is verified by the wire-level test
+    // (`taps/cc-events/__tests__/cloud-publisher.mtls-wire.test.ts`, a Node
+    // `requestCert` server observing the client CN). This line states only
+    // what we KNOW at THIS point: the material loaded and will be attached.
     process.stderr.write(
-      `transport.mtls=${mode}: ${ctx.site} presenting client cert ` +
+      `transport.mtls=${mode}: ${ctx.site} loaded client cert, will attach to the HTTPS leg ` +
         `(fingerprint sha256:${fingerprint(cert)}${ca !== undefined ? ", custom CA" : ", system CA"})\n`,
     );
     return { cert, key, ...(ca !== undefined ? { ca } : {}) };

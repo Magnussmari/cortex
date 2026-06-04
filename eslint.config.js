@@ -132,6 +132,10 @@ export default tseslint.config(
       "src/taps/gh-webhook/",
       "src/surface/mc/dashboard-v2/",
       "**/*.bak.ts",
+      // TC-4e — Node-subprocess mTLS test server (runs under Node, not Bun;
+      // raw node:https + process.stdout protocol). Not part of the typed
+      // project, same as the scripts/ carve-out below.
+      "src/taps/cc-events/__tests__/mtls-wire-server.mjs",
       "eslint.config.js",
       "scripts/",
       ".github/scripts/",

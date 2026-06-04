@@ -33,8 +33,19 @@ import type { HttpsMtlsMaterial } from "../../common/config/transport-mtls";
  * declare it. This narrow extension types the `tls` we attach WITHOUT widening
  * to `any` and without a Bun-types dependency. We only ever set `cert`/`key`/
  * `ca` (contents) — NEVER `rejectUnauthorized` or any skip-verify field
- * (CLAUDE.md hard line). On a runtime that ignores `tls` on fetch the leg
- * stays server-auth HTTPS (no downgrade of verification, just no client cert).
+ * (CLAUDE.md hard line).
+ *
+ * WIRE BEHAVIOUR (review FIX-FIRST, empirically verified — see
+ * `__tests__/cloud-publisher.mtls-wire.test.ts`): on Bun 1.3.2, attaching
+ * `tls: { cert, key, ca }` to `fetch` DOES present the client certificate to a
+ * real mTLS-enforcing server (Cloudflare Worker / a Node `https` server with
+ * `requestCert: true`). The cloud→Worker leg therefore runs REAL mutual auth
+ * under `require`, not server-auth-only. (The security review's "Bun silently
+ * drops the cert" reading reproduced only under socket-pool / session-ticket
+ * contamination — a probe that reuses an already-mTLS-authenticated keep-alive
+ * socket. Against a fresh connection the cert is presented; the wire test
+ * proves this against a real enforcing server and is the regression guard for
+ * any future runtime that might drop it.)
  */
 type MtlsRequestInit = RequestInit & {
   tls?: { cert: string; key: string; ca?: string };
