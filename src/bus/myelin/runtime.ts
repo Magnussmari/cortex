@@ -493,18 +493,25 @@ export interface MyelinRuntimeOptions {
 export type ReconnectTimerHandle = object;
 
 /**
- * IAW Phase F-3b (cortex#659) — structured publish-routing error surfaced
- * via {@link MyelinRuntimeOptions.onRoutingError}. Today the only `reason`
- * is `unknown_network_in_publish_subject` (a `federated.{network_id}.*`
- * publish whose `{network_id}` has no link in the pool); the discriminated
- * shape leaves room for additional routing failure modes without breaking
- * the callback contract.
+ * IAW Phase F-3b (cortex#659), reworked for ADR 0001 (supersedes cortex#661) —
+ * structured publish-routing error surfaced via
+ * {@link MyelinRuntimeOptions.onRoutingError}. The only `reason` is
+ * `unknown_network_in_publish_subject`: a `federated.{principal}.{stack}.*`
+ * publish whose TARGET PRINCIPAL (subject segment[1]) resolves to no leaf via
+ * the `peers[]` topology map. The reason literal is kept stable across the ADR
+ * for callback-contract compatibility; the discriminated shape leaves room for
+ * additional routing failure modes without breaking the contract.
  */
 export interface RoutingError {
   reason: "unknown_network_in_publish_subject";
   /** The resolved subject the publish targeted. */
   subject: string;
-  /** The `{network_id}` segment that failed to resolve to a pool link. */
+  /**
+   * The subject segment that failed to resolve to a pool link. Under ADR 0001
+   * this is the TARGET PRINCIPAL (`federated.{principal}.…` segment[1]) — the
+   * network is no longer on the wire. Field name retained for the stable
+   * discriminated shape; reads as "the unresolved routing key".
+   */
   networkId: string;
   /** The envelope id, for joinability with the audit/event stream. */
   envelopeId: string;
@@ -1034,6 +1041,38 @@ export async function startMyelinRuntime(
     }
   }
 
+  // ADR 0001 (supersedes cortex#661) — the `{target_principal} → linkId` routing
+  // map. Federated subjects carry `federated.{principal}.{stack}.…` (segment[1] is
+  // the TARGET PRINCIPAL — same identity grammar as `local.*`), and the network is
+  // NEVER on the wire. `selectLink` resolves which leaf a federated publish targets
+  // from the target principal via the deployment topology: each network's
+  // `peers[].principal_id` enumerates the remote principals reachable on that
+  // network, and the network already maps to a `linkId` above. Composing the two
+  // gives `principal_id → linkId` — built ONCE here at boot (no per-message Map
+  // rebuild), the L1/topology resolution the ADR's layering mandates (Cortex L7
+  // addresses by identity; myelin/L1 resolves the route).
+  //
+  // A target principal that appears in NO network's `peers[]` is unknown — its
+  // `federated.*` publish fails closed (routing error + skip), never leaks onto
+  // primary or another leaf (design §5 — no cross-network leakage). When the same
+  // principal is declared on two networks, the FIRST network's link wins; a
+  // collision is logged so the deploying principal can disambiguate (multi-homing a single
+  // principal across networks is unusual and out of scope for this slice).
+  const principalIdToLinkId = new Map<string, string>();
+  for (const network of federatedNetworks) {
+    const linkId = networkIdToLinkId.get(network.id) ?? primary.linkId;
+    for (const peer of network.peers) {
+      const existing = principalIdToLinkId.get(peer.principal_id);
+      if (existing !== undefined && existing !== linkId) {
+        console.error(
+          `myelin-runtime: peer principal "${peer.principal_id}" is declared on more than one federated network with different leaf links (keeping link="${existing}", ignoring link="${linkId}" from network="${network.id}") — a principal should be reachable on a single network leaf; the deploying principal should disambiguate policy.federated.networks[].peers[]`,
+        );
+        continue;
+      }
+      principalIdToLinkId.set(peer.principal_id, linkId);
+    }
+  }
+
   // Back-compat alias: every existing reference to the single `link` now
   // targets the primary link's `NatsLink`. The subscribe/pull/jsm helpers
   // below stay bound to `primary` (design §3.5 — `subscribePull` and the
@@ -1111,43 +1150,45 @@ export async function startMyelinRuntime(
   };
 
   /**
-   * IAW Phase F-3d (cortex#666) — anti-spoof source-link assertion (design
-   * §3.3 / §5, isolation layer 2). For a `federated.{network_id}.…` subject
-   * delivered on a leaf link, the subject's `{network_id}` segment MUST map to
-   * a network whose `leaf_node` equals the delivering `linkId`; an envelope
-   * claiming network X that arrived on a link NOT owning X is a cross-network
-   * spoof and is DROPPED + logged. The PRIMARY link carries `local.*` /
-   * `public.*` plus every network WITHOUT a `nats:` block (those ride
-   * primary), so primary-delivered traffic is never spoof-checked here — its
-   * legitimacy is governed by the surface-router federation gate, not by link
-   * attribution. Non-`federated.*` subjects are never checked.
+   * IAW Phase F-3d (cortex#666) — source-link attribution gate, reworked for
+   * ADR 0001 (supersedes cortex#661).
    *
-   * Returns `true` when the envelope is allowed to fan out, `false` when it
-   * was dropped as a spoof.
+   * Under cortex#661 a federated subject's segment[1] was the SENDER's target
+   * `{network_id}`, so this gate dropped any envelope whose `{network_id}` did
+   * not map to the delivering leaf (a cross-network spoof). ADR 0001 removes the
+   * network from the wire entirely: each leaf now subscribes only to
+   * `federated.{my-principal}.{my-stack}.>` (envelopes addressed to THIS stack),
+   * so segment[1] is OUR OWN principal, never a network — the old network→leaf
+   * spoof check has nothing to key off and is retired.
    *
-   * **Back-compat:** with zero leaf links the primary subscriber is the only
-   * one bound and `linkId === "primary"`, so this returns `true` for every
-   * subject — byte-identical to the pre-F-3d single-link delivery path.
+   * The cross-principal TRUST decision (is the SENDER — resolved from the
+   * `signed_by[]` chain / `envelope.source`, NOT from the subject — a legitimate
+   * peer on a network owning this leaf?) now lives entirely at the verify layer
+   * (TC-2d `verify-signed-by-chain`, keyed off the delivering `sourceLink`) and
+   * the surface-router federation gate. This function therefore lets every
+   * leaf-delivered envelope fan out; the `sourceLink` tag (which leaf delivered
+   * it) is still attached by `fanOut` so those downstream gates can do their
+   * per-network peer-pubkey lookup. Returning `true` here is NOT "trust it" — it
+   * is "attribute it and defer the trust decision to the layer that owns it."
+   *
+   * Returns `true` to fan out. (Always, post-ADR-0001 — kept as a function so
+   * the fan-out call site and the design's "anti-spoof seam" stay greppable and
+   * a future network-aware drop can re-enter here without touching the caller.)
+   *
+   * **Back-compat:** with zero leaf links the primary subscriber is the only one
+   * bound and `linkId === "primary"`, so this returns `true` for every subject —
+   * byte-identical to the pre-F-3d single-link delivery path.
    */
   const passesSourceLinkCheck = (subject: string, linkId: string): boolean => {
-    // Only leaf-delivered federated subjects are spoof-checked. Primary
-    // delivery + non-federated subjects pass through (see docblock).
+    // Primary delivery + non-federated subjects always pass (unchanged).
     if (linkId === primary.linkId) return true;
     if (!subject.startsWith("federated.")) return true;
-    const claimedNetworkId = subject.split(".")[1];
-    // The link that delivered this owns these network ids (built once at boot
-    // — the inverse of `networkIdToLinkId`, scoped to THIS leaf). A subject
-    // whose `{network_id}` doesn't resolve to a network on this exact leaf is
-    // a spoof.
-    const owningLinkId =
-      claimedNetworkId === undefined || claimedNetworkId.length === 0
-        ? undefined
-        : networkIdToLinkId.get(claimedNetworkId);
-    if (owningLinkId === linkId) return true;
-    console.error(
-      `myelin-runtime: DROPPING spoofed envelope subject=${subject} — claimed network "${claimedNetworkId ?? "<malformed>"}" did not arrive on its own leaf (delivered on link="${linkId}", network maps to link="${owningLinkId ?? "<unknown>"}")`,
-    );
-    return false;
+    // ADR 0001 — leaf-delivered federated traffic is addressed to our own
+    // principal/stack (segment[1] is OUR principal, not a sender network), so
+    // there is no network segment to validate here. Attribute via `sourceLink`
+    // (the delivering leaf) and defer the cross-principal trust decision to the
+    // verify layer + surface-router gate. Fan out.
+    return true;
   };
 
   /**
@@ -1214,42 +1255,54 @@ export async function startMyelinRuntime(
     bindPushPattern(primary, pattern);
   }
 
-  // IAW Phase F-3d (cortex#666) — per-leaf inbound subscriptions. Each leaf
-  // link subscribes to the federated subjects of EVERY network mapped to it,
-  // so an inbound envelope on that leaf fans out tagged with the leaf's
-  // `linkId` as `sourceLink` (design §3.3 — "each subscriber binds to exactly
-  // one link and tags `sourceLink`"). The pattern is `federated.{network_id}.>`
-  // per network on the leaf — the same `{network_id}`-keyed grammar the
-  // surface-router gate + `selectLink` already use, so inbound attribution and
-  // outbound routing agree on a federated subject's network segment.
+  // IAW Phase F-3d (cortex#666) — per-leaf inbound subscriptions, reworked for
+  // ADR 0001 (supersedes cortex#661). Each leaf link subscribes to the federated
+  // traffic addressed to THIS stack — `federated.{my-principal}.{my-stack}.>` —
+  // so an inbound envelope on that leaf fans out tagged with the leaf's `linkId`
+  // as `sourceLink` (design §3.3 — "each subscriber binds to exactly one link and
+  // tags `sourceLink`"). The cross-principal TRUST decision (was the SENDER a
+  // legitimate peer on a network owning this leaf?) is the verify layer's job
+  // (TC-2d, keyed off `sourceLink`), not the subscription pattern's.
   //
-  // EMIT-SITE ASYMMETRY — RESOLVED (cortex#661 — the SAME seam `selectLink`
-  // documents on the OUTBOUND side, here on the INBOUND side). `deriveNatsSubject`
-  // now emits federated subjects as `federated.{network_id}.{stack}.{type}` —
-  // segment[1] is the TARGET network_id (from `extensions.network_id`), matching
-  // the `network_id` this subscription pattern (per §3.2) keys off. A REAL
-  // federated envelope produced through the derive path now matches the leaf's
-  // `federated.{network_id}.>` interest — inbound (this loop) and outbound
-  // (`selectLink`) agree on the network segment end to end. Both ends already
-  // used the `{network_id}` grammar; #661 corrected the emit side so they match
-  // together (round-trip proven in `runtime-linkpool.test.ts` test `(f)` and the
-  // per-leaf `{network_id}` symmetry test in `runtime-principal-symmetry.test.ts`).
-  // The anti-spoof check (`passesSourceLinkCheck`) only
-  // ever runs on subjects that actually arrived here, which are
-  // `federated.{network_id}.…` by construction of this very pattern, so
-  // segment[1] is genuinely the network_id at the check site — no false-drop.
+  // GRAMMAR (ADR 0001): the subject is `federated.{principal}.{stack}.…` where
+  // `{principal}` is the TARGET principal — the SAME identity grammar as
+  // `local.*`. The network is NEVER on the wire; a stack accepts federated
+  // traffic addressed to its OWN principal/stack. Pre-ADR (cortex#661) this loop
+  // subscribed per-network to `federated.{network_id}.>` — a transport-topology
+  // value on the wire that `CONTEXT.md` forbids. Now the receiving stack's own
+  // identity is the subscription key, symmetric with the `local.*` subscribe
+  // patterns the boot loop above resolves via `makeSubjectPlaceholderSubstituter`.
   //
-  // **Back-compat:** with zero leaf links this loop binds nothing — the pool
-  // is primary-only and delivery is byte-identical to pre-F-3d. A DOWN leaf
+  // Subscribe ONCE per DISTINCT leaf link (multiple networks may share a
+  // `leaf_node`; the stack's inbound interest is the same regardless of which
+  // network the peer rode in on). `bindPushPattern`'s per-link dedupe also makes
+  // a repeated bind a no-op, so iterating distinct leaves is belt-and-braces.
+  //
+  // **Back-compat:** with zero leaf links this loop binds nothing — the pool is
+  // primary-only and delivery is byte-identical to pre-F-3d. A DOWN leaf
   // (link === null) is skipped by `bindPushPattern`; the F-3c background
   // reconnect attaches the link but re-binding its interest on reconnect is
   // deferred (the leaf comes back publish-capable; inbound re-bind is a TC-2d-
   // adjacent follow-up, noted in the PR).
-  for (const [networkId, linkId] of networkIdToLinkId) {
+  const myPrincipal = principalFromConfig(options?.principal);
+  const myStack = options?.stack;
+  // `federated.{my-principal}.{my-stack}.>` (stack-aware) or
+  // `federated.{my-principal}.>` (stack-less — the `>` multi-segment wildcard
+  // matches the stack-defaulting form too). Mirrors the `local.*` grammar
+  // `deriveSubject` emits, so inbound subscribe and outbound emit agree on
+  // `{principal}.{stack}` end to end.
+  const inboundFederatedPattern =
+    myStack !== undefined
+      ? `federated.${myPrincipal}.${myStack}.>`
+      : `federated.${myPrincipal}.>`;
+  const leafLinksSeen = new Set<string>();
+  for (const linkId of networkIdToLinkId.values()) {
     if (linkId === primary.linkId) continue; // rides primary — no leaf sub.
+    if (leafLinksSeen.has(linkId)) continue; // one inbound sub per distinct leaf.
+    leafLinksSeen.add(linkId);
     const leaf = pool.get(linkId);
     if (leaf === undefined) continue; // defensive — mapping invariant holds.
-    bindPushPattern(leaf, `federated.${networkId}.>`);
+    bindPushPattern(leaf, inboundFederatedPattern);
   }
 
   // cortex#337 — pre-#337 a non-empty `subjects[]` that ALL failed to
@@ -1333,54 +1386,43 @@ export async function startMyelinRuntime(
     });
 
   /**
-   * IAW Phase F-3b (cortex#659) — PURE link selection from the RESOLVED
-   * subject (design §3.2). No global mutable routing state, no per-message
-   * Map rebuild: reads `network_id → linkId` (built once at boot) and the
-   * `pool`.
+   * IAW Phase F-3b (cortex#659), reworked for ADR 0001 (supersedes cortex#661)
+   * — PURE link selection from the RESOLVED subject. No global mutable routing
+   * state, no per-message Map rebuild: reads `principal_id → linkId` (built once
+   * at boot from `policy.federated.networks[].peers[]`) and the `pool`.
    *
-   *   | resolved subject            | target link                         |
-   *   |-----------------------------|-------------------------------------|
-   *   | `local.…`                   | `primary`                           |
-   *   | `public.…`                  | `primary` (public mesh deferred §3.5)|
-   *   | `federated.{network_id}.…`  | the pool link owning `{network_id}` |
-   *   | `federated.{unknown}.…`     | none → routing error + skip         |
+   *   | resolved subject                   | target link                          |
+   *   |------------------------------------|--------------------------------------|
+   *   | `local.…`                          | `primary`                            |
+   *   | `public.…`                         | `primary` (public mesh deferred §3.5)|
+   *   | `federated.{principal}.{stack}.…`  | the leaf owning that target principal|
+   *   | `federated.{unknown-principal}.…`  | none → routing error + skip          |
    *
-   * Returns the selected `PoolLink`, or `null` to signal "skip the
-   * publish" (the only `null` case today is an unknown federated network,
-   * which also fires `onRoutingError`). `{network_id}` is the subject's
-   * SECOND segment — the same grammar the inbound surface-router federation
-   * gate already keys off (`evaluateFederationGate`, `surface-router.ts`)
-   * and the design (`docs/design-multi-network.md` §3.2) mandates, so
-   * publish/subscribe routing agree on what a federated subject's network
-   * segment is.
+   * Returns the selected `PoolLink`, or `null` to signal "skip the publish" (the
+   * only `null` case is an unknown target principal — one that appears in no
+   * network's `peers[]` — which also fires `onRoutingError`).
    *
-   * EMIT-SITE ASYMMETRY — RESOLVED (cortex#661). `deriveNatsSubject` now
-   * emits federated subjects as `federated.{network_id}.{stack}.{type}` —
-   * segment[1] is the TARGET network_id (read from `extensions.network_id`),
-   * matching what this function (per §3.2) keys off. A REAL federated publish
-   * routed through the derive path (`runtime.publish` with
-   * `classification: "federated"`) WHILE a leaf link exists now resolves
-   * segment[1]=`{network_id}` and routes to that network's leaf — emit and
-   * route agree end to end. (Pre-#661 the emit site slotted the source
-   * principal into segment[1], so such a publish hit the unknown-network skip
-   * below and was DROPPED; a federated envelope that names no network is now
-   * an emit error that throws in `deriveNatsSubject` rather than routing
-   * anywhere.) The round-trip is proven by test `(f)` in
-   * `runtime-linkpool.test.ts` (federated derive-path publish lands on its
-   * network's leaf) and the per-leaf `{network_id}` symmetry test in
-   * `runtime-principal-symmetry.test.ts`.
+   * ADR 0001 — `{principal}` is the subject's SECOND segment (the TARGET
+   * principal — the SAME identity grammar as `local.*`), NOT a `network_id`.
+   * The network is NEVER on the wire; this function resolves WHICH leaf the
+   * target principal lives behind from the deployment topology (`peers[]`), the
+   * L1/L7 separation the ADR's layering mandates. cortex#661 had keyed segment[1]
+   * as a target `network_id` — a transport-topology value leaking into the L7
+   * identity address, which `CONTEXT.md` forbids and which can't even address a
+   * specific principal on a multi-principal network. This reverts that: address
+   * by identity, resolve the route from topology.
    *
-   * BACK-COMPAT (the load-bearing zero-leaf invariant): with zero leaf
-   * links (no per-network `nats:`) the pool is primary-only, so the
-   * `pool.size === 1` short-circuit below returns `primary` for EVERY
-   * subject — including any stray `federated.*` — WITHOUT reading
-   * segment[1] at all. The unknown-network skip is therefore a
-   * multi-link-ONLY concept and never engages in the zero-leaf case; a
-   * `federated.*` subject for an un-configured segment was already not
-   * separately routable pre-F-3b (it just published on the single link),
-   * and that is preserved byte-for-byte. NOTE this short-circuit is also
-   * what makes the cortex#661 emit-site asymmetry above invisible today —
-   * it only surfaces once a leaf link exists.
+   * A stack can therefore be re-homed to a different network without changing its
+   * subjects (topology change ≠ identity change) — the load-bearing property
+   * behind isolated multi-network deployments.
+   *
+   * BACK-COMPAT (the load-bearing zero-leaf invariant): with zero leaf links (no
+   * per-network `nats:`) the pool is primary-only, so the `pool.size === 1`
+   * short-circuit below returns `primary` for EVERY subject — including any stray
+   * `federated.*` — WITHOUT reading segment[1] at all. The unknown-principal skip
+   * is therefore a multi-link-ONLY concept and never engages in the zero-leaf
+   * case; a `federated.*` subject was already not separately routable pre-F-3b
+   * (it just published on the single link), and that is preserved byte-for-byte.
    */
   const selectLink = (subject: string, envelopeId: string): PoolLink | null => {
     // Non-federated subjects (`local.*`, `public.*`, and anything that
@@ -1390,14 +1432,19 @@ export async function startMyelinRuntime(
     }
     // Primary-only pool ⇒ federated traffic rides primary, exactly as the
     // single-link runtime did pre-F-3b. No routing error in this case: the
-    // unknown-network skip is a multi-link-only concept.
+    // unknown-principal skip is a multi-link-only concept.
     if (pool.size === 1) {
       return primary;
     }
-    // `federated.{network_id}.…` — segment[1] is the network id.
-    const networkId = subject.split(".")[1];
-    if (networkId === undefined || networkId.length === 0) {
-      // Malformed `federated.` / `federated..…` — treat as unknown network.
+    // ADR 0001 — `federated.{principal}.{stack}.…`: segment[1] is the TARGET
+    // PRINCIPAL. Resolve which leaf hosts that principal via the topology map
+    // (`peers[].principal_id → network → linkId`, built once at boot). The
+    // `RoutingError.networkId` field is retained for the discriminated shape but
+    // now carries the unresolved target principal — the value that failed to
+    // resolve to a leaf.
+    const targetPrincipal = subject.split(".")[1];
+    if (targetPrincipal === undefined || targetPrincipal.length === 0) {
+      // Malformed `federated.` / `federated..…` — treat as unroutable.
       onRoutingError({
         reason: "unknown_network_in_publish_subject",
         subject,
@@ -1406,16 +1453,15 @@ export async function startMyelinRuntime(
       });
       return null;
     }
-    const linkId = networkIdToLinkId.get(networkId);
+    const linkId = principalIdToLinkId.get(targetPrincipal);
     const target = linkId === undefined ? undefined : pool.get(linkId);
     if (target === undefined) {
-      // Unknown network (no such network id) — fail closed: signal + skip,
-      // NEVER leak onto primary. A network configured WITHOUT any `nats:`
-      // maps to `'primary'` and resolves here normally.
+      // Unknown target principal (in no network's peers[]) — fail closed:
+      // signal + skip, NEVER leak onto primary or another leaf (design §5).
       onRoutingError({
         reason: "unknown_network_in_publish_subject",
         subject,
-        networkId,
+        networkId: targetPrincipal,
         envelopeId,
       });
       return null;
@@ -1429,10 +1475,13 @@ export async function startMyelinRuntime(
     // this same path routes the network's traffic normally. F-3b left such a
     // leaf UNMAPPED so it could never recover; F-3c tracks it down + retries.
     if (target.link === null) {
+      // Target principal's leaf is KNOWN but currently DOWN (boot-unreachable or
+      // dropped, awaiting F-3c background reconnect). Fail closed exactly like an
+      // unknown principal — never fall back onto primary or another leaf.
       onRoutingError({
         reason: "unknown_network_in_publish_subject",
         subject,
-        networkId,
+        networkId: targetPrincipal,
         envelopeId,
       });
       return null;

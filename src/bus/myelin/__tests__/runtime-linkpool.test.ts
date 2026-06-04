@@ -1,26 +1,35 @@
 /**
- * F-3b (cortex#659): MyelinRuntime LinkPool tests.
+ * F-3b (cortex#659): MyelinRuntime LinkPool tests — reworked for ADR 0001
+ * (supersedes cortex#661).
  *
  * The runtime backs EVERY publish/subscribe, so the back-compat invariant
  * is load-bearing: with ZERO per-network `nats:` configured, the pool has
  * ONLY the primary link and behaviour is byte-identical to the pre-F-3b
  * single-link runtime. These tests cover the design (`docs/design-multi-
- * network.md` §7) matrix:
+ * network.md` §7) matrix, on the ADR 0001 grammar:
  *
  *   (a) zero networks → single primary link, publishes route to primary
- *       (back-compat proof). local.* is byte-identical pre/post cortex#661.
- *   (a') cortex#661: a federated envelope with NO network_id throws (no
- *       silent principal fallback).
- *   (b) a `federated.{net}.*` publish routes to that net's leaf link
- *       (per-link publish capture).
+ *       (back-compat proof). local.* is byte-identical pre/post ADR 0001.
+ *   (a') ADR 0001: a federated envelope with NO network_id derives a valid
+ *       `federated.{principal}.{stack}.…` subject (no throw) and rides primary
+ *       in the zero-leaf pool.
+ *   (b) a `federated.{target-principal}.{stack}.*` publish routes to the leaf
+ *       hosting that target principal (per-link publish capture).
  *   (c) `local.*` / `public.*` always → primary even with leaves present.
- *   (d) `federated.{unknown}.*` → routing error + NO publish.
+ *   (d) `federated.{unknown-principal}.*` → routing error + NO publish.
  *   (e) per-link dedupe (the cortex#491 `boundByPattern` is per-link).
- *   (f) cortex#661: emit↔route round-trip — `runtime.publish` of a federated
- *       envelope (network_id in extensions) routes to its leaf via the derive
- *       path. Pre-#661 this was the emit-site asymmetry drop-pin; now RESOLVED.
+ *   (f) ADR 0001: emit↔route round-trip — `runtime.publish` of a federated
+ *       envelope routes to the leaf hosting the TARGET PRINCIPAL (subject[1])
+ *       via the derive path + `peers[]` topology resolution.
  *   (+) negative leakage (§5 cardinal): `federated.{B}.*` never on link A.
  *   (+) `stop()` drains + closes ALL pool links.
+ *
+ * ADR 0001 (supersedes cortex#661): federated subjects carry
+ * `federated.{principal}.{stack}.…` (the TARGET principal — same identity
+ * grammar as `local.*`); the network is NEVER on the wire. `selectLink` resolves
+ * which leaf a target principal lives behind from `policy.federated.networks[].peers[]`,
+ * so the network fixtures below declare `peers[]` and the explicit
+ * `publishOnSubject` subjects address by target principal, not network id.
  *
  * Uses the `MyelinRuntimeOptions.connectImpl` fake-link seam — no real
  * `nats-server`. A PER-URL fake registry lets each test assert WHICH link
@@ -36,7 +45,10 @@ import type {
   Subscription,
 } from "nats";
 import type { AgentConfig } from "../../../common/types/config";
-import type { PolicyFederatedNetwork } from "../../../common/types/cortex-config";
+import type {
+  PolicyFederatedNetwork,
+  PolicyFederatedPeer,
+} from "../../../common/types/cortex-config";
 import { startMyelinRuntime, type RoutingError } from "../runtime";
 
 function makeConfig(natsBlock: AgentConfig["nats"]): AgentConfig {
@@ -142,6 +154,20 @@ const PRIMARY_URL = "nats://localhost:4222";
 const RESEARCH_URL = "nats://research:4222";
 const JV_URL = "nats://jv:4222";
 
+/**
+ * A federated peer fixture — a remote principal reachable on a network. ADR
+ * 0001 routes by TARGET PRINCIPAL, so the peer's `principal_id` is what
+ * `selectLink` resolves to a leaf. `stack_id` / `principal_pubkey` are
+ * structural-only here (routing doesn't crypto-verify).
+ */
+function makePeer(principalId: string): PolicyFederatedPeer {
+  return {
+    principal_id: principalId,
+    stack_id: `${principalId}/home`,
+    principal_pubkey: "U" + "A".repeat(55),
+  };
+}
+
 /** Minimal valid `PolicyFederatedNetwork` fixture. */
 function makeNetwork(
   overrides: Partial<PolicyFederatedNetwork>,
@@ -158,20 +184,27 @@ function makeNetwork(
   };
 }
 
-/** Federated envelope whose derived subject we control via an explicit publishOnSubject. */
+/**
+ * Federated envelope. ADR 0001 — the derived subject is
+ * `federated.{principal-from-source}.{stack}.{type}`; the network is resolved
+ * from the target principal at the routing layer, NOT carried on the wire.
+ * `extensions.network_id` MAY still be set as a routing HINT but never affects
+ * the subject. `targetPrincipal` overrides `source` so the derive-path tests can
+ * address a specific peer principal.
+ */
 function makeEnvelope(
   overrides: Partial<{
     id: string;
     type: string;
     classification: string;
-    // cortex#661 — federated envelopes carry their target network in
-    // extensions.network_id; deriveNatsSubject reads segment[1] from it.
-    networkId: string;
+    /** The principal whose identity the subject carries (envelope.source[0]). */
+    targetPrincipal: string;
   }> = {},
 ) {
+  const principal = overrides.targetPrincipal ?? "metafactory";
   return {
     id: overrides.id ?? "11111111-1111-4111-8111-111111111111",
-    source: "metafactory.grove.local",
+    source: `${principal}.grove.local`,
     type: overrides.type ?? "system.adapter.degraded",
     timestamp: "2026-06-04T12:00:00.000Z",
     sovereignty: {
@@ -184,14 +217,11 @@ function makeEnvelope(
       frontier_ok: true,
       model_class: "any" as const,
     },
-    ...(overrides.networkId !== undefined
-      ? { extensions: { network_id: overrides.networkId } }
-      : {}),
     payload: { adapter_id: "discord-luna" },
   };
 }
 
-describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
+describe("MyelinRuntime LinkPool (F-3b, cortex#659; ADR 0001)", () => {
   let logs: { kind: "log" | "info" | "warn" | "error"; msg: string }[];
   let restore: () => void;
 
@@ -233,27 +263,27 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
 
     // local.* publish → primary, with the SAME subject the pre-F-3b runtime
     // produced (`local.{principal-from-source}.{stack}.{type}`). BACK-COMPAT
-    // PROOF: this assertion is byte-identical pre/post cortex#661 — the
-    // network_id grammar change touches ONLY the federated.* branch.
+    // PROOF: this assertion is byte-identical pre/post ADR 0001 — the
+    // federated grammar change touches ONLY the federated.* branch.
     await runtime.publish(makeEnvelope({ type: "system.adapter.degraded" }));
     expect(primary.publishes.map((p) => p.subject)).toEqual([
       "local.metafactory.default.system.adapter.degraded",
     ]);
 
-    // cortex#661 — a federated envelope with a network_id rides primary in the
-    // zero-leaf pool (the `pool.size === 1` short-circuit in selectLink), and
-    // its subject now carries the network_id at segment[1] (not the principal).
-    // No routing error: the unknown-network skip is a multi-link-only concept.
+    // ADR 0001 — a federated envelope rides primary in the zero-leaf pool (the
+    // `pool.size === 1` short-circuit in selectLink), and its subject carries
+    // the SOURCE PRINCIPAL at segment[1] (same identity grammar as local.*),
+    // NOT a network id. No routing error: the unknown-principal skip is a
+    // multi-link-only concept.
     await runtime.publish(
       makeEnvelope({
         classification: "federated",
         type: "system.adapter.degraded",
-        networkId: "research-collab",
       }),
     );
     expect(primary.publishes.map((p) => p.subject)).toEqual([
       "local.metafactory.default.system.adapter.degraded",
-      "federated.research-collab.default.system.adapter.degraded",
+      "federated.metafactory.default.system.adapter.degraded",
     ]);
     // No routing error was logged in the back-compat case.
     expect(logs.some((l) => l.msg.includes("unknown_network_in_publish_subject"))).toBe(false);
@@ -261,12 +291,12 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     await runtime.stop();
   });
 
-  // cortex#661 — a federated envelope that names NO target network
-  // (no extensions.network_id) is an emit error: deriveNatsSubject throws
-  // rather than silently slotting the principal into segment[1] (the pre-#661
-  // bug that produced un-routable subjects). publishEnabled derives the
-  // subject OUTSIDE its try/catch, so the throw surfaces to the caller.
-  test("(a') back-compat: a federated envelope with NO network_id throws (no silent principal fallback)", async () => {
+  // (a') ADR 0001 — a federated envelope with NO network_id is no longer an emit
+  //      error: the network is not on the wire, so `deriveNatsSubject` derives a
+  //      valid `federated.{principal}.{stack}.…` subject from `envelope.source`
+  //      (identical to the local.* branch). In the zero-leaf pool it rides
+  //      primary, no throw, no routing error.
+  test("(a') ADR 0001: a federated envelope with NO network_id derives a valid subject and rides primary (no throw)", async () => {
     const reg = makeFakeRegistry();
     const runtime = await startMyelinRuntime(
       makeConfig({ url: PRIMARY_URL, name: "cortex", subjects: [] }),
@@ -274,22 +304,22 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     );
     const primary = reg.forUrl(PRIMARY_URL)!;
 
-    await expect(
-      runtime.publish(makeEnvelope({ classification: "federated" })),
-    ).rejects.toThrow(/no extensions\.network_id/i);
-    // Nothing was published — the throw aborts before any link.publish.
-    expect(primary.publishes).toEqual([]);
+    await runtime.publish(makeEnvelope({ classification: "federated" }));
+    expect(primary.publishes.map((p) => p.subject)).toEqual([
+      "federated.metafactory.default.system.adapter.degraded",
+    ]);
 
     await runtime.stop();
   });
 
-  // (b) federated.{net}.* routes to that net's leaf link.
-  test("(b) federated.{net}.* publish routes to that network's leaf link", async () => {
+  // (b) federated.{target-principal}.* routes to the leaf hosting that principal.
+  test("(b) federated.{target-principal}.* publish routes to the leaf hosting that principal", async () => {
     const reg = makeFakeRegistry();
     const networks = [
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
     ];
@@ -304,12 +334,12 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     const research = reg.forUrl(RESEARCH_URL)!;
 
     await runtime.publishOnSubject!(
-      makeEnvelope({ classification: "federated" }),
-      "federated.research-collab.system.adapter.degraded",
+      makeEnvelope({ classification: "federated", targetPrincipal: "jcfischer" }),
+      "federated.jcfischer.host.system.adapter.degraded",
     );
-    // Landed on the research leaf ONLY.
+    // Landed on the research leaf ONLY (jcfischer is a peer on research-collab).
     expect(research.publishes.map((p) => p.subject)).toEqual([
-      "federated.research-collab.system.adapter.degraded",
+      "federated.jcfischer.host.system.adapter.degraded",
     ]);
     expect(primary.publishes).toEqual([]);
 
@@ -323,6 +353,7 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
     ];
@@ -348,14 +379,15 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     await runtime.stop();
   });
 
-  // (d) federated.{unknown}.* → routing error + NO publish.
-  test("(d) federated.{unknown}.* emits routing error and does NOT publish (skip)", async () => {
+  // (d) federated.{unknown-principal}.* → routing error + NO publish.
+  test("(d) federated.{unknown-principal}.* emits routing error and does NOT publish (skip)", async () => {
     const reg = makeFakeRegistry();
     const routingErrors: RoutingError[] = [];
     const networks = [
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
     ];
@@ -370,17 +402,20 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     const primary = reg.forUrl(PRIMARY_URL)!;
     const research = reg.forUrl(RESEARCH_URL)!;
 
+    // `nobody` is in no network's peers[] — unroutable target principal.
     await runtime.publishOnSubject!(
       makeEnvelope({ classification: "federated", id: "deadbeef-id" }),
-      "federated.no-such-net.system.x",
+      "federated.nobody.host.system.x",
     );
 
-    // Routing error fired with the canonical reason; NOTHING published.
+    // Routing error fired with the canonical reason; the unresolved target
+    // principal is carried in the (legacy-named) `networkId` field; NOTHING
+    // published.
     expect(routingErrors).toEqual([
       {
         reason: "unknown_network_in_publish_subject",
-        subject: "federated.no-such-net.system.x",
-        networkId: "no-such-net",
+        subject: "federated.nobody.host.system.x",
+        networkId: "nobody",
         envelopeId: "deadbeef-id",
       },
     ]);
@@ -390,18 +425,21 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     await runtime.stop();
   });
 
-  // (+) NEGATIVE LEAKAGE (§5 cardinal): federated.{B}.* never on link A.
-  test("(+) negative leakage: a federated.{jv}.* publish never appears on the research leaf", async () => {
+  // (+) NEGATIVE LEAKAGE (§5 cardinal): a publish to a principal on leaf B
+  //     never appears on leaf A.
+  test("(+) negative leakage: a federated publish for a jv-network principal never appears on the research leaf", async () => {
     const reg = makeFakeRegistry();
     const networks = [
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
       makeNetwork({
         id: "jv",
         leaf_node: "nats-leaf-jv",
+        peers: [makePeer("partner")],
         nats: { url: JV_URL, name: "cortex" },
       }),
     ];
@@ -414,37 +452,40 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     const jv = reg.forUrl(JV_URL)!;
 
     await runtime.publishOnSubject!(
-      makeEnvelope({ classification: "federated" }),
-      "federated.jv.system.x",
+      makeEnvelope({ classification: "federated", targetPrincipal: "partner" }),
+      "federated.partner.host.system.x",
     );
     await runtime.publishOnSubject!(
-      makeEnvelope({ classification: "federated" }),
-      "federated.research-collab.system.y",
+      makeEnvelope({ classification: "federated", targetPrincipal: "jcfischer" }),
+      "federated.jcfischer.host.system.y",
     );
 
-    // jv traffic hit jv only; research traffic hit research only.
-    expect(jv.publishes.map((p) => p.subject)).toEqual(["federated.jv.system.x"]);
+    // partner traffic hit jv only; jcfischer traffic hit research only.
+    expect(jv.publishes.map((p) => p.subject)).toEqual(["federated.partner.host.system.x"]);
     expect(research.publishes.map((p) => p.subject)).toEqual([
-      "federated.research-collab.system.y",
+      "federated.jcfischer.host.system.y",
     ]);
-    // CARDINAL: jv's subject never leaked onto the research leaf's wire.
-    expect(research.publishes.some((p) => p.subject.startsWith("federated.jv."))).toBe(false);
+    // CARDINAL: the partner (jv) subject never leaked onto the research leaf's wire.
+    expect(research.publishes.some((p) => p.subject.startsWith("federated.partner."))).toBe(false);
 
     await runtime.stop();
   });
 
   // (+) two networks SHARING a leaf_node ⇒ ONE physical link (de-dup key).
+  //     A peer on either network resolves to the SAME shared leaf.
   test("(+) two networks sharing a leaf_node share one physical leaf link", async () => {
     const reg = makeFakeRegistry();
     const networks = [
       makeNetwork({
         id: "research-collab",
         leaf_node: "shared-leaf",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
       makeNetwork({
         id: "research-collab-2",
         leaf_node: "shared-leaf",
+        peers: [makePeer("kestrel")],
         // Second declaration omits nats: (rides the first's link) — the
         // F-3a cross-validator guarantees consistency.
       }),
@@ -457,18 +498,18 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     expect(reg.byUrl.size).toBe(2);
     const shared = reg.forUrl(RESEARCH_URL)!;
 
-    // Both network ids route to the SAME leaf.
+    // Both networks' peers route to the SAME leaf.
     await runtime.publishOnSubject!(
-      makeEnvelope({ classification: "federated" }),
-      "federated.research-collab.system.a",
+      makeEnvelope({ classification: "federated", targetPrincipal: "jcfischer" }),
+      "federated.jcfischer.host.system.a",
     );
     await runtime.publishOnSubject!(
-      makeEnvelope({ classification: "federated" }),
-      "federated.research-collab-2.system.b",
+      makeEnvelope({ classification: "federated", targetPrincipal: "kestrel" }),
+      "federated.kestrel.host.system.b",
     );
     expect(shared.publishes.map((p) => p.subject)).toEqual([
-      "federated.research-collab.system.a",
-      "federated.research-collab-2.system.b",
+      "federated.jcfischer.host.system.a",
+      "federated.kestrel.host.system.b",
     ]);
 
     await runtime.stop();
@@ -503,23 +544,21 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     await runtime.stop();
   });
 
-  // (f) EMIT↔ROUTE ROUND-TRIP (cortex#661 — asymmetry RESOLVED). Pre-#661
-  //     `deriveNatsSubject` emitted `federated.{principal}.{stack}.{type}` —
-  //     segment[1] was the PRINCIPAL, whereas selectLink (per design §3.2)
-  //     keys segment[1] as the network_id, so a real federated publish through
-  //     the derive path was DROPPED at the unknown-network skip. #661 fixes the
-  //     EMIT site: deriveNatsSubject now reads segment[1] from
-  //     extensions.network_id. This test proves the derive path
-  //     (`runtime.publish`, NOT publishOnSubject) for a federated envelope WITH
-  //     a leaf present now routes to that network's leaf — emit, selectLink, and
-  //     the per-leaf subscribe agree on the network segment, end to end.
-  test("(f) EMIT↔ROUTE round-trip (cortex#661): runtime.publish() of a federated envelope routes to its network's leaf via the derive path", async () => {
+  // (f) EMIT↔ROUTE ROUND-TRIP (ADR 0001 — supersedes the cortex#661 asymmetry).
+  //     `deriveNatsSubject` emits `federated.{principal}.{stack}.{type}` from
+  //     `envelope.source` — segment[1] is the TARGET PRINCIPAL. `selectLink`
+  //     resolves that principal to a leaf via `peers[]`. This test proves the
+  //     derive path (`runtime.publish`, NOT publishOnSubject) for a federated
+  //     envelope addressed to a peer principal routes to that peer's leaf —
+  //     emit, selectLink, and the topology map agree on the identity, end to end.
+  test("(f) EMIT↔ROUTE round-trip (ADR 0001): runtime.publish() of a federated envelope routes to the target principal's leaf via the derive path", async () => {
     const reg = makeFakeRegistry();
     const routingErrors: RoutingError[] = [];
     const networks = [
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
     ];
@@ -535,21 +574,21 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     const primary = reg.forUrl(PRIMARY_URL)!;
     const research = reg.forUrl(RESEARCH_URL)!;
 
-    // DERIVE path: extensions.network_id = "research-collab" → derived subject
-    // is `federated.research-collab.default.<type>` (segment[1] = network_id).
+    // DERIVE path: envelope addressed to peer `jcfischer` (source first segment)
+    // → derived subject `federated.jcfischer.default.<type>` (segment[1] = target
+    // principal). selectLink resolves jcfischer → research leaf via peers[].
     await runtime.publish(
       makeEnvelope({
         classification: "federated",
-        id: "seam-661-id",
-        networkId: "research-collab",
+        id: "seam-adr1-id",
+        targetPrincipal: "jcfischer",
       }),
     );
 
-    // selectLink reads segment[1]="research-collab", resolves the leaf, and the
-    // envelope lands on the research leaf ONLY. No routing error, no leak to primary.
+    // No routing error; the envelope lands on the research leaf ONLY (no leak).
     expect(routingErrors).toEqual([]);
     expect(research.publishes.map((p) => p.subject)).toEqual([
-      "federated.research-collab.default.system.adapter.degraded",
+      "federated.jcfischer.default.system.adapter.degraded",
     ]);
     expect(primary.publishes).toEqual([]);
 
@@ -563,11 +602,13 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
       makeNetwork({
         id: "jv",
         leaf_node: "nats-leaf-jv",
+        peers: [makePeer("partner")],
         nats: { url: JV_URL, name: "cortex" },
       }),
     ];
@@ -588,8 +629,8 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
   });
 
   // (+) a leaf that fails to connect at boot does NOT take the runtime down
-  //     (degrade-don't-crash seam — full lifecycle is F-3c). Its network's
-  //     publishes then resolve to the unknown-network skip.
+  //     (degrade-don't-crash seam — full lifecycle is F-3c). Its hosted
+  //     principals' publishes then resolve to the unknown/down skip.
   test("(+) leaf connect failure degrades (runtime stays enabled on primary); that network's publishes skip", async () => {
     const routingErrors: RoutingError[] = [];
     // A registry whose JV url throws on connect, but primary + research succeed.
@@ -608,11 +649,13 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
       makeNetwork({
         id: "research-collab",
         leaf_node: "nats-leaf-research",
+        peers: [makePeer("jcfischer")],
         nats: { url: RESEARCH_URL, name: "cortex" },
       }),
       makeNetwork({
         id: "jv",
         leaf_node: "nats-leaf-jv",
+        peers: [makePeer("partner")],
         nats: { url: JV_URL, name: "cortex" },
       }),
     ];
@@ -625,20 +668,20 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     expect(logs.some((l) => l.kind === "error" && l.msg.includes("nats-leaf-jv"))).toBe(true);
 
     const research = byUrl.get(RESEARCH_URL)!;
-    // research traffic still routes fine.
+    // research-hosted principal still routes fine.
     await runtime.publishOnSubject!(
-      makeEnvelope({ classification: "federated" }),
-      "federated.research-collab.system.a",
+      makeEnvelope({ classification: "federated", targetPrincipal: "jcfischer" }),
+      "federated.jcfischer.host.system.a",
     );
     expect(research.publishes.map((p) => p.subject)).toEqual([
-      "federated.research-collab.system.a",
+      "federated.jcfischer.host.system.a",
     ]);
-    // jv traffic skips (its leaf never made it into the pool).
+    // partner (jv-hosted) traffic skips — its leaf is down (link === null).
     await runtime.publishOnSubject!(
-      makeEnvelope({ classification: "federated" }),
-      "federated.jv.system.b",
+      makeEnvelope({ classification: "federated", targetPrincipal: "partner" }),
+      "federated.partner.host.system.b",
     );
-    expect(routingErrors.map((e) => e.networkId)).toEqual(["jv"]);
+    expect(routingErrors.map((e) => e.networkId)).toEqual(["partner"]);
 
     await runtime.stop();
   });

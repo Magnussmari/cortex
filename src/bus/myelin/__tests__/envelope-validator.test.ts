@@ -828,11 +828,37 @@ describe("deriveNatsSubject (IAW A.3)", () => {
     );
   });
 
-  // cortex#661 — federated subjects are NETWORK-scoped: segment[1] is the
-  // target network_id from extensions.network_id, NOT the source principal.
-  // This aligns the emit site with selectLink + the federation gate + the
-  // per-leaf subscribe, which all key segment[1] as the network id (§3.2).
-  test("federated classification → federated.{network_id}.{type} (from extensions.network_id)", () => {
+  // ADR 0001 (supersedes cortex#661) — federated subjects carry the SAME
+  // identity segments as local.*: segment[1] is the `{principal}` from
+  // `envelope.source`, NOT a target network_id. The network is never on the
+  // wire; it is resolved from the target principal at the routing layer
+  // (`selectLink` → `peers[]`). `CONTEXT.md`: "A network is NOT a subject
+  // segment … never a network name on the wire."
+  test("federated classification → federated.{principal}.{type} (from envelope.source, identical to local)", () => {
+    const env = envWithClassification(
+      "federated",
+      "metafactory.cortex.local",
+      "system.adapter.degraded",
+    );
+    expect(deriveNatsSubject(env)).toBe(
+      "federated.metafactory.system.adapter.degraded",
+    );
+  });
+
+  // ADR 0001 — a federated envelope no longer needs extensions.network_id to
+  // derive a subject: the network is not on the wire. An absent network hint is
+  // NOT an emit error (cortex#661's fail-loud throw is retired).
+  test("federated classification without extensions.network_id → derives a valid subject (no throw)", () => {
+    const env = envWithClassification("federated");
+    expect(deriveNatsSubject(env)).toBe(
+      "federated.metafactory.system.adapter.degraded",
+    );
+  });
+
+  // ADR 0001 — extensions.network_id MAY travel as a routing HINT, but it is
+  // NOT a subject segment: a stale/mismatched hint never leaks into the subject,
+  // which is derived purely from `envelope.source`'s principal segment.
+  test("federated extensions.network_id is ignored for subject derivation (routing hint only)", () => {
     const env = envWithClassification(
       "federated",
       "metafactory.cortex.local",
@@ -840,29 +866,7 @@ describe("deriveNatsSubject (IAW A.3)", () => {
       { network_id: "research-collab" },
     );
     expect(deriveNatsSubject(env)).toBe(
-      "federated.research-collab.system.adapter.degraded",
-    );
-  });
-
-  // cortex#661 — a federated envelope that names no target network is an emit
-  // error: it cannot be routed to any leaf. Fail loudly, NEVER fall back to
-  // the principal segment (the pre-#661 bug that produced un-routable subjects).
-  test("federated classification without extensions.network_id → throws (no silent principal fallback)", () => {
-    const env = envWithClassification("federated");
-    expect(() => deriveNatsSubject(env)).toThrow(
-      /federated envelope.*no extensions\.network_id/i,
-    );
-  });
-
-  test("federated classification with empty extensions.network_id → throws", () => {
-    const env = envWithClassification(
-      "federated",
-      "metafactory.cortex.local",
-      "system.adapter.degraded",
-      { network_id: "" },
-    );
-    expect(() => deriveNatsSubject(env)).toThrow(
-      /no extensions\.network_id/i,
+      "federated.metafactory.system.adapter.degraded",
     );
   });
 
@@ -888,17 +892,16 @@ describe("deriveNatsSubject (IAW A.3)", () => {
     );
   });
 
-  // cortex#661 — segment[1] is the network_id (from extensions.network_id);
-  // the stack segment still lands at segment[2] in the stack-aware form.
-  test("federated + stack → federated.{network_id}.{stack}.{type}", () => {
+  // ADR 0001 — federated stack-aware form is byte-identical to local's:
+  // `federated.{principal}.{stack}.{type}`, principal from envelope.source.
+  test("federated + stack → federated.{principal}.{stack}.{type}", () => {
     const env = envWithClassification(
       "federated",
       "metafactory.cortex.local",
       "system.adapter.degraded",
-      { network_id: "research-collab" },
     );
     expect(deriveNatsSubject(env, "security")).toBe(
-      "federated.research-collab.security.system.adapter.degraded",
+      "federated.metafactory.security.system.adapter.degraded",
     );
   });
 

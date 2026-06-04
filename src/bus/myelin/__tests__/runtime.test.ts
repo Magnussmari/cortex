@@ -440,17 +440,19 @@ describe("MyelinRuntime", () => {
       await runtime.stop();
     });
 
-    test("enabled runtime: publish derives federated.{network_id}.{type} subject", async () => {
+    test("enabled runtime: publish derives federated.{principal}.{type} subject", async () => {
       // IAW Phase A.3 — federation unblock. When an emit site opts into
       // `classification: "federated"`, the envelope's sovereignty AND the
       // runtime-derived subject move in lockstep onto the `federated.*`
       // namespace. This is what makes cortex able to emit federated
       // envelopes for the first time.
       //
-      // cortex#661 — segment[1] of a federated subject is the TARGET
-      // network_id (from extensions.network_id), NOT the source principal.
-      // This aligns the emit site with selectLink + the federation gate +
-      // the per-leaf subscribe (design §3.2).
+      // ADR 0001 (supersedes cortex#661) — segment[1] of a federated subject is
+      // the `{principal}` from `envelope.source` (the SAME identity grammar as
+      // local.*), NOT a target network_id. The network is never on the wire; it
+      // is resolved from the target principal at the routing layer (selectLink →
+      // peers[]). `extensions.network_id` MAY travel as a routing HINT but does
+      // not affect the derived subject.
       const fake = makeFakeNatsConnection();
       const runtime = await startMyelinRuntime(
         makeConfig({
@@ -464,12 +466,13 @@ describe("MyelinRuntime", () => {
       const env = {
         ...baseEnv,
         sovereignty: { ...baseEnv.sovereignty, classification: "federated" as const },
+        // network_id hint present but IGNORED for subject derivation.
         extensions: { network_id: "research-collab" },
       };
       await runtime.publish(env);
       expect(fake.publish).toHaveBeenCalledTimes(1);
       expect(fake.publishes[0]?.subject).toBe(
-        "federated.research-collab.system.adapter.degraded",
+        "federated.metafactory.system.adapter.degraded",
       );
       await runtime.stop();
     });
