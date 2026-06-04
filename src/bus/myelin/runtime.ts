@@ -18,6 +18,13 @@ import type { AgentConfig } from "../../common/types/config";
 import type { PolicyFederatedNetwork } from "../../common/types/cortex-config";
 import { NatsLink } from "../nats/connection";
 import {
+  buildNatsTlsOptions,
+  warnFederatedCleartext,
+  type MtlsMode,
+  type MtlsPaths,
+  type FederatedCleartextWarning,
+} from "../../common/config/transport-mtls";
+import {
   MyelinSubscriber,
   type EnvelopeErrorHandler,
   type EnvelopeHandler as SubscriberEnvelopeHandler,
@@ -444,6 +451,36 @@ export interface MyelinRuntimeOptions {
     setTimer: (cb: () => void, ms: number) => ReconnectTimerHandle;
     clearTimer: (handle: ReconnectTimerHandle) => void;
   };
+  /**
+   * TC-4d/4e (#627 Phase 4) — transport-mTLS posture for the LinkPool. The
+   * runtime builds a `tls` block (via `buildNatsTlsOptions`) for the PRIMARY
+   * link AND each federated leaf link, gated by `mode`:
+   *
+   *   - `off` (default / omitted) — no `tls` on any link; plaintext,
+   *     byte-identical to the pre-TC-4d single-link AND F-3 multi-link paths.
+   *   - `on` — offer a client cert when the cert/key/ca paths load; degrade
+   *     to plaintext (loud warning) when they don't.
+   *   - `require` — every link MUST present a client cert; a missing/invalid
+   *     cert FAILS CLOSED (the connect throws — primary failure disables the
+   *     runtime, a leaf failure leaves that network dark per the F-3c contract).
+   *
+   * Cross-principal federated leaves especially want mTLS, so the same posture
+   * applies to leaf links — and a federated leaf that connects WITHOUT TLS
+   * triggers the {@link warnFederatedCleartext} advisory regardless of mode.
+   *
+   * **Back-compat:** when omitted (or `mode: "off"`), no tls machinery
+   * engages — the pool is byte-identical to today.
+   */
+  transportMtls?: {
+    mode: MtlsMode;
+    paths?: MtlsPaths;
+    /**
+     * Optional structured sink for the federated-leaf-cleartext warning. The
+     * runtime has no `SystemEventSource`; a caller that does can pass a sink
+     * here to promote the stderr advisory to a `system.error` audit envelope.
+     */
+    onFederatedCleartext?: (info: FederatedCleartextWarning) => void;
+  };
 }
 
 /**
@@ -706,6 +743,15 @@ export async function startMyelinRuntime(
   // reference avoid a forbidden non-null assertion on the now-nullable
   // `PoolLink.link`. Primary is the ONE link guaranteed live past this block.
   let primaryLink: NatsLink;
+  // TC-4d (#627 Phase 4) — transport-mTLS posture for the whole pool. `off`
+  // (default / omitted) builds no tls block on any link ⇒ plaintext,
+  // byte-identical to today. `require` fails closed at connect (a missing/
+  // invalid cert throws below, which for the primary disables the runtime).
+  const mtlsMode: MtlsMode = options?.transportMtls?.mode ?? "off";
+  const mtlsPaths: MtlsPaths | undefined = options?.transportMtls?.paths;
+  const primaryTls = buildNatsTlsOptions(mtlsMode, mtlsPaths, {
+    site: "primary link",
+  });
   try {
     primaryLink = await NatsLink.connect({
       url: nats.url,
@@ -715,6 +761,8 @@ export async function startMyelinRuntime(
       // credsPath wins with a warn log.
       ...(nats.credsPath ? { credsPath: nats.credsPath } : {}),
       name: nats.name,
+      // TC-4d: transport mTLS (undefined ⇒ plaintext, unchanged).
+      ...(primaryTls !== undefined ? { tls: primaryTls } : {}),
       ...(options?.connectImpl ? { connectImpl: options.connectImpl } : {}),
     });
     primary = {
@@ -883,12 +931,36 @@ export async function startMyelinRuntime(
     if (network.nats === undefined) continue; // rides primary — resolved in PASS 2.
     const leafId = network.leaf_node;
     if (pool.has(leafId)) continue; // already built by an earlier sharing network.
+    // TC-4d (#627 Phase 4) — same transport-mTLS posture as the primary,
+    // applied per-leaf. Cross-principal federated leaves especially want
+    // mTLS; under `require` a leaf with a missing/invalid cert throws below
+    // and that network goes dark (F-3c degrade-don't-crash), while primary is
+    // unaffected. `off` ⇒ no tls block ⇒ plaintext, byte-identical to today.
+    const leafTls = buildNatsTlsOptions(mtlsMode, mtlsPaths, {
+      site: `leaf "${leafId}"`,
+    });
+    // TC-4e — a FEDERATED leaf that ends up WITHOUT TLS is a cross-principal
+    // cleartext-confidentiality risk. Warn loudly (advisory, regardless of
+    // posture) when neither a tls block was built NOR the URL is `tls://`.
+    const leafProtected = leafTls !== undefined || network.nats.url.startsWith("tls://");
+    if (!leafProtected) {
+      warnFederatedCleartext(
+        {
+          leafId,
+          networkId: network.id,
+          safeUrl: safeUrlOf(network.nats.url),
+        },
+        options?.transportMtls?.onFederatedCleartext,
+      );
+    }
     // The connect options retained on the PoolLink so the F-3c background-
     // reconnect scheduler can re-attempt with the SAME parameters.
     const leafConnectOpts: Parameters<typeof NatsLink.connect>[0] = {
       url: network.nats.url,
       ...(network.nats.credsPath ? { credsPath: network.nats.credsPath } : {}),
       name: network.nats.name,
+      // TC-4d: transport mTLS for this leaf (undefined ⇒ plaintext).
+      ...(leafTls !== undefined ? { tls: leafTls } : {}),
       ...(options?.connectImpl ? { connectImpl: options.connectImpl } : {}),
     };
     try {

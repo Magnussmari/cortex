@@ -60,6 +60,8 @@ function emptyDefault<T>(): T {
 //   advertises an enc_pub (both accepted) · require = reject cleartext.
 // - `encryption.at_rest`: off | on (field-encrypt high-sensitivity columns).
 // - `transport.mtls`: off | on (offer client cert) | require (refuse non-mTLS).
+//   `transport.tls.{cert_path,key_path,ca_path}` (TC-4d/4e) carry the client
+//   cert material consumed when `mtls` is on/require. Key file chmod-600 gated.
 //
 // The `emptyDefault()` + transform idiom mirrors the `cockpit` block below:
 // `.default(emptyDefault())` returns `{}` without re-parsing inner defaults,
@@ -73,6 +75,19 @@ export const SecurityPostureSchema = z.object({
   }).default(emptyDefault()),
   transport: z.object({
     mtls: z.enum(["off", "on", "require"]).default("off"),
+    // TC-4d/4e (#627 Phase 4) — client cert/key/ca paths for transport mTLS.
+    // CONSUMED only when `mtls` is `on`/`require` (the `buildNatsTlsOptions`
+    // builder in `src/common/config/transport-mtls.ts` reads them). The
+    // private `key_path` is chmod-600 gated at load (same policy as the
+    // nkey-seed / `.creds` loaders); cert + ca are public material. All three
+    // are optional so a partial config fails per-mode at connect time (a clear
+    // fail-closed error under `require`) rather than being rejected at schema
+    // parse — and so the back-compat `off` path never requires these fields.
+    tls: z.object({
+      cert_path: z.string().optional(),
+      key_path: z.string().optional(),
+      ca_path: z.string().optional(),
+    }).optional(),
   }).default(emptyDefault()),
 }).default(emptyDefault()).transform((val) => ({
   /* eslint-disable @typescript-eslint/no-unnecessary-condition */
@@ -83,6 +98,7 @@ export const SecurityPostureSchema = z.object({
   },
   transport: {
     mtls: val.transport?.mtls ?? "off",
+    ...(val.transport?.tls !== undefined ? { tls: val.transport.tls } : {}),
   },
   /* eslint-enable @typescript-eslint/no-unnecessary-condition */
 }));

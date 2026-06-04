@@ -16,6 +16,11 @@ import { RawEventSchema } from "./hooks/lib/event-types";
 import { resolvePrincipalEnv } from "./hooks/lib/principal-env";
 import { NatsLink } from "../../bus/nats/connection";
 import { createCcEventPublisher } from "./cc-events";
+import {
+  buildNatsTlsOptions,
+  type MtlsMode,
+  type MtlsPaths,
+} from "../../common/config/transport-mtls";
 
 // Per-command Commander option shapes. Pin the permissive `opts: any`
 // default to the actual flag set so `opts.policy` etc. narrow.
@@ -27,6 +32,11 @@ interface StartOptions {
   org?: string;
   stack?: string;
   originatorPrincipal?: string;
+  // TC-4d (#627 Phase 4) — transport mTLS for the relay's own NatsLink.
+  mtls?: string;
+  tlsCert?: string;
+  tlsKey?: string;
+  tlsCa?: string;
 }
 interface TestOptions {
   policy: string;
@@ -173,6 +183,22 @@ program
     "--originator-principal <did>",
     "cortex#346 / myelin#161 — DID (did:mf:<name>) stamped onto envelope.originator for every relay-lifted CC event. Attribution mode is fixed at 'adapter-resolved' (the relay maps the running CC session to the stack's myelin principal). Falls back to env var CORTEX_ORIGINATOR_PRINCIPAL. Omit to publish without an originator block (pre-#346 behaviour; receivers fall back to signed_by[0].principal).",
   )
+  .option(
+    "--mtls <mode>",
+    "TC-4d (#627 Phase 4) — transport mTLS mode for the relay's NATS connection: off (default, plaintext) | on (offer client cert, degrade to plaintext if absent) | require (refuse non-mTLS, fail closed). Falls back to env var CORTEX_TRANSPORT_MTLS.",
+  )
+  .option(
+    "--tls-cert <path>",
+    "TC-4d — path to the PEM client certificate the relay presents. Falls back to env var CORTEX_TLS_CERT_PATH.",
+  )
+  .option(
+    "--tls-key <path>",
+    "TC-4d — path to the PEM private key for --tls-cert (chmod 600 enforced). Falls back to env var CORTEX_TLS_KEY_PATH.",
+  )
+  .option(
+    "--tls-ca <path>",
+    "TC-4d — path to the PEM CA bundle used to verify the NATS server cert (omit to use the system trust store). Falls back to env var CORTEX_TLS_CA_PATH.",
+  )
   .action(async (options: StartOptions) => {
     if (!existsSync(options.policy)) {
       console.error(`Policy file not found: ${options.policy}`);
@@ -237,12 +263,40 @@ program
     let natsLink: NatsLink | undefined;
     let onPublished: ((e: import("./hooks/lib/event-types").PublishedEvent) => void) | undefined;
 
+    // TC-4d (#627 Phase 4) — transport-mTLS for the relay's own NatsLink
+    // (token-only pre-TC-4d). Mode + cert/key/ca resolve from flags then env;
+    // `off` (default) builds no tls block ⇒ plaintext, byte-identical to today.
+    // Under `require`, a missing/invalid cert throws from `buildNatsTlsOptions`
+    // and is caught by the existing connect try/catch — the relay then
+    // continues JSONL-only (it must never crash its archival job), but it does
+    // NOT publish over a plaintext bus, so the fail-closed guarantee holds.
+    const mtlsModeRaw = options.mtls ?? process.env.CORTEX_TRANSPORT_MTLS ?? "off";
+    if (mtlsModeRaw !== "off" && mtlsModeRaw !== "on" && mtlsModeRaw !== "require") {
+      console.error(
+        `cortex-relay: invalid --mtls / CORTEX_TRANSPORT_MTLS value ${JSON.stringify(mtlsModeRaw)} — must be off | on | require`,
+      );
+      process.exit(1);
+    }
+    const mtlsMode: MtlsMode = mtlsModeRaw;
+    // `MtlsPaths` fields are all optional; `buildNatsTlsOptions` reads them via
+    // `paths?.cert_path`, so an absent flag/env resolving to `undefined` is
+    // equivalent to omitting the key. No conditional spread needed.
+    const tlsPaths: MtlsPaths = {
+      cert_path: options.tlsCert ?? process.env.CORTEX_TLS_CERT_PATH,
+      key_path: options.tlsKey ?? process.env.CORTEX_TLS_KEY_PATH,
+      ca_path: options.tlsCa ?? process.env.CORTEX_TLS_CA_PATH,
+    };
+
     if (natsUrl) {
       try {
+        const relayTls = buildNatsTlsOptions(mtlsMode, tlsPaths, {
+          site: "cortex-relay",
+        });
         natsLink = await NatsLink.connect({
           url: natsUrl,
           token: natsToken,
           name: "cortex-relay",
+          ...(relayTls !== undefined ? { tls: relayTls } : {}),
         });
         onPublished = createCcEventPublisher({
           link: natsLink,

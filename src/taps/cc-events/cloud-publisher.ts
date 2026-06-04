@@ -25,6 +25,20 @@
 import type { PublishedEvent } from "./hooks/lib/event-types";
 import type { NetworkResolver } from "../../common/types/config";
 import { fetchWithTimeout } from "../../common/timeout";
+import type { HttpsMtlsMaterial } from "../../common/config/transport-mtls";
+
+/**
+ * TC-4e (#627 Phase 4) — Bun's `fetch` accepts a `tls` field on the request
+ * init for client-cert (mutual) TLS; the WHATWG `RequestInit` type does not
+ * declare it. This narrow extension types the `tls` we attach WITHOUT widening
+ * to `any` and without a Bun-types dependency. We only ever set `cert`/`key`/
+ * `ca` (contents) — NEVER `rejectUnauthorized` or any skip-verify field
+ * (CLAUDE.md hard line). On a runtime that ignores `tls` on fetch the leg
+ * stays server-auth HTTPS (no downgrade of verification, just no client cert).
+ */
+type MtlsRequestInit = RequestInit & {
+  tls?: { cert: string; key: string; ca?: string };
+};
 
 export interface CloudPublisherConfig {
   /** Function to resolve network config by network_id. Returns null for unknown networks. */
@@ -33,6 +47,16 @@ export interface CloudPublisherConfig {
   batchSizeLimit?: number;   // default 50
   maxRetries?: number;       // default 3
   retryBaseMs?: number;      // default 1000 (backoff = 2^attempt * retryBaseMs)
+  /**
+   * TC-4e (#627 Phase 4) — optional client-cert material for the
+   * publisher→Worker HTTPS leg (built by `buildHttpsMtlsMaterial` from the
+   * `security.transport.mtls` posture). When present, every `/api/ingest` POST
+   * (and the startup health probe) presents this client certificate. When
+   * `undefined` (default / posture `off`), the leg is ordinary server-auth
+   * HTTPS — byte-identical to pre-TC-4e. Loaded once at boot; contents are
+   * never logged.
+   */
+  mtls?: HttpsMtlsMaterial;
 }
 
 export class CloudPublisher {
@@ -41,6 +65,8 @@ export class CloudPublisher {
   private readonly batchSizeLimit: number;
   private readonly maxRetries: number;
   private readonly retryBaseMs: number;
+  /** TC-4e — client-cert material for the →Worker HTTPS leg, or undefined. */
+  private readonly mtls?: HttpsMtlsMaterial;
 
   private static readonly MAX_BUFFER_SIZE = 500;
   private buffer: PublishedEvent[] = [];
@@ -53,6 +79,7 @@ export class CloudPublisher {
     this.batchSizeLimit = config.batchSizeLimit ?? 50;
     this.maxRetries = config.maxRetries ?? 3;
     this.retryBaseMs = config.retryBaseMs ?? 1000;
+    this.mtls = config.mtls;
 
     this.interval = setInterval(() => {
       void this.flushInternal();
@@ -102,7 +129,11 @@ export class CloudPublisher {
    * Detects stale endpoints (redirects from zombie CF Access apps), timeouts, and DNS failures.
    * Non-blocking — logs warnings but does not prevent startup.
    */
-  static async checkEndpoints(resolver: NetworkResolver, networkIds: string[]): Promise<void> {
+  static async checkEndpoints(
+    resolver: NetworkResolver,
+    networkIds: string[],
+    mtls?: HttpsMtlsMaterial,
+  ): Promise<void> {
     for (const networkId of networkIds) {
       const config = resolver(networkId);
       if (!config) continue;
@@ -114,11 +145,15 @@ export class CloudPublisher {
           headers["CF-Access-Client-Id"] = config.cfAccessClientId;
           headers["CF-Access-Client-Secret"] = config.cfAccessClientSecret;
         }
-        const res = await fetchWithTimeout("cloud_publisher", 5_000, url, {
+        // TC-4e — present the client cert on the health probe too, so a
+        // require-mode misconfig surfaces at startup, not first publish.
+        const init: MtlsRequestInit = {
           method: "GET",
           headers,
           redirect: "manual",
-        });
+          ...(mtls !== undefined ? { tls: mtls } : {}),
+        };
+        const res = await fetchWithTimeout("cloud_publisher", 5_000, url, init);
 
         if (res.status >= 300 && res.status < 400) {
           const location = res.headers.get("location") ?? "(unknown)";
@@ -215,7 +250,16 @@ export class CloudPublisher {
           headers["CF-Access-Client-Id"] = networkConfig.cfAccessClientId;
           headers["CF-Access-Client-Secret"] = networkConfig.cfAccessClientSecret;
         }
-        const res = await fetch(url, { method: "POST", headers, body, redirect: "manual" });
+        // TC-4e — attach the client cert when mTLS material is configured;
+        // omitted ⇒ ordinary server-auth HTTPS, byte-identical to pre-TC-4e.
+        const init: MtlsRequestInit = {
+          method: "POST",
+          headers,
+          body,
+          redirect: "manual",
+          ...(this.mtls !== undefined ? { tls: this.mtls } : {}),
+        };
+        const res = await fetch(url, init);
 
         if (res.ok) {
           return; // Success
