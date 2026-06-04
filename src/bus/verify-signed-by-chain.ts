@@ -46,6 +46,7 @@
 import {
   verifyEnvelopeIdentity,
   createInMemoryRegistry,
+  type Identity,
   type IdentityRegistry,
 } from "@the-metafactory/myelin/identity";
 import { Prefix } from "@nats-io/nkeys";
@@ -60,6 +61,7 @@ import { Codec } from "@nats-io/nkeys/lib/codec";
 
 import {
   getSignedByChain,
+  principalFromEnvelope,
   type Envelope,
   type SignedBy,
 } from "./myelin/envelope-validator";
@@ -102,6 +104,26 @@ export type ChainRejectionReason =
   | { kind: "unknown_agent"; principal: string; agentId: string }
   | { kind: "principal_has_no_nkey_pub"; principal: string; agentId: string }
   | { kind: "signer_not_trusted"; principal: string; agentId: string }
+  | {
+      /**
+       * TC-2d (cortex#635) — a `federated.*` envelope's signer **peer
+       * principal** could not be resolved to a verified pubkey. The
+       * peer-resolution seam (`resolveFederatedPeer`, backed by the
+       * TC-2b `MultiPrincipalIdentityRegistry` + TC-2a resolver) returned
+       * a negative: the registry returned 404 for the peer, OR the
+       * registry-signed assertion failed to verify / was transiently
+       * unreachable. The inbound envelope is rejected — an unverifiable
+       * peer principal is admitted by NO posture.
+       *
+       * `peerPrincipal` is the signer peer's principal id (the leading
+       * dotted segment of `envelope.source`); `detail` carries the
+       * resolver's negative reason verbatim (`not_found` / `unresolved`)
+       * for audit + grep.
+       */
+      kind: "federated_peer_unresolved";
+      peerPrincipal: string;
+      detail: string;
+    }
   | {
       /**
        * Cryptographic verification failed — the bytes don't match the
@@ -227,7 +249,54 @@ export interface VerifySignedByChainOptions {
    * uses `stackIdentity` alone (the short-circuit is the whole point).
    */
   stackNKeyPub?: string;
+  /**
+   * TC-2d (cortex#635) — federation peer-pubkey resolution seam.
+   *
+   * The CAPSTONE of the cross-principal trust chain. When supplied AND
+   * `cryptoVerify: true` AND the inbound envelope is `federated.*`
+   * (`sovereignty.classification === "federated"`), the helper resolves
+   * the **signer peer principal** (the leading dotted segment of
+   * `envelope.source`) to its verified Ed25519 `Identity` BEFORE the
+   * crypto-verify pass, then merges that peer identity into the
+   * myelin `IdentityRegistry` the verify runs against. The signature is
+   * then checked against the **registry-resolved peer pubkey** rather
+   * than only the local boot/stack identity — admitting a principal-B-
+   * signed envelope on principal-A's node iff B's pubkey resolves and
+   * the bytes verify.
+   *
+   * **Posture gate lives at the construction site, NOT here (#635).**
+   * This seam is wired in `src/cortex.ts` ONLY when
+   * `security.signing === "enforce"`; under `off`/`permissive` the field
+   * is `undefined` and federated verify NEVER reaches a resolver — ZERO
+   * registry I/O. (Deriving the gate from `cryptoVerify`, which is `true`
+   * for ALL postures as cheap observability, would make dev stacks reach
+   * out to the registry — the regression the #635 wiring note forbids.)
+   * The helper itself reads no posture; it engages the seam purely on
+   * "federated + cryptoVerify + seam present".
+   *
+   * The seam is async and MUST NEVER throw — a federation/registry
+   * problem must not crash the verify path. It returns a discriminated
+   * outcome: `resolved` carries the peer's myelin `Identity` to merge;
+   * any negative carries a `reason` the helper surfaces as
+   * `federated_peer_unresolved` (the inbound envelope is rejected).
+   * A `local.*` / `public.*` envelope NEVER engages this seam — those
+   * verify against the boot/local identity exactly as today.
+   */
+  resolveFederatedPeer?: (
+    peerPrincipal: string,
+  ) => Promise<FederatedPeerResolution>;
 }
+
+/**
+ * TC-2d (cortex#635) — outcome of the {@link
+ * VerifySignedByChainOptions.resolveFederatedPeer} seam. Discriminated so
+ * the verifier branches cleanly: `resolved` merges `identity` into the
+ * verify registry; every negative rejects the inbound envelope as
+ * `federated_peer_unresolved` with `reason` carried verbatim for audit.
+ */
+export type FederatedPeerResolution =
+  | { resolved: true; identity: Identity }
+  | { resolved: false; reason: string };
 
 // =============================================================================
 // Verification
@@ -270,10 +339,74 @@ export async function verifySignedByChain(
     return { valid: true, skipped: [] };
   }
 
+  // TC-2d (cortex#635) — resolve the federated SIGNER PEER up-front. The
+  // CAPSTONE of the cross-principal trust chain. Engaged ONLY for an inbound
+  // `federated.*` envelope AND only when the resolution seam was wired
+  // (which `cortex.ts` does ONLY under `signing === "enforce"` — the
+  // load-bearing #635 gate; under off/permissive the seam is `undefined` so
+  // this never runs and there is ZERO registry I/O). A `local.*`/`public.*`
+  // envelope skips this entirely and verifies against the boot/local
+  // registry exactly as today — the single-principal path is untouched.
+  //
+  // The signer peer principal is the SOURCE principal: the leading dotted
+  // segment of `envelope.source` (`principalFromEnvelope`). NOTE this is NOT
+  // the `federated.{network_id}` subject segment — that names the TARGET
+  // network (cortex#661); the peer we resolve is the principal that SIGNED
+  // the envelope (its source). The peer's federation identity is keyed
+  // `did:mf:<peerPrincipal>`.
+  //
+  // A federated peer is, by construction, NOT a local agent and NOT in the
+  // receiver's `trust:` list — its trust is anchored in the registry-signed
+  // resolve, not the local trust graph. So a resolved peer's stamp DID
+  // short-circuits the STRUCTURAL trust check (mirroring the cortex#480
+  // own-stack short-circuit) and is admitted on the strength of the
+  // registry resolution + the crypto bytes-check below — NOT the bytes
+  // check alone. A negative resolve rejects the envelope before any stamp
+  // is structurally walked.
+  //
+  // **Gated on `cryptoVerify === true` (self-review S-1, fail-closed).** The
+  // structural short-circuit is only SAFE because the crypto pass below
+  // verifies the peer's stamp bytes against the resolved pubkey. If
+  // `cryptoVerify` is off, NO bytes-check runs — admitting a federated peer
+  // structurally would accept a forged stamp on the strength of an
+  // unauthenticated `source` segment alone. So the short-circuit engages
+  // ONLY when crypto will actually run; otherwise the peer stamp falls
+  // through to the normal structural walk (and fails closed as
+  // `unknown_agent`, the safe direction). In production `cortex.ts` always
+  // pairs the seam with `cryptoVerify: true` (`enforce` → `cryptoVerify:
+  // true`), so this only matters defensively / for non-enforce callers.
+  let federatedPeerDid: string | undefined;
+  let federatedPeerIdentity: Identity | undefined;
+  if (
+    opts.resolveFederatedPeer !== undefined &&
+    opts.cryptoVerify === true &&
+    envelope.sovereignty.classification === "federated"
+  ) {
+    const peerPrincipal = principalFromEnvelope(envelope);
+    const peerOutcome = await opts.resolveFederatedPeer(peerPrincipal);
+    if (!peerOutcome.resolved) {
+      // Peer unverifiable (404 / transient / signature failure / disabled).
+      // Reject the inbound envelope — an unresolved peer principal is
+      // admitted by NO posture. The seam already logged the detailed cause.
+      return {
+        valid: false,
+        rejectedAt: 0,
+        reason: {
+          kind: "federated_peer_unresolved",
+          peerPrincipal,
+          detail: peerOutcome.reason,
+        },
+        skipped: [],
+      };
+    }
+    federatedPeerDid = peerOutcome.identity.id;
+    federatedPeerIdentity = peerOutcome.identity;
+  }
+
   const skipped: number[] = [];
 
   for (const [i, stamp] of chain.entries()) {
-    const stampResult = verifyOneStamp(stamp, opts);
+    const stampResult = verifyOneStamp(stamp, opts, federatedPeerDid);
     if (stampResult.kind === "skip") {
       skipped.push(i);
       continue;
@@ -313,6 +446,18 @@ export async function verifySignedByChain(
         ? { identity: opts.stackIdentity, nkeyPub: opts.stackNKeyPub }
         : undefined,
     );
+
+    // TC-2d (cortex#635) — merge the registry-resolved federated peer
+    // identity (resolved up-front, before the structural walk) so the
+    // crypto-verify pass below finds a registered Principal to verify the
+    // peer's stamp against. myelin `add()` is last-write-wins on the DID
+    // key; the boot anchor's DID is structurally distinct from a peer's
+    // (guarded in the TC-2b `MultiPrincipalIdentityRegistry`), so this
+    // never displaces it. Undefined for local.*/public.* and for
+    // off/permissive (no seam) — the single-principal registry is untouched.
+    if (federatedPeerIdentity !== undefined) {
+      registry.add(federatedPeerIdentity);
+    }
     // Myelin's verifier expects `signed_by` normalised to array form;
     // cortex's `Envelope` keeps the back-compat shim of single-stamp
     // OR array. Normalise here before handing off.
@@ -370,10 +515,22 @@ type StampOutcome =
  * Classify a single stamp. Hub-stamps are skipped at this slice — Phase D
  * extends with hub-trust verification. Bare ed25519 stamps run the
  * structural trust check.
+ *
+ * `federatedPeerDid` (TC-2d / cortex#635) — when set, a stamp whose
+ * `identity` matches it short-circuits the structural agent-registry /
+ * trust-list lookup. A federated signer peer is, by construction, NOT a
+ * local agent and NOT in the receiver's `trust:` list — its trust is
+ * anchored in the registry-signed resolve (already performed up-front),
+ * not the local trust graph. This mirrors the cortex#480 own-stack
+ * short-circuit; the crypto-verify pass still runs against the resolved
+ * peer pubkey (merged into the registry), so this short-circuits the
+ * *trust* check, NOT the *bytes* check — a forged peer signature still
+ * fails.
  */
 function verifyOneStamp(
   stamp: SignedBy,
   opts: VerifySignedByChainOptions,
+  federatedPeerDid: string | undefined,
 ): StampOutcome {
   if (stamp.method === "hub-stamp") {
     return { kind: "skip" };
@@ -410,6 +567,14 @@ function verifyOneStamp(
   // pass below still runs against `stackNKeyPub` — short-circuit the
   // *trust* check, not the *bytes* check.
   if (opts.stackIdentity !== undefined && principal === opts.stackIdentity) {
+    return { kind: "accept" };
+  }
+
+  // TC-2d (cortex#635) — federated signer-peer short-circuit. The stamp's
+  // identity matches the registry-resolved federated peer DID; admit it
+  // structurally (registry-anchored trust) and let the crypto pass verify
+  // the bytes against the resolved peer pubkey. See function docblock.
+  if (federatedPeerDid !== undefined && principal === federatedPeerDid) {
     return { kind: "accept" };
   }
 
@@ -554,7 +719,7 @@ export function buildIdentityRegistry(
  * want. The `Codec` subpath import is the narrow way to the decoded
  * payload without re-implementing crockford base32 + CRC16 inline.
  */
-function nkeyToBase64Pubkey(nkey: string): string | undefined {
+export function nkeyToBase64Pubkey(nkey: string): string | undefined {
   try {
     const asciiBytes = new TextEncoder().encode(nkey);
     const raw = Codec.decode(Prefix.User, asciiBytes);

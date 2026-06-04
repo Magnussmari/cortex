@@ -111,6 +111,7 @@ import {
   type ResponseRouting,
 } from "../bus/dispatch-events";
 import type { TrustResolver } from "../common/agents/trust-resolver";
+import type { FederatedPeerResolution } from "../common/registry";
 import {
   verifySignedByChain,
   type ChainRejectionReason,
@@ -414,6 +415,19 @@ export interface DispatchListenerOptions {
    */
   resignSigner?: BusEnvelopeSigner;
   /**
+   * TC-2d (cortex#635) — federated.* peer-pubkey resolution seam. When
+   * supplied AND `cryptoVerify: true`, an inbound `federated.*` dispatch
+   * has its **signer peer principal** resolved to a verified Ed25519
+   * identity before the crypto-verify pass (the cross-principal trust
+   * chain capstone). `cortex.ts` wires this ONLY under
+   * `signing === "enforce"`; `off`/`permissive` leave it `undefined`
+   * (ZERO registry I/O — federated envelopes verify local-only, as today).
+   * Inert for `local.*` dispatches. See `verify-signed-by-chain.ts` JSDoc.
+   */
+  resolveFederatedPeer?: (
+    peerPrincipal: string,
+  ) => Promise<FederatedPeerResolution>;
+  /**
    * cortex#492 — dispatch-stage tracing toggle. When `true`, the
    * inbound path emits a `system.dispatch.stage` envelope (via
    * `runtime.publish`) AND a structured stderr line at each pipeline
@@ -682,6 +696,7 @@ export function createDispatchListener(
     stackIdentity,
     stackNKeyPub,
     resignSigner,
+    resolveFederatedPeer,
     adapterId = "runner-dispatch-listener",
   } = opts;
   // v2.0.2 default: structural trust + ed25519 crypto verification.
@@ -758,6 +773,7 @@ export function createDispatchListener(
         stackIdentity,
         stackNKeyPub,
         resignSigner,
+        resolveFederatedPeer,
         traceDispatch,
       });
     } catch (err) {
@@ -1088,6 +1104,13 @@ interface DispatchHandlerContext {
    */
   resignSigner: BusEnvelopeSigner | undefined;
   /**
+   * TC-2d (cortex#635) — federated.* peer-pubkey resolution seam.
+   * Inert for `local.*`; `undefined` unless `signing === "enforce"`.
+   */
+  resolveFederatedPeer:
+    | ((peerPrincipal: string) => Promise<FederatedPeerResolution>)
+    | undefined;
+  /**
    * cortex#492 — when `true`, emit a `system.dispatch.stage` trace at
    * each gate inside the handler. Resolved by `createDispatchListener`
    * from the explicit option or `CORTEX_TRACE_DISPATCH`; the handler
@@ -1116,6 +1139,7 @@ async function handleDispatchEnvelope(
     stackIdentity,
     stackNKeyPub,
     resignSigner,
+    resolveFederatedPeer,
     traceDispatch,
   } = ctx;
   // cortex#492 — pre-parse trace context. Refined to the trusted payload
@@ -1269,6 +1293,9 @@ async function handleDispatchEnvelope(
         // entry for self-signed adapter-originated dispatches.
         ...(stackIdentity !== undefined && { stackIdentity }),
         ...(stackNKeyPub !== undefined && { stackNKeyPub }),
+        // TC-2d (cortex#635) — federated.* peer-pubkey resolution seam.
+        // Inert for local.* dispatches; `undefined` under off/permissive.
+        ...(resolveFederatedPeer !== undefined && { resolveFederatedPeer }),
       });
     } catch (err) {
       // `verifySignedByChain` throws when `cryptoVerify: true` and

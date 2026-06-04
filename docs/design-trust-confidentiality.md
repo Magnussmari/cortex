@@ -144,9 +144,19 @@ gateway round-trip with zero crypto, then enable signing-permissive without touc
   construct a multi-principal registry for inbound `federated.*`.
 - **2c. Relax the single-principal guard** (the boot guard added in GW.a.3d) once 2a/2b make
   cross-principal envelopes verifiable; multi-principal subject derivation in the gateway sink.
-- **2d. `federated.*` verify wiring** in the surface-router/policy path (the gate exists; add the
-  crypto verify against registry-resolved peer pubkeys). **Acceptance:** principal A's node verifies a
-  principal-B-signed envelope end-to-end; forged peer signature rejected.
+- **2d. `federated.*` verify wiring (TC-2d, #635 — DONE).** Wired the federation crypto-verify into
+  `verifySignedByChain` (`src/bus/verify-signed-by-chain.ts`): for an inbound `federated.*` envelope
+  under `signing: enforce`, the **signer peer principal** (the leading segment of `envelope.source`,
+  NOT the `federated.{network_id}` target segment) is resolved via the TC-2a/TC-2b
+  `MultiPrincipalIdentityRegistry.resolveFederatedPeer` seam, its registry-verified pubkey merged into
+  the myelin `IdentityRegistry`, and the peer stamp's bytes verified against it (with a structural
+  short-circuit mirroring the cortex#480 own-stack admit — registry-anchored trust, not local
+  `trust:`). A negative resolve rejects the envelope (`federated_peer_unresolved`). **Load-bearing
+  gate (#635):** the resolver `enabled` flag is driven by `signing === "enforce"`, NOT `cryptoVerify`
+  (which is `true` for all postures); `cortex.ts` wires the seam ONLY under `enforce`, so off/permissive
+  stacks do ZERO registry I/O (pinned by a fetch-spy test). `local.*`/`public.*` envelopes are
+  unchanged — single-principal path untouched. **Acceptance:** principal A's node verifies a
+  principal-B-signed envelope end-to-end; forged peer signature rejected; peer-not-in-registry rejected.
 
 ### Phase 3 — Payload encryption (E2E on bus) · implements ratified #369
 
