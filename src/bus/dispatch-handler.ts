@@ -450,6 +450,8 @@ export class DispatchHandler extends EventEmitter {
     resumeSessionId: string | undefined;
     allowedDirs: string[];
     disallowedTools: string[];
+    /** cortex#710 — per-skill grant list (see InboundChatDispatchPublishOpts). */
+    allowedSkills: string[] | undefined;
     timeoutMs: number | undefined;
     cwd: string | undefined;
     additionalArgs: string[] | undefined;
@@ -721,8 +723,23 @@ export class DispatchHandler extends EventEmitter {
       const effectiveDisallowed = access.toolRestrictions?.length
         ? access.toolRestrictions
         : [...new Set([...globalDisallowed, ...networkDisallowed])];
-      // G-121: If allowedSkills is explicitly empty, hard-block the Skill tool
-      if (access.allowedSkills?.length === 0 && !effectiveDisallowed.includes("Skill")) {
+
+      // cortex#710 (C-701 Part B) — default-deny + per-skill grants, FLIPPED
+      // ATOMICALLY from the legacy binary G-121 gate. The grant decision is
+      // `access.allowedSkills`:
+      //   - undefined / []  → NO skills. Hard-block the bare `Skill` tool
+      //     (the legacy-direct path consumes `effectiveDisallowed` straight
+      //     into CCSession; the bus path's harness also re-asserts this deny
+      //     as a backstop).
+      //   - [...]           → grant exactly those skills. Do NOT deny `Skill`:
+      //     the grant flows as `allowedSkills` to the session, which (a)
+      //     broadly ALLOWS the bare `Skill` tool and (b) registers the Skill
+      //     Guard PreToolUse hook that denies any skill ∉ the list. This is
+      //     the {broad Skill allow + gate hook} pair — never the broken
+      //     {`Skill(name)` allow + bare `Skill` deny} of the reverted #706.
+      const skillGrants = access.allowedSkills;
+      const hasSkillGrants = skillGrants !== undefined && skillGrants.length > 0;
+      if (!hasSkillGrants && !effectiveDisallowed.includes("Skill")) {
         effectiveDisallowed.push("Skill");
       }
       // G-500: Per-network claude overrides take precedence over global
@@ -764,6 +781,10 @@ export class DispatchHandler extends EventEmitter {
           resumeSessionId: existingSession?.sessionId,
           allowedDirs: invokeDirs,
           disallowedTools: effectiveDisallowed,
+          // cortex#710 — carry the grant decision so the runner harness
+          // applies {broad Skill allow + gate hook} for grants, default-deny
+          // otherwise. `access.allowedSkills` is undefined → field omitted.
+          allowedSkills: skillGrants,
           timeoutMs: this.config.claude.timeoutMs,
           cwd: effectiveCwd,
           additionalArgs: this.config.claude.additionalArgs,
@@ -789,13 +810,13 @@ export class DispatchHandler extends EventEmitter {
       // 12. Route by mode
       switch (parsed.mode) {
         case "async":
-          await this.handleAsync(adapter, msg, prompt, existingSession?.sessionId, invokeDirs, effectiveDisallowed, attachmentSessionId, sessionKey, bashGuardDisabled, effectiveBashAllowlist, effectiveGroveChannel, effectiveGroveNetwork, groveProject, groveEntity, principal, effectiveCwd);
+          await this.handleAsync(adapter, msg, prompt, existingSession?.sessionId, invokeDirs, effectiveDisallowed, attachmentSessionId, sessionKey, bashGuardDisabled, effectiveBashAllowlist, effectiveGroveChannel, effectiveGroveNetwork, groveProject, groveEntity, principal, effectiveCwd, skillGrants);
           break;
         case "team":
-          await this.handleTeam(adapter, msg, parsed.content, invokeDirs, effectiveDisallowed, bashGuardDisabled, effectiveBashAllowlist, effectiveGroveChannel, effectiveGroveNetwork, groveProject, groveEntity, principal, effectiveCwd);
+          await this.handleTeam(adapter, msg, parsed.content, invokeDirs, effectiveDisallowed, bashGuardDisabled, effectiveBashAllowlist, effectiveGroveChannel, effectiveGroveNetwork, groveProject, groveEntity, principal, effectiveCwd, skillGrants);
           break;
         default:
-          await this.handleSync(adapter, msg, prompt, existingSession?.sessionId, invokeDirs, effectiveDisallowed, attachmentSessionId, sessionKey, useSession, bashGuardDisabled, effectiveBashAllowlist, effectiveGroveChannel, effectiveGroveNetwork, groveProject, groveEntity, principal, effectiveCwd);
+          await this.handleSync(adapter, msg, prompt, existingSession?.sessionId, invokeDirs, effectiveDisallowed, attachmentSessionId, sessionKey, useSession, bashGuardDisabled, effectiveBashAllowlist, effectiveGroveChannel, effectiveGroveNetwork, groveProject, groveEntity, principal, effectiveCwd, skillGrants);
           break;
       }
     } catch (error) {
@@ -831,6 +852,8 @@ export class DispatchHandler extends EventEmitter {
     groveEntity?: string,
     principal?: string,
     cwd?: string,
+    /** cortex#710 — per-skill grant list ([...] → grants; undefined/[] → none). */
+    allowedSkills?: string[],
   ): Promise<void> {
     const target = this.targetFromMsg(adapter, msg);
 
@@ -871,6 +894,7 @@ export class DispatchHandler extends EventEmitter {
       resumeSessionId,
       allowedTools: this.config.claude.allowedTools,
       disallowedTools,
+      ...(allowedSkills !== undefined && { allowedSkills }),
       allowedDirs: invokeDirs.length > 0 ? invokeDirs : undefined,
       cwd,
       bashAllowlist,
@@ -1165,6 +1189,8 @@ export class DispatchHandler extends EventEmitter {
     groveEntity?: string,
     principal?: string,
     cwd?: string,
+    /** cortex#710 — per-skill grant list ([...] → grants; undefined/[] → none). */
+    allowedSkills?: string[],
   ): Promise<void> {
     const taskId = `task-${randomUUID()}`;
 
@@ -1186,6 +1212,7 @@ export class DispatchHandler extends EventEmitter {
       resumeSessionId,
       allowedTools: this.config.claude.allowedTools,
       disallowedTools,
+      ...(allowedSkills !== undefined && { allowedSkills }),
       allowedDirs: invokeDirs.length > 0 ? invokeDirs : undefined,
       cwd,
       project: groveProject,
@@ -1294,6 +1321,8 @@ export class DispatchHandler extends EventEmitter {
     groveEntity?: string,
     principal?: string,
     _cwd?: string,
+    /** cortex#710 — per-skill grant list ([...] → grants; undefined/[] → none). */
+    allowedSkills?: string[],
   ): Promise<void> {
     const taskId = `team-${randomUUID()}`;
 
@@ -1316,6 +1345,7 @@ export class DispatchHandler extends EventEmitter {
       additionalArgs: this.config.claude.additionalArgs,
       allowedTools: this.config.claude.allowedTools,
       disallowedTools,
+      ...(allowedSkills !== undefined && { allowedSkills }),
       allowedDirs: invokeDirs.length > 0 ? invokeDirs : undefined,
       timeoutMs: this.config.claude.asyncTimeoutMs,
       bashGuardDisabled,

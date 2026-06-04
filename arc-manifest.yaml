@@ -65,6 +65,15 @@ provides:
       target: ~/.claude/hooks/CortexEventLogger.hook.ts
     - source: src/runner/hooks/bash-guard.hook.ts
       target: ~/.claude/hooks/CortexBashGuard.hook.ts
+    # cortex#710 (C-701 Part B) — per-skill grant PreToolUse hook. Installed
+    # as a symlink ONLY (no `hooks:` entry below) so it is NEVER registered in
+    # the principal's GLOBAL settings.json — it would otherwise gate the
+    # principal's own Skill invocations. It is registered PER-SESSION in the
+    # curated `--settings` file (session-settings.ts) for bot sessions that
+    # carry skill grants. The symlink must exist so that curated file can
+    # reference the installed absolute path.
+    - source: src/runner/hooks/skill-guard.hook.ts
+      target: ~/.claude/hooks/CortexSkillGuard.hook.ts
     - source: src/taps/cc-events/hooks/lib
       target: ~/.claude/hooks/lib/cortex-events
 

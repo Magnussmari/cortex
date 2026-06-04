@@ -171,10 +171,17 @@ export class BusInboundSink implements GatewayInboundSink {
       // Without this, an envelope carrying empty allow/deny lists spawns a
       // session where the `Skill` tool is AVAILABLE BY DEFAULT (verified,
       // CLI 2.1.158) — a fail-open hole on the gateway path. Fail-closed.
-      // Per-skill grants on this path are the cortex#701 Part B follow-up
-      // (PreToolUse-hook design); until it lands the gateway path has no
-      // skills, by design.
       disallowedTools: ["Skill"],
+      // cortex#710 — the per-skill grant mechanism now exists (PreToolUse
+      // hook + broad `Skill` allow, applied when `allowedSkills` is a
+      // non-empty list). The gateway is a thin demux that grants NOTHING, so
+      // it leaves `allowedSkills` undefined → the runner harness keeps the
+      // default-deny posture and the bare `Skill` deny above stays in force.
+      // If/when a gateway binding is given an explicit skill grant set (a
+      // future config-split #5 concern), THIS is the field to populate; the
+      // bound stack's harness would then apply the hook-based grant exactly
+      // as the per-stack dispatch path does. Until then: no skills, by design.
+      allowedSkills: undefined,
       // Optional opts — the gateway does not own these; the bound stack applies
       // its own policy and session context.
       resumeSessionId: undefined,

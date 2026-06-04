@@ -334,11 +334,40 @@ export class ClaudeCodeHarness implements SessionHarness {
     };
 
     // Q1-α: harness-native tool strings pass through untouched.
-    if (req.tools.allow.length > 0) {
-      opts.allowedTools = [...req.tools.allow];
+    const allowedTools = req.tools.allow.length > 0 ? [...req.tools.allow] : [];
+    const disallowedTools =
+      req.tools.deny && req.tools.deny.length > 0 ? [...req.tools.deny] : [];
+
+    // cortex#710 — per-skill grants, applied ATOMICALLY with the `Skill`
+    // tool permission so a granted agent never lands in the broken
+    // intermediate state {`Skill(name)` allow + bare `Skill` deny} (#706).
+    //
+    //   - Grants present (allowedSkills non-empty): broadly ALLOW the bare
+    //     `Skill` tool and REMOVE any `Skill` deny, so the permission layer
+    //     is permissive — the Skill Guard PreToolUse hook (registered in the
+    //     curated settings when CCSessionOpts.allowedSkills is non-empty) is
+    //     the real per-skill gate. The grant list reaches the hook via the
+    //     CORTEX_SKILL_GRANTS env var (cc-session.ts).
+    //   - No grants (undefined or []): keep the default-deny posture — ensure
+    //     `Skill` is in disallowedTools (no Skill tool at all). The upstream
+    //     dispatch path already emits a bare `Skill` deny; this is the
+    //     harness-side backstop so the CC session is fail-closed even if the
+    //     envelope omitted it.
+    const grants = req.allowedSkills;
+    if (grants !== undefined && grants.length > 0) {
+      opts.allowedSkills = [...grants];
+      if (!allowedTools.includes("Skill")) allowedTools.push("Skill");
+      const skillDenyIdx = disallowedTools.indexOf("Skill");
+      if (skillDenyIdx !== -1) disallowedTools.splice(skillDenyIdx, 1);
+    } else {
+      if (!disallowedTools.includes("Skill")) disallowedTools.push("Skill");
     }
-    if (req.tools.deny && req.tools.deny.length > 0) {
-      opts.disallowedTools = [...req.tools.deny];
+
+    if (allowedTools.length > 0) {
+      opts.allowedTools = allowedTools;
+    }
+    if (disallowedTools.length > 0) {
+      opts.disallowedTools = disallowedTools;
     }
 
     // Q6: wall-clock cap maps to cc-session's existing inactivity timer

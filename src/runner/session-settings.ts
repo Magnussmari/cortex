@@ -22,12 +22,17 @@
  *   --settings <file-or-json>     Path to a settings JSON file (additive).
  *
  * The principal's global `~/.claude/settings.json` is the **user** source.
- * By spawning bot sessions with `--setting-sources project,local` we
- * EXCLUDE the `user` source entirely — nothing from the principal's global
- * settings (hooks, skills, plugins, permissions) is loaded. We then layer
- * cortex's OWN curated settings on top via `--settings <path>`, containing
- * only cortex's hooks (EventLogger, bash-guard, context) plus the
- * explicitly-granted skills/tools for this session.
+ * By spawning bot sessions with an EMPTY `--setting-sources ""` we load NO
+ * ambient source at all — not `user` (the principal's global settings), and
+ * not `project`/`local` (the cwd repo's `.claude/`). Nothing from the
+ * principal's global settings (hooks, skills, plugins, permissions) — and
+ * nothing from the working-repo cwd — is loaded. We then layer cortex's OWN
+ * curated settings on top via `--settings <path>`, containing only cortex's
+ * hooks (EventLogger, bash-guard, context) plus, when the session is granted
+ * skills, the Skill Guard PreToolUse hook (cortex#710). See the "Why drop
+ * `project` and `local`, not just `user`?" self-check below for why the
+ * tighter empty-source default (rather than `project,local`) is the only
+ * sound posture.
  *
  * ### Why `--setting-sources ` (empty) and not `--bare`?
  *
@@ -41,9 +46,9 @@
  *
  * ### Why drop `project` and `local`, not just `user`? (cortex#701 self-check)
  *
- * `--setting-sources project,local` excludes the principal's GLOBAL
- * `~/.claude/settings.json` (`user`) — but `--settings` is ADDITIVE, not a
- * replacement, so `project` (`<cwd>/.claude/settings.json`) and `local`
+ * A narrower `--setting-sources project,local` would exclude the principal's
+ * GLOBAL `~/.claude/settings.json` (`user`) — but `--settings` is ADDITIVE,
+ * not a replacement, so `project` (`<cwd>/.claude/settings.json`) and `local`
  * (`<cwd>/.claude/settings.local.json`) STILL load alongside the curated
  * file. Empirically verified (CLI 2.1.158): a project/local hook in the
  * session cwd fires INSIDE the bot session even with `--settings` present.
@@ -144,23 +149,67 @@ export const CORTEX_PRESERVED_CLAUDE_ENV = new Set<string>([
 ]);
 
 /**
+ * Env var carrying the per-session **skill grant list** to the Skill Guard
+ * PreToolUse hook (cortex#710). Value is a JSON array of allowed skill-name
+ * strings (e.g. `["code-review"]`). The hook (`skill-guard.hook.ts`) reads
+ * this and DENIES any `Skill` invocation whose name is not in the list.
+ *
+ * Set on the child env by `cc-session.ts`, layered AFTER `scopeSessionEnv`
+ * (it is not a `CLAUDE_*` var, so scoping passes it through regardless; the
+ * explicit layering keeps it alongside cortex's other pipeline vars). Mirrors
+ * how `GROVE_BASH_GUARD` carries the bash-guard config to that hook.
+ */
+export const CORTEX_SKILL_GRANTS_ENV = "CORTEX_SKILL_GRANTS";
+
+/**
  * Build the curated settings object cortex spawns bot sessions under.
  *
  * Contains ONLY cortex's own hooks (resolved to the installed symlink
- * paths under `${claudeDir}/hooks/`) plus an optional permissions block
- * carrying the explicitly-granted tools. Skills are gated separately via
- * the `Skill` tool allow/deny on the CLI (see dispatch-handler Part B);
- * this object never re-adds the principal's skills because it is the ONLY
- * settings file loaded besides the repo-scoped project/local sources.
+ * paths under `${claudeDir}/hooks/`). It never re-adds the principal's
+ * skills/hooks because it is the ONLY settings file loaded — the spawn
+ * passes an EMPTY `--setting-sources` so no ambient source (`user`,
+ * `project`, `local`) loads alongside it.
+ *
+ * ## Skill gating (cortex#710, Part B)
+ *
+ * When `skillGrants` is a NON-EMPTY array, the session is meant to have
+ * those skills. We register the **Skill Guard** PreToolUse hook (matcher
+ * `Skill`) here; the caller broadly ALLOWS the bare `Skill` tool (so the
+ * permission rule is permissive) and the hook is the real gate — it denies
+ * any skill name ∉ the grant list (see `skill-guard.hook.ts`). The grant
+ * list itself reaches the hook via the {@link CORTEX_SKILL_GRANTS_ENV} env
+ * var on the child, NOT via this file.
+ *
+ * When `skillGrants` is `undefined`/empty, NO Skill hook is registered:
+ * the caller keeps the default-deny `disallowedTools: ["Skill"]` rule
+ * instead (no Skill tool at all). This is the #706 lesson made atomic — a
+ * session is either {broad `Skill` allow + this gate hook} or {no `Skill`
+ * tool}, never the broken {`Skill(name)` allow + bare `Skill` deny}.
  *
  * @param claudeDir Absolute path to the cortex-owned `.claude` dir holding
  *   the installed hook symlinks. Defaults to `${HOME}/.claude`.
+ * @param skillGrants Per-session skill grant list. Non-empty → register the
+ *   Skill Guard hook. Undefined/empty → no Skill hook (default-deny lives
+ *   in the caller's `disallowedTools`).
  */
-export function buildCuratedSettings(claudeDir: string): Record<string, unknown> {
+export function buildCuratedSettings(
+  claudeDir: string,
+  skillGrants?: readonly string[],
+): Record<string, unknown> {
   const hook = (name: string) => ({
     type: "command",
     command: `${claudeDir}/hooks/${name}`,
   });
+
+  // PreToolUse always carries the Bash guard. When the session is granted
+  // skills, ALSO register the Skill guard (matcher `Skill`) — the per-skill
+  // gate that backs the broad `Skill` allow the caller layers in.
+  const preToolUse: { matcher: string; hooks: ReturnType<typeof hook>[] }[] = [
+    { matcher: "Bash", hooks: [hook("CortexBashGuard.hook.ts")] },
+  ];
+  if (skillGrants !== undefined && skillGrants.length > 0) {
+    preToolUse.push({ matcher: "Skill", hooks: [hook("CortexSkillGuard.hook.ts")] });
+  }
 
   // Mirrors src/settings/cortex-hooks.json (the reference fallback) but
   // pinned to ABSOLUTE installed paths so it stands alone without relying
@@ -172,9 +221,7 @@ export function buildCuratedSettings(claudeDir: string): Record<string, unknown>
       PostToolUse: [{ hooks: [hook("CortexEventLogger.hook.ts")] }],
       Stop: [{ hooks: [hook("CortexEventLogger.hook.ts")] }],
       UserPromptSubmit: [{ hooks: [hook("CortexEventLogger.hook.ts")] }],
-      PreToolUse: [
-        { matcher: "Bash", hooks: [hook("CortexBashGuard.hook.ts")] },
-      ],
+      PreToolUse: preToolUse,
     },
   };
 }
@@ -203,13 +250,27 @@ export interface IsolatedSettings {
  * return the args + cleanup. The caller spawns `claude` with
  * `[...buildClaudeArgs(opts), ...isolated.args]` (or threads `args` into
  * additionalArgs) and invokes `cleanup()` on session exit.
+ *
+ * @param claudeDir Absolute path to the cortex-owned `.claude` dir holding
+ *   the installed hook symlinks.
+ * @param skillGrants Per-session skill grant list (cortex#710). Non-empty →
+ *   the curated file registers the Skill Guard PreToolUse hook; the caller
+ *   must ALSO broadly allow the `Skill` tool and set the
+ *   {@link CORTEX_SKILL_GRANTS_ENV} env var. Undefined/empty → no Skill hook.
  */
-export function createIsolatedSettings(claudeDir: string): IsolatedSettings {
+export function createIsolatedSettings(
+  claudeDir: string,
+  skillGrants?: readonly string[],
+): IsolatedSettings {
   const dir = mkdtempSync(join(tmpdir(), "cortex-session-"));
   const settingsPath = join(dir, "settings.json");
-  writeFileSync(settingsPath, JSON.stringify(buildCuratedSettings(claudeDir), null, 2), {
-    mode: 0o600,
-  });
+  writeFileSync(
+    settingsPath,
+    JSON.stringify(buildCuratedSettings(claudeDir, skillGrants), null, 2),
+    {
+      mode: 0o600,
+    },
+  );
 
   return {
     settingsPath,

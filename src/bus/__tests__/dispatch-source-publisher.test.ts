@@ -131,6 +131,7 @@ function baseOpts(
     resumeSessionId: undefined,
     allowedDirs: [],
     disallowedTools: [],
+    allowedSkills: undefined,
     timeoutMs: undefined,
     cwd: undefined,
     additionalArgs: undefined,
@@ -248,5 +249,36 @@ describe("dispatch-source-publisher — F-1b subject principal derivation (corte
 
     expect(result.published).toBe(true);
     expect(result.subject).toBe("local.holly.tasks.@did-mf-luna.chat");
+  });
+
+  // ── cortex#710 — per-skill grant list rides the payload `allowed_skills` ────
+
+  test("grants present → payload carries allowed_skills", async () => {
+    const runtime = makeRecordingRuntime();
+    await publishInboundChatDispatchEnvelope(
+      baseOpts(runtime, { allowedSkills: ["code-review"] }),
+    );
+    const payload = runtime.subjectPublishes[0]!.envelope.payload;
+    expect(payload.allowed_skills).toEqual(["code-review"]);
+  });
+
+  test("grants explicitly [] → payload carries the empty array (decided: no skills)", async () => {
+    const runtime = makeRecordingRuntime();
+    await publishInboundChatDispatchEnvelope(
+      baseOpts(runtime, { allowedSkills: [] }),
+    );
+    const payload = runtime.subjectPublishes[0]!.envelope.payload;
+    // Emitted even for [] so the runner distinguishes "no decision" (absent)
+    // from "decided: no skills".
+    expect(payload.allowed_skills).toEqual([]);
+  });
+
+  test("grants undefined → payload OMITS allowed_skills (no decision)", async () => {
+    const runtime = makeRecordingRuntime();
+    await publishInboundChatDispatchEnvelope(
+      baseOpts(runtime, { allowedSkills: undefined }),
+    );
+    const payload = runtime.subjectPublishes[0]!.envelope.payload;
+    expect("allowed_skills" in payload).toBe(false);
   });
 });

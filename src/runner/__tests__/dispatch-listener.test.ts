@@ -648,7 +648,10 @@ describe("dispatch-listener — success path", () => {
     expect(opts.agentName).toBe("Cortex");
     expect(opts.agentId).toBe("cortex"); // sourced from payload.agent_id
     expect(opts.allowedTools).toEqual(["Read", "Edit"]);
-    expect(opts.disallowedTools).toEqual(["Bash"]);
+    // cortex#710 — no allowed_skills on the payload → harness appends the
+    // default-deny `Skill` alongside the payload's `Bash` deny.
+    expect(opts.disallowedTools).toEqual(["Bash", "Skill"]);
+    expect(opts.allowedSkills).toBeUndefined();
     expect(opts.allowedDirs).toEqual(["/tmp"]);
     expect(opts.timeoutMs).toBe(60_000);
     expect(opts.cwd).toBe("/tmp");
@@ -657,6 +660,38 @@ describe("dispatch-listener — success path", () => {
     expect(opts.entity).toBe("issue/12");
     expect(opts.principal).toBe("andreas");
     expect(opts.resumeSessionId).toBe("prior-session");
+  });
+
+  test("allowed_skills round-trips payload → harness → CCSessionOpts (cortex#710)", async () => {
+    // The grant decision rides the payload's `allowed_skills`; the harness
+    // turns it into {broad Skill allow + allowedSkills (→ gate hook)} —
+    // never the broken {Skill(name) allow + bare Skill deny}.
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory, optsCaptured } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["dispatch.cortex"]),
+    });
+    await listener.start();
+    await router.start();
+
+    r.trigger(
+      makeReceivedEnvelope({
+        prompt: "review the PR",
+        allowed_skills: ["code-review"],
+      }),
+      CANONICAL_CORTEX_CHAT_SUBJECT,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(optsCaptured).toHaveLength(1);
+    const opts = optsCaptured[0]!;
+    expect(opts.allowedSkills).toEqual(["code-review"]);
+    expect(opts.allowedTools ?? []).toContain("Skill");
+    expect(opts.disallowedTools ?? []).not.toContain("Skill");
   });
 
   test("agent_name falls back to agent_id when omitted (A.1b flip)", async () => {
@@ -723,7 +758,11 @@ describe("dispatch-listener — success path", () => {
     expect(opts.entity).toBeUndefined();
     expect(opts.project).toBeUndefined();
     expect(opts.allowedTools).toBeUndefined();
-    expect(opts.disallowedTools).toBeUndefined();
+    // cortex#710 — even a bare payload (no allowed_skills) gets the
+    // harness's default-deny `Skill` so the session has no Skill tool. This
+    // is the only knob the flip adds to an otherwise-minimal opts.
+    expect(opts.disallowedTools).toEqual(["Skill"]);
+    expect(opts.allowedSkills).toBeUndefined();
   });
 
   test("delegate distribution mode routes to AgentTeamHarness", async () => {
