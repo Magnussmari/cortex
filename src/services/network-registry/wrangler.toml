@@ -31,11 +31,50 @@ workers_dev = false
 ENVIRONMENT = "local"
 
 # ──────────────────────────────────────────────────────────────────
+# #682 — D1-backed durable storage (principals + nonce-replay cache).
+#
+# The registry's principal directory AND its nonce-replay cache live in
+# D1 so both survive Worker-isolate recycling. This is the durability
+# gate before the PROD deploy: an in-memory store loses registrations on
+# every isolate restart, and an in-memory nonce cache lets an in-flight
+# registration be replayed against a fresh isolate within the skew
+# window. D1 is a single logical database shared by every isolate/colo,
+# so a nonce seen anywhere is rejected everywhere — closing the
+# documented cross-isolate replay gap.
+#
+# The `binding` name is `DB` in EVERY environment (base/dev/prod); only
+# `database_name` + `database_id` differ per env. The code reads
+# `env.DB` and falls back to the in-memory backend when it is absent
+# (`wrangler dev` without a configured local DB, and `bun test`).
+#
+# This base binding points at the dev database so a bare `wrangler dev`
+# / top-level `wrangler deploy` has a DB. Deploys MUST always pass
+# `--env dev` or `--env production`; the per-env blocks below override
+# `database_id`.
+#
+# Apply migrations per environment (migrations/0001_init.sql):
+#   bunx wrangler d1 migrations apply cortex-network-registry-dev --env dev --remote
+#   bunx wrangler d1 migrations apply cortex-network-registry      --env production --remote
+[[d1_databases]]
+binding = "DB"
+database_name = "cortex-network-registry-dev"
+database_id = "19925196-a7ba-4fe0-85fa-4c8181a96bba"
+migrations_dir = "migrations"
+
+# ──────────────────────────────────────────────────────────────────
 # Environment: Development
 # ──────────────────────────────────────────────────────────────────
 [env.dev]
 name = "cortex-network-registry-dev"
 workers_dev = false
+
+# #682 — dev D1 (cortex-network-registry-dev). Same `binding = "DB"` as
+# prod; only the database differs.
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "cortex-network-registry-dev"
+database_id = "19925196-a7ba-4fe0-85fa-4c8181a96bba"
+migrations_dir = "migrations"
 
 # Dev route. The principal must create the proxied DNS record for
 # network-dev.meta-factory.ai in the meta-factory.ai zone, then
@@ -90,6 +129,14 @@ workers_dev = false
 routes = [
   { pattern = "network.meta-factory.ai/*", zone_name = "meta-factory.ai" }
 ]
+
+# #682 — production D1 (cortex-network-registry). Same `binding = "DB"`
+# as dev; only the database differs.
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "cortex-network-registry"
+database_id = "cb822de5-aba5-4f72-897e-299d274daa2f"
+migrations_dir = "migrations"
 
 [env.production.vars]
 ENVIRONMENT = "production"

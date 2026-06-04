@@ -1,0 +1,172 @@
+/**
+ * Thin D1 mock (cortex#682).
+ *
+ * Implements the `D1Database` surface the registry actually uses —
+ * `prepare(sql).bind(...args).run() / .all() / .first()` — backed by two
+ * in-memory maps that stand in for the `principals` and `nonces` tables.
+ *
+ * Why a hand-rolled mock and not miniflare/wrangler local D1:
+ *   - `bun test` runs the suite via `app.fetch(req, env)` with no Worker
+ *     runtime; spinning up wrangler's local D1 would couple the unit
+ *     tests to the wrangler toolchain and a filesystem sqlite. The mock
+ *     keeps the suite hermetic and fast.
+ *   - The mock recognises the EXACT statements D1RegistryStore /
+ *     D1NonceCache issue, so it faithfully exercises the parameterised
+ *     query path (every value arrives via `.bind(...)`, never via string
+ *     interpolation — that is exactly what the SQLi-safety test asserts:
+ *     a quote-laden principal_id round-trips as opaque data).
+ *
+ * Crucially, ONE `MockD1` instance shared across two `D1RegistryStore`
+ * / `D1NonceCache` instances models two Worker isolates talking to the
+ * same logical D1 — which is how the nonce-durability test proves a
+ * replay is caught across isolates.
+ */
+
+import type { D1Like } from "../src/store";
+
+interface PrincipalRow {
+  principal_id: string;
+  principal_pubkey: string;
+  stacks: string;
+  capabilities: string;
+  updated_at: string;
+}
+
+/** What D1's `.run()` returns — we only populate `meta.changes`. */
+interface RunResult {
+  meta: { changes: number };
+}
+
+/**
+ * Normalise a SQL string to a single-spaced, trimmed form so multi-line
+ * template-literal queries match regardless of indentation/newlines.
+ */
+function norm(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim();
+}
+
+class MockStatement {
+  private args: unknown[] = [];
+
+  constructor(
+    private readonly db: MockD1,
+    private readonly sql: string,
+  ) {}
+
+  bind(...args: unknown[]): MockStatement {
+    this.args = args;
+    return this;
+  }
+
+  async run(): Promise<RunResult> {
+    return this.db._exec(this.sql, this.args);
+  }
+
+  async first<T>(): Promise<T | null> {
+    const rows = this.db._query(this.sql, this.args);
+    return (rows[0] as T) ?? null;
+  }
+
+  async all<T>(): Promise<{ results: T[] }> {
+    return { results: this.db._query(this.sql, this.args) as T[] };
+  }
+}
+
+export class MockD1 {
+  readonly principals = new Map<string, PrincipalRow>();
+  readonly nonces = new Map<string, number>();
+
+  /** Count of writes, exposed so tests can assert query activity if needed. */
+  writeCount = 0;
+
+  prepare(sql: string): MockStatement {
+    return new MockStatement(this, sql);
+  }
+
+  // --- statement dispatch ---------------------------------------------------
+
+  _exec(sqlRaw: string, args: unknown[]): RunResult {
+    const sql = norm(sqlRaw);
+    this.writeCount++;
+
+    // nonces: opportunistic prune
+    if (sql.startsWith("DELETE FROM nonces WHERE seen_at <")) {
+      const cutoff = args[0] as number;
+      for (const [k, ts] of this.nonces) {
+        if (ts < cutoff) this.nonces.delete(k);
+      }
+      return { meta: { changes: 0 } };
+    }
+
+    // nonces: atomic insert-or-ignore
+    if (sql.startsWith("INSERT INTO nonces")) {
+      const [nonce, seenAt] = args as [string, number];
+      if (this.nonces.has(nonce)) return { meta: { changes: 0 } };
+      this.nonces.set(nonce, seenAt);
+      return { meta: { changes: 1 } };
+    }
+
+    // nonces: reset
+    if (sql === "DELETE FROM nonces") {
+      const n = this.nonces.size;
+      this.nonces.clear();
+      return { meta: { changes: n } };
+    }
+
+    // principals: UPSERT
+    if (sql.startsWith("INSERT INTO principals")) {
+      const [principalId, pubkey, stacks, capabilities, updatedAt] = args as [
+        string,
+        string,
+        string,
+        string,
+        string,
+      ];
+      this.principals.set(principalId, {
+        principal_id: principalId,
+        principal_pubkey: pubkey,
+        stacks,
+        capabilities,
+        updated_at: updatedAt,
+      });
+      // An UPSERT always touches exactly one row (insert or update).
+      return { meta: { changes: 1 } };
+    }
+
+    // principals: reset
+    if (sql === "DELETE FROM principals") {
+      const n = this.principals.size;
+      this.principals.clear();
+      return { meta: { changes: n } };
+    }
+
+    throw new Error(`MockD1: unhandled write statement: ${sql}`);
+  }
+
+  _query(sqlRaw: string, args: unknown[]): unknown[] {
+    const sql = norm(sqlRaw);
+
+    // principals: SELECT one by id
+    if (sql.includes("FROM principals WHERE principal_id =")) {
+      const id = args[0] as string;
+      const row = this.principals.get(id);
+      return row ? [row] : [];
+    }
+
+    // principals: SELECT all
+    if (sql.startsWith("SELECT") && sql.includes("FROM principals")) {
+      return [...this.principals.values()];
+    }
+
+    throw new Error(`MockD1: unhandled read statement: ${sql}`);
+  }
+}
+
+/**
+ * Hand the mock to code expecting the `D1Like` surface the stores accept.
+ * The mock implements that structural shape directly, so this is just a
+ * typed pass-through (no real D1Database global is touched).
+ */
+export function asD1(mock: MockD1): D1Like {
+  return mock;
+}

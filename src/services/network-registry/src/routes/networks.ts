@@ -23,7 +23,7 @@ export function networkRoutes(): Hono<{ Bindings: Env }> {
     if (!isValidNetworkId(networkId)) {
       return c.json({ error: "invalid network_id in path" }, 400);
     }
-    const store = getStore();
+    const store = getStore(c.env);
     const principals = await store.listPrincipals();
     const roster = rosterFromPrincipals(principals, networkId);
     const assertion = await signAssertion(c.env, roster);
