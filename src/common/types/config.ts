@@ -153,6 +153,17 @@ export const DiscordInstanceSchema = z.object({
   trustedBotIds: z.array(z.coerce.string()).default([]),
 
   /**
+   * cortex#709 — DM stack-OWNERSHIP flag. Mirror of the cortex-shape field —
+   * `cortex.ts` threads it through to the `DiscordPresence` it builds, and the
+   * adapter drops DM-scoped `messageCreate` early when `false`.
+   *
+   * @see DiscordPresenceSchema.dmOwner in `cortex-config.ts` for the canonical
+   * principal-facing description, default (`true`), and misconfiguration
+   * semantics.
+   */
+  dmOwner: z.boolean().default(true),
+
+  /**
    * MIG-3b / cortex#205: NATS subject patterns this Discord adapter renders
    * to chat. Mirror of the cortex-shape field — `flattenDiscordPresences`
    * threads it through verbatim.

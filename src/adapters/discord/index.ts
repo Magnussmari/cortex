@@ -390,6 +390,24 @@ export class DiscordAdapter implements PlatformAdapter {
       const isDM = message.channel.type === ChannelType.DM;
 
       if (isDM) {
+        // cortex#709 — DM stack-OWNERSHIP gate. The DM facet of #524 and the
+        // counterpart to the C-704 guild filter above. `message.guildId` is
+        // null for DMs (see #537), so the guild filter cannot gate them: with
+        // one bot token logged into N stacks, EVERY process receives EVERY DM
+        // and would run a full CC session → N duplicate replies. The
+        // per-process `recentMessageIds` dedup can't help — it's local to each
+        // adapter instance and never sees the sibling process's delivery.
+        //
+        // Resolution is config-driven (NOT a first-to-respond race): exactly
+        // one stack sets `presence.dmOwner: true`; non-owner stacks drop the
+        // DM here, before any access check or CC session. Defaults to true so
+        // single-stack deployments and pre-#709 configs are unchanged. See
+        // `DiscordPresenceSchema.dmOwner` for the misconfiguration semantics
+        // (all-true → today's double-answer; all-false → DMs unanswered, the
+        // deliberate fail-safe direction).
+        if (!this.presence.dmOwner) {
+          return;
+        }
         // Self-loop guard — never respond to our own DMs, regardless of
         // any trustedBotIds entry (the bot's own id is never allowed).
         if (message.author.id === this.client.user?.id) return;
