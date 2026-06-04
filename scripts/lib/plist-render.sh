@@ -87,6 +87,22 @@ config_file_to_slug() {
   esac
 }
 
+# Inverse of config_file_to_slug: derive the config filename from a slug.
+#
+#   meta-factory → cortex.yaml   (special case)
+#   {slug}       → cortex.{slug}.yaml
+#
+# Used by render_stack_plist and postupgrade.sh to map slugs back to config
+# paths without repeating the branch logic in multiple callers.
+slug_to_config_file() {
+  local slug="$1"
+  if [ "${slug}" = "meta-factory" ]; then
+    printf '%s' "cortex.yaml"
+  else
+    printf '%s' "cortex.${slug}.yaml"
+  fi
+}
+
 # Discover all stack slugs from config files under CONFIG_DIR.
 # Prints one slug per line. Never includes the relay daemon.
 #
@@ -133,13 +149,9 @@ render_stack_plist() {
 
   local dst="${launch_dir}/ai.meta-factory.cortex.${slug}.plist"
 
-  # Derive config filename from slug (inverse of config_file_to_slug).
+  # Derive config filename from slug via the shared inverse function.
   local config_file
-  if [ "${slug}" = "meta-factory" ]; then
-    config_file="cortex.yaml"
-  else
-    config_file="cortex.${slug}.yaml"
-  fi
+  config_file="$(slug_to_config_file "${slug}")"
   local config_yaml="${config_dir}/${config_file}"
 
   # If the config no longer exists, remove any stale rendered plist so

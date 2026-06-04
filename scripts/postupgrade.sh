@@ -46,15 +46,15 @@ source "${SCRIPT_DIR}/lib/stack-identity-provision.sh"
 source "${SCRIPT_DIR}/lib/plist-render.sh"
 
 while IFS= read -r slug; do
+  local_config_file="$(slug_to_config_file "${slug}")"
+  # nkey basename: cortex.yaml → "cortex", cortex.{slug}.yaml → "cortex-{slug}".
   if [ "${slug}" = "meta-factory" ]; then
-    config_file="cortex.yaml"
     nkey_basename="cortex"
   else
-    config_file="cortex.${slug}.yaml"
     nkey_basename="cortex-${slug}"
   fi
-  if [ -f "${CONFIG_DIR}/${config_file}" ]; then
-    provision_stack_identity "${CONFIG_DIR}/${config_file}" "${nkey_basename}" || true
+  if [ -f "${CONFIG_DIR}/${local_config_file}" ]; then
+    provision_stack_identity "${CONFIG_DIR}/${local_config_file}" "${nkey_basename}" || true
   fi
 done < <(discover_stack_slugs "${CONFIG_DIR}")
 

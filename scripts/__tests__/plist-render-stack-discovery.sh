@@ -80,22 +80,27 @@ LAUNCH_DIR="${TMPBASE}/LaunchAgents"
 mkdir -p "${CONFIG_DIR}" "${LAUNCH_DIR}"
 
 # Mock bun: the real bun isn't needed for slug/render tests; we provide a
-# stub that prints a deterministic path so sed substitution works without
-# requiring bun to be installed.
+# stub that prints a fixed path so sed substitution produces a valid (non-
+# empty) string in the rendered plist without requiring bun to be installed.
 MOCK_BIN="${TMPBASE}/mock-bin"
 mkdir -p "${MOCK_BIN}"
-printf '#!/bin/sh\nprintf "%s" "%s"\n' "${MOCK_BIN}/bun" > "${MOCK_BIN}/bun"
+# Use a heredoc so the path literal is baked into the stub at creation time.
+cat > "${MOCK_BIN}/bun" <<EOF
+#!/bin/sh
+printf '%s' "${MOCK_BIN}/bun"
+EOF
 chmod +x "${MOCK_BIN}/bun"
 
 # Mock launchctl: never actually invoke launchctl — just emit a trace line
 # so tests can assert it was (or wasn't) called.
-LAUNCHCTL_LOG="${TMPBASE}/launchctl.log"
+# Export LAUNCHCTL_LOG before writing the heredoc so the subshell (the mock
+# binary) inherits the variable when invoked by plist-render.sh functions.
+export LAUNCHCTL_LOG="${TMPBASE}/launchctl.log"
 cat > "${MOCK_BIN}/launchctl" <<'EOF'
 #!/bin/sh
 printf 'launchctl %s\n' "$*" >> "${LAUNCHCTL_LOG:-/dev/null}"
 EOF
 chmod +x "${MOCK_BIN}/launchctl"
-LAUNCHCTL_LOG="${LAUNCHCTL_LOG}" # re-export for subshells
 export PATH="${MOCK_BIN}:${PATH}"
 
 # ─── Section 1: config_file_to_slug ──────────────────────────────
@@ -124,7 +129,22 @@ else
   pass "bot.yaml returns non-zero (not a cortex config)"
 fi
 
-# ─── Section 2: discover_stack_slugs ─────────────────────────────
+# ─── Section 2: slug_to_config_file (inverse of config_file_to_slug) ─
+printf '\n=== slug_to_config_file ===\n'
+
+assert_eq "meta-factory → cortex.yaml" \
+  "cortex.yaml" \
+  "$(slug_to_config_file "meta-factory")"
+
+assert_eq "work → cortex.work.yaml" \
+  "cortex.work.yaml" \
+  "$(slug_to_config_file "work")"
+
+assert_eq "halden → cortex.halden.yaml" \
+  "cortex.halden.yaml" \
+  "$(slug_to_config_file "halden")"
+
+# ─── Section 3: discover_stack_slugs ─────────────────────────────
 printf '\n=== discover_stack_slugs ===\n'
 
 # Empty dir — no stacks.
