@@ -2455,6 +2455,73 @@ describe("dispatch-listener — Shape B re-sign on ingest (TC-1c #552)", () => {
     const auditChain = (allowed.payload.signed_by ?? []) as unknown[];
     expect(auditChain).toHaveLength(1);
   });
+
+  test("(e) re-sign failure is non-fatal → dispatch proceeds UNSIGNED (Shape A fallback), not dropped", async () => {
+    // A transient crypto failure inside `signEnvelope` (modelled here with a
+    // malformed seed that trips its 32-byte length guard) MUST NOT drop the
+    // dispatch. The hook logs + falls through with the original (unsigned)
+    // envelope, mirroring the runtime's `signFailureMode: "fallback"` posture.
+    // The downstream audit envelope therefore carries an EMPTY signed_by chain,
+    // and policy attribution is unaffected (resolved from `originator`).
+    const { nkeyPub } = generateStackSignerForRunner(STACK_IDENTITY);
+    // Malformed signer: a 1-byte seed → `signEnvelope` throws at its
+    // `expected 32-byte Ed25519 seed` guard. principal stays a valid DID so the
+    // throw comes from the seed, not the DID check.
+    const brokenSigner = {
+      rawSeedBytes: new Uint8Array([1]),
+      principal: STACK_IDENTITY,
+    };
+    const cortex = agentFixtureForRunner({ id: "cortex", trust: [] });
+    const resolver = runnerResolverWith(cortex);
+
+    const captured: { principalId: string }[] = [];
+    const engine = engineForGatewayPrincipal();
+    const origCheck = engine.check.bind(engine);
+    engine.check = (principalId, intent) => {
+      captured.push({ principalId });
+      return origCheck(principalId, intent);
+    };
+
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engine,
+      trustResolver: resolver,
+      receivingAgentId: "cortex",
+      principalId: "andreas",
+      cryptoVerify: true,
+      stackIdentity: STACK_IDENTITY,
+      stackNKeyPub: nkeyPub,
+      resignSigner: brokenSigner,
+    });
+    await listener.start();
+    await router.start();
+
+    r.trigger(gatewayInjectedEnvelope(), CANONICAL_CORTEX_CHAT_SUBJECT);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Dispatch is NOT dropped — the sign failure fell through to the policy
+    // gate and the harness ran (allow + lifecycle).
+    expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.allowed",
+      "dispatch.task.started",
+      "dispatch.task.completed",
+    ]);
+
+    // The audit envelope carries an EMPTY signed_by chain — the re-stamp did
+    // not land, so ingest fell back to pure Shape A. No partial / corrupt stamp.
+    const allowed = r.published.find((e) => e.type === "system.access.allowed")!;
+    const auditChain = (allowed.payload.signed_by ?? []) as unknown[];
+    expect(auditChain).toHaveLength(0);
+
+    // Attribution unchanged: still resolved `andreas` from `originator`.
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.principalId).toBe("andreas");
+  });
 });
 
 // ---------------------------------------------------------------------------
