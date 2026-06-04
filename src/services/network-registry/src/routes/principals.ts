@@ -17,6 +17,12 @@ import { Hono } from "hono";
 import { getRegistryPublicKey, type Env } from "../index";
 import { signEd25519, verifyEd25519, canonicalJSON } from "../signing";
 import { getNonceCache, getStore } from "../store";
+import {
+  checkRateLimit,
+  clientKey,
+  retryAfterSeconds,
+  TOO_MANY_REQUESTS_BODY,
+} from "../rate-limit";
 import type { PrincipalRecord, SignedAssertion } from "../types";
 import {
   isValidPrincipalId,
@@ -52,6 +58,25 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
     const principalId = c.req.param("principal_id");
     if (!isValidPrincipalId(principalId)) {
       return c.json({ error: "invalid principal_id in path" }, 400);
+    }
+
+    // #680 — rate-limit BEFORE the expensive signature verify. Register is the
+    // strictest limit (mutation + Ed25519 compute). We key by (IP, principal_id)
+    // so one principal hammering register can't hide behind a shared/NAT egress
+    // IP, and one IP can't exhaust the limit across many principals. Placing
+    // this here — after the cheap path validation, before JSON parse + verify —
+    // means a flood of bad-signature registers is shed early rather than burning
+    // verify compute. The limit value is a code constant identical on dev+prod
+    // (see rate-limit.ts RATE_LIMITS.register).
+    const allowed = await checkRateLimit(
+      c.env,
+      "register",
+      clientKey(c.req.raw, principalId),
+    );
+    if (!allowed) {
+      return c.json(TOO_MANY_REQUESTS_BODY, 429, {
+        "Retry-After": String(retryAfterSeconds("register")),
+      });
     }
 
     let body: unknown;

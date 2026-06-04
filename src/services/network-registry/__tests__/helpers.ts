@@ -11,6 +11,7 @@ import { canonicalJSON, generateKeypair, signEd25519 } from "../src/signing";
 import type { Capability, RegistrationClaim, StackIdentity } from "../src/types";
 import { _setNonceCacheForTest, _setStoreForTest } from "../src/store";
 import { _resetDerivedPublicKeyForTest } from "../src/index";
+import { _resetRateLimitBucketsForTest } from "../src/rate-limit";
 
 export interface PrincipalKey {
   privateKeyB64: string;
@@ -37,11 +38,17 @@ export async function makeRegistryKey(): Promise<{
   return { signingKey: kp.privateKeyB64, publicKey: kp.publicKeyB64 };
 }
 
-/** Reset all module-scoped state between tests (store, nonce cache, derived pubkey). */
+/**
+ * Reset all module-scoped state between tests (store, nonce cache, derived
+ * pubkey, rate-limit fallback buckets). The rate-limit buckets are module-scoped
+ * like the store, so without this reset they'd bleed across tests and a later
+ * test could spuriously 429.
+ */
 export function resetStores(): void {
   _setStoreForTest(undefined);
   _setNonceCacheForTest(undefined);
   _resetDerivedPublicKeyForTest();
+  _resetRateLimitBucketsForTest();
 }
 
 /**
