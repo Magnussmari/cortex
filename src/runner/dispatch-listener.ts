@@ -1909,6 +1909,18 @@ function enrichDenyReason(
 }
 
 /**
+ * ⚠️ ADR 0001 (supersedes cortex#661) GRAMMAR MISMATCH — REWORK IN cortex#686.
+ *
+ * This reads subject segment[1] as a `{network_id}` (the cortex#661 grammar).
+ * Under ADR 0001 segment[1] is the RECEIVING principal, not a network id — so on
+ * a conformant inbound `federated.{principal}.{stack}.…` subject this returns the
+ * PRINCIPAL where it claims to return a network id. Its sole consumer is the
+ * `source_network` audit-annotation on `system.access.denied` (an observability
+ * field, not an isolation decision), and the federation gate it feeds
+ * (`evaluateFederationGate`) is itself ADR-mismatched + fails closed — so the
+ * mislabelled value cannot WIDEN access; it only mis-tags the audit stream until
+ * the cortex#686 lockstep reworks both onto the `{principal}.{stack}` grammar.
+ *
  * IAW Phase D.3 (cortex#116) — derive the federation network id from
  * a NATS subject of the form `federated.{network_id}.<...>`. Returns
  * `undefined` for any other subject shape (including local dispatches

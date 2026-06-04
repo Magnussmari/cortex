@@ -992,6 +992,62 @@ describe("CortexConfigSchema — federated accept/deny subject scope (ADR 0001)"
     expect(parsed.policy?.federated?.networks[0]?.accept_subjects).toHaveLength(2);
   });
 
+  test("scope principal comes from principal.id, not stack.id's principal-half (override-path silent-drop guard)", () => {
+    // The `deriveStackId` "override path": principal.id "andreas" runs a stack
+    // whose stack.id declares a DIFFERENT principal-half "jcfischer". The runtime
+    // stamps the WIRE principal from principal.id, so it subscribes/emits on
+    // `federated.andreas.sage-host.…`. The accept-list scope MUST follow the wire
+    // principal (andreas), NOT stack.id's principal-half (jcfischer) — otherwise
+    // the validated prefix never matches the live subscription and the accept-list
+    // is silently inert. The stack SEGMENT still comes from stack.id ("sage-host").
+    const parsed = CortexConfigSchema.parse({
+      ...minConfig(),
+      principal: { id: "andreas" },
+      stack: { id: "jcfischer/sage-host" },
+      policy: {
+        federated: {
+          networks: [
+            {
+              id: "research-collab",
+              leaf_node: "leaf",
+              peers: [],
+              accept_subjects: ["federated.andreas.sage-host.>"],
+              deny_subjects: [],
+              announce_capabilities: [],
+              max_hop: 0,
+            },
+          ],
+        },
+      },
+    });
+    expect(parsed.policy?.federated?.networks[0]?.accept_subjects).toHaveLength(1);
+
+    // And the jcfischer-prefixed form (stack.id's principal-half) is REJECTED —
+    // it would never match the live `federated.andreas.…` subscription.
+    expect(() =>
+      CortexConfigSchema.parse({
+        ...minConfig(),
+        principal: { id: "andreas" },
+        stack: { id: "jcfischer/sage-host" },
+        policy: {
+          federated: {
+            networks: [
+              {
+                id: "research-collab",
+                leaf_node: "leaf",
+                peers: [],
+                accept_subjects: ["federated.jcfischer.sage-host.>"],
+                deny_subjects: [],
+                announce_capabilities: [],
+                max_hop: 0,
+              },
+            ],
+          },
+        },
+      }),
+    ).toThrow(/must begin with.*federated\.andreas\.sage-host\./);
+  });
+
   test("scope follows an explicit stack: block (federated.{principal}.{stack}.)", () => {
     // With `stack: { id: "andreas/research" }`, the expected prefix becomes
     // `federated.andreas.research.` — a topology-independent identity scope.

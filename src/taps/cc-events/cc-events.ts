@@ -345,12 +345,16 @@ export interface CreateCcEventPublisherOpts {
  * **IAW Phase A.3:** subject derivation now mirrors
  * `envelope.sovereignty.classification` via `deriveNatsSubject`:
  *
- *   - `classification === "local"`     → `local.{principal}.{type}`
- *   - `classification === "federated"` → `federated.{network_id}.{type}`
- *     (cortex#661 — segment[1] is the TARGET network id from
- *     `extensions.network_id`, NOT the source principal; `createCcEventEnvelope`
- *     stamps it from `event.network_id`. A federated cc-event with no
- *     `network_id` throws at derive time.)
+ *   - `classification === "local"`     → `local.{principal}.{stack}.{type}`
+ *   - `classification === "federated"` → `federated.{principal}.{stack}.{type}`
+ *     (ADR 0001, supersedes cortex#661 — segment[1] is the SOURCE principal from
+ *     `envelope.source`, the SAME identity grammar as `local.*`, NOT a target
+ *     network id. The network is NEVER on the wire; it is resolved from the
+ *     target principal at the routing layer (`selectLink` → `peers[]`).
+ *     `extensions.network_id` MAY still travel as a deployment-topology HINT
+ *     (stamped from `event.network_id` when present) but is NOT load-bearing for
+ *     subject derivation — a federated cc-event with no `network_id` derives a
+ *     valid subject and does NOT throw. cortex#661's fail-loud throw is retired.)
  *   - `classification === "public"`    → `public.{type}` (no `{principal}` segment)
  *
  * Prior code hardcoded `local.{principal}.{type}` here regardless of

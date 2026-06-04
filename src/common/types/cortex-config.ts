@@ -2235,7 +2235,23 @@ export const CortexConfigSchema = z.object({
   // at config load rather than silently in the surface-router gate.
   .superRefine((config, ctx) => {
     if (config.policy?.federated === undefined) return;
-    const { principal, stack } = deriveStackId(config);
+    // The receiving stack's own federated subject scope. The PRINCIPAL segment
+    // MUST come from `config.principal.id` — that is the value the runtime stamps
+    // into the wire (`resolvePrincipalId(options.principal)` →
+    // `MyelinRuntimeOptions.principal` → the `federated.{principal}.{stack}.>`
+    // inbound subscription AND `envelope.source` seg[0] on emit). We deliberately
+    // do NOT take the principal from `deriveStackId(config).principal`: when an
+    // explicit `stack:` block declares a DIFFERENT principal-half (the documented
+    // `deriveStackId` "override path" — e.g. `principal.id: andreas` running
+    // `stack.id: jcfischer/sage-host`), `deriveStackId().principal` is `jcfischer`
+    // while the runtime still subscribes/emits on `federated.andreas.…`. Validating
+    // the accept-list against `jcfischer` there would force a prefix that never
+    // matches the live subscription — a silent-drop (every inbound federated
+    // envelope dropped) that parses clean. Pin the principal to the wire source.
+    // The STACK segment is `deriveStackId().stack`, exactly as the runtime resolves
+    // it at boot (`derivedStack.stack` → `MyelinRuntimeOptions.stack`).
+    const stack = deriveStackId(config).stack;
+    const principal = config.principal.id;
     const expectedSubjectPrefix = `federated.${principal}.${stack}.`;
     config.policy.federated.networks.forEach((network, networkIdx) => {
       const validateSubjectScope = (
