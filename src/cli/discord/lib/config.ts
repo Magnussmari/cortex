@@ -17,6 +17,26 @@ export interface ChannelConfig {
   id: string;
 }
 
+/**
+ * A named server profile — a second (or third, …) guild the same bot is in.
+ *
+ * Only `guildId` is required: it is the value used for channel/thread NAME
+ * resolution within that guild. `botToken`, `defaultChannel`, and `channels`
+ * are optional overrides; when absent the top-level (grove) values are used.
+ * This lets one token serve every guild the bot has joined while keeping each
+ * guild's name→id resolution scoped to the right server.
+ */
+export interface ServerProfile {
+  /** Discord guild/server ID for this profile (required) */
+  guildId: string;
+  /** Per-profile bot token; falls back to top-level botToken when absent */
+  botToken?: string;
+  /** Per-profile default channel; falls back to top-level defaultChannel */
+  defaultChannel?: string;
+  /** Per-profile cached channel name→id map */
+  channels?: Record<string, ChannelConfig>;
+}
+
 export interface DiscordCliConfig {
   /** Discord bot token */
   botToken?: string;
@@ -26,6 +46,8 @@ export interface DiscordCliConfig {
   defaultChannel?: string;
   /** Named channel configs */
   channels?: Record<string, ChannelConfig>;
+  /** Named server profiles for guilds other than the top-level (grove) one */
+  servers?: Record<string, ServerProfile>;
 }
 
 const CONFIG_PATH = join(process.env.HOME ?? "~", ".config", "grove", "cli.yaml");

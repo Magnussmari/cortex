@@ -9,19 +9,43 @@
 import { Command } from "commander";
 import YAML from "yaml";
 import { loadConfig, saveConfig, getConfigPath } from "./lib/config";
+import { resolveServerContext, registerServerProfile, ServerContextError } from "./lib/server-context";
+import type { ResolvedServerContext, ServerContextOptions } from "./lib/server-context";
+import type { DiscordCliConfig } from "./lib/config";
 import { postMessage, resolveChannelByName, resolveThreadByName, readMessages, listChannels, listThreads } from "./lib/discord";
 
 // Per-command option shapes. Commander's typing is permissive; pinning each
 // `.action((opts) => …)` to the concrete shape lets the typed-checked preset
 // narrow .channel/.thread/.limit instead of falling through as `any`.
-interface PostOptions {
+// `guild`/`server` carry the multi-server overrides (see lib/server-context).
+interface PostOptions extends ServerContextOptions {
   channel?: string;
   thread?: string;
 }
-interface ReadOptions {
+interface ReadOptions extends ServerContextOptions {
   channel?: string;
   thread?: string;
   limit: string;
+}
+
+/**
+ * Resolve the effective server context for a command, translating a
+ * `ServerContextError` into a CLI error + exit. Returns a context whose
+ * `guildId`/`botToken` are then validated by the caller exactly as before.
+ */
+function resolveContextOrExit(
+  config: ReturnType<typeof loadConfig>,
+  opts: ServerContextOptions
+): ResolvedServerContext {
+  try {
+    return resolveServerContext(config, opts);
+  } catch (err) {
+    if (err instanceof ServerContextError) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
 }
 
 // `setNestedValue`/`getNestedValue` walk an arbitrarily-nested config tree.
@@ -47,15 +71,18 @@ program
   .argument("<message...>", "Message text (multiple words joined)")
   .option("-c, --channel <name>", "Channel name (default: defaultChannel from config)")
   .option("-t, --thread <name-or-id>", "Thread name or ID to post into")
+  .option("-g, --guild <id>", "Guild ID to resolve channel/thread names against (overrides config)")
+  .option("-s, --server <name>", "Named server profile from config (layers guildId + overrides)")
   .action(async (messageParts: string[], opts: PostOptions) => {
     const config = loadConfig();
+    const ctx = resolveContextOrExit(config, opts);
     const message = messageParts.join(" ");
 
-    if (!config.botToken) {
+    if (!ctx.botToken) {
       console.error("Bot token required. Run: discord config set botToken <token>");
       process.exit(1);
     }
-    if (!config.guildId) {
+    if (!ctx.guildId) {
       console.error("Guild ID required. Run: discord config set guildId <id>");
       process.exit(1);
     }
@@ -63,7 +90,7 @@ program
     // Resolve thread by name if provided and not a numeric ID
     let threadId = opts.thread;
     if (threadId && !/^\d+$/.test(threadId)) {
-      const resolved = await resolveThreadByName(config.botToken, config.guildId, threadId);
+      const resolved = await resolveThreadByName(ctx.botToken, ctx.guildId, threadId);
       if (!resolved) {
         console.error(`Thread "${threadId}" not found. Run: discord threads`);
         process.exit(1);
@@ -71,27 +98,26 @@ program
       threadId = resolved.id;
     }
 
-    const channelName = opts.channel ?? config.defaultChannel;
+    const channelName = opts.channel ?? ctx.defaultChannel;
     if (!threadId && !channelName) {
       console.error("No channel or thread specified and no defaultChannel configured.");
       console.error("Run: discord config set defaultChannel <name>");
       process.exit(1);
     }
 
-    // Resolve channel name → ID (cached in config, or looked up via API)
+    // Resolve channel name → ID (cached in context, or looked up via API).
+    // A cached id posts directly and is guild-agnostic — no resolution needed.
     let channelId: string | undefined;
     if (channelName) {
-      channelId = config.channels?.[channelName]?.id;
+      channelId = ctx.channels?.[channelName]?.id;
       if (!channelId) {
-        channelId = await resolveChannelByName(config.botToken, config.guildId, channelName) ?? undefined;
+        channelId = await resolveChannelByName(ctx.botToken, ctx.guildId, channelName) ?? undefined;
         if (!channelId && !threadId) {
           console.error(`Channel "#${channelName}" not found. Run: discord channels`);
           process.exit(1);
         }
         if (channelId) {
-          // Cache the resolved ID
-          config.channels ??= {};
-          config.channels[channelName] = { id: channelId };
+          cacheChannelId(config, ctx, channelName, channelId);
           saveConfig(config);
         }
       }
@@ -103,7 +129,7 @@ program
       process.exit(1);
     }
 
-    const result = await postMessage(config.botToken, targetId, message);
+    const result = await postMessage(ctx.botToken, targetId, message);
     if (result.success) {
       console.log(`Posted to #${channelName}${opts.thread ? ` (thread)` : ""}`);
     } else {
@@ -120,14 +146,17 @@ program
   .option("-c, --channel <name>", "Channel name (default: defaultChannel from config)")
   .option("-t, --thread <name-or-id>", "Thread name or ID to read from")
   .option("-n, --limit <n>", "Number of messages", "10")
+  .option("-g, --guild <id>", "Guild ID to resolve channel/thread names against (overrides config)")
+  .option("-s, --server <name>", "Named server profile from config (layers guildId + overrides)")
   .action(async (opts: ReadOptions) => {
     const config = loadConfig();
+    const ctx = resolveContextOrExit(config, opts);
 
-    if (!config.botToken) {
+    if (!ctx.botToken) {
       console.error("Bot token required. Run: discord config set botToken <token>");
       process.exit(1);
     }
-    if (!config.guildId) {
+    if (!ctx.guildId) {
       console.error("Guild ID required. Run: discord config set guildId <id>");
       process.exit(1);
     }
@@ -135,7 +164,7 @@ program
     // Resolve thread by name if provided
     let threadId = opts.thread;
     if (threadId && !/^\d+$/.test(threadId)) {
-      const resolved = await resolveThreadByName(config.botToken, config.guildId, threadId);
+      const resolved = await resolveThreadByName(ctx.botToken, ctx.guildId, threadId);
       if (!resolved) {
         console.error(`Thread "${threadId}" not found. Run: discord threads`);
         process.exit(1);
@@ -148,27 +177,26 @@ program
     if (threadId) {
       readTargetId = threadId;
     } else {
-      const channelName = opts.channel ?? config.defaultChannel;
+      const channelName = opts.channel ?? ctx.defaultChannel;
       if (!channelName) {
         console.error("No channel or thread specified and no defaultChannel configured.");
         process.exit(1);
       }
 
-      let channelId = config.channels?.[channelName]?.id;
+      let channelId = ctx.channels?.[channelName]?.id;
       if (!channelId) {
-        channelId = await resolveChannelByName(config.botToken, config.guildId, channelName) ?? undefined;
+        channelId = await resolveChannelByName(ctx.botToken, ctx.guildId, channelName) ?? undefined;
         if (!channelId) {
           console.error(`Channel "#${channelName}" not found.`);
           process.exit(1);
         }
-        config.channels ??= {};
-        config.channels[channelName] = { id: channelId };
+        cacheChannelId(config, ctx, channelName, channelId);
         saveConfig(config);
       }
       readTargetId = channelId;
     }
 
-    const messages = await readMessages(config.botToken, readTargetId, parseInt(opts.limit));
+    const messages = await readMessages(ctx.botToken, readTargetId, parseInt(opts.limit));
     for (const msg of messages) {
       const time = new Date(msg.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
       console.log(`[${time}] ${msg.author}: ${msg.content}`);
@@ -180,14 +208,17 @@ program
 program
   .command("channels")
   .description("List channels in the Discord server")
-  .action(async () => {
+  .option("-g, --guild <id>", "Guild ID to list channels from (overrides config)")
+  .option("-s, --server <name>", "Named server profile from config (layers guildId + overrides)")
+  .action(async (opts: ServerContextOptions) => {
     const config = loadConfig();
-    if (!config.botToken || !config.guildId) {
+    const ctx = resolveContextOrExit(config, opts);
+    if (!ctx.botToken || !ctx.guildId) {
       console.error("botToken and guildId required. Run: discord config set botToken <token>");
       process.exit(1);
     }
 
-    const channels = await listChannels(config.botToken, config.guildId);
+    const channels = await listChannels(ctx.botToken, ctx.guildId);
     for (const ch of channels) {
       console.log(`  #${ch.name.padEnd(25)} ${ch.id}`);
     }
@@ -198,14 +229,17 @@ program
 program
   .command("threads")
   .description("List active threads in the Discord server")
-  .action(async () => {
+  .option("-g, --guild <id>", "Guild ID to list threads from (overrides config)")
+  .option("-s, --server <name>", "Named server profile from config (layers guildId + overrides)")
+  .action(async (opts: ServerContextOptions) => {
     const config = loadConfig();
-    if (!config.botToken || !config.guildId) {
+    const ctx = resolveContextOrExit(config, opts);
+    if (!ctx.botToken || !ctx.guildId) {
       console.error("botToken and guildId required.");
       process.exit(1);
     }
 
-    const threads = await listThreads(config.botToken, config.guildId);
+    const threads = await listThreads(ctx.botToken, ctx.guildId);
     if (threads.length === 0) {
       console.log("No active threads.");
       return;
@@ -231,6 +265,30 @@ configCmd
     setNestedValue(config as unknown as ConfigObject, key, value);
     saveConfig(config);
     console.log(`Set ${key} = ${value.length > 50 ? value.slice(0, 50) + "..." : value}`);
+  });
+
+configCmd
+  .command("set-server")
+  .description("Register a named server profile (a second guild the bot is in)")
+  .argument("<name>", "Profile name (e.g. halden)")
+  .argument("<guildId>", "Discord guild/server ID for the profile")
+  .argument("[defaultChannel]", "Optional default channel name for the profile")
+  .action((name: string, guildId: string, defaultChannel?: string) => {
+    const config = loadConfig();
+    try {
+      registerServerProfile(config, name, guildId, defaultChannel);
+    } catch (err) {
+      if (err instanceof ServerContextError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
+    saveConfig(config);
+    console.log(
+      `Registered server "${name}" → guild ${guildId}` +
+        (defaultChannel ? ` (default channel #${defaultChannel})` : "")
+    );
   });
 
 configCmd
@@ -264,6 +322,28 @@ configCmd
   });
 
 // ─── helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Cache a freshly-resolved channel id back into config, writing to the active
+ * server profile's `channels` map when a `--server` profile is in effect, else
+ * to the top-level `channels`. Keeps each guild's name→id cache isolated so a
+ * name that exists in two guilds never cross-contaminates.
+ */
+function cacheChannelId(
+  config: DiscordCliConfig,
+  ctx: ResolvedServerContext,
+  channelName: string,
+  channelId: string
+): void {
+  const profile = ctx.serverName ? config.servers?.[ctx.serverName] : undefined;
+  if (profile) {
+    profile.channels ??= {};
+    profile.channels[channelName] = { id: channelId };
+  } else {
+    config.channels ??= {};
+    config.channels[channelName] = { id: channelId };
+  }
+}
 
 function setNestedValue(obj: ConfigObject, key: string, value: string): void {
   const parts = key.split(".");

@@ -19,8 +19,25 @@ Post a message to a Discord channel.
 
 4. **Confirm** — report success or failure to the user.
 
+## Posting to another guild (multi-server)
+
+The same bot can post to any guild it has joined (e.g. grove + halden). Pick the
+guild for channel/thread name resolution with one of:
+
+```bash
+# Saved profile (preferred — register once with `discord config set-server`):
+discord post --server halden "Deployed v0.6.0 to halden"
+
+# One-off by guild ID:
+discord post --guild 1512054429023731884 --channel general "Deployed halden"
+```
+
+Precedence: `--guild`/`--channel` beat a `--server` profile, which beats the
+top-level config. With no `--server`/`--guild`, posting is exactly as before.
+
 ## Notes
 
 - For multi-line messages, use quotes and `\n` or write to a temp file first.
 - If posting fails with "Bot token required", run `discord config show` and guide setup.
-- Channel names are resolved automatically on first use and cached.
+- Channel names are resolved automatically on first use and cached (per guild).
+- `--guild` and `--server` must not disagree on the guild — the CLI errors if they do.
