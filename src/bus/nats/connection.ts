@@ -20,6 +20,7 @@ import {
   Events,
   type ConnectionOptions,
   type NatsConnection,
+  type TlsOptions,
 } from "nats";
 import { enforceChmod600 } from "../../common/config/file-permissions";
 import { expandTilde } from "../../common/config/loader";
@@ -42,6 +43,22 @@ export interface NatsLinkOptions {
   credsPath?: string;
   /** Connection name surfaced on the server's `varz` endpoint. */
   name?: string;
+  /**
+   * TC-4d (#627 Phase 4) — transport-mTLS options for this connection. When
+   * present, it is passed straight through to nats.js's `connect({ tls })` so
+   * the client presents its certificate and verifies the server's. When
+   * `undefined` (the default), no `tls` block is sent and the connection is
+   * plaintext NKey/JWT auth — byte-identical to pre-TC-4d.
+   *
+   * Built by `buildNatsTlsOptions` (`src/common/config/transport-mtls.ts`)
+   * from the `security.transport.mtls` posture + cert/key/ca paths. This
+   * wrapper is deliberately dumb: it does NOT read posture or load files — the
+   * caller builds the (already chmod-600-gated, contents-loaded) options and
+   * passes them in. It NEVER injects `rejectUnauthorized:false` or any
+   * skip-verify hatch (CLAUDE.md hard line); the contents-or-undefined shape
+   * is the whole contract.
+   */
+  tls?: TlsOptions;
   /** Override the underlying nats `connect` function (test seam). */
   connectImpl?: (opts: ConnectionOptions) => Promise<NatsConnection>;
 }
@@ -117,6 +134,13 @@ export class NatsLink {
       name,
       // Defer reconnect to the underlying client; we just log status.
       reconnect: true,
+      // TC-4d (#627 Phase 4) — transport mTLS. When the caller built a `tls`
+      // block (posture `on`/`require` with a loaded client cert), pass it
+      // through verbatim so the node transport negotiates mutual TLS. Omitted
+      // entirely when undefined ⇒ plaintext, byte-identical to pre-TC-4d. We
+      // never set `rejectUnauthorized` — nats.js defaults it to `true` (both
+      // sides verify) and we never weaken that (CLAUDE.md hard line).
+      ...(opts.tls !== undefined ? { tls: opts.tls } : {}),
     };
 
     if (opts.credsPath) {
