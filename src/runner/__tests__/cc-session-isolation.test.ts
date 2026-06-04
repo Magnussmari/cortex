@@ -13,6 +13,7 @@
  */
 
 import { describe, test, expect, spyOn, afterEach } from "bun:test";
+import { readFileSync } from "fs";
 import { CCSession } from "../cc-session";
 
 interface Captured {
@@ -105,6 +106,126 @@ describe("CCSession — settings isolation (default ON)", () => {
       process.env.CLAUDE_HOOKS_PATH = prev.CLAUDE_HOOKS_PATH;
       if (prev.CLAUDE_CODE_EXTRA_SETTINGS === undefined) delete process.env.CLAUDE_CODE_EXTRA_SETTINGS;
       if (prev.CLAUDE_HOOKS_PATH === undefined) delete process.env.CLAUDE_HOOKS_PATH;
+    }
+  });
+});
+
+describe("CCSession — per-skill grants (cortex#710)", () => {
+  /**
+   * Capturing spy that ALSO reads the curated `--settings` file content at
+   * spawn time — before it throws (which triggers CCSession's catch path,
+   * which cleans up the temp dir). So we snapshot the file while it exists.
+   */
+  function captureSpawnWithSettings(): {
+    calls: (Captured & { settings: unknown })[];
+    restore: () => void;
+  } {
+    const calls: (Captured & { settings: unknown })[] = [];
+    const spy = spyOn(Bun, "spawn").mockImplementation(((
+      cmd: string[],
+      opts: { env: Record<string, string> },
+    ) => {
+      const idx = cmd.indexOf("--settings");
+      const settings =
+        idx > -1 ? JSON.parse(readFileSync(cmd[idx + 1]!, "utf8")) : undefined;
+      calls.push({ cmd, env: opts.env, settings });
+      throw new Error("spawn intercepted by test");
+    }) as unknown as typeof Bun.spawn);
+    return { calls, restore: () => spy.mockRestore() };
+  }
+
+  const skillEntry = (settings: {
+    hooks: { PreToolUse: { matcher?: string }[] };
+  }) => settings.hooks.PreToolUse.find((e) => e.matcher === "Skill");
+
+  test("WITH grants → curated file registers the Skill hook + CORTEX_SKILL_GRANTS env set", () => {
+    const { calls, restore } = captureSpawnWithSettings();
+    try {
+      const session = new CCSession({
+        prompt: "hi",
+        groveChannel: "test",
+        claudeDir: "/fake/.claude",
+        allowedSkills: ["code-review"],
+      });
+      session.on("error", () => {/* expected */});
+      session.start();
+
+      expect(calls.length).toBe(1);
+      const skill = skillEntry(calls[0]!.settings as never) as
+        | { hooks: { command: string }[] }
+        | undefined;
+      expect(skill).toBeDefined();
+      expect(skill!.hooks[0]!.command).toContain("CortexSkillGuard.hook.ts");
+      // The grant list reaches the hook via env, as a JSON array.
+      expect(calls[0]!.env.CORTEX_SKILL_GRANTS).toBe(JSON.stringify(["code-review"]));
+    } finally {
+      restore();
+    }
+  });
+
+  test("NO grants → no Skill hook + no CORTEX_SKILL_GRANTS env (default-deny path)", () => {
+    const { calls, restore } = captureSpawnWithSettings();
+    try {
+      const session = new CCSession({
+        prompt: "hi",
+        groveChannel: "test",
+        claudeDir: "/fake/.claude",
+        // no allowedSkills
+      });
+      session.on("error", () => {/* expected */});
+      session.start();
+
+      expect(skillEntry(calls[0]!.settings as never)).toBeUndefined();
+      expect(calls[0]!.env.CORTEX_SKILL_GRANTS).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("grants normalise tool lists: Skill added to a non-empty allowlist, stripped from deny", () => {
+    const { calls, restore } = captureSpawnWithSettings();
+    try {
+      const session = new CCSession({
+        prompt: "hi",
+        groveChannel: "test",
+        claudeDir: "/fake/.claude",
+        allowedSkills: ["code-review"],
+        allowedTools: ["Bash", "Read"],
+        disallowedTools: ["Skill", "WebFetch"],
+      });
+      session.on("error", () => {/* expected */});
+      session.start();
+
+      const argv = calls[0]!.cmd;
+      const allowedIdx = argv.indexOf("--allowedTools");
+      const disallowedIdx = argv.indexOf("--disallowedTools");
+      // Skill is broadly allowed (the hook is the real gate)…
+      expect(argv[allowedIdx + 1]).toContain("Skill");
+      // …and NOT in the deny list (the broken intermediate state).
+      expect(argv[disallowedIdx + 1]).not.toContain("Skill");
+      // unrelated deny survives
+      expect(argv[disallowedIdx + 1]).toContain("WebFetch");
+    } finally {
+      restore();
+    }
+  });
+
+  test("empty grants array → treated as no grants (no hook, no env)", () => {
+    const { calls, restore } = captureSpawnWithSettings();
+    try {
+      const session = new CCSession({
+        prompt: "hi",
+        groveChannel: "test",
+        claudeDir: "/fake/.claude",
+        allowedSkills: [],
+      });
+      session.on("error", () => {/* expected */});
+      session.start();
+
+      expect(skillEntry(calls[0]!.settings as never)).toBeUndefined();
+      expect(calls[0]!.env.CORTEX_SKILL_GRANTS).toBeUndefined();
+    } finally {
+      restore();
     }
   });
 });

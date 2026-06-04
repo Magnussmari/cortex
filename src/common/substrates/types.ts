@@ -359,6 +359,24 @@ export interface DispatchRequest {
    */
   tools: ToolCapability;
   /**
+   * cortex#710 — per-skill grant list. Distinct from `tools`: skills are a
+   * Claude-Code-specific capability gated by a PreToolUse hook, not by the
+   * `allowedTools`/`disallowedTools` permission lists (Claude Code's `Skill`
+   * tool has no `Skill(<name>)` specifier syntax, so the grant can't be
+   * expressed as a tool rule — see cortex#706/#710).
+   *
+   * Semantics, mirroring `AccessDecision.allowedSkills`:
+   *   - `undefined` → no decision carried; the harness applies its default
+   *     (which, for the CC harness, is the default-deny `disallowedTools:
+   *     ["Skill"]` posture — no skills).
+   *   - `[]` → explicit default-deny: no skills (no Skill tool).
+   *   - `[...]` → grant exactly those skills via the Skill Guard PreToolUse
+   *     hook + a broad `Skill` allow.
+   *
+   * Non-CC harnesses (bus-peer, future) ignore this field.
+   */
+  allowedSkills?: string[];
+  /**
    * Pluggable context bundle. The runner attaches whatever the agent's
    * trigger source produced (Discord message history, GitHub PR diffs,
    * attachments, environment hints). The harness handles whichever

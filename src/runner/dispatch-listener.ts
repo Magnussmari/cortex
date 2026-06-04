@@ -190,6 +190,12 @@ export interface DispatchTaskReceivedPayload {
   resume_session_id?: string;
   allowed_tools?: string[];
   disallowed_tools?: string[];
+  /**
+   * cortex#710 — per-skill grant list. `undefined` → harness default
+   * (default-deny, no Skill tool); `[]` → explicit no-skills; `[...]` →
+   * grant exactly those skills via the Skill Guard PreToolUse hook.
+   */
+  allowed_skills?: string[];
   allowed_dirs?: string[];
   timeout_ms?: number;
   cwd?: string;
@@ -1035,6 +1041,11 @@ function buildDispatchRequest(
   const req: DispatchRequest = {
     prompt: payload.prompt,
     tools,
+    // cortex#710 — per-skill grants ride the payload's `allowed_skills`.
+    // Omitted when the payload didn't carry it (→ harness default-deny).
+    ...(payload.allowed_skills !== undefined && {
+      allowedSkills: payload.allowed_skills,
+    }),
     context: hasEnvContext ? [{ kind: "env", data: envContext }] : [],
     agent: {
       id: payload.agent_id,

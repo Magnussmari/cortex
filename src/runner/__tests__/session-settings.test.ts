@@ -69,6 +69,60 @@ describe("buildCuratedSettings — cortex's own hooks only", () => {
   });
 });
 
+describe("buildCuratedSettings — per-skill grant hook (cortex#710)", () => {
+  interface Curated {
+    hooks: Record<string, { matcher?: string; hooks: { command: string }[] }[]>;
+  }
+
+  const skillHook = (s: Curated) =>
+    s.hooks.PreToolUse!.find((e) => e.matcher === "Skill");
+
+  test("NO grants → no Skill hook registered (default-deny lives in disallowedTools)", () => {
+    expect(skillHook(buildCuratedSettings("/fake/.claude") as unknown as Curated)).toBeUndefined();
+    expect(
+      skillHook(buildCuratedSettings("/fake/.claude", []) as unknown as Curated),
+    ).toBeUndefined();
+  });
+
+  test("WITH grants → Skill Guard hook registered under the Skill matcher", () => {
+    const s = buildCuratedSettings("/fake/.claude", ["code-review"]) as unknown as Curated;
+    const entry = skillHook(s);
+    expect(entry).toBeDefined();
+    expect(entry!.hooks[0]!.command).toMatch(/\/hooks\/CortexSkillGuard\.hook\.ts$/);
+  });
+
+  test("the Bash guard is ALWAYS present, with or without grants", () => {
+    for (const grants of [undefined, [], ["code-review"]]) {
+      const s = buildCuratedSettings("/fake/.claude", grants) as unknown as Curated;
+      const bash = s.hooks.PreToolUse!.find((e) => e.matcher === "Bash");
+      expect(bash).toBeDefined();
+      expect(bash!.hooks[0]!.command).toContain("CortexBashGuard.hook.ts");
+    }
+  });
+
+  test("grant list is NOT baked into the settings file (it rides the env var)", () => {
+    // The grant names travel via CORTEX_SKILL_GRANTS, not the curated file —
+    // the file only registers the gate hook. Asserting the skill NAME is
+    // absent keeps the two channels separate (the hook reads the env).
+    const s = buildCuratedSettings("/fake/.claude", ["code-review"]);
+    expect(JSON.stringify(s)).not.toContain("code-review");
+  });
+
+  test("createIsolatedSettings threads grants into the written file", () => {
+    const iso = createIsolatedSettings("/fake/.claude", ["code-review"]);
+    try {
+      const written = JSON.parse(readFileSync(iso.settingsPath, "utf8"));
+      const skill = written.hooks.PreToolUse.find(
+        (e: { matcher?: string }) => e.matcher === "Skill",
+      );
+      expect(skill).toBeDefined();
+      expect(skill.hooks[0].command).toContain("CortexSkillGuard.hook.ts");
+    } finally {
+      iso.cleanup();
+    }
+  });
+});
+
 describe("createIsolatedSettings — materialised file + args", () => {
   test("writes a settings file and emits the isolation args", () => {
     const iso = createIsolatedSettings("/fake/.claude");

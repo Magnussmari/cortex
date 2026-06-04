@@ -235,7 +235,83 @@ describe("ClaudeCodeHarness — DispatchRequest → CCSessionOpts mapping", () =
     await drain(h.dispatch(req));
 
     expect(cap.opts[0]?.allowedTools).toEqual(["Bash", "Edit"]);
-    expect(cap.opts[0]?.disallowedTools).toEqual(["WebFetch"]);
+    // cortex#710 — with no skill grants, the harness ALSO appends the
+    // default-deny `Skill` (no Skill tool). `WebFetch` from `tools.deny`
+    // is preserved; `Skill` is added as the fail-closed backstop.
+    expect(cap.opts[0]?.disallowedTools).toEqual(["WebFetch", "Skill"]);
+  });
+
+  // cortex#710 (C-701 Part B) — per-skill grants applied ATOMICALLY with the
+  // Skill tool permission. The whole point: a granted agent gets {broad Skill
+  // allow + the gate hook via allowedSkills}, NEVER {Skill(name) allow + bare
+  // Skill deny} (the broken #706 form).
+  describe("per-skill grants (cortex#710 default-deny flip)", () => {
+    test("NO grants (undefined) → default-deny: Skill appended to disallowedTools, no allowedSkills", async () => {
+      const cap = captureFactory(makeResult());
+      const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });
+
+      await drain(h.dispatch(makeRequest({ tools: { allow: ["Bash"] } })));
+
+      expect(cap.opts[0]?.disallowedTools).toContain("Skill");
+      expect(cap.opts[0]?.allowedSkills).toBeUndefined();
+      // The bare Skill is NOT in allowedTools — there is no Skill tool.
+      expect(cap.opts[0]?.allowedTools ?? []).not.toContain("Skill");
+    });
+
+    test("empty grants ([]) → default-deny: Skill denied, no allowedSkills", async () => {
+      const cap = captureFactory(makeResult());
+      const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });
+
+      await drain(
+        h.dispatch(makeRequest({ tools: { allow: ["Bash"] }, allowedSkills: [] })),
+      );
+
+      expect(cap.opts[0]?.disallowedTools).toContain("Skill");
+      expect(cap.opts[0]?.allowedSkills).toBeUndefined();
+    });
+
+    test("WITH grants → broad Skill ALLOW + allowedSkills set + Skill NOT denied (the atomic pair)", async () => {
+      const cap = captureFactory(makeResult());
+      const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });
+
+      await drain(
+        h.dispatch(
+          makeRequest({
+            tools: { allow: ["Bash"], deny: ["WebFetch"] },
+            allowedSkills: ["code-review"],
+          }),
+        ),
+      );
+
+      // (a) the gate hook is fed the grant list
+      expect(cap.opts[0]?.allowedSkills).toEqual(["code-review"]);
+      // (b) the bare Skill tool is broadly ALLOWED (permission rule permissive)
+      expect(cap.opts[0]?.allowedTools).toContain("Skill");
+      // (c) Skill is NOT in the deny list — the broken form would have it here
+      expect(cap.opts[0]?.disallowedTools ?? []).not.toContain("Skill");
+      // unrelated denies survive
+      expect(cap.opts[0]?.disallowedTools).toContain("WebFetch");
+    });
+
+    test("grants + an upstream Skill deny → deny is REMOVED (never the broken intermediate state)", async () => {
+      const cap = captureFactory(makeResult());
+      const h = new ClaudeCodeHarness({ source: SOURCE, ccSessionFactory: cap.factory });
+
+      // Simulate a stale upstream that put Skill in deny AND carries a grant:
+      // the atomic flip must resolve to {allow + hook}, not {allow + deny}.
+      await drain(
+        h.dispatch(
+          makeRequest({
+            tools: { allow: [], deny: ["Skill"] },
+            allowedSkills: ["code-review"],
+          }),
+        ),
+      );
+
+      expect(cap.opts[0]?.disallowedTools ?? []).not.toContain("Skill");
+      expect(cap.opts[0]?.allowedTools).toContain("Skill");
+      expect(cap.opts[0]?.allowedSkills).toEqual(["code-review"]);
+    });
   });
 
   test("empty tools.allow drops the field rather than passing an empty array", async () => {

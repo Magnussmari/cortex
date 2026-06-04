@@ -115,6 +115,14 @@ export interface AgentTeamOpts {
   additionalArgs?: string[];
   allowedTools?: string[];
   disallowedTools?: string[];
+  /**
+   * cortex#710 — per-skill grant list, propagated to ALL team sessions
+   * (moderator + participants + synthesis) so a granted team inherits the
+   * Skill Guard PreToolUse hook + broad `Skill` allow like any other
+   * session. Undefined/empty → no skills (default-deny). Per-participant
+   * skill overrides are out of scope; the whole team shares the grant set.
+   */
+  allowedSkills?: string[];
   allowedDirs?: string[];
   timeoutMs?: number;
   /** Bash guard config — propagated to all team sessions (moderator + participants) */
@@ -565,6 +573,7 @@ export class AgentTeam extends EventEmitter {
       additionalArgs: this.opts.additionalArgs,
       allowedTools: this.opts.allowedTools,
       disallowedTools: this.opts.disallowedTools,
+      ...(this.opts.allowedSkills !== undefined && { allowedSkills: this.opts.allowedSkills }),
       allowedDirs: this.opts.allowedDirs,
       timeoutMs: this.opts.timeoutMs ?? 900_000,
       bashGuardDisabled: this.opts.bashGuardDisabled,
@@ -674,6 +683,7 @@ export class AgentTeam extends EventEmitter {
       additionalArgs: this.opts.additionalArgs,
       allowedTools: config.allowedTools ?? this.opts.allowedTools,
       disallowedTools: config.disallowedTools ?? this.opts.disallowedTools,
+      ...(this.opts.allowedSkills !== undefined && { allowedSkills: this.opts.allowedSkills }),
       allowedDirs: config.dirs ?? this.opts.allowedDirs,
       timeoutMs: this.opts.timeoutMs ?? 900_000,
       bashGuardDisabled: this.opts.bashGuardDisabled,
@@ -846,6 +856,7 @@ export class AgentTeam extends EventEmitter {
       additionalArgs: this.opts.additionalArgs,
       allowedTools: this.opts.allowedTools,
       disallowedTools: this.opts.disallowedTools,
+      ...(this.opts.allowedSkills !== undefined && { allowedSkills: this.opts.allowedSkills }),
       allowedDirs: this.opts.allowedDirs,
       timeoutMs: this.opts.timeoutMs ?? 900_000,
       bashGuardDisabled: this.opts.bashGuardDisabled,
