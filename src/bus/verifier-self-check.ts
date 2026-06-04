@@ -154,3 +154,135 @@ export async function runVerifierSelfCheck(
     return { ok: false, detail: `threw: ${detail}` };
   }
 }
+
+// =============================================================================
+// TC-1b (#632) — posture-aware boot gate
+// =============================================================================
+
+/**
+ * The three settable `security.signing` postures, re-exported here so the
+ * boot gate can be unit-tested without importing the full cortex-config
+ * schema graph.
+ */
+export type SigningPosture = "off" | "permissive" | "enforce";
+
+/**
+ * Inputs to the posture-aware boot self-check. A subset of the boot context
+ * in `src/cortex.ts`: the signing posture plus the (possibly-absent) stack
+ * identity captured at signer attach. When `identity` is `undefined` the
+ * stack has NO usable signing identity wired (no seed, or seed load failed).
+ */
+export interface BootVerifierSelfCheckOpts {
+  /** Resolved `config.security.signing`. */
+  posture: SigningPosture;
+  /**
+   * The stack identity captured at signer attach, or `undefined` when no
+   * signing identity is wired. Under `enforce` a `undefined` identity is a
+   * fatal misconfiguration (the boot gate throws); under `off`/`permissive`
+   * it is the expected unsigned-dev shape (the gate no-ops).
+   */
+  identity:
+    | {
+        /** Stack signing DID — `signer.principal`. */
+        stackIdentity: string;
+        /** Stack NKey public key. */
+        stackNKeyPub: string;
+        /** Raw 32-byte ed25519 seed bytes — `signer.rawSeedBytes`. */
+        stackSeedBytes: Uint8Array;
+      }
+    | undefined;
+  /** Trust resolver wired into the production listeners. */
+  resolver: TrustResolver;
+  /** Receiving agent id — same as production listeners. */
+  receivingAgentId: string;
+  /** Principal id — same as production listeners. */
+  principalId: string;
+  /** Optional logger seams (tests; default console / stderr). */
+  log?: (line: string) => void;
+  err?: (line: string) => void;
+}
+
+/**
+ * TC-1b boot gate around {@link runVerifierSelfCheck}, posture-aware per
+ * `docs/design-trust-confidentiality.md` §4 Phase 1.1b
+ * ("`verifier-self-check` passes on every stack at boot").
+ *
+ * Behaviour by posture:
+ *
+ *   - **`enforce`** — a stack serving SIGNED traffic MUST have a valid,
+ *     self-verifiable signing identity. If `identity` is missing (no seed /
+ *     load failed) OR the self-check round-trip fails, this **throws** so the
+ *     boot path aborts rather than silently serving traffic peers will reject.
+ *     A passing self-check returns normally.
+ *   - **`permissive`** — run the self-check when an identity is wired and WARN
+ *     (do not throw) on failure; no-op when no identity is wired. This is the
+ *     shadow rung: prove signing against live boot before gating.
+ *   - **`off`** — advisory. Run the self-check only when an identity happens
+ *     to be wired (observability), WARN on failure, never throw; no-op when
+ *     unsigned (today's dev default).
+ *
+ * Throwing (only under `enforce`) is the fail-fast contract: the caller does
+ * NOT wrap this in a swallow — a thrown error propagates to the CLI exit so
+ * launchd / the principal sees the refusal.
+ */
+export async function bootVerifierSelfCheck(
+  opts: BootVerifierSelfCheckOpts,
+): Promise<void> {
+  const err = opts.err ?? ((line: string) => {
+    process.stderr.write(line + "\n");
+  });
+
+  // No signing identity wired.
+  if (opts.identity === undefined) {
+    if (opts.posture === "enforce") {
+      // Fail fast: enforce with no signing identity means every outbound
+      // envelope would be unsigned and every inbound empty-chain rejected —
+      // the stack cannot serve. Refuse to boot with an actionable message.
+      throw new Error(
+        "verifier-self-check: REFUSING TO BOOT — security.signing=enforce but no " +
+          "stack signing identity is wired. Provision one with " +
+          "`cortex provision-stack` (writes stack.nkey_seed_path chmod 600 + " +
+          "registers the pubkey), set stack.nkey_seed_path in cortex.yaml, then " +
+          "restart. See docs/design-trust-confidentiality.md §Phase 1.1b.",
+      );
+    }
+    // off / permissive with no identity — the expected unsigned-dev shape.
+    // Nothing to check; stay silent (the unsigned-publish WARNING already
+    // fired upstream at signer-attach).
+    return;
+  }
+
+  const result = await runVerifierSelfCheck({
+    stackIdentity: opts.identity.stackIdentity,
+    stackNKeyPub: opts.identity.stackNKeyPub,
+    stackSeedBytes: opts.identity.stackSeedBytes,
+    resolver: opts.resolver,
+    receivingAgentId: opts.receivingAgentId,
+    principalId: opts.principalId,
+    ...(opts.log !== undefined && { log: opts.log }),
+    ...(opts.err !== undefined && { err: opts.err }),
+  });
+
+  if (result.ok) return;
+
+  if (opts.posture === "enforce") {
+    // Fail fast: the stack has an identity but it does not round-trip through
+    // the verifier — serving SIGNED traffic with it would silently drop every
+    // adapter-originated dispatch. Refuse to boot.
+    throw new Error(
+      `verifier-self-check: REFUSING TO BOOT — security.signing=enforce and the ` +
+        `stack signing identity (${opts.identity.stackIdentity}) failed the boot ` +
+        `self-check: ${result.detail}. The verifier would reject this stack's own ` +
+        `signatures; fix the stack.nkey_pub / registration / signing-key consistency ` +
+        `before serving signed traffic.`,
+    );
+  }
+
+  // off / permissive — advisory. runVerifierSelfCheck already logged the
+  // detailed FAILED line via `err`; add a posture note so the principal knows
+  // the boot deliberately continued under the non-enforcing posture.
+  err(
+    `verifier-self-check: continuing boot under signing=${opts.posture} despite ` +
+      `failed self-check (advisory; set signing=enforce to fail fast).`,
+  );
+}

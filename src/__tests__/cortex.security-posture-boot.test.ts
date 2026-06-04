@@ -30,6 +30,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { createUser } from "nkeys.js";
 import { AgentConfigSchema, type AgentConfig } from "../common/types/config";
+import type { Agent } from "../common/types/cortex-config";
 import { startCortex } from "../cortex";
 import type { Envelope } from "../bus/myelin/envelope-validator";
 import type { EnvelopeHandler, MyelinRuntime } from "../bus/myelin/runtime";
@@ -47,6 +48,22 @@ function minimalConfig(security?: AgentConfig["security"]): AgentConfig {
     paths: { publishedEventsDir: "/tmp/grove-cortex-posture-test-published" },
   });
   return security === undefined ? base : { ...base, security };
+}
+
+/**
+ * Minimal inline `Agent` so the boot path has a `firstAgent` to run the TC-1b
+ * (#632) self-check against under `enforce`. Trust is empty (the self-check
+ * exercises the own-stack short-circuit, not peer trust).
+ */
+function enforceAgentFixture(): Agent {
+  return {
+    id: "luna",
+    displayName: "Luna",
+    persona: "./personas/luna.md",
+    roles: [],
+    trust: [],
+    presence: {},
+  } as Agent;
 }
 
 interface RecordingRuntime extends MyelinRuntime {
@@ -216,18 +233,32 @@ describe("startCortex — TC-0 security posture wiring (#628)", () => {
   });
 
   test("enforce → rejecting knobs (rejectEmpty=true, drop)", async () => {
+    // The posture-knob log line is emitted at boot independent of stack
+    // identity / agents. Under TC-1b (#632) an `enforce` stack with no
+    // self-verifiable identity FAILS FAST after that line, so we capture logs
+    // around the (expected) throw and assert the knob resolution still logged.
     const runtime = createRecordingRuntime();
     const cfg = minimalConfig({
       signing: "enforce",
       encryption: { payload: "off", at_rest: "off" },
       transport: { mtls: "off" },
     });
-    const { result: handle, logs } = await withCapturedConsoleLog(() =>
-      startCortex(cfg, {
-        ...COMMON_OPTS,
-        injectRuntime: runtime,
-      }),
-    );
+
+    const originalLog = console.log.bind(console);
+    const logs: string[] = [];
+    console.log = (...args: unknown[]): void => {
+      logs.push(args.map((a) => String(a)).join(" "));
+    };
+    let threw = false;
+    try {
+      await startCortex(cfg, { ...COMMON_OPTS, injectRuntime: runtime });
+    } catch (err) {
+      threw = true;
+      expect(err instanceof Error ? err.message : String(err)).toMatch(/REFUSING TO BOOT/i);
+    } finally {
+      console.log = originalLog;
+    }
+    expect(threw).toBe(true);
 
     const postureLines = logs.filter((l) =>
       l.includes("cortex: security posture — signing=enforce"),
@@ -235,7 +266,54 @@ describe("startCortex — TC-0 security posture wiring (#628)", () => {
     expect(postureLines.length).toBe(1);
     expect(postureLines[0]!).toContain("rejectEmpty=true");
     expect(postureLines[0]!).toContain("signFailureMode=drop");
+  });
 
-    await handle.stop();
+  test("TC-1b: enforce + valid stack identity + agent → boots clean", async () => {
+    // The positive path: a provisioned seed + an agent that can receive the
+    // self-check envelope. The boot self-check round-trips and boot proceeds.
+    const tmp = mkdtempSync(join(tmpdir(), "cortex-posture-enforce-ok-"));
+    const seedPath = join(tmp, "stack.nk");
+    writeFileSync(seedPath, new TextDecoder().decode(createUser().getSeed()));
+    chmodSync(seedPath, 0o600);
+    try {
+      const runtime = createRecordingRuntime();
+      const cfg = minimalConfig({
+        signing: "enforce",
+        encryption: { payload: "off", at_rest: "off" },
+        transport: { mtls: "off" },
+      });
+      const { result: handle, logs } = await withCapturedConsoleLog(() =>
+        startCortex(cfg, {
+          ...COMMON_OPTS,
+          stack: { id: "test-op/research", nkey_seed_path: seedPath },
+          inlineAgents: [enforceAgentFixture()],
+          injectRuntime: runtime,
+        }),
+      );
+      // Self-check round-tripped under enforce → boot proceeded.
+      expect(logs.join("\n")).toContain("verifier-self-check OK");
+      await handle.stop();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("TC-1b: enforce + no stack identity → REFUSES TO BOOT (fail fast)", async () => {
+    // The TC-1b boot gate: a stack serving SIGNED traffic under `enforce` must
+    // have a self-verifiable signing identity. With none wired, startCortex
+    // must throw rather than silently serve unverifiable traffic.
+    const runtime = createRecordingRuntime();
+    const cfg = minimalConfig({
+      signing: "enforce",
+      encryption: { payload: "off", at_rest: "off" },
+      transport: { mtls: "off" },
+    });
+    await expect(
+      startCortex(cfg, {
+        ...COMMON_OPTS,
+        inlineAgents: [enforceAgentFixture()],
+        injectRuntime: runtime,
+      }),
+    ).rejects.toThrow(/REFUSING TO BOOT/i);
   });
 });

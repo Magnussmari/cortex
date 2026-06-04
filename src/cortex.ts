@@ -68,7 +68,7 @@ import {
   verifySignedByChain,
   nkeyToBase64Pubkey,
 } from "./bus/verify-signed-by-chain";
-import { runVerifierSelfCheck } from "./bus/verifier-self-check";
+import { bootVerifierSelfCheck } from "./bus/verifier-self-check";
 import { CCSession, type CCSessionOpts } from "./runner/cc-session";
 import { makePiDevPipelineRunner } from "./runner/substrate/pi-dev-runner";
 
@@ -2272,34 +2272,54 @@ export async function startCortex(
       `adapters=${adapters.length}`,
   );
 
-  // cortex#480 — boot-time self-signed envelope sanity check. After the
-  // listeners are wired with `stackIdentity` + `stackNKeyPub`, build a
-  // tiny envelope signed by the stack's own NKey and round-trip it
-  // through `verifySignedByChain` to confirm the verifier admits it.
-  // The check exists because the cortex#480 root-cause (verifier
-  // rejecting `did:mf:<stack>` as unknown_agent) shipped to prod
-  // unnoticed — no boot-side observability exercised the identity the
-  // wire would actually carry. A future regression in the stack-trust
-  // short-circuit / NKey bridge / Principal-registry shape now fails
-  // loudly at boot with a grep-friendly stderr WARNING instead of at
-  // first Discord chat. Skipped when no signing identity is wired
-  // (deployments running unsigned by design).
-  if (
-    signer !== undefined
-    && stackNKeyPubForVerifier !== undefined
-    && firstAgent !== undefined
-  ) {
-    // Fire-and-forget by design — boot does not wait for the result.
-    // The check is informational; production deployment health is
-    // ultimately validated by the dashboard / first round-trip chat.
-    void runVerifierSelfCheck({
-      stackIdentity: signer.principal,
-      stackNKeyPub: stackNKeyPubForVerifier,
-      stackSeedBytes: signer.rawSeedBytes,
+  // cortex#480 + TC-1b (#632) — boot-time self-signed envelope sanity check,
+  // posture-aware. After the listeners are wired with `stackIdentity` +
+  // `stackNKeyPub`, build a tiny envelope signed by the stack's own NKey and
+  // round-trip it through `verifySignedByChain` to confirm the verifier
+  // admits it. The check exists because the cortex#480 root-cause (verifier
+  // rejecting `did:mf:<stack>` as unknown_agent) shipped to prod unnoticed —
+  // no boot-side observability exercised the identity the wire would actually
+  // carry.
+  //
+  // TC-1b makes the gate **posture-aware** (per design §Phase 1.1b
+  // "`verifier-self-check` passes on every stack at boot"):
+  //   - `enforce` → a missing OR unverifiable stack identity FAILS FAST: the
+  //     gate throws, the catch below maps it to a fatal boot error and the
+  //     CLI exits non-zero. A stack serving SIGNED traffic must not run with
+  //     an identity its own verifier rejects.
+  //   - `permissive`/`off` → advisory: WARN on failure (or when no identity
+  //     is wired, no-op), boot continues — the pre-TC-1b behaviour.
+  //
+  // We `await` (not fire-and-forget) so the `enforce` throw can abort boot
+  // deterministically before the router starts admitting envelopes. The
+  // grep-friendly `verifier-self-check` stderr line is preserved for
+  // pilot-loop / on-call pattern matching.
+  if (firstAgent !== undefined) {
+    const selfCheckIdentity =
+      signer !== undefined && stackNKeyPubForVerifier !== undefined
+        ? {
+            stackIdentity: signer.principal,
+            stackNKeyPub: stackNKeyPubForVerifier,
+            stackSeedBytes: signer.rawSeedBytes,
+          }
+        : undefined;
+    await bootVerifierSelfCheck({
+      posture: config.security.signing,
+      identity: selfCheckIdentity,
       resolver: trustResolver,
       receivingAgentId: firstAgent.id,
       principalId,
     });
+  } else if (config.security.signing === "enforce") {
+    // No agents at all under `enforce` — there is no `receivingAgentId` to run
+    // the self-check against, but a stack with no agents cannot serve signed
+    // traffic meaningfully either. Refuse to boot with the same fail-fast
+    // posture so a misconfigured enforce stack does not start silently.
+    throw new Error(
+      "verifier-self-check: REFUSING TO BOOT — security.signing=enforce but no " +
+        "agents are configured; cannot run the boot self-check. Configure at " +
+        "least one agent, or drop signing to permissive/off.",
+    );
   }
 
   // Start router AFTER all surfaces register so the first envelope
