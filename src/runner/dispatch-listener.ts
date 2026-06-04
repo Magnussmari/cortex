@@ -70,6 +70,7 @@ import {
   getSignedByChain,
   getFirstStampPrincipal,
   getTargetAssistant,
+  principalFromEnvelope,
 } from "../bus/myelin/envelope-validator";
 import { encodeDidSegment } from "@the-metafactory/myelin/subjects";
 import type { MyelinRuntime, BusEnvelopeSigner } from "../bus/myelin/runtime";
@@ -77,6 +78,7 @@ import { signEnvelope } from "@the-metafactory/myelin/identity";
 import {
   emitFederationDenied,
   evaluateFederationGate,
+  resolveSourceNetwork,
   subjectMatches,
 } from "../bus/surface-router";
 import type { PolicyFederated, PolicyFederatedNetwork } from "../common/types/cortex-config";
@@ -100,7 +102,6 @@ import type {
 import type { PolicyEngine } from "../common/policy/engine";
 import { extractAgentIdFromDid } from "../common/policy/did";
 import { isUuid } from "../common/types/uuid";
-import { LETTER_PREFIX_ID_REGEX } from "../common/types/id";
 import type {
   Intent,
   PolicyDenyReason,
@@ -780,6 +781,7 @@ export function createDispatchListener(
         stackNKeyPub,
         resignSigner,
         resolveFederatedPeer,
+        federatedNetworksById,
         traceDispatch,
       });
     } catch (err) {
@@ -1122,6 +1124,13 @@ interface DispatchHandlerContext {
     | ((peerPrincipal: string) => Promise<FederatedPeerResolution>)
     | undefined;
   /**
+   * cortex#686 (ADR 0001) — federated networks indexed by id, used to resolve
+   * the SOURCE network from the SOURCE PRINCIPAL's `peers[]` membership for the
+   * `source_network` audit annotation (ADR 0001 — the network is never on the
+   * wire). Built once by `createDispatchListener`; empty map = no federation.
+   */
+  federatedNetworksById: Map<string, PolicyFederatedNetwork>;
+  /**
    * cortex#492 — when `true`, emit a `system.dispatch.stage` trace at
    * each gate inside the handler. Resolved by `createDispatchListener`
    * from the explicit option or `CORTEX_TRACE_DISPATCH`; the handler
@@ -1151,6 +1160,7 @@ async function handleDispatchEnvelope(
     stackNKeyPub,
     resignSigner,
     resolveFederatedPeer,
+    federatedNetworksById,
     traceDispatch,
   } = ctx;
   // cortex#492 — pre-parse trace context. Refined to the trusted payload
@@ -1477,7 +1487,7 @@ async function handleDispatchEnvelope(
   // subject when the envelope arrived via `federated.{id}.>`. Local
   // dispatches (subjects like `local.{principal}.dispatch.task.received`)
   // leave it `undefined` so the engine skips the federation branch.
-  const sourceNetwork = extractSourceNetwork(subject);
+  const sourceNetwork = extractSourceNetwork(envelope, subject, federatedNetworksById);
   let gatedPrincipal: Principal | undefined;
   if (policyEngine === undefined) {
     // v2.0.1 (cortex#311): fail-closed when policy engine is unavailable.
@@ -1920,46 +1930,41 @@ function enrichDenyReason(
 }
 
 /**
- * ⚠️ ADR 0001 (supersedes cortex#661) GRAMMAR MISMATCH — REWORK IN cortex#686.
+ * cortex#686 (ADR 0001, supersedes cortex#661) — resolve the SOURCE network id
+ * from the SOURCE PRINCIPAL via deployment topology, NOT from a subject segment.
  *
- * This reads subject segment[1] as a `{network_id}` (the cortex#661 grammar).
- * Under ADR 0001 segment[1] is the RECEIVING principal, not a network id — so on
- * a conformant inbound `federated.{principal}.{stack}.…` subject this returns the
- * PRINCIPAL where it claims to return a network id. Its sole consumer is the
- * `source_network` audit-annotation on `system.access.denied` (an observability
- * field, not an isolation decision), and the federation gate it feeds
- * (`evaluateFederationGate`) is itself ADR-mismatched + fails closed — so the
- * mislabelled value cannot WIDEN access; it only mis-tags the audit stream until
- * the cortex#686 lockstep reworks both onto the `{principal}.{stack}` grammar.
+ * Under ADR 0001 the network is NEVER on the wire: an inbound federated subject
+ * is `federated.{target-principal}.{stack}.…` where segment[1] is the RECEIVING
+ * principal. The source network is resolved from the source principal (the
+ * leading segment of `envelope.source`, via `principalFromEnvelope`) by finding
+ * the configured network whose `peers[]` lists that principal — the same
+ * `resolveSourceNetwork` topology lookup the federation gate uses. This keeps
+ * the `source_network` audit-annotation on `system.access.denied` correct under
+ * the conformant grammar instead of mis-tagging it with the receiving principal.
  *
- * IAW Phase D.3 (cortex#116) — derive the federation network id from
- * a NATS subject of the form `federated.{network_id}.<...>`. Returns
- * `undefined` for any other subject shape (including local dispatches
- * and undefined inputs).
+ * Returns the resolved network id, or `undefined` when:
+ *   - the envelope is not federated (`local.*` / `public.*` subjects, where the
+ *     engine skips the federation branch), or
+ *   - the source principal is in no configured network's `peers[]` (the
+ *     federation gate has already denied such an envelope before this is read).
  *
- * The `{network_id}` grammar matches `PolicyFederatedNetworkSchema.id`
- * — lowercase alphanumeric + hyphen, starting with a letter. A
- * subject whose second segment doesn't match this grammar yields
- * `undefined` (defensive — the schema rejects malformed network ids
- * at config-load, but the wire path could still surface unexpected
- * subjects).
- *
- * Examples:
- *   `federated.research-collab.tasks.code-review` → `"research-collab"`
- *   `federated.research-collab` → `undefined` (no trailing segments,
- *     not a dispatch subject)
- *   `local.metafactory.dispatch.task.received` → `undefined`
- *   `undefined` → `undefined`
+ * IAW Phase D.3 (cortex#116) — the consumer of this value is the engine's
+ * federation branch + the `system.access.denied` audit annotation.
  */
-function extractSourceNetwork(subject: string | undefined): string | undefined {
-  if (subject === undefined) return undefined;
-  const parts = subject.split(".");
-  if (parts.length < 3) return undefined;
-  if (parts[0] !== "federated") return undefined;
-  const networkId = parts[1];
-  if (networkId === undefined || networkId.length === 0) return undefined;
-  if (!LETTER_PREFIX_ID_REGEX.test(networkId)) return undefined;
-  return networkId;
+function extractSourceNetwork(
+  envelope: Envelope,
+  subject: string | undefined,
+  networksById: Map<string, PolicyFederatedNetwork>,
+): string | undefined {
+  // Only federated traffic carries a source network. Local/public dispatches
+  // leave it undefined so the engine skips the federation branch — same
+  // contract as the pre-ADR subject-prefix guard.
+  if (!subject?.startsWith("federated.")) {
+    return undefined;
+  }
+  const sourcePrincipal = principalFromEnvelope(envelope);
+  const resolved = resolveSourceNetwork(sourcePrincipal, networksById);
+  return resolved?.networkId;
 }
 
 /**

@@ -42,6 +42,7 @@ import {
   OFFER_DISPATCH_REVIEWER,
   failedReasonToAckDecision,
   parseReviewRequestPayload,
+  parseFederatedRequester,
   readLogicalResponseRouting,
   type ReviewConsumerAgent,
   type ReviewConsumerOpts,
@@ -93,17 +94,21 @@ const PAYLOAD: ReviewRequestPayload = {
 interface RecordingRuntime extends MyelinRuntime {
   published: Envelope[];
   publishOutcomes: { ok: boolean; error?: Error }[];
+  /** cortex#686 — every `publishOnSubject(envelope, subject)` call, in order. */
+  publishedOnSubject: { envelope: Envelope; subject: string }[];
 }
 
 function createRecordingRuntime(): RecordingRuntime {
   const published: Envelope[] = [];
   const publishOutcomes: { ok: boolean; error?: Error }[] = [];
+  const publishedOnSubject: { envelope: Envelope; subject: string }[] = [];
   let publishCallIndex = 0;
   const onEnvelopeHandlers = new Set<EnvelopeHandler>();
   return {
     enabled: false,
     published,
     publishOutcomes,
+    publishedOnSubject,
     onEnvelope(handler) {
       onEnvelopeHandlers.add(handler);
       return {
@@ -119,6 +124,10 @@ function createRecordingRuntime(): RecordingRuntime {
         throw outcome.error ?? new Error("publish failed");
       }
       published.push(envelope);
+    },
+    // cortex#686 — federated review consumer routes verdicts via this path.
+    publishOnSubject: async (envelope: Envelope, subject: string) => {
+      publishedOnSubject.push({ envelope, subject });
     },
     stop: async () => {},
   };
@@ -1361,5 +1370,196 @@ describe("ReviewConsumer — response_routing echo (cortex#502)", () => {
       // ...but no response_routing key anywhere.
       expect("response_routing" in (env.payload as object)).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cortex#686 (ADR 0001) — FEDERATED review consumer
+// ---------------------------------------------------------------------------
+
+describe("parseFederatedRequester — ADR 0001 grammar (cortex#686)", () => {
+  test("stack-aware subject → {principal, stack} from segment[1]/[2]", () => {
+    expect(
+      parseFederatedRequester(
+        "federated.jc.sage-host.tasks.code-review.typescript",
+      ),
+    ).toEqual({ principal: "jc", stack: "sage-host" });
+  });
+
+  test("stack-less 5-segment subject → {principal} only", () => {
+    expect(
+      parseFederatedRequester("federated.jc.tasks.code-review.typescript"),
+    ).toEqual({ principal: "jc" });
+  });
+
+  test("non-federated subject → undefined (falls through to local publish)", () => {
+    expect(
+      parseFederatedRequester("local.andreas.meta-factory.tasks.code-review.ts"),
+    ).toBeUndefined();
+  });
+
+  test("bare `federated.` → undefined", () => {
+    expect(parseFederatedRequester("federated.")).toBeUndefined();
+  });
+
+  test("federated subject with no tasks segment → undefined (not dispatch traffic)", () => {
+    expect(parseFederatedRequester("federated.jc.sage-host")).toBeUndefined();
+  });
+
+  test("does NOT treat a network id as a segment — principal is segment[1]", () => {
+    // The network is NEVER on the wire (ADR 0001). segment[1] is the requester
+    // principal, not a network id.
+    const r = parseFederatedRequester(
+      "federated.jc.sage-host.tasks.code-review.bun",
+    );
+    expect(r?.principal).toBe("jc");
+    expect(r?.stack).toBe("sage-host");
+  });
+});
+
+describe("ReviewConsumer — federated mode (cortex#686)", () => {
+  /** Inbound federated review-request subject keyed to the REQUESTER `jc/sage-host`. */
+  const FED_SUBJECT = "federated.jc.sage-host.tasks.code-review.typescript";
+
+  test("verdict path → ALL envelopes routed via publishOnSubject on federated.{requester}.{stack}.{type}", async () => {
+    const runtime = createRecordingRuntime();
+    const request = makeRequest("typescript");
+    const verdict = buildVerdictEnvelope(request, "approved");
+
+    const consumer = new ReviewConsumer(
+      baseOpts({
+        runtime,
+        federated: true,
+        pipelineRunner: fixedPipeline((opts) => {
+          // cortex#686 — the pipeline is told to stamp federated sovereignty.
+          expect(opts.classification).toBe("federated");
+          return { kind: "verdict", envelope: verdict };
+        }),
+      }),
+    );
+
+    const decision = await consumer.processEnvelope(request, FED_SUBJECT, null);
+    expect(decision).toEqual({ kind: "ack" });
+
+    // NOTHING on the local `publish` path; everything on `publishOnSubject`.
+    expect(runtime.published).toHaveLength(0);
+    const subjects = runtime.publishedOnSubject.map((p) => p.subject);
+    const types = runtime.publishedOnSubject.map((p) => p.envelope.type);
+    expect(types).toEqual([
+      "dispatch.task.started",
+      "review.verdict.approved",
+      "dispatch.task.completed",
+    ]);
+    // Every emitted subject targets the REQUESTER's identity (jc/sage-host),
+    // NOT the consumer's own principal/stack and NOT a network id.
+    for (const s of subjects) {
+      expect(s.startsWith("federated.jc.sage-host.")).toBe(true);
+    }
+    expect(subjects[1]).toBe("federated.jc.sage-host.review.verdict.approved");
+    expect(subjects[2]).toBe("federated.jc.sage-host.dispatch.task.completed");
+  });
+
+  test("correlation_id preserved across the federated verdict + lifecycle envelopes", async () => {
+    const runtime = createRecordingRuntime();
+    const request = makeRequest("typescript");
+    const verdict = buildVerdictEnvelope(request, "approved");
+    const consumer = new ReviewConsumer(
+      baseOpts({
+        runtime,
+        federated: true,
+        pipelineRunner: fixedPipeline(() => ({ kind: "verdict", envelope: verdict })),
+      }),
+    );
+    await consumer.processEnvelope(request, FED_SUBJECT, null);
+    for (const { envelope } of runtime.publishedOnSubject) {
+      expect(envelope.correlation_id).toBe(request.id);
+    }
+  });
+
+  test("pre-pipeline failure (bad payload) → failed envelope routed on federated subject", async () => {
+    const runtime = createRecordingRuntime();
+    // A review-typed envelope with an unparseable payload.
+    const bad = createReviewRequestEvent({
+      source: SOURCE,
+      flavor: "typescript",
+      payload: PAYLOAD,
+    });
+    (bad as { payload: Record<string, unknown> }).payload = { nonsense: true };
+
+    const consumer = new ReviewConsumer(
+      baseOpts({
+        runtime,
+        federated: true,
+        pipelineRunner: fixedPipeline(() => {
+          throw new Error("pipeline must not run on a bad payload");
+        }),
+      }),
+    );
+
+    const decision = await consumer.processEnvelope(bad, FED_SUBJECT, null);
+    expect(decision.kind).toBe("term");
+    expect(runtime.published).toHaveLength(0);
+    expect(runtime.publishedOnSubject).toHaveLength(1);
+    const failed = runtime.publishedOnSubject[0]!;
+    expect(failed.envelope.type).toBe("dispatch.task.failed");
+    expect(failed.subject).toBe("federated.jc.sage-host.dispatch.task.failed");
+  });
+
+  test("federated emitted envelopes declare federated sovereignty", async () => {
+    const runtime = createRecordingRuntime();
+    const request = makeRequest("typescript");
+    const verdict = buildVerdictEnvelope(request, "commented");
+    const consumer = new ReviewConsumer(
+      baseOpts({
+        runtime,
+        federated: true,
+        pipelineRunner: fixedPipeline((opts) => ({
+          kind: "verdict",
+          // Echo the pipeline's classification onto the verdict so the test
+          // sees federated sovereignty end-to-end.
+          envelope: createReviewVerdictEvent({
+            source: SOURCE,
+            kind: "commented",
+            correlationId: request.id,
+            ...(opts.classification !== undefined && {
+              classification: opts.classification,
+            }),
+            payload: (verdict.payload as never),
+          }),
+        })),
+      }),
+    );
+    await consumer.processEnvelope(request, FED_SUBJECT, null);
+    for (const { envelope } of runtime.publishedOnSubject) {
+      expect(envelope.sovereignty.classification).toBe("federated");
+    }
+  });
+
+  test("local mode (federated: false) is byte-for-byte unchanged — uses runtime.publish", async () => {
+    const runtime = createRecordingRuntime();
+    const request = makeRequest("typescript");
+    const verdict = buildVerdictEnvelope(request, "approved");
+    const consumer = new ReviewConsumer(
+      baseOpts({
+        runtime,
+        // federated NOT set → local path.
+        pipelineRunner: fixedPipeline((opts) => {
+          expect(opts.classification).toBeUndefined();
+          return { kind: "verdict", envelope: verdict };
+        }),
+      }),
+    );
+    await consumer.processEnvelope(
+      request,
+      "local.metafactory.meta-factory.tasks.code-review.typescript",
+      null,
+    );
+    // Local path: everything on `publish`, nothing on `publishOnSubject`.
+    expect(runtime.publishedOnSubject).toHaveLength(0);
+    expect(runtime.published.map((e) => e.type)).toEqual([
+      "dispatch.task.started",
+      "review.verdict.approved",
+      "dispatch.task.completed",
+    ]);
   });
 });

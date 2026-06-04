@@ -986,6 +986,18 @@ export async function startCortex(
   // Reuses `derivedStack.stack` resolved at boot (line 308) — same source
   // sage's bridge subscription already uses for `local.{principal}.{stack}.>`.
   const reviewSubjectPattern = `local.${reviewPrincipalId}.${derivedStack.stack}.tasks.code-review.>`;
+  // cortex#686 (ADR 0001) — the FEDERATED review pattern: this RECEIVING stack's
+  // OWN identity (`federated.{my-principal}.{my-stack}.tasks.code-review.>`),
+  // the same `{principal}.{stack}` segments as the local pattern, only the
+  // scope prefix differs (the network is NEVER on the wire — resolved from
+  // topology). Cross-principal review-requests from a configured peer land
+  // here; the federated consumer routes the verdict back to the REQUESTER's
+  // identity (see ReviewConsumer `federated` mode). Gated on a `federated:`
+  // policy block: a deployment with no federation declared adds no federated
+  // filter/consumer (back-compat — local path byte-for-byte unchanged).
+  const federationConfigured =
+    (options.policy?.federated?.networks ?? []).length > 0;
+  const reviewFederatedSubjectPattern = `federated.${reviewPrincipalId}.${derivedStack.stack}.tasks.code-review.>`;
   const reviewConfig = options.bus?.review;
   const reviewStream = reviewConfig?.stream.name ?? "CODE_REVIEW";
   const reviewStreamMaxAgeNs =
@@ -1009,18 +1021,27 @@ export async function startCortex(
   // try/catch and aborted boot (sage review on #338, round 2).
   const reviewJsm = await resolveReviewProvisioningJsm(runtime, reviewCapableAgents);
 
+  // cortex#686 — the CODE_REVIEW stream's subject filter carries BOTH the
+  // local and (when federation is configured) the federated code-review
+  // patterns, so an inbound `federated.{me}.{stack}.tasks.code-review.…`
+  // request from a peer is captured by the same JetStream stream the local
+  // consumer binds. A parallel federated DURABLE (per agent) binds below.
+  const reviewStreamSubjects = federationConfigured
+    ? [reviewSubjectPattern, reviewFederatedSubjectPattern]
+    : [reviewSubjectPattern];
+
   if (reviewJsm !== null) {
     try {
       const outcome = await provisionReviewStream({
         jsm: reviewJsm,
         name: reviewStream,
-        subjects: [reviewSubjectPattern],
+        subjects: reviewStreamSubjects,
         maxAgeNs: reviewStreamMaxAgeNs,
         maxBytes: reviewStreamMaxBytes,
       });
       if (outcome === "created") {
         console.log(
-          `cortex: provisioned JetStream stream "${reviewStream}" (subjects=[${reviewSubjectPattern}])`,
+          `cortex: provisioned JetStream stream "${reviewStream}" (subjects=[${reviewStreamSubjects.join(", ")}])`,
         );
       } else if (outcome === "exists") {
         console.log(
@@ -1142,38 +1163,51 @@ export async function startCortex(
 
       const reviewSessionOpts = buildReviewSessionOpts(config, agent);
 
-      const consumer = new ReviewConsumer({
-        agent: consumerAgent,
-        source: systemEventSource,
-        runtime,
-        // CC session factory — spawns a real `claude` process. Mirrors the
-        // default factory inside `ClaudeCodeHarness` (the harness keeps its
-        // own copy private; we don't re-export to avoid the symbol leaking
-        // into the public bus surface). Tests don't reach the factory
-        // unless `processEnvelope` is invoked; the boot test in
-        // `src/__tests__/cortex.review-consumer-boot.test.ts` only
-        // exercises instantiation + subscribe. Stays wired even when a
-        // non-CC pipelineRunner is selected — the consumer's type still
-        // requires the factory, and the CC path remains the default
-        // fallthrough for non-pi-dev substrates.
-        ccSessionFactory: (opts) => new CCSession(opts),
-        // PR-6 has no policy hook — that's a future PR (sovereignty /
-        // compliance gate). Until then the pipeline goes straight to CC.
-        promptBuilder: ({ payload }) =>
-          // Dispatch INTENT, not method. cortex pings the reviewer with the
-          // PR to review; the reviewing agent (e.g. Echo) owns HOW — its
-          // persona routes to its canonical review entry (`/review-pr` →
-          // CodeReview skill → `gh pr review` + the cortex#237 verdict block).
-          // Do NOT send a `/review` slash command here: that hijacks the
-          // session into the generic built-in reviewer (which produces prose
-          // and *asks* before posting — never posting in a non-interactive
-          // dispatch). Capability routing already happened on the subject
-          // (`tasks.code-review.*`); the prompt only carries the intent.
-          `Review PR ${payload.repo}#${payload.pr}`,
-        sessionOpts: reviewSessionOpts,
-        ...(pipelineRunner !== undefined && { pipelineRunner }),
-        ...(signatureVerifier !== undefined && { signatureVerifier }),
-      });
+      // cortex#686 — shared construction options for the local + federated
+      // consumers. Both serve the SAME reviewer agent (same capabilities,
+      // verifier, substrate, prompt); they differ only in the `federated` flag
+      // (which flips verdict routing to the requester) and the subscription
+      // pattern/durable. Factored into a closure so the two consumers can't
+      // drift on the heavy CC-session / verifier / prompt wiring.
+      const makeConsumer = (federated: boolean): ReviewConsumer =>
+        new ReviewConsumer({
+          agent: consumerAgent,
+          source: systemEventSource,
+          runtime,
+          // CC session factory — spawns a real `claude` process. Mirrors the
+          // default factory inside `ClaudeCodeHarness` (the harness keeps its
+          // own copy private; we don't re-export to avoid the symbol leaking
+          // into the public bus surface). Tests don't reach the factory
+          // unless `processEnvelope` is invoked; the boot test in
+          // `src/__tests__/cortex.review-consumer-boot.test.ts` only
+          // exercises instantiation + subscribe. Stays wired even when a
+          // non-CC pipelineRunner is selected — the consumer's type still
+          // requires the factory, and the CC path remains the default
+          // fallthrough for non-pi-dev substrates.
+          ccSessionFactory: (opts) => new CCSession(opts),
+          // PR-6 has no policy hook — that's a future PR (sovereignty /
+          // compliance gate). Until then the pipeline goes straight to CC.
+          promptBuilder: ({ payload }) =>
+            // Dispatch INTENT, not method. cortex pings the reviewer with the
+            // PR to review; the reviewing agent (e.g. Echo) owns HOW — its
+            // persona routes to its canonical review entry (`/review-pr` →
+            // CodeReview skill → `gh pr review` + the cortex#237 verdict block).
+            // Do NOT send a `/review` slash command here: that hijacks the
+            // session into the generic built-in reviewer (which produces prose
+            // and *asks* before posting — never posting in a non-interactive
+            // dispatch). Capability routing already happened on the subject
+            // (`tasks.code-review.*`); the prompt only carries the intent.
+            `Review PR ${payload.repo}#${payload.pr}`,
+          sessionOpts: reviewSessionOpts,
+          ...(pipelineRunner !== undefined && { pipelineRunner }),
+          ...(signatureVerifier !== undefined && { signatureVerifier }),
+          // cortex#686 — federated consumers route the verdict back to the
+          // requester's identity on the conformant `federated.{requester}.…`
+          // grammar (the cortex receiver that closes the cross-principal loop).
+          ...(federated && { federated: true }),
+        });
+
+      const consumer = makeConsumer(false);
       reviewConsumers.push(consumer);
       // Subscribe via the runtime's subscribePull helper. When the
       // runtime is disabled the helper returns null inside start() and
@@ -1246,6 +1280,58 @@ export async function startCortex(
         console.log(
           `cortex: review consumer DORMANT for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} — cortex MyelinRuntime subscriptions disabled (G-1111 pending; tasks.code-review.* envelopes will not be claimed by this consumer)`,
         );
+      }
+
+      // cortex#686 (ADR 0001) — the FEDERATED review consumer. Subscribes this
+      // stack's OWN federated identity (`federated.{my-principal}.{my-stack}.
+      // tasks.code-review.>`) on the SAME CODE_REVIEW stream (its subject
+      // filter was extended above when federation is configured), via a
+      // SEPARATE durable so local + federated traffic ack independently. Routes
+      // the verdict back to the REQUESTER's identity (the `federated: true`
+      // flag). Only wired when a `federated:` policy block is declared — a
+      // non-federating deployment skips this entirely (back-compat).
+      if (federationConfigured) {
+        const federatedConsumer = makeConsumer(true);
+        reviewConsumers.push(federatedConsumer);
+        const federatedDurable = `cortex-review-consumer-federated-${reviewPrincipalId}-${agent.id}`;
+        if (reviewJsm !== null) {
+          try {
+            const outcome = await provisionReviewConsumer({
+              jsm: reviewJsm,
+              stream: reviewStream,
+              durable: federatedDurable,
+              maxDeliver: reviewConsumerMaxDeliver,
+            });
+            if (outcome === "created") {
+              console.log(
+                `cortex: provisioned JetStream durable "${federatedDurable}" on stream "${reviewStream}"`,
+              );
+            } else if (outcome === "updated") {
+              console.log(
+                `cortex: reconciled JetStream durable "${federatedDurable}" ack_wait (cortex#422) on stream "${reviewStream}"`,
+              );
+            }
+          } catch (provisionErr) {
+            process.stderr.write(
+              `cortex: provisionReviewConsumer failed for "${federatedDurable}": ` +
+                `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+            );
+          }
+        }
+        const federatedStarted = await federatedConsumer.start({
+          pattern: reviewFederatedSubjectPattern,
+          stream: reviewStream,
+          durable: federatedDurable,
+        });
+        if (federatedStarted.subscribed) {
+          console.log(
+            `cortex: federated review consumer ready for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} pattern=${reviewFederatedSubjectPattern}`,
+          );
+        } else {
+          console.log(
+            `cortex: federated review consumer DORMANT for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} — cortex MyelinRuntime subscriptions disabled (federated.* code-review envelopes will not be claimed by this consumer)`,
+          );
+        }
       }
     } catch (err) {
       // Per CLAUDE.md: log every error. A single agent's consumer crash
