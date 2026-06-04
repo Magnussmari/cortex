@@ -331,6 +331,87 @@ describe("negative paths (no throw, boot anchor preserved)", () => {
 });
 
 // =============================================================================
+// DID-collision attack — boot anchor displacement at materialisation
+// =============================================================================
+
+describe("DID-collision attack (boot anchor displacement)", () => {
+  // The internal map is keyed by principalId, but the materialised myelin
+  // registry the verifier consumes is keyed by DID and is last-write-wins.
+  // `peerDid(p) = did:mf:<p>` is injective over principalId, so two peers can
+  // never collide — the ONLY reachable collision is peer-vs-boot, because the
+  // boot DID is a caller-supplied STACK DID (`did:mf:<principal>-<stack>`),
+  // independent of the boot principalId. A peer registering the hyphenated id
+  // `andreas-meta-factory` yields `did:mf:andreas-meta-factory`, colliding with
+  // a boot stack DID of the same form. That peer must be REFUSED, or a registry
+  // compromise could shadow the out-of-band boot anchor in the verify registry.
+
+  // Boot whose principalId ("boot") differs from its DID (a stack-DID form),
+  // so a peer with a distinct principalId can collide on the DID.
+  function bootWithStackDid(): Identity {
+    return {
+      id: "did:mf:andreas-meta-factory",
+      display_name: "boot",
+      network: "andreas",
+      public_key: BOOT_PUBKEY,
+      type: "agent",
+      created_at: new Date(0).toISOString(),
+    };
+  }
+
+  test("peer whose DID collides with the boot DID is refused; boot pubkey preserved in BOTH key spaces", async () => {
+    const stub = makeResolverStub({
+      "andreas-meta-factory": {
+        status: "resolved",
+        principalPubkey: PEER_PUBKEY_A,
+      },
+    });
+    const reg = new MultiPrincipalIdentityRegistry({
+      bootPrincipal: { principalId: "boot", identity: bootWithStackDid() },
+      resolver: stub,
+    });
+
+    // Distinct principalId → NOT a boot cache-hit → reaches the resolver →
+    // the DID-collision guard fires (proves it's the guard, not the map cache).
+    const outcome = await reg.resolve("andreas-meta-factory");
+    expect(outcome.resolved).toBe(false);
+    if (!outcome.resolved) expect(outcome.reason).toBe("unresolved");
+    expect(stub.calls).toEqual(["andreas-meta-factory"]); // resolver WAS consulted
+
+    // principalId map: the collision entry was never stored.
+    expect(reg.get("andreas-meta-factory")).toBeUndefined();
+    expect(reg.list()).toHaveLength(1);
+
+    // DID-keyed materialised registry: the boot pubkey survives, NOT the peer's.
+    const myelin = reg.toIdentityRegistry();
+    expect(myelin.list()).toHaveLength(1);
+    expect(myelin.resolve("did:mf:andreas-meta-factory")?.public_key).toBe(
+      BOOT_PUBKEY,
+    );
+  });
+
+  test("a non-colliding peer alongside a stack-DID boot still resolves normally", async () => {
+    // Guard is a precise equality check on the boot DID — it must not reject
+    // legitimate peers that merely share a principal prefix.
+    const stub = makeResolverStub({
+      andreas: { status: "resolved", principalPubkey: PEER_PUBKEY_B },
+    });
+    const reg = new MultiPrincipalIdentityRegistry({
+      bootPrincipal: { principalId: "boot", identity: bootWithStackDid() },
+      resolver: stub,
+    });
+
+    const outcome = await reg.resolve("andreas"); // did:mf:andreas ≠ boot DID
+    expect(outcome.resolved).toBe(true);
+    expect(reg.get("andreas")?.identity.public_key).toBe(PEER_PUBKEY_B);
+    const myelin = reg.toIdentityRegistry();
+    expect(myelin.resolve("did:mf:andreas")?.public_key).toBe(PEER_PUBKEY_B);
+    expect(myelin.resolve("did:mf:andreas-meta-factory")?.public_key).toBe(
+      BOOT_PUBKEY,
+    );
+  });
+});
+
+// =============================================================================
 // Ed25519 sign-side helpers + ephemeral registry stub (mirrors
 // resolve-pubkey.test.ts — Bun.serve({ port: 0 }), never a hardcoded port).
 // =============================================================================

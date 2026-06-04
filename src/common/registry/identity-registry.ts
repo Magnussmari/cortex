@@ -44,10 +44,15 @@
  *
  * TC-2d / audit can distinguish "we trust this because the principal pinned
  * it at boot" from "we trust this because the network registry asserted it".
- * A resolved peer entry NEVER overwrites the pinned local boot identity
- * (`pin(principalId, …)` is rejected for the boot id) — the boot anchor is
- * the strongest link in the chain and a registry compromise must not be able
- * to displace it.
+ * A resolved peer entry NEVER overwrites the pinned local boot identity, in
+ * EITHER key space: a resolve for the boot `principalId` short-circuits on the
+ * cache before the resolver is consulted, AND a resolved peer whose
+ * `did:mf:<principalId>` collides with the boot DID is refused (the
+ * materialised myelin registry is DID-keyed and last-write-wins, so without
+ * this guard a hyphenated registry id like `andreas-meta-factory` could shadow
+ * the boot stack DID `did:mf:andreas-meta-factory`). The boot anchor is the
+ * strongest link in the chain and a registry compromise must not be able to
+ * displace it.
  *
  * ## Failure handling (CLAUDE.md: NEVER empty catch)
  *
@@ -177,12 +182,20 @@ export class MultiPrincipalIdentityRegistry {
   private readonly entries = new Map<string, PrincipalEntry>();
   /** The boot principal id — immutable, never overwritten by a peer. */
   private readonly bootPrincipalId: string;
+  /**
+   * The boot principal's DID. The boot anchor is keyed two ways: by
+   * `principalId` in {@link entries} AND by this DID in the materialised
+   * myelin registry. A resolved peer must never collide with EITHER, so we
+   * refuse to store a peer whose `peerDid(principalId)` equals this value.
+   */
+  private readonly bootDid: string;
   private readonly resolver: Pick<PrincipalPubkeyResolver, "resolve"> | undefined;
   private readonly peerNetwork: (principalId: string) => string;
   private readonly logError: (msg: string) => void;
 
   constructor(options: MultiPrincipalIdentityRegistryOptions) {
     this.bootPrincipalId = options.bootPrincipal.principalId;
+    this.bootDid = options.bootPrincipal.identity.id;
     this.resolver = options.resolver;
     this.peerNetwork = options.peerNetwork ?? ((id) => id);
     this.logError =
@@ -272,7 +285,24 @@ export class MultiPrincipalIdentityRegistry {
       case "resolved": {
         // Reached only on a CACHE MISS, so `principalId` cannot be the boot
         // id (boot is always cached above) — the boot anchor is structurally
-        // safe from a resolver-supplied pubkey.
+        // safe from a resolver-supplied pubkey IN THE principalId MAP.
+        //
+        // But the materialised myelin registry is keyed by DID, and
+        // `peerDid(principalId)` is NOT injective with the boot DID: registry
+        // ids permit hyphens and the boot stack DID is `did:mf:<principal>-
+        // <stack>`, so a peer id like `andreas-meta-factory` yields the same
+        // DID as boot `did:mf:andreas-meta-factory`. myelin `add()` is
+        // last-write-wins, so storing such a peer would let a registry
+        // assertion DISPLACE the out-of-band boot anchor in the exact
+        // registry the verifier consumes. Refuse it — a peer whose DID
+        // collides with the boot anchor is a trust-displacement attempt.
+        const did = peerDid(principalId);
+        if (did === this.bootDid) {
+          this.logError(
+            `resolve(${principalId}): SECURITY — resolved peer DID ${did} collides with the boot anchor DID; refusing (possible trust-displacement via a hyphenated registry id)`,
+          );
+          return { resolved: false, reason: "unresolved" };
+        }
         const entry: PrincipalEntry = {
           principalId,
           identity: {
@@ -304,7 +334,24 @@ export class MultiPrincipalIdentityRegistry {
    */
   toIdentityRegistry(): IdentityRegistry {
     const registry = createInMemoryRegistry();
+    // myelin `add()` is last-write-wins on the DID key. Track DIDs and skip
+    // any later entry that collides with one already added. The boot principal
+    // is inserted first in `entries` (ctor) so it is iterated first here and
+    // therefore always WINS a collision — the boot anchor can never be
+    // displaced in the materialised registry the verifier consumes. (The
+    // resolve-success guard already refuses peers whose DID collides with the
+    // boot DID; this is the defense-in-depth backstop, and it also prevents
+    // two distinct peers with a colliding DID from silently clobbering.)
+    const seenDids = new Set<string>();
     for (const entry of this.entries.values()) {
+      const did = entry.identity.id;
+      if (seenDids.has(did)) {
+        this.logError(
+          `toIdentityRegistry: skipping ${entry.principalId} (provenance=${entry.provenance}) — DID ${did} already materialised; refusing to overwrite`,
+        );
+        continue;
+      }
+      seenDids.add(did);
       registry.add(entry.identity);
     }
     return registry;
