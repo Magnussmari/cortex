@@ -118,9 +118,21 @@ gateway round-trip with zero crypto, then enable signing-permissive without touc
   re-emit through the stack's **signer-bearing** runtime so `signAndPublishOnSubject` (`runtime.ts:559`)
   stamps it with the stack NKey before the harness runs. **Acceptance:** gateway-injected dispatches
   carry a stack `signed_by[]` stamp downstream.
-- **1d. Enforce.** Flip `signFailureMode` `fallback`→`drop` (#210) and tighten the `tasks.chat`
-  inbound path toward `rejectEmpty: true` once subscribe-side verification is enforcing. **Gate:** one
-  of the #552 revisit triggers (below) must hold.
+- **1d. Enforce (TC-1d, #210 — DONE: toggle-driven, no code change).** #210 originally tracked a
+  one-line source flip of `signFailureMode` `fallback`→`drop`. That flip is now a **per-deployment
+  config flip**, not a code change: TC-0 (#628) made `security.signing: enforce` resolve to
+  `{ rejectEmpty: true, signFailureMode: "drop", cryptoVerify: true }` via `resolveSigningKnobs`, and
+  TC-1c (#552) added the Shape-B re-sign-on-ingest so gateway-injected dispatches carry a stack
+  `signed_by[]` stamp BEFORE the reject gate runs. Under `enforce` an unsigned (empty-chain) inbound
+  is dropped (`empty_chain`); a re-signed gateway envelope is non-empty and passes. There is **no
+  global default flip** — the default posture stays `off` (backward-compatible), and an operator opts
+  a deployment into fail-closed by setting `signing: enforce` in that stack's `cortex.yaml`.
+  **Gate (per-deployment):** the stack must have signing provisioned (1b) and the Shape-B re-sign in
+  place (1c) before flipping `enforce`, else legitimate gateway/adapter traffic would be dropped at the
+  `rejectEmpty` gate. The enforce↔reject and `off`/`permissive`↔accept contract is pinned end-to-end in
+  `src/bus/__tests__/bus-dispatch-listener.test.ts` (TC-1d). **Acceptance:** with `signing: enforce`,
+  an unsigned peer dispatch is rejected and a stack-re-signed gateway dispatch is accepted; with
+  `off`/`permissive` the same unsigned dispatch is accepted (shadow).
 
 ### Phase 2 — Federation trust · removes the single-principal boundary
 
