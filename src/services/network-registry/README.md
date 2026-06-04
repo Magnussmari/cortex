@@ -78,17 +78,24 @@ real-world signature paths are exercised.
 ## Deploy
 
 ```bash
-# One-time per environment: provision the signing key.
+# One-time per environment: generate the registry's signing keypair.
+# Prints the base64 PKCS#8 private key (REGISTRY_SIGNING_KEY) + the raw
+# base64 public key to pin client-side. Verified to round-trip through
+# the Worker's own pubkeyFromPkcs8() before it emits.
+bun run gen-key
+
+# Provision the signing key (paste the printed REGISTRY_SIGNING_KEY value).
 bunx wrangler secret put REGISTRY_SIGNING_KEY --env production
-# Paste a base64-encoded PKCS#8 Ed25519 private key.
+# The secret is a base64-encoded PKCS#8 Ed25519 private key (#677).
 
 # Deploy
 bunx wrangler deploy --env production
 ```
 
-DNS for `network.meta-factory.ai` is provisioned at first deploy time;
-the placeholder route in `wrangler.toml` is commented out and finalised
-then.
+The `wrangler.toml` route points `network.meta-factory.ai` (prod) /
+`network-dev.meta-factory.ai` (dev) at this Worker. The principal creates
+the matching proxied DNS record in the `meta-factory.ai` zone, then runs
+`wrangler deploy --env <env>`.
 
 ## Roadmap (follow-ups)
 

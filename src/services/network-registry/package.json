@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "gen-key": "bun run scripts/generate-registry-keypair.ts",
     "test": "bun test"
   },
   "dependencies": {
