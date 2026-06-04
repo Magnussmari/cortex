@@ -3050,6 +3050,43 @@ export function runDryRun(configPath: string): DryRunResult {
 // Skipping the CLI wiring at module load is what lets tests
 // `import { startCortex }` here without parsing argv or registering signal
 // handlers.
+/**
+ * Run the boot sequence and treat ANY boot-phase failure as FATAL. The daemon
+ * must NEVER linger half-booted — inbound dispatch listeners already live, the
+ * PID file written so launchd sees a "healthy" process — while the failure that
+ * should have stopped it is logged and ignored. This is the load-bearing
+ * guarantee behind `signing: enforce`: a stack whose `bootVerifierSelfCheck`
+ * throws "REFUSING TO BOOT" MUST exit non-zero, not survive serving traffic.
+ *
+ * Why a helper and not just a try/catch inline: the `start` action is an async
+ * commander action invoked by the synchronous `program.parse()`, which does NOT
+ * await it. A rejected boot promise would otherwise fall through to the
+ * `unhandledRejection` handler and be logged "non-fatal". Because this helper
+ * calls `process.exit(1)` itself, the fatal exit happens regardless of whether
+ * the dispatcher awaits the action.
+ */
+export async function bootOrDie<T>(
+  boot: () => Promise<T>,
+  pidFile: string,
+): Promise<T> {
+  try {
+    return await boot();
+  } catch (err) {
+    console.error(
+      `cortex: FATAL — boot aborted: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    // Remove the PID file so launchd / `cortex status` don't mistake a process
+    // that failed to boot for a healthy daemon. Best-effort — the exit is what
+    // actually matters.
+    try {
+      if (existsSync(pidFile)) unlinkSync(pidFile);
+    } catch (_err) {
+      // PID cleanup failed; nothing safe to do but proceed to the fatal exit.
+    }
+    process.exit(1);
+  }
+}
+
 if (import.meta.main) {
   const program = new Command()
     .name("cortex")
@@ -3092,22 +3129,29 @@ if (import.meta.main) {
       // block when the principal declared one — `startCortex` calls
       // `deriveStackId` and logs the resolved stack id. Today this is
       // observational only; emit subjects are unchanged.
-      const { config, inlineAgents, stack, policy, principal, bus, surfaces } = loadConfigWithAgents(options.config);
-      const handle = await startCortex(config, {
-        configPath: options.config,
-        ...(inlineAgents.length > 0 && { inlineAgents }),
-        ...(stack !== undefined && { stack }),
-        ...(policy !== undefined && { policy }),
-        // PR-R13.B.i: both LoadedConfig and StartCortexOptions now use
-        // the canonical `.principal` field.
-        ...(principal !== undefined && { principal }),
-        ...(bus !== undefined && { bus }),
-        // IAW GW (cortex#524) — thread the validated surface binding map
-        // through so the flag-gated gateway block in startCortex can read it.
-        // Dormant unless CORTEX_GATEWAY is set; undefined when no surfaces:
-        // block was declared.
-        ...(surfaces !== undefined && { surfaces }),
-      });
+      // Boot through bootOrDie: a config-load error OR a boot-phase throw
+      // (notably the signing:enforce verifier-self-check "REFUSING TO BOOT")
+      // exits the process non-zero instead of being swallowed as a "non-fatal"
+      // unhandled rejection. The daemon must not survive a failed security gate.
+      const handle = await bootOrDie(async () => {
+        const { config, inlineAgents, stack, policy, principal, bus, surfaces } =
+          loadConfigWithAgents(options.config);
+        return startCortex(config, {
+          configPath: options.config,
+          ...(inlineAgents.length > 0 && { inlineAgents }),
+          ...(stack !== undefined && { stack }),
+          ...(policy !== undefined && { policy }),
+          // PR-R13.B.i: both LoadedConfig and StartCortexOptions now use
+          // the canonical `.principal` field.
+          ...(principal !== undefined && { principal }),
+          ...(bus !== undefined && { bus }),
+          // IAW GW (cortex#524) — thread the validated surface binding map
+          // through so the flag-gated gateway block in startCortex can read it.
+          // Dormant unless CORTEX_GATEWAY is set; undefined when no surfaces:
+          // block was declared.
+          ...(surfaces !== undefined && { surfaces }),
+        });
+      }, pidFile);
 
       const shutdown = async () => {
         await handle.stop();

@@ -260,7 +260,17 @@ export function generateStackIdentity(
   // file is never momentarily group/world-readable, then assert via chmod for
   // platforms where the umask widened the create mode. The trailing newline
   // matches `nsc generate nkey` output; `loadStackSigningKey` trims it.
-  writeFileSync(seedPath, material.seed + "\n", { mode: 0o600 });
+  //
+  // Non-force create uses flag "wx" (O_EXCL|O_CREAT): the no-clobber guarantee
+  // becomes KERNEL-enforced (closing the existsSync→write TOCTOU above) and a
+  // symlink planted at `seedPath` is REFUSED rather than followed-and-written-
+  // through. Force (deliberate rotation) overwrites in place ("w"); the chmod
+  // re-assert below covers that path, where writeFileSync ignores `mode` on an
+  // already-existing file.
+  writeFileSync(seedPath, material.seed + "\n", {
+    mode: 0o600,
+    ...(force ? {} : { flag: "wx" }),
+  });
   // Defensive: an inherited umask can clear bits from the create-mode on some
   // platforms, so re-assert 600 explicitly. No-op on POSIX where the create
   // mode already took; harmless on win32 (ACL-governed).

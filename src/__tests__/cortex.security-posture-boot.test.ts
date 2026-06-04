@@ -24,14 +24,21 @@
  * stderr/console capture pattern).
  */
 
-import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { describe, expect, test, spyOn } from "bun:test";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { createUser } from "nkeys.js";
 import { AgentConfigSchema, type AgentConfig } from "../common/types/config";
 import type { Agent } from "../common/types/cortex-config";
-import { startCortex } from "../cortex";
+import { startCortex, bootOrDie } from "../cortex";
 import type { Envelope } from "../bus/myelin/envelope-validator";
 import type { EnvelopeHandler, MyelinRuntime } from "../bus/myelin/runtime";
 
@@ -315,5 +322,73 @@ describe("startCortex — TC-0 security posture wiring (#628)", () => {
         injectRuntime: runtime,
       }),
     ).rejects.toThrow(/REFUSING TO BOOT/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bootOrDie — the ENTRYPOINT-layer fatal-exit guarantee.
+//
+// The library `startCortex` rejecting (above) is NECESSARY but not SUFFICIENT:
+// the `start` action is an async commander action invoked by synchronous
+// `program.parse()`, which does not await it, so the rejection used to land in
+// the "non-fatal" unhandledRejection handler and the daemon lingered half-
+// booted. These tests pin that a boot-phase rejection now EXITS the process
+// non-zero and removes the PID file (so launchd can't see a "healthy" daemon).
+// ---------------------------------------------------------------------------
+describe("bootOrDie — boot-phase failure is fatal (cortex#632 review BLOCK)", () => {
+  function tmpPid(): string {
+    return join(
+      tmpdir(),
+      `cortex-bootordie-${process.pid}-${Math.random().toString(36).slice(2)}.pid`,
+    );
+  }
+
+  test("a boot throw (REFUSING TO BOOT) exits non-zero and removes the PID file", async () => {
+    const pidFile = tmpPid();
+    writeFileSync(pidFile, String(process.pid)); // simulate the singleton PID write
+
+    // Mock process.exit to HALT (throw) like the real thing, so we can assert
+    // the code without killing the test runner.
+    const exitSpy = spyOn(process, "exit").mockImplementation(
+      (code?: number) => {
+        throw new Error(`__exit__:${code}`);
+      },
+    );
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        bootOrDie(async () => {
+          throw new Error(
+            "verifier-self-check: REFUSING TO BOOT — stack identity unverifiable under signing: enforce",
+          );
+        }, pidFile),
+      ).rejects.toThrow("__exit__:1");
+
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      // The PID file MUST be gone — launchd must not see a healthy daemon.
+      expect(existsSync(pidFile)).toBe(false);
+      // The fatal reason is surfaced, not swallowed as "non-fatal".
+      expect(
+        errSpy.mock.calls.some((c) => String(c[0]).includes("FATAL")),
+      ).toBe(true);
+    } finally {
+      exitSpy.mockRestore();
+      errSpy.mockRestore();
+      if (existsSync(pidFile)) unlinkSync(pidFile);
+    }
+  });
+
+  test("a successful boot returns the handle and leaves the PID file intact", async () => {
+    const pidFile = tmpPid();
+    writeFileSync(pidFile, String(process.pid));
+    try {
+      const sentinel = { ok: true };
+      const handle = await bootOrDie(async () => sentinel, pidFile);
+      expect(handle).toBe(sentinel);
+      expect(existsSync(pidFile)).toBe(true); // healthy boot keeps its PID file
+    } finally {
+      if (existsSync(pidFile)) unlinkSync(pidFile);
+    }
   });
 });

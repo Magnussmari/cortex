@@ -15,7 +15,14 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, statSync, readFileSync, existsSync } from "fs";
+import {
+  mkdtempSync,
+  rmSync,
+  statSync,
+  readFileSync,
+  existsSync,
+  symlinkSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -92,6 +99,23 @@ describe("generateStackIdentity (TC-1b #632)", () => {
     if (process.platform !== "win32") {
       expect(statSync(seedPath).mode & 0o777).toBe(0o600);
     }
+  });
+
+  test("[2b] refuses to follow a dangling symlink at the seed path — no write-through (wx)", () => {
+    const dir = freshDir();
+    const seedPath = join(dir, "stack.nk");
+    const attackerTarget = join(dir, "attacker-capture.nk");
+    // Dangling symlink: its target does not exist, so existsSync(seedPath) is
+    // FALSE — the userspace no-clobber guard passes. Pre-fix (plain "w"),
+    // writeFileSync would FOLLOW the link and create attackerTarget, writing the
+    // seed THROUGH it to an attacker-controlled path. O_EXCL ("wx") refuses to
+    // create through a symlink.
+    symlinkSync(attackerTarget, seedPath);
+    expect(existsSync(seedPath)).toBe(false); // dangling → reported absent
+
+    expect(() => generateStackIdentity({ seedPath })).toThrow();
+    // The seed was NOT written through to the attacker-controlled target.
+    expect(existsSync(attackerTarget)).toBe(false);
   });
 
   test("[5] materialFromSeedString re-derives identical material", () => {
