@@ -2002,3 +2002,112 @@ describe("emitAccessFiltered — defensive .catch on publish failure (cortex#137
     }
   });
 });
+
+// =============================================================================
+// IAW Phase F-3d (cortex#666) — sourceLink anti-spoof cross-check
+// =============================================================================
+
+describe("evaluateFederationGate — F-3d sourceLink anti-spoof", () => {
+  test("no sourceLink supplied → cross-check skipped (pre-F-3d behaviour, allow)", () => {
+    const decision = evaluateFederationGate(
+      "federated.research-collab.tasks.code-review.ts",
+      makeFederatedEnvelope(),
+      networksMap([makeNetwork()]),
+      // sourceLink omitted entirely.
+    );
+    expect(decision).toBe("allow");
+  });
+
+  test("sourceLink matches the network's leaf_node → allow", () => {
+    const decision = evaluateFederationGate(
+      "federated.research-collab.tasks.code-review.ts",
+      makeFederatedEnvelope(),
+      networksMap([makeNetwork({ leaf_node: "leaf-research" })]),
+      "leaf-research",
+    );
+    expect(decision).toBe("allow");
+  });
+
+  test("sourceLink names a DIFFERENT leaf than the claimed network → source_link_mismatch", () => {
+    const decision = evaluateFederationGate(
+      "federated.research-collab.tasks.code-review.ts",
+      makeFederatedEnvelope(),
+      networksMap([makeNetwork({ leaf_node: "leaf-research" })]),
+      "leaf-jv", // arrived on the JV leaf, but subject claims research-collab.
+    );
+    expect(decision).toEqual({
+      kind: "source_link_mismatch",
+      networkId: "research-collab",
+      sourceLink: "leaf-jv",
+      expectedLeafNode: "leaf-research",
+    });
+  });
+
+  test('sourceLink === "primary" → cross-check skipped (network riding primary keeps accept/deny gating)', () => {
+    // A network without a `nats:` block rides the primary link; its declared
+    // leaf_node is NOT "primary", but a primary-delivered envelope must NOT be
+    // flagged as a spoof — the runtime's symmetric exclusion. The accept-list
+    // still governs admission.
+    const decision = evaluateFederationGate(
+      "federated.research-collab.tasks.code-review.ts",
+      makeFederatedEnvelope(),
+      networksMap([makeNetwork({ leaf_node: "leaf-research" })]),
+      "primary",
+    );
+    expect(decision).toBe("allow");
+  });
+
+  test("mismatch is decided BEFORE accept/deny (a subject the network WOULD accept is still spoof-denied)", () => {
+    const decision = evaluateFederationGate(
+      "federated.research-collab.tasks.code-review.ts", // in accept_subjects
+      makeFederatedEnvelope(),
+      networksMap([makeNetwork({ leaf_node: "leaf-research" })]),
+      "leaf-jv",
+    );
+    expect(decision).toMatchObject({ kind: "source_link_mismatch" });
+  });
+});
+
+describe("createSurfaceRouter — F-3d sourceLink threaded into the gate", () => {
+  test("dispatch(env, subject, sourceLink) with mismatched leaf → denied (no adapter render)", async () => {
+    const router = createSurfaceRouter(fakeRuntime(), {
+      federated: { networks: [makeNetwork({ leaf_node: "leaf-research" })] },
+    });
+    const a = recordingAdapter({
+      id: "a",
+      subjects: ["federated.research-collab.>"],
+    });
+    router.register(a.adapter);
+    await router.start();
+
+    // Subject claims research-collab but arrived on the JV leaf → spoof.
+    await router.dispatch(
+      makeFederatedEnvelope(),
+      "federated.research-collab.tasks.code-review.ts",
+      "leaf-jv",
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    // Hard drop — the adapter never rendered.
+    expect(a.calls).toHaveLength(0);
+  });
+
+  test("dispatch(env, subject, sourceLink) with matching leaf → adapter renders", async () => {
+    const router = createSurfaceRouter(fakeRuntime(), {
+      federated: { networks: [makeNetwork({ leaf_node: "leaf-research" })] },
+    });
+    const a = recordingAdapter({
+      id: "a",
+      subjects: ["federated.research-collab.>"],
+    });
+    router.register(a.adapter);
+    await router.start();
+
+    await router.dispatch(
+      makeFederatedEnvelope(),
+      "federated.research-collab.tasks.code-review.ts",
+      "leaf-research",
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(a.calls).toHaveLength(1);
+  });
+});

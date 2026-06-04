@@ -171,8 +171,21 @@ export interface SurfaceRouter {
   /** Dispatch one envelope to all matching adapters. Subject is optional;
    *  when omitted, it is derived from `envelope.type` for local testing.
    *  Production callers (the future runtime hook) MUST pass the actual
-   *  NATS subject so wildcard patterns match correctly. */
-  dispatch(envelope: Envelope, subject?: string): Promise<void>;
+   *  NATS subject so wildcard patterns match correctly.
+   *
+   *  IAW Phase F-3d (cortex#666) — optional trailing `sourceLink` carrying
+   *  the delivering pool link's `linkId` (`"primary"` or a federated
+   *  `leaf_node`), threaded from the runtime's `onEnvelope` fan-out. The
+   *  federation gate consumes it as an ADDITIVE anti-spoof cross-check: a
+   *  `federated.{X}.…` subject delivered on a link NOT owning network X is
+   *  rejected. Omitted (or `undefined`) preserves pre-F-3d behaviour
+   *  exactly — the cross-check only runs when an attribution is supplied,
+   *  so existing 2-arg callers and single-link deployments are unchanged. */
+  dispatch(
+    envelope: Envelope,
+    subject?: string,
+    sourceLink?: string,
+  ): Promise<void>;
 }
 
 // =============================================================================
@@ -300,12 +313,18 @@ export function createSurfaceRouter(
       // Wire runtime → router. Each envelope from any active subscription
       // arrives at the router with its actual NATS subject (so wildcard
       // patterns route correctly).
-      envelopeReg = runtime.onEnvelope((env, subject) => {
+      envelopeReg = runtime.onEnvelope((env, subject, sourceLink) => {
         // dispatch() returns a Promise; we don't await — the runtime's
         // subscriber loop must not block on adapter rendering. The router
         // already isolates adapter errors via renderWithIsolation so this
         // floating Promise resolves cleanly.
-        void router.dispatch(env, subject);
+        //
+        // IAW Phase F-3d (cortex#666): forward the delivering link's
+        // attribution so the federation gate can cross-check the subject's
+        // claimed network against the link it actually arrived on. Additive —
+        // a runtime that doesn't tag (older fake stubs) passes `undefined` and
+        // the gate's cross-check is skipped.
+        void router.dispatch(env, subject, sourceLink);
       });
     },
 
@@ -319,7 +338,7 @@ export function createSurfaceRouter(
       }
     },
 
-    async dispatch(envelope, subject) {
+    async dispatch(envelope, subject, sourceLink) {
       if (stopped) return;
 
       const effectiveSubject = subject ?? envelope.type;
@@ -354,6 +373,12 @@ export function createSurfaceRouter(
           effectiveSubject,
           envelope,
           federatedNetworksById,
+          // IAW Phase F-3d (cortex#666) — additive anti-spoof input. When the
+          // runtime tags the delivering `linkId`, the gate cross-checks the
+          // subject's claimed `{network_id}` against the network the
+          // attribution belongs to; `undefined` (no attribution) skips the
+          // cross-check, preserving pre-F-3d behaviour.
+          sourceLink,
         );
         if (decision !== "allow") {
           emitFederationDenied(
@@ -646,6 +671,21 @@ export type FederationGateDecision =
       networkId: string;
       observed_hops: number;
       max_hop: number;
+    }
+  | {
+      /**
+       * IAW Phase F-3d (cortex#666) — anti-spoof: the envelope's subject
+       * claimed network `networkId`, but it was DELIVERED on a link whose
+       * `leaf_node` does not own that network (`sourceLink`). A subject
+       * claiming `federated.{X}.…` that arrived on a link not owning X is a
+       * cross-network spoof (design §3.3 / §5 isolation layer 2). Only
+       * possible when a `sourceLink` attribution is supplied — the
+       * cross-check is skipped otherwise (back-compat).
+       */
+      kind: "source_link_mismatch";
+      networkId: string;
+      sourceLink: string;
+      expectedLeafNode: string;
     };
 
 /**
@@ -675,6 +715,7 @@ export function evaluateFederationGate(
   subject: string,
   envelope: Envelope,
   networksById: Map<string, PolicyFederatedNetwork>,
+  sourceLink?: string,
 ): FederationGateDecision {
   // Subject MUST start with `federated.` — caller guards this, but
   // the function is exported for tests and we'd rather fail-closed
@@ -715,6 +756,40 @@ export function evaluateFederationGate(
       kind: "peer_not_in_accept_list",
       networkId,
       unknown_network: true,
+    };
+  }
+
+  // IAW Phase F-3d (cortex#666) — anti-spoof cross-check (design §3.3 / §5
+  // isolation layer 2). When the runtime supplied a LEAF delivering-link
+  // attribution, the subject's claimed network MUST be served by that exact
+  // leaf: the network's `leaf_node` has to equal `sourceLink`. A subject
+  // claiming `federated.{X}.…` that arrived on a different leaf is a
+  // cross-network spoof and is denied BEFORE deny/accept/hop checks — the
+  // delivering link is more authoritative than any subject-pattern rule.
+  //
+  // SKIPPED in two cases (both back-compat-preserving):
+  //   1. `sourceLink === undefined` — no attribution (pre-F-3d callers,
+  //      primary-only deployments routed without tagging). Behaviour
+  //      unchanged unless the runtime opts in.
+  //   2. `sourceLink === "primary"` — the envelope arrived on the primary
+  //      link, which carries `local.*`/`public.*` PLUS every federated
+  //      network WITHOUT a `nats:` block (those ride primary by design).
+  //      A network riding primary keeps its declared `leaf_node` name, so a
+  //      `leaf_node !== "primary"` equality would wrongly flag legitimate
+  //      primary-routed federated traffic. The runtime's `passesSourceLinkCheck`
+  //      makes the symmetric exclusion (primary delivery is never spoof-checked);
+  //      this gate mirrors it. Primary-routed federated subjects remain
+  //      governed by the accept/deny/hop checks below, exactly as pre-F-3d.
+  if (
+    sourceLink !== undefined &&
+    sourceLink !== "primary" &&
+    network.leaf_node !== sourceLink
+  ) {
+    return {
+      kind: "source_link_mismatch",
+      networkId,
+      sourceLink,
+      expectedLeafNode: network.leaf_node,
     };
   }
 
@@ -834,6 +909,14 @@ export function emitFederationDenied(
         kind: "max_hop_exceeded",
         observed_hops: decision.observed_hops,
         max_hop: decision.max_hop,
+      };
+      break;
+    case "source_link_mismatch":
+      // IAW Phase F-3d (cortex#666) — anti-spoof denial.
+      reason = {
+        kind: "source_link_mismatch",
+        source_link: decision.sourceLink,
+        expected_leaf_node: decision.expectedLeafNode,
       };
       break;
   }

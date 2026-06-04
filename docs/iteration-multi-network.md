@@ -50,12 +50,16 @@ See `docs/design-multi-network.md` §9.
       no-op, stop()-cancels-pending-timer, post-stop reconnect no-op.
 
 ### F-3d — Inbound attribution + gate wiring
-- [ ] `EnvelopeHandler` gains additive `sourceLink?: string` (`runtime.ts:40`); existing handlers ignore.
-- [ ] Per-link subscriber tags delivered envelopes with the delivering `linkId`.
-- [ ] Anti-spoof: subject `{network_id}` must map to a network with `leaf_node === sourceLink`; mismatch
-      dropped + logged.
-- [ ] Surface-router fed gate (`surface-router.ts:350-366`) keyed by the delivering network.
-- [ ] Tests: attribution, anti-spoof drop, extend `runtime-principal-symmetry.test.ts` per-link.
+- [x] `EnvelopeHandler` gains additive `sourceLink?: string` (`runtime.ts:40`); existing handlers ignore.
+- [x] Per-link subscriber tags delivered envelopes with the delivering `linkId` (each leaf subscribes
+      `federated.{network_id}.>` and fans out with `sourceLink = leaf_node`; primary ⇒ `"primary"`).
+- [x] Anti-spoof: subject `{network_id}` must map to a network with `leaf_node === sourceLink`; mismatch
+      dropped + logged (runtime `passesSourceLinkCheck`) and denied at the surface-router gate
+      (`source_link_mismatch`).
+- [x] Surface-router fed gate keyed by the delivering network (additive `sourceLink` cross-check in
+      `evaluateFederationGate`; threaded through `dispatch` + the dispatch-listener Option-D gate).
+- [x] Tests: attribution (`runtime-source-link.test.ts`), anti-spoof drop (runtime + surface-router),
+      extend `runtime-principal-symmetry.test.ts` per-link `{network_id}` symmetry.
 
 ## Out of scope (deferred — design §3.5)
 - Per-network JetStream durables (`subscribePull` stays primary-only).

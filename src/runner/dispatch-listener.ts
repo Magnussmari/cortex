@@ -812,7 +812,7 @@ export function createDispatchListener(
       // directly on the runtime, symmetric with `BusDispatchListener`.
       // The handler filters by subject + dispatches in a tracked
       // microtask; no render-timeout wraps the CC session.
-      envelopeRegistration = runtime.onEnvelope((envelope, subject) => {
+      envelopeRegistration = runtime.onEnvelope((envelope, subject, sourceLink) => {
         // cortex#492 — best-effort trace context from the raw envelope
         // before the payload is parsed. `task_id` falls back to the
         // correlation_id / envelope id; `agent_id` is a peek at the
@@ -857,6 +857,11 @@ export function createDispatchListener(
             subject,
             envelope,
             federatedNetworksById,
+            // IAW Phase F-3d (cortex#666) — additive anti-spoof input. The
+            // runtime tags the delivering `linkId`; the gate cross-checks the
+            // subject's claimed network against the link it arrived on.
+            // `undefined` (no attribution) skips the cross-check (back-compat).
+            sourceLink,
           );
           if (decision !== "allow") {
             trace(
