@@ -143,7 +143,12 @@ function deny(reason: string): void {
 // here must never affect the deny decision.
 // =============================================================================
 
-const INGEST_URL = "http://localhost:8766/api/events/ingest";
+// Default targets the local dashboard ingest endpoint. Overridable via
+// CORTEX_INGEST_URL so tests can point the POST at an ephemeral port instead of
+// the hardcoded 8766 (which collides with sibling Bun.serve suites under the
+// full test run). Production leaves the env unset → unchanged behaviour.
+const INGEST_URL =
+  process.env.CORTEX_INGEST_URL ?? "http://localhost:8766/api/events/ingest";
 const EVENTS_DIR = join(process.env.HOME ?? "~", ".claude", "events");
 const RAW_DIR = join(EVENTS_DIR, "raw");
 

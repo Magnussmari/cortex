@@ -229,9 +229,11 @@ describe("bash-guard.hook — block telemetry", () => {
   });
 
   test("a block POSTs the event to the HTTP ingest endpoint", async () => {
-    // The hook POSTs to a hardcoded http://localhost:8766/api/events/ingest
-    // before falling back to JSONL. Stand up a real listener on that port so
-    // the POST "succeeds", and capture the request body to assert its shape.
+    // The hook POSTs to its ingest endpoint before falling back to JSONL. Stand
+    // up a real listener on an EPHEMERAL port (port: 0) and point the hook at it
+    // via CORTEX_INGEST_URL, so the POST "succeeds" and we can capture the body
+    // to assert its shape. Using port 0 (not the hardcoded 8766) avoids the
+    // EADDRINUSE flake when sibling Bun.serve suites hold 8766 under the full run.
     //
     // NOTE: the hook must be spawned *asynchronously* here. spawnSync would
     // block the test's event loop, starving the in-process Bun.serve so the
@@ -245,7 +247,7 @@ describe("bash-guard.hook — block telemetry", () => {
     } = { body: null, path: null, contentType: null };
 
     const server = Bun.serve({
-      port: 8766,
+      port: 0,
       async fetch(req) {
         seen.path = new URL(req.url).pathname;
         seen.contentType = req.headers.get("content-type");
@@ -253,6 +255,7 @@ describe("bash-guard.hook — block telemetry", () => {
         return new Response("ok", { status: 200 });
       },
     });
+    const ingestUrl = `http://localhost:${server.port}/api/events/ingest`;
 
     try {
       const groveOverrides = new Set(GROVE_ENV_KEYS);
@@ -263,6 +266,7 @@ describe("bash-guard.hook — block telemetry", () => {
       Object.assign(merged, {
         GROVE_CHANNEL: "test-channel",
         HOME: homeDir,
+        CORTEX_INGEST_URL: ingestUrl,
       });
 
       const proc = Bun.spawn(["bun", HOOK_PATH], {
