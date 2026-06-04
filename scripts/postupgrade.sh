@@ -8,6 +8,10 @@ set -e
 # arc itself handles `provides.files` symlink updates BEFORE this script
 # runs, so the `ln -sf` calls below are belt-and-braces for any target arc
 # doesn't yet manage (lib subdirs, relay directory).
+#
+# cortex#700: stacks are now discovered from cortex*.yaml globs. The daemon
+# restart loop reads the state file written by preupgrade.sh and restores
+# exactly the stacks that were running before the upgrade (symmetry).
 
 CORTEX_DIR="${PAI_INSTALL_PATH:-$(cd "$(dirname "$0")/.." && pwd)}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,39 +33,73 @@ ln -sf "${CORTEX_DIR}/src/taps/cc-events"          "${CLAUDE_DIR}/relay/cortex"
 ln -sf "${CORTEX_DIR}/src/cli/discord/skill"       "${CLAUDE_DIR}/skills/Discord"
 echo "  ✓ Nested symlinks refreshed"
 
-# ─── 2. Auto-provision stack signing identity (cortex#324 / v2.0.3) ──
-# Walk-the-talk: stack signing is ON by default. When the operator's
-# cortex.yaml (or cortex.work.yaml) lacks `stack.nkey_seed_path`, the
-# helper generates an NKey at the canonical path and wires the field
-# into the config. Idempotent — skipped when the field is already set.
+# ─── 2. Auto-provision stack signing identity ─────────────────────
+# cortex#324 / v2.0.3: stack signing is ON by default. When a config file
+# lacks `stack.nkey_seed_path`, the helper generates an NKey and wires it
+# in. Idempotent — skipped when the field is already set.
+#
+# cortex#700: loop over all discovered stacks rather than hardcoding
+# cortex.yaml + cortex.work.yaml. Derive the nkey basename from the config
+# filename: cortex.yaml → "cortex", cortex.{slug}.yaml → "cortex-{slug}".
 echo "  Provisioning stack signing identity..."
 source "${SCRIPT_DIR}/lib/stack-identity-provision.sh"
-provision_stack_identity "${CONFIG_DIR}/cortex.yaml"      "cortex" || true
-if [ -f "${CONFIG_DIR}/cortex.work.yaml" ]; then
-  provision_stack_identity "${CONFIG_DIR}/cortex.work.yaml" "cortex-work" || true
-fi
+source "${SCRIPT_DIR}/lib/plist-render.sh"
+
+while IFS= read -r slug; do
+  local_config_file="$(slug_to_config_file "${slug}")"
+  # nkey basename: cortex.yaml → "cortex", cortex.{slug}.yaml → "cortex-{slug}".
+  if [ "${slug}" = "meta-factory" ]; then
+    nkey_basename="cortex"
+  else
+    nkey_basename="cortex-${slug}"
+  fi
+  if [ -f "${CONFIG_DIR}/${local_config_file}" ]; then
+    provision_stack_identity "${CONFIG_DIR}/${local_config_file}" "${nkey_basename}" || true
+  fi
+done < <(discover_stack_slugs "${CONFIG_DIR}")
 
 # ─── 3. Re-template launchd plists (shared with postinstall.sh) ──
-source "${SCRIPT_DIR}/lib/plist-render.sh"
 if [ "$(uname)" = "Darwin" ]; then
   LAUNCH_DIR="${HOME}/Library/LaunchAgents"
   render_cortex_plists "${CORTEX_DIR}" "${LAUNCH_DIR}" "${CONFIG_DIR}"
 
   # ─── 4. Restart daemons ─────────────────────────────────────────
+  # cortex#700: relay is always restarted (it was always unconditional).
+  # Stacks are restarted based on the running-set recorded by preupgrade.sh.
+  # This gives symmetry: no stack left down; none started that wasn't running.
+  #
   # `|| true` keeps a partial upgrade non-fatal — if a daemon was already
   # unloaded by preupgrade.sh, load just re-loads cleanly.
+
   launchctl load "${LAUNCH_DIR}/ai.meta-factory.cortex.relay.plist" 2>/dev/null || true
   echo "  ✓ Relay daemon started"
 
-  launchctl load "${LAUNCH_DIR}/ai.meta-factory.cortex.meta-factory.plist" 2>/dev/null || true
-  echo "  ✓ Meta-factory daemon started"
-
-  # cortex#244: work stack is optional. Only load if `plist-render.sh`
-  # actually rendered it (gated on cortex.work.yaml existence). Same
-  # `|| true` non-fatal pattern as the others.
-  if [ -f "${LAUNCH_DIR}/ai.meta-factory.cortex.work.plist" ]; then
-    launchctl load "${LAUNCH_DIR}/ai.meta-factory.cortex.work.plist" 2>/dev/null || true
-    echo "  ✓ Work daemon started"
+  # Read the running-stacks state file written by preupgrade.sh.
+  RUNNING_STACKS_FILE="${TMPDIR:-/tmp}/cortex-upgrade-running-stacks"
+  if [ -f "${RUNNING_STACKS_FILE}" ]; then
+    while IFS= read -r slug; do
+      [ -z "${slug}" ] && continue
+      plist="${LAUNCH_DIR}/ai.meta-factory.cortex.${slug}.plist"
+      if [ -f "${plist}" ]; then
+        launchctl load "${plist}" 2>/dev/null || true
+        echo "  ✓ ${slug} daemon started"
+      else
+        echo "  ⚠ ${slug} plist not found after render — skipping restart" >&2
+      fi
+    done < "${RUNNING_STACKS_FILE}"
+    rm -f "${RUNNING_STACKS_FILE}"
+  else
+    # No state file — preupgrade.sh may not have run (e.g. manual upgrade or
+    # first install via arc). Fall back to starting all discovered stacks so
+    # the operator doesn't end up with a silent no-daemon state.
+    echo "  ⚠ No preupgrade state file found — starting all discovered stacks" >&2
+    while IFS= read -r slug; do
+      plist="${LAUNCH_DIR}/ai.meta-factory.cortex.${slug}.plist"
+      if [ -f "${plist}" ]; then
+        launchctl load "${plist}" 2>/dev/null || true
+        echo "  ✓ ${slug} daemon started (fallback)"
+      fi
+    done < <(discover_stack_slugs "${CONFIG_DIR}")
   fi
 fi
 
