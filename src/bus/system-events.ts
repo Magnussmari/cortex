@@ -771,6 +771,12 @@ export function createSystemAccessDeniedEvent(
  *     (D.2.3). Variant fields carry the observed hop count + the
  *     network's budget so subscribers can render "3 stamps > 1
  *     allowed" without re-parsing the envelope.
+ *   - `"source_link_mismatch"` — IAW Phase F-3d (cortex#666) anti-spoof:
+ *     the subject claimed network `network_id`, but it was DELIVERED on a
+ *     federated leaf link whose `leaf_node` does not own that network. A
+ *     cross-network spoof (design §3.3 / §5). Variant fields carry the
+ *     delivering link and the network's expected `leaf_node` so audit
+ *     consumers can render "arrived on leaf X, expected leaf Y".
  *
  * Subjects (the actual `deny_subjects` / `accept_subjects` patterns
  * are principal data, not enum values — they ride on `reason.subject`
@@ -779,7 +785,8 @@ export function createSystemAccessDeniedEvent(
 export type SystemAccessFederationDeniedReasonKind =
   | "peer_not_in_accept_list"
   | "peer_deny_list"
-  | "max_hop_exceeded";
+  | "max_hop_exceeded"
+  | "source_link_mismatch";
 
 /**
  * Options for `createSystemAccessFederationDeniedEvent` — the D.2
@@ -860,6 +867,14 @@ export interface SystemAccessFederationDeniedOpts {
         observed_hops: number;
         /** Configured `network.max_hop`. */
         max_hop: number;
+      }
+    | {
+        /** IAW Phase F-3d (cortex#666) — anti-spoof leaf/subject mismatch. */
+        kind: "source_link_mismatch";
+        /** The link the envelope actually arrived on (delivering `linkId`). */
+        source_link: string;
+        /** The `leaf_node` the claimed network is configured to use. */
+        expected_leaf_node: string;
       };
   /** Classification override; defaults to local per system.* convention. */
   classification?: Classification;
