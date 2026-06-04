@@ -27,7 +27,7 @@ export function capabilityRoutes(): Hono<{ Bindings: Env }> {
     if (query.length > 128) {
       return c.json({ error: "query parameter too long (max 128 chars)" }, 400);
     }
-    const store = getStore();
+    const store = getStore(c.env);
     const principals = await store.listPrincipals();
     const allHits = searchCapabilities(principals, query);
     const hits = allHits.slice(0, MAX_HITS);

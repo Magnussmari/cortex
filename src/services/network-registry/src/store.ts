@@ -1,22 +1,28 @@
 /**
- * IAW D.4 — Storage interface + in-memory v1 implementation.
+ * IAW D.4 — Storage interface + in-memory and D1-backed implementations.
  *
- * V1 ships with an in-memory store so the endpoint surface, signing,
- * and tests are exercised end-to-end without provisioning D1. The
- * persistence wiring (D1 or KV) is a follow-up: see README §Roadmap
- * and the cortex#116 D.4 checklist. The store interface is the seam
- * — a D1Store implementation can drop in without touching routes.
+ * Two backends share the `RegistryStore` / `NonceCache` seams:
+ *
+ *   - In-memory (InMemoryRegistryStore / InMemoryNonceCache): used for
+ *     `wrangler dev` and `bun test`, where no D1 binding is present.
+ *   - D1 (D1RegistryStore / D1NonceCache, cortex#682): the durable
+ *     backend wired when `env.DB` is present. Registrations AND the
+ *     nonce-replay cache survive Worker-isolate recycling, closing the
+ *     documented cross-isolate replay gap (see D1NonceCache below).
+ *
+ * `getStore(env)` / `getNonceCache(env)` pick the backend per request:
+ * D1 when bound, in-memory otherwise. The selection is memoised at
+ * module scope so handlers within an isolate share one instance.
  *
  * Concurrency model
  * ─────────────────
- * Cloudflare Workers run each request in an isolate. Module-scoped
- * Map state inside an isolate is per-instance; the InMemoryStore is
- * therefore NOT durable across deploys, restarts, or even across
- * isolates that the colo spins up under load. This is acceptable for
- * a dev/staging surface and for the test suite — production rollout
- * MUST swap in a durable backend. The store is constructed inside
- * the request handler (via `getStore(env)`) so dependency injection
- * is straightforward.
+ * Cloudflare Workers run each request in an isolate. Module-scoped Map
+ * state inside an isolate is per-instance; the in-memory backend is
+ * therefore NOT durable across deploys, restarts, or across isolates a
+ * colo spins up under load. That is why production binds D1: D1 is a
+ * single logical database shared by every isolate/colo, so a principal
+ * registered on one isolate is visible to the next, and a nonce seen on
+ * one isolate is rejected on every other.
  */
 
 import type {
@@ -26,6 +32,42 @@ import type {
   PrincipalRecord,
   StackIdentity,
 } from "./types";
+
+/**
+ * Minimal binding surface this module reads. We DON'T import `Env` from
+ * `./index` to avoid a store↔index import cycle; the only field the
+ * storage layer cares about is the optional D1 binding `DB`.
+ */
+export interface StoreEnv {
+  /**
+   * D1 binding. Present in deployed environments (wired in wrangler.toml
+   * as `[[env.<env>.d1_databases]]` with `binding = "DB"`). Absent under
+   * `wrangler dev` / `bun test`, where the in-memory backends are used.
+   */
+  DB?: D1Like;
+}
+
+/**
+ * Minimal structural slice of Cloudflare's `D1Database` — just the
+ * `prepare → bind → run/first/all` surface the registry uses.
+ *
+ * We deliberately do NOT depend on the `D1Database` global from
+ * `@cloudflare/workers-types` here. This module is reachable both from
+ * the registry's own tsconfig (which loads workers-types) AND, via
+ * cross-service integration tests, from the repo-root tsconfig (which
+ * does not). A self-contained structural type type-checks identically
+ * under both, and the real D1 binding is structurally assignable to it.
+ */
+export interface D1Like {
+  prepare(query: string): D1PreparedLike;
+}
+
+export interface D1PreparedLike {
+  bind(...values: unknown[]): D1PreparedLike;
+  run(): Promise<{ meta?: { changes?: number } }>;
+  first<T = unknown>(): Promise<T | null>;
+  all<T = unknown>(): Promise<{ results?: T[] }>;
+}
 
 // =============================================================================
 // Store interface
@@ -92,7 +134,7 @@ export interface NonceCache {
 
 export const NONCE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
-class InMemoryNonceCache implements NonceCache {
+export class InMemoryNonceCache implements NonceCache {
   private readonly seen = new Map<string, number>();
 
   /** Sweep threshold — only walk the map when it grows past this. */
@@ -116,6 +158,50 @@ class InMemoryNonceCache implements NonceCache {
 
   async reset(): Promise<void> {
     this.seen.clear();
+  }
+}
+
+/**
+ * Durable nonce cache backed by D1 (cortex#682). This closes the
+ * cross-isolate replay gap the in-memory cache documents: because D1 is
+ * a single logical database shared by every isolate/colo, a nonce
+ * recorded by one request is visible to every other.
+ *
+ * Freshness is decided ATOMICALLY by the database, not by a read-then-
+ * write in the Worker. `recordIfFresh` issues a single
+ * `INSERT ... ON CONFLICT(nonce) DO NOTHING`; D1 reports `meta.changes`,
+ * the number of rows the statement created. A fresh nonce inserts one
+ * row (`changes === 1`); a replay conflicts on the PRIMARY KEY and
+ * inserts nothing (`changes === 0`). No window exists between a SELECT
+ * and an INSERT in which two concurrent replays could both see "fresh",
+ * so the check is replay-safe even under concurrent posts of the same
+ * nonce.
+ */
+export class D1NonceCache implements NonceCache {
+  constructor(private readonly db: D1Like) {}
+
+  async recordIfFresh(nonce: string, now: number): Promise<boolean> {
+    // Opportunistic prune of expired entries. Bounded by the seen_at
+    // index; runs before the insert so the table stays near the
+    // NONCE_WINDOW_MS horizon. Parameterised — no string interpolation.
+    await this.db
+      .prepare("DELETE FROM nonces WHERE seen_at < ?")
+      .bind(now - NONCE_WINDOW_MS)
+      .run();
+
+    // Atomic insert-or-ignore. Fresh iff THIS statement created the row.
+    const res = await this.db
+      .prepare("INSERT INTO nonces (nonce, seen_at) VALUES (?, ?) ON CONFLICT(nonce) DO NOTHING")
+      .bind(nonce, now)
+      .run();
+
+    // `meta.changes` is the row count the write affected. 1 → we won the
+    // insert (fresh); 0 → the PK already existed (replay).
+    return (res.meta?.changes ?? 0) > 0;
+  }
+
+  async reset(): Promise<void> {
+    await this.db.prepare("DELETE FROM nonces").run();
   }
 }
 
@@ -157,25 +243,160 @@ export class InMemoryRegistryStore implements RegistryStore {
 }
 
 // =============================================================================
+// D1-backed store (cortex#682)
+// =============================================================================
+
+/**
+ * Durable principal directory backed by D1. The variable-length `stacks`
+ * and `capabilities` lists are stored as JSON text columns (see
+ * migrations/0001_init.sql for why): the registry only ever reads/writes
+ * a principal as a whole record, so `putPrincipal` is a single atomic
+ * UPSERT.
+ *
+ * SQLi-safety: EVERY query uses `.bind(...)` parameter placeholders — no
+ * value (principal_id, pubkey, JSON blob) is ever string-interpolated
+ * into SQL. A principal_id containing quotes or SQL metacharacters is
+ * passed as an opaque bound parameter and cannot alter the query. (The
+ * route layer also constrains principal_id grammar via isValidPrincipalId,
+ * but the store does not rely on that for injection safety — defence in
+ * depth.)
+ */
+export class D1RegistryStore implements RegistryStore {
+  constructor(private readonly db: D1Like) {}
+
+  async putPrincipal(
+    principalId: string,
+    pubkey: string,
+    stacks: StackIdentity[],
+    capabilities: Capability[],
+  ): Promise<PrincipalRecord> {
+    const record: PrincipalRecord = {
+      principal_id: principalId,
+      principal_pubkey: pubkey,
+      stacks,
+      capabilities,
+      updated_at: new Date().toISOString(),
+    };
+    // UPSERT: a re-register replaces the row in place, so the new stacks/
+    // capabilities fully overwrite the old (matches InMemory semantics —
+    // no leftover stacks). Parameterised; the JSON columns hold the
+    // serialised lists.
+    await this.db
+      .prepare(
+        `INSERT INTO principals (principal_id, principal_pubkey, stacks, capabilities, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(principal_id) DO UPDATE SET
+           principal_pubkey = excluded.principal_pubkey,
+           stacks           = excluded.stacks,
+           capabilities     = excluded.capabilities,
+           updated_at       = excluded.updated_at`,
+      )
+      .bind(
+        principalId,
+        pubkey,
+        JSON.stringify(stacks),
+        JSON.stringify(capabilities),
+        record.updated_at,
+      )
+      .run();
+    return record;
+  }
+
+  async getPrincipal(principalId: string): Promise<PrincipalRecord | undefined> {
+    const row = await this.db
+      .prepare(
+        "SELECT principal_id, principal_pubkey, stacks, capabilities, updated_at FROM principals WHERE principal_id = ?",
+      )
+      .bind(principalId)
+      .first<PrincipalRow>();
+    return row ? rowToRecord(row) : undefined;
+  }
+
+  async listPrincipals(): Promise<PrincipalRecord[]> {
+    const res = await this.db
+      .prepare(
+        "SELECT principal_id, principal_pubkey, stacks, capabilities, updated_at FROM principals",
+      )
+      .all<PrincipalRow>();
+    return (res.results ?? []).map(rowToRecord);
+  }
+
+  async reset(): Promise<void> {
+    await this.db.prepare("DELETE FROM principals").run();
+  }
+}
+
+/** Raw column shape for a `principals` row. JSON columns are TEXT. */
+interface PrincipalRow {
+  principal_id: string;
+  principal_pubkey: string;
+  stacks: string;
+  capabilities: string;
+  updated_at: string;
+}
+
+/**
+ * Decode a D1 row into a PrincipalRecord, parsing the JSON list columns.
+ * A malformed JSON column (should never happen — only this store writes
+ * them) degrades to an empty list rather than throwing, so one bad row
+ * can't take down a roster/capability scan over the whole table.
+ */
+function rowToRecord(row: PrincipalRow): PrincipalRecord {
+  return {
+    principal_id: row.principal_id,
+    principal_pubkey: row.principal_pubkey,
+    stacks: parseJsonArray<StackIdentity>(row.stacks),
+    capabilities: parseJsonArray<Capability>(row.capabilities),
+    updated_at: row.updated_at,
+  };
+}
+
+function parseJsonArray<T>(json: string): T[] {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch (_err) {
+    // Defensive: a non-JSON value in a column this store solely owns is a
+    // data-integrity bug, not a request error. Return empty so the scan
+    // continues; the row is still listed with its other fields intact.
+    return [];
+  }
+}
+
+// =============================================================================
 // Singleton accessors per isolate
 // =============================================================================
 
 /**
  * The Worker entry point doesn't see the test harness — it just sees
- * `env`. We attach the store to a module-scoped slot so request handlers
- * share state within an isolate. Tests reset between cases via
- * `getStore().reset()`.
+ * `env`. We memoise the chosen backend in a module-scoped slot so request
+ * handlers share one instance within an isolate. Tests reset between
+ * cases via `_setStoreForTest(undefined)` (and the per-test `env` lacks a
+ * `DB` binding, so they get the in-memory backend).
+ *
+ * Backend selection (cortex#682): when `env.DB` is bound (deployed envs
+ * via wrangler.toml) we use the D1-backed durable implementations; with
+ * no binding (`wrangler dev` / `bun test`) we fall back to the in-memory
+ * implementations. The D1 instances are stateless wrappers over the
+ * shared database, so memoising one per isolate is safe — all isolates
+ * read/write the same underlying D1.
  */
 let storeSingleton: RegistryStore | undefined;
 let nonceSingleton: NonceCache | undefined;
 
-export function getStore(): RegistryStore {
-  if (!storeSingleton) storeSingleton = new InMemoryRegistryStore();
+export function getStore(env: StoreEnv): RegistryStore {
+  if (!storeSingleton) {
+    storeSingleton = env.DB
+      ? new D1RegistryStore(env.DB)
+      : new InMemoryRegistryStore();
+  }
   return storeSingleton;
 }
 
-export function getNonceCache(): NonceCache {
-  if (!nonceSingleton) nonceSingleton = new InMemoryNonceCache();
+export function getNonceCache(env: StoreEnv): NonceCache {
+  if (!nonceSingleton) {
+    nonceSingleton = env.DB ? new D1NonceCache(env.DB) : new InMemoryNonceCache();
+  }
   return nonceSingleton;
 }
 
