@@ -215,6 +215,21 @@ export function createCcEventEnvelope(
     },
   });
   envelope.timestamp = event.timestamp;
+  // cortex#661 — federated subjects key segment[1] on the TARGET network id,
+  // which `deriveNatsSubject` reads from `extensions.network_id` (NOT the source
+  // principal, NOT `payload.network_id`). A federated cc-event MUST carry its
+  // network id in `extensions` or the publish throws (`networkIdFromEnvelope`).
+  // Stamp it here from `event.network_id` so the cc-events tap matches the
+  // canonical federated emit pattern (pilot's `buildReviewRequestedEnvelope`,
+  // which sets `extensions.network_id`). Harmless for the default `local`/
+  // `public` classifications — those derivation paths never read `extensions`;
+  // `network_id` also remains mirrored in `payload` above for legacy consumers
+  // that index it there (back-compat preserved). Mutation-after-build is safe
+  // for the same reason the originator block below is: `buildBaseEnvelope`
+  // returns a fresh object per call (no aliasing) and the field is top-level.
+  if (event.network_id !== undefined) {
+    envelope.extensions = { network_id: event.network_id };
+  }
   // cortex#346 / myelin#161 — attach the originator block when configured.
   // Mutation-after-build is fine here: `buildBaseEnvelope` returns a fresh
   // object per call (no aliasing risk), and the field lives at the top
@@ -330,7 +345,11 @@ export interface CreateCcEventPublisherOpts {
  * `envelope.sovereignty.classification` via `deriveNatsSubject`:
  *
  *   - `classification === "local"`     → `local.{principal}.{type}`
- *   - `classification === "federated"` → `federated.{principal}.{type}`
+ *   - `classification === "federated"` → `federated.{network_id}.{type}`
+ *     (cortex#661 — segment[1] is the TARGET network id from
+ *     `extensions.network_id`, NOT the source principal; `createCcEventEnvelope`
+ *     stamps it from `event.network_id`. A federated cc-event with no
+ *     `network_id` throws at derive time.)
  *   - `classification === "public"`    → `public.{type}` (no `{principal}` segment)
  *
  * Prior code hardcoded `local.{principal}.{type}` here regardless of
