@@ -68,7 +68,7 @@ import {
   verifySignedByChain,
   nkeyToBase64Pubkey,
 } from "./bus/verify-signed-by-chain";
-import { runVerifierSelfCheck } from "./bus/verifier-self-check";
+import { bootVerifierSelfCheck } from "./bus/verifier-self-check";
 import { CCSession, type CCSessionOpts } from "./runner/cc-session";
 import { makePiDevPipelineRunner } from "./runner/substrate/pi-dev-runner";
 
@@ -2272,34 +2272,54 @@ export async function startCortex(
       `adapters=${adapters.length}`,
   );
 
-  // cortex#480 — boot-time self-signed envelope sanity check. After the
-  // listeners are wired with `stackIdentity` + `stackNKeyPub`, build a
-  // tiny envelope signed by the stack's own NKey and round-trip it
-  // through `verifySignedByChain` to confirm the verifier admits it.
-  // The check exists because the cortex#480 root-cause (verifier
-  // rejecting `did:mf:<stack>` as unknown_agent) shipped to prod
-  // unnoticed — no boot-side observability exercised the identity the
-  // wire would actually carry. A future regression in the stack-trust
-  // short-circuit / NKey bridge / Principal-registry shape now fails
-  // loudly at boot with a grep-friendly stderr WARNING instead of at
-  // first Discord chat. Skipped when no signing identity is wired
-  // (deployments running unsigned by design).
-  if (
-    signer !== undefined
-    && stackNKeyPubForVerifier !== undefined
-    && firstAgent !== undefined
-  ) {
-    // Fire-and-forget by design — boot does not wait for the result.
-    // The check is informational; production deployment health is
-    // ultimately validated by the dashboard / first round-trip chat.
-    void runVerifierSelfCheck({
-      stackIdentity: signer.principal,
-      stackNKeyPub: stackNKeyPubForVerifier,
-      stackSeedBytes: signer.rawSeedBytes,
+  // cortex#480 + TC-1b (#632) — boot-time self-signed envelope sanity check,
+  // posture-aware. After the listeners are wired with `stackIdentity` +
+  // `stackNKeyPub`, build a tiny envelope signed by the stack's own NKey and
+  // round-trip it through `verifySignedByChain` to confirm the verifier
+  // admits it. The check exists because the cortex#480 root-cause (verifier
+  // rejecting `did:mf:<stack>` as unknown_agent) shipped to prod unnoticed —
+  // no boot-side observability exercised the identity the wire would actually
+  // carry.
+  //
+  // TC-1b makes the gate **posture-aware** (per design §Phase 1.1b
+  // "`verifier-self-check` passes on every stack at boot"):
+  //   - `enforce` → a missing OR unverifiable stack identity FAILS FAST: the
+  //     gate throws, the catch below maps it to a fatal boot error and the
+  //     CLI exits non-zero. A stack serving SIGNED traffic must not run with
+  //     an identity its own verifier rejects.
+  //   - `permissive`/`off` → advisory: WARN on failure (or when no identity
+  //     is wired, no-op), boot continues — the pre-TC-1b behaviour.
+  //
+  // We `await` (not fire-and-forget) so the `enforce` throw can abort boot
+  // deterministically before the router starts admitting envelopes. The
+  // grep-friendly `verifier-self-check` stderr line is preserved for
+  // pilot-loop / on-call pattern matching.
+  if (firstAgent !== undefined) {
+    const selfCheckIdentity =
+      signer !== undefined && stackNKeyPubForVerifier !== undefined
+        ? {
+            stackIdentity: signer.principal,
+            stackNKeyPub: stackNKeyPubForVerifier,
+            stackSeedBytes: signer.rawSeedBytes,
+          }
+        : undefined;
+    await bootVerifierSelfCheck({
+      posture: config.security.signing,
+      identity: selfCheckIdentity,
       resolver: trustResolver,
       receivingAgentId: firstAgent.id,
       principalId,
     });
+  } else if (config.security.signing === "enforce") {
+    // No agents at all under `enforce` — there is no `receivingAgentId` to run
+    // the self-check against, but a stack with no agents cannot serve signed
+    // traffic meaningfully either. Refuse to boot with the same fail-fast
+    // posture so a misconfigured enforce stack does not start silently.
+    throw new Error(
+      "verifier-self-check: REFUSING TO BOOT — security.signing=enforce but no " +
+        "agents are configured; cannot run the boot self-check. Configure at " +
+        "least one agent, or drop signing to permissive/off.",
+    );
   }
 
   // Start router AFTER all surfaces register so the first envelope
@@ -3030,6 +3050,43 @@ export function runDryRun(configPath: string): DryRunResult {
 // Skipping the CLI wiring at module load is what lets tests
 // `import { startCortex }` here without parsing argv or registering signal
 // handlers.
+/**
+ * Run the boot sequence and treat ANY boot-phase failure as FATAL. The daemon
+ * must NEVER linger half-booted — inbound dispatch listeners already live, the
+ * PID file written so launchd sees a "healthy" process — while the failure that
+ * should have stopped it is logged and ignored. This is the load-bearing
+ * guarantee behind `signing: enforce`: a stack whose `bootVerifierSelfCheck`
+ * throws "REFUSING TO BOOT" MUST exit non-zero, not survive serving traffic.
+ *
+ * Why a helper and not just a try/catch inline: the `start` action is an async
+ * commander action invoked by the synchronous `program.parse()`, which does NOT
+ * await it. A rejected boot promise would otherwise fall through to the
+ * `unhandledRejection` handler and be logged "non-fatal". Because this helper
+ * calls `process.exit(1)` itself, the fatal exit happens regardless of whether
+ * the dispatcher awaits the action.
+ */
+export async function bootOrDie<T>(
+  boot: () => Promise<T>,
+  pidFile: string,
+): Promise<T> {
+  try {
+    return await boot();
+  } catch (err) {
+    console.error(
+      `cortex: FATAL — boot aborted: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    // Remove the PID file so launchd / `cortex status` don't mistake a process
+    // that failed to boot for a healthy daemon. Best-effort — the exit is what
+    // actually matters.
+    try {
+      if (existsSync(pidFile)) unlinkSync(pidFile);
+    } catch (_err) {
+      // PID cleanup failed; nothing safe to do but proceed to the fatal exit.
+    }
+    process.exit(1);
+  }
+}
+
 if (import.meta.main) {
   const program = new Command()
     .name("cortex")
@@ -3072,22 +3129,29 @@ if (import.meta.main) {
       // block when the principal declared one — `startCortex` calls
       // `deriveStackId` and logs the resolved stack id. Today this is
       // observational only; emit subjects are unchanged.
-      const { config, inlineAgents, stack, policy, principal, bus, surfaces } = loadConfigWithAgents(options.config);
-      const handle = await startCortex(config, {
-        configPath: options.config,
-        ...(inlineAgents.length > 0 && { inlineAgents }),
-        ...(stack !== undefined && { stack }),
-        ...(policy !== undefined && { policy }),
-        // PR-R13.B.i: both LoadedConfig and StartCortexOptions now use
-        // the canonical `.principal` field.
-        ...(principal !== undefined && { principal }),
-        ...(bus !== undefined && { bus }),
-        // IAW GW (cortex#524) — thread the validated surface binding map
-        // through so the flag-gated gateway block in startCortex can read it.
-        // Dormant unless CORTEX_GATEWAY is set; undefined when no surfaces:
-        // block was declared.
-        ...(surfaces !== undefined && { surfaces }),
-      });
+      // Boot through bootOrDie: a config-load error OR a boot-phase throw
+      // (notably the signing:enforce verifier-self-check "REFUSING TO BOOT")
+      // exits the process non-zero instead of being swallowed as a "non-fatal"
+      // unhandled rejection. The daemon must not survive a failed security gate.
+      const handle = await bootOrDie(async () => {
+        const { config, inlineAgents, stack, policy, principal, bus, surfaces } =
+          loadConfigWithAgents(options.config);
+        return startCortex(config, {
+          configPath: options.config,
+          ...(inlineAgents.length > 0 && { inlineAgents }),
+          ...(stack !== undefined && { stack }),
+          ...(policy !== undefined && { policy }),
+          // PR-R13.B.i: both LoadedConfig and StartCortexOptions now use
+          // the canonical `.principal` field.
+          ...(principal !== undefined && { principal }),
+          ...(bus !== undefined && { bus }),
+          // IAW GW (cortex#524) — thread the validated surface binding map
+          // through so the flag-gated gateway block in startCortex can read it.
+          // Dormant unless CORTEX_GATEWAY is set; undefined when no surfaces:
+          // block was declared.
+          ...(surfaces !== undefined && { surfaces }),
+        });
+      }, pidFile);
 
       const shutdown = async () => {
         await handle.stop();
