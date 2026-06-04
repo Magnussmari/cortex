@@ -81,7 +81,7 @@ cortex provision-stack register andreas \
 
 `register` is the only subcommand that does network I/O. You can also fold it into `generate` with `--register --registry-url <url>`, or use `cortex provision-stack claim …` to print the signed body for an air-gapped / review-before-post flow. The registry verifies (in order): unconfigured→503, shape→400, ±5-min clock skew→400, nonce replay→409, Ed25519 signature→401, silent-key-swap rotation guard→409, then upserts and returns a signed `201`. (Full verification ladder: `docs/sop-network-registry.md` §"What the registry verifies".)
 
-> ⚠️ The v1 registry store is **in-memory per-isolate** (`docs/sop-network-registry.md` §"Not yet implemented — durable persistence"). A registration may need re-running after an isolate cycles; D1 persistence is a follow-up.
+> ✓ The production registry store is **D1-backed and durable** (cortex#694) — registrations *and* the nonce-replay cache survive Worker-isolate recycling and are shared across every isolate/colo, so a nonce seen anywhere is rejected everywhere. (`bun test` and a bare `wrangler dev` without a local DB fall back to the in-memory backend; prod **fails closed** if the `DB` binding is absent — `assertDurableBackendInProd`, `src/services/network-registry/src/store.ts`.)
 
 ### Step (iii) — pin the registry (NOT each peer)
 
