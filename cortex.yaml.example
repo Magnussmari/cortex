@@ -193,6 +193,41 @@ policy:
         - tool.read
         - tool.glob
         - tool.grep
+  # ---------------------------------------------------------------------------
+  # federated — optional cross-stack federation (Phase D + F-3)
+  # ---------------------------------------------------------------------------
+  # Each network is a trust closure with its own peers[], accept/deny subject
+  # lists, and hop budget. F-3a (cortex#657) adds an OPTIONAL inline `nats:`
+  # leaf-node connection per network (Option B). When `nats:` is present the
+  # network rides its own dedicated leaf; when ABSENT it rides the primary
+  # link (the top-level `nats:` block) — today's behaviour, byte-for-byte.
+  #
+  # `leaf_node` is the link-pool de-dup key: two networks sharing a leaf_node
+  # name share ONE physical link, so their `nats:` blocks MUST be consistent
+  # (byte-identical, or omitted on all but one). A conflicting `nats:` under a
+  # shared leaf_node fails config-load loudly.
+  #
+  # The per-network `nats:` block mirrors a subset of the top-level NATS
+  # schema: { url (nats://|tls://), credsPath?, name? }. token / subjects /
+  # identity are intentionally not accepted here.
+  #
+  # federated:
+  #   networks:
+  #     - id: research-collab
+  #       leaf_node: nats-leaf-research   # routing label / link-pool key
+  #       nats:                           # OPTIONAL — omit to ride primary link
+  #         url: nats://research:4222
+  #         credsPath: ~/.config/cortex/creds/research.creds
+  #       peers:
+  #         - principal_id: jcfischer
+  #           stack_id: jcfischer/sage-host
+  #           principal_pubkey: U...   # peer stack NKey public key (56 chars)
+  #       accept_subjects:
+  #         - federated.research-collab.>
+  #       deny_subjects: []
+  #       announce_capabilities:
+  #         - code-review.typescript
+  #       max_hop: 1
 
 # -----------------------------------------------------------------------------
 # agents — first-class agents on this stack

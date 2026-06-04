@@ -1432,6 +1432,61 @@ export type PolicyFederatedPeer = z.infer<typeof PolicyFederatedPeerSchema>;
 const NATS_SUBJECT_PATTERN_RE = /^([a-z][a-z0-9_-]*|\*)(\.([a-z][a-z0-9_-]*|\*))*(\.>)?$/;
 
 /**
+ * Per-network leaf-node connection — IAW Phase F-3a (cortex#657),
+ * Option B from `docs/design-multi-network.md` §2 (OD-F3-1, RATIFIED).
+ *
+ * A network may declare its own dedicated NATS leaf connection inline.
+ * This is a **subset** of the top-level `NatsConfigSchema` shape
+ * (`cortex-config.ts:870`) — only the connection-shaping fields, mirrored
+ * 1:1: `{ url, credsPath?, name? }`. Deliberately dropped vs the top-level
+ * schema:
+ *
+ *   - `subjects` — a per-network link's subscribe set derives from the
+ *     network's `accept_subjects`, not a standalone subjects list.
+ *   - `token` — bearer-token auth is discouraged for federated leaves
+ *     (creds-file auth is the path); add as a follow-up if a deployment
+ *     genuinely needs it.
+ *   - `identity` / `accountSigningKeyPath` — one stack identity signs
+ *     every link in F-3 (per-link signing keys are deferred — design §3.5).
+ *
+ * **Back-compat:** the field is OPTIONAL on the network. When absent, the
+ * network has no dedicated leaf and rides the primary link (`config.nats`)
+ * — exactly today's Phase D "one leaf at a time" behaviour. Zero
+ * per-network `nats:` blocks ⇒ today's single-link runtime, byte-for-byte.
+ *
+ * The LinkPool that consumes this lands in F-3b (cortex#658); F-3a is the
+ * schema + the `leaf_node`-consistency cross-validator only.
+ */
+export const PolicyFederatedNetworkNatsSchema = z.object({
+  /**
+   * Leaf-node connection URL. Same grammar as `NatsConfigSchema.url`:
+   * MUST start with `nats://` or `tls://`. Mirrored verbatim so the
+   * loader and `NatsLink.connect` treat a per-network URL identically
+   * to the primary one.
+   */
+  url: z.string().min(1).refine(
+    (s) => s.startsWith("nats://") || s.startsWith("tls://"),
+    { message: "network.nats.url must start with nats:// or tls://" },
+  ),
+  /**
+   * Connection name surfaced on the leaf server's varz endpoint.
+   * Defaults to `cortex` (same default as `NatsConfigSchema.name`) so a
+   * per-network leaf is identifiable when set, and harmless when omitted.
+   */
+  name: z.string().default("cortex"),
+  /**
+   * Path to a NATS user `.creds` file for this leaf's connect-time auth.
+   * Same semantics as `NatsConfigSchema.credsPath`: leading `~/` expands
+   * to `$HOME`; chmod-600 enforcement + file read happen in the
+   * `NatsLink` loader, not at schema time. Optional — a leaf may be
+   * anonymous in a test rig.
+   */
+  credsPath: z.string().optional(),
+}).strict();
+
+export type PolicyFederatedNetworkNats = z.infer<typeof PolicyFederatedNetworkNatsSchema>;
+
+/**
  * A single federation network — IAW Phase D.1 (cortex#116).
  *
  * Networks are the unit of federation policy in cortex per Q4
@@ -1440,6 +1495,14 @@ const NATS_SUBJECT_PATTERN_RE = /^([a-z][a-z0-9_-]*|\*)(\.([a-z][a-z0-9_-]*|\*))
  * budget. Multi-link transport (one MyelinRuntime per network)
  * lands in Phase E; Phase D operates one network's leaf-node at a
  * time, named via `leaf_node`.
+ *
+ * IAW Phase F-3a (cortex#657) the schema extends with an OPTIONAL
+ * per-network `nats:` block (Option B, `docs/design-multi-network.md`
+ * §2) — when present, the network has its own dedicated leaf
+ * connection; when absent, it rides the primary link (today's
+ * behaviour). The `leaf_node` name is the de-dup / pool key: two
+ * networks sharing a `leaf_node` share one physical link and so MUST
+ * declare consistent `nats:` blocks (cross-validated below).
  */
 export const PolicyFederatedNetworkSchema = z.object({
   /**
@@ -1526,6 +1589,20 @@ export const PolicyFederatedNetworkSchema = z.object({
    * Echo cortex#223 round 2.
    */
   max_hop: z.number().int().min(0),
+  /**
+   * IAW Phase F-3a (cortex#657) — OPTIONAL inline leaf-node connection
+   * (Option B, `docs/design-multi-network.md` §2). When present, this
+   * network rides its own dedicated NATS leaf; when absent, it rides the
+   * primary link (`config.nats`) — today's Phase D behaviour, byte-for-byte.
+   *
+   * The `leaf_node` field above is the pool key: two networks declaring
+   * the same `leaf_node` share one physical link, so their `nats:` blocks
+   * MUST be consistent — at most one declares the block and the rest omit
+   * it, or every declaration is byte-identical. Conflicting `nats:` under
+   * a shared `leaf_node` fails load loudly (cross-validated in
+   * `PolicySchema.superRefine`).
+   */
+  nats: PolicyFederatedNetworkNatsSchema.optional(),
 });
 
 export type PolicyFederatedNetwork = z.infer<typeof PolicyFederatedNetworkSchema>;
@@ -1718,6 +1795,18 @@ export const PolicySchema = z.object({
   if (policy.federated !== undefined) {
     // Uniqueness — networks[].id.
     const seenNetwork = new Map<string, number>();
+    // IAW Phase F-3a (cortex#657) — `leaf_node` is the link-pool de-dup
+    // key. Two networks sharing a `leaf_node` name share one physical
+    // NATS link, so their inline `nats:` blocks MUST agree on the
+    // connection. We remember the FIRST network that declared a `nats:`
+    // block for a given `leaf_node` (its index + the block), then assert
+    // every later network on the same `leaf_node` either omits `nats:`
+    // or declares a byte-identical block. A mismatch is a config error:
+    // one leaf cannot be two connections.
+    const leafNats = new Map<
+      string,
+      { networkIdx: number; nats: PolicyFederatedNetworkNats }
+    >();
     policy.federated.networks.forEach((n, networkIdx) => {
       const dupAt = seenNetwork.get(n.id);
       if (dupAt !== undefined) {
@@ -1754,6 +1843,30 @@ export const PolicySchema = z.object({
       };
       validateSubjectScope(n.accept_subjects, "accept_subjects");
       validateSubjectScope(n.deny_subjects, "deny_subjects");
+
+      // IAW Phase F-3a (cortex#657) — `leaf_node` connection consistency.
+      // Networks sharing a `leaf_node` share one physical link, so an
+      // inline `nats:` block here must not contradict an earlier network's
+      // block on the same `leaf_node`. The first declaration wins as the
+      // canonical connection; a later mismatched one is the offender. A
+      // later network that omits `nats:` (or re-declares an identical one)
+      // is fine — it just rides the already-defined link.
+      if (n.nats !== undefined) {
+        const prior = leafNats.get(n.leaf_node);
+        if (prior === undefined) {
+          leafNats.set(n.leaf_node, { networkIdx, nats: n.nats });
+        } else if (
+          prior.nats.url !== n.nats.url ||
+          prior.nats.name !== n.nats.name ||
+          prior.nats.credsPath !== n.nats.credsPath
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            message: `network "${n.id}" declares a nats: block for leaf_node "${n.leaf_node}" that conflicts with the one at federated.networks[${prior.networkIdx}] — networks sharing a leaf_node share one physical link and MUST declare consistent (byte-identical) nats: connections, or omit nats: on all but one`,
+            path: ["federated", "networks", networkIdx, "nats"],
+          });
+        }
+      }
 
       // Per-network peer cross-validation.
       const seenPeerStack = new Map<string, number>();
