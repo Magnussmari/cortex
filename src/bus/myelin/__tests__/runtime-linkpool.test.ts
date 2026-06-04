@@ -459,6 +459,62 @@ describe("MyelinRuntime LinkPool (F-3b, cortex#659)", () => {
     await runtime.stop();
   });
 
+  // (f) KNOWN EMIT-SITE ASYMMETRY PIN (cortex#661). `deriveNatsSubject`
+  //     emits `federated.{principal}.{stack}.{type}` — segment[1] is the
+  //     PRINCIPAL, whereas selectLink (per design §3.2) keys segment[1] as
+  //     the network_id. This test PINS the current behaviour of the derive
+  //     path (`runtime.publish`, NOT publishOnSubject) for a federated
+  //     envelope WHILE a leaf link exists: segment[1] = the source principal
+  //     ("metafactory"), which matches no network id ("research-collab"), so
+  //     the publish hits the unknown-network skip and is DROPPED. This is the
+  //     documented seam deferred to F-3c/E.2 — the fix lands at the EMIT
+  //     site (cortex#661), not in selectLink. When that fix lands this test
+  //     is expected to CHANGE (the federated envelope should land on the
+  //     leaf); until then it guards against silent drift in the routing path.
+  test("(f) KNOWN SEAM (cortex#661): runtime.publish() of a federated envelope WITH a leaf present hits the unknown-network skip (emit-site asymmetry, deferred to F-3c)", async () => {
+    const reg = makeFakeRegistry();
+    const routingErrors: RoutingError[] = [];
+    const networks = [
+      makeNetwork({
+        id: "research-collab",
+        leaf_node: "nats-leaf-research",
+        nats: { url: RESEARCH_URL, name: "cortex" },
+      }),
+    ];
+    const runtime = await startMyelinRuntime(
+      makeConfig({ url: PRIMARY_URL, name: "cortex", subjects: [] }),
+      {
+        connectImpl: reg.connectImpl,
+        federatedNetworks: networks,
+        stack: "default",
+        onRoutingError: (info) => routingErrors.push(info),
+      },
+    );
+    const primary = reg.forUrl(PRIMARY_URL)!;
+    const research = reg.forUrl(RESEARCH_URL)!;
+
+    // DERIVE path: source principal = "metafactory" → derived subject is
+    // `federated.metafactory.default.<type>` (segment[1] = principal).
+    await runtime.publish(
+      makeEnvelope({ classification: "federated", id: "seam-661-id" }),
+    );
+
+    // selectLink reads segment[1]="metafactory", finds no network with
+    // id==="metafactory" → unknown-network skip. Nothing published anywhere.
+    expect(routingErrors).toEqual([
+      {
+        reason: "unknown_network_in_publish_subject",
+        subject: "federated.metafactory.default.system.adapter.degraded",
+        networkId: "metafactory",
+        envelopeId: "seam-661-id",
+      },
+    ]);
+    expect(primary.publishes).toEqual([]);
+    expect(research.publishes).toEqual([]);
+
+    await runtime.stop();
+  });
+
   // (+) stop() drains + closes ALL pool links.
   test("(+) stop() drains and closes every pool link", async () => {
     const reg = makeFakeRegistry();

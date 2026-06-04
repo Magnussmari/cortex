@@ -890,20 +890,40 @@ export async function startMyelinRuntime(
    * publish" (the only `null` case today is an unknown federated network,
    * which also fires `onRoutingError`). `{network_id}` is the subject's
    * SECOND segment — the same grammar the inbound surface-router federation
-   * gate already keys off (`evaluateFederationGate`, `surface-router.ts`),
-   * so publish/subscribe routing agree on what a federated subject's
-   * network segment is.
+   * gate already keys off (`evaluateFederationGate`, `surface-router.ts`)
+   * and the design (`docs/design-multi-network.md` §3.2) mandates, so
+   * publish/subscribe routing agree on what a federated subject's network
+   * segment is.
    *
-   * BACK-COMPAT: with zero leaf links (no per-network `nats:`),
-   * `networkIdToLinkId` is empty or maps every network to `'primary'`, so
-   * even a `federated.*` subject whose segment[1] matches a configured
-   * network resolves to `primary` — and a `federated.*` subject for an
-   * UN-configured segment was already not separately routable pre-F-3b
-   * (it just published on the single link). To preserve that exact
-   * behaviour, the unknown-network skip ONLY engages when there is at
-   * least one leaf link in the pool; with a primary-only pool every
-   * subject (including stray `federated.*`) routes to primary, byte-for-
-   * byte as today.
+   * KNOWN EMIT-SITE ASYMMETRY (cortex#661, deferred to F-3c/E.2 — NOT a
+   * back-compat hazard). `deriveNatsSubject` currently emits federated
+   * subjects as `federated.{principal}.{stack}.{type}` — segment[1] is the
+   * PRINCIPAL, not the network_id this function (correctly, per §3.2) keys
+   * off. Consequence: a REAL federated publish routed through the derive
+   * path (`runtime.publish` with `classification: "federated"`) WHILE a leaf
+   * link exists resolves segment[1]=`{principal}` and — unless a network is
+   * coincidentally named after the principal — hits the unknown-network skip
+   * and is DROPPED (or mis-routes on that coincidence). This is harmless
+   * today only because (1) the zero-leaf back-compat case short-circuits to
+   * primary below before any segment is read, and (2) F-3b scopes the
+   * federated emit/relay enablement (E.2/E.3/E.7) OUT — no production site
+   * emits a `classification: "federated"` envelope through the derive path
+   * with a leaf present yet. The fix lands at the EMIT site under cortex#661,
+   * not here: `selectLink` already implements the design grammar. The
+   * regression test `(f)` in `runtime-linkpool.test.ts` PINS this current
+   * derive-path-with-leaf behaviour so the seam is explicit, not silent.
+   *
+   * BACK-COMPAT (the load-bearing zero-leaf invariant): with zero leaf
+   * links (no per-network `nats:`) the pool is primary-only, so the
+   * `pool.size === 1` short-circuit below returns `primary` for EVERY
+   * subject — including any stray `federated.*` — WITHOUT reading
+   * segment[1] at all. The unknown-network skip is therefore a
+   * multi-link-ONLY concept and never engages in the zero-leaf case; a
+   * `federated.*` subject for an un-configured segment was already not
+   * separately routable pre-F-3b (it just published on the single link),
+   * and that is preserved byte-for-byte. NOTE this short-circuit is also
+   * what makes the cortex#661 emit-site asymmetry above invisible today —
+   * it only surfaces once a leaf link exists.
    */
   const selectLink = (subject: string, envelopeId: string): PoolLink | null => {
     // Non-federated subjects (`local.*`, `public.*`, and anything that
