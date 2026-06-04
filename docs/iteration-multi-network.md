@@ -40,12 +40,14 @@ See `docs/design-multi-network.md` §9.
 - [ ] Tests: two-link routing matrix, **negative leakage test**, link-selection pure-function,
       back-compat snapshot (zero `nats:` ⇒ identical subjects).
 
-### F-3c — Lifecycle + degraded boot *(needs OD-F3-2)*
-- [ ] Per-link connect/drain/reconnect; one link's failure isolated.
-- [ ] `stop()` drains all links via `Promise.allSettled` (extend `runtime.ts:908`).
-- [ ] Boot: primary link governs `enabled`; dead per-network link ⇒ `system.error` + disabled-link
-      skip-and-log + background retry (replaces all-or-nothing `runtime.ts:519-533`).
-- [ ] Tests: boot-degradation, stop-drains-all-on-partial-failure.
+### F-3c — Lifecycle + degraded boot *(needs OD-F3-2)* — DONE (cortex#662)
+- [x] Per-link connect/drain/reconnect; one link's failure isolated. A down leaf is a tracked
+      `PoolLink` (`link: null`, `status: "disconnected"`) with a bounded-backoff background reconnect.
+- [x] `stop()` drains all links via `Promise.allSettled` (F-3b) AND cancels pending reconnect timers.
+- [x] Boot: primary link governs `enabled`; dead per-network link ⇒ routing-error skip-and-log
+      (fail-closed) + background retry (replaces F-3b's UNMAPPED-and-unrecoverable leaf).
+- [x] Tests: leaf-down-at-boot degrade, background-reconnect resume, bounded backoff, zero-network
+      no-op, stop()-cancels-pending-timer, post-stop reconnect no-op.
 
 ### F-3d — Inbound attribution + gate wiring
 - [ ] `EnvelopeHandler` gains additive `sourceLink?: string` (`runtime.ts:40`); existing handlers ignore.
