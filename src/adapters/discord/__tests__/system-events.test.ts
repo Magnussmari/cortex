@@ -34,6 +34,7 @@ function makePresence(overrides: Partial<DiscordPresence> = {}): DiscordPresence
     contextDepth: 5,
     enableAgentLog: false,
     trustedBotIds: [],
+    dmOwner: true,
     surfaceSubjects: [],
     ...overrides,
   };

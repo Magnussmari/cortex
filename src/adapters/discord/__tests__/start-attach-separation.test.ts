@@ -92,6 +92,7 @@ function makeAdapter(instanceId = "discord-test"): {
     contextDepth: 0,
     enableAgentLog: false,
     trustedBotIds: [],
+    dmOwner: true,
     surfaceSubjects: [],
   };
   const agent: Agent = {
@@ -183,6 +184,7 @@ describe("DiscordAdapter.attachInboundDispatch: pre-start guard (cortex#108)", (
       contextDepth: 0,
       enableAgentLog: false,
       trustedBotIds: [],
+      dmOwner: true,
       surfaceSubjects: [],
     };
     const agent: Agent = {

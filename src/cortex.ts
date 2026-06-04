@@ -1664,6 +1664,10 @@ export async function startCortex(
       // v2.0.0 (cortex#297) — roles/defaultRole/dm retired.
       ...(instance.operatorRoleId !== undefined && { operatorRoleId: instance.operatorRoleId }),
       trustedBotIds: instance.trustedBotIds,
+      // cortex#709 — DM stack-ownership. Threaded verbatim from the legacy
+      // instance shape; the adapter drops DM-scoped messageCreate early when
+      // false. Defaults to true at the schema layer (back-compat).
+      dmOwner: instance.dmOwner,
       surfaceSubjects: instance.surfaceSubjects,
       ...(instance.surfaceFallbackChannelId !== undefined && {
         surfaceFallbackChannelId: instance.surfaceFallbackChannelId,

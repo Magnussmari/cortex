@@ -390,6 +390,24 @@ export class DiscordAdapter implements PlatformAdapter {
       const isDM = message.channel.type === ChannelType.DM;
 
       if (isDM) {
+        // cortex#709 — DM stack-OWNERSHIP gate. The DM facet of #524 and the
+        // counterpart to the C-704 guild filter above. `message.guildId` is
+        // null for DMs (see #537), so the guild filter cannot gate them: with
+        // one bot token logged into N stacks, EVERY process receives EVERY DM
+        // and would run a full CC session → N duplicate replies. The
+        // per-process `recentMessageIds` dedup can't help — it's local to each
+        // adapter instance and never sees the sibling process's delivery.
+        //
+        // Resolution is config-driven (NOT a first-to-respond race): exactly
+        // one stack sets `presence.dmOwner: true`; non-owner stacks drop the
+        // DM here, before any access check or CC session. Defaults to true so
+        // single-stack deployments and pre-#709 configs are unchanged. See
+        // `DiscordPresenceSchema.dmOwner` for the misconfiguration semantics
+        // (all-true → today's double-answer; all-false → DMs unanswered, the
+        // deliberate fail-safe direction).
+        if (!this.presence.dmOwner) {
+          return;
+        }
         // Self-loop guard — never respond to our own DMs, regardless of
         // any trustedBotIds entry (the bot's own id is never allowed).
         if (message.author.id === this.client.user?.id) return;
@@ -788,8 +806,24 @@ export class DiscordAdapter implements PlatformAdapter {
   private static readonly PENDING_MAX_SIZE = 100;
   private static readonly PENDING_PRINCIPAL_MAX = 50;
 
+  /**
+   * cortex#708 — key the progress registry on the SESSION, not just the
+   * channel/thread. Two concurrent sessions in the same DM/channel resolve to
+   * the same `threadId ?? channelId` scope; without the session suffix they
+   * collapse onto one "working…" placeholder and the second session edits the
+   * first's message. `target.sessionId` is the inbound correlation id threaded
+   * by `dispatch-handler.targetFromMsg`. When it's absent (e.g. the
+   * surface-router's envelope render path, which has no inbound session) we
+   * fall back to channel-scoped keying — the pre-#708 behaviour, which is
+   * correct there because those targets aren't session-scoped.
+   */
+  private progressKey(target: ResponseTarget): string {
+    const scope = target.threadId ?? target.channelId;
+    return target.sessionId ? `${scope}:${target.sessionId}` : scope;
+  }
+
   async sendProgress(target: ResponseTarget, text: string): Promise<void> {
-    const key = target.threadId ?? target.channelId;
+    const key = this.progressKey(target);
     const existing = this.progressMessages.get(key);
     try {
       if (existing) {
@@ -813,7 +847,7 @@ export class DiscordAdapter implements PlatformAdapter {
   }
 
   async clearProgress(target: ResponseTarget): Promise<void> {
-    const key = target.threadId ?? target.channelId;
+    const key = this.progressKey(target);
     const msg = this.progressMessages.get(key);
     this.progressMessages.delete(key);
     this.progressSending.delete(key);
