@@ -30,6 +30,15 @@ export interface InboundChatDispatchPublishOpts {
   resumeSessionId: string | undefined;
   allowedDirs: string[];
   disallowedTools: string[];
+  /**
+   * cortex#710 — per-skill grant list. `undefined` → omit `allowed_skills`
+   * from the payload (the runner harness applies default-deny: no Skill
+   * tool). `[]` → explicit no-skills. `[...]` → grant exactly those skills
+   * via the runner's Skill Guard PreToolUse hook. The dispatch-handler maps
+   * `AccessDecision.allowedSkills` here; the gateway leaves it `undefined`
+   * (it grants nothing — see bus-inbound-sink.ts).
+   */
+  allowedSkills: string[] | undefined;
   timeoutMs: number | undefined;
   cwd: string | undefined;
   additionalArgs: string[] | undefined;
@@ -220,6 +229,12 @@ export async function publishInboundChatDispatchEnvelope(
     }),
     ...(opts.disallowedTools.length > 0 && {
       disallowed_tools: opts.disallowedTools,
+    }),
+    // cortex#710 — carry the per-skill grant list when the source decided
+    // one. Emitted even for `[]` (explicit no-skills) so the runner can
+    // distinguish "no decision" (field absent) from "decided: no skills".
+    ...(opts.allowedSkills !== undefined && {
+      allowed_skills: opts.allowedSkills,
     }),
     ...(opts.allowedDirs.length > 0 && { allowed_dirs: opts.allowedDirs }),
     ...(opts.timeoutMs !== undefined && { timeout_ms: opts.timeoutMs }),

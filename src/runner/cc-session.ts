@@ -9,7 +9,12 @@ import { EventEmitter } from "events";
 import { homedir } from "os";
 import { parseStreamLine, StreamLineBuffer, type UsageStats, type StreamEvent } from "./stream-parser";
 import { buildClaudeArgs, type ClaudeInvocationOpts } from "./claude-invoker";
-import { createIsolatedSettings, scopeSessionEnv, type IsolatedSettings } from "./session-settings";
+import {
+  createIsolatedSettings,
+  scopeSessionEnv,
+  CORTEX_SKILL_GRANTS_ENV,
+  type IsolatedSettings,
+} from "./session-settings";
 
 // Re-export for convenience
 export type { UsageStats, StreamEvent };
@@ -60,6 +65,23 @@ export interface CCSessionOpts {
    * tests can point at a fixture dir; production leaves it unset.
    */
   claudeDir?: string;
+  /**
+   * cortex#710 (Part B) — per-skill grant list for this session. When
+   * NON-EMPTY, the curated settings file registers the Skill Guard
+   * PreToolUse hook (matcher `Skill`), the bare `Skill` tool is broadly
+   * allowed, and this list is passed to the hook via the
+   * `CORTEX_SKILL_GRANTS` env var so it denies any skill ∉ the list.
+   *
+   * When `undefined`/empty, no Skill hook is registered and the caller is
+   * expected to keep `disallowedTools: ["Skill"]` (default-deny, no Skill
+   * tool). Set together as an atomic pair by the dispatch path — never
+   * {`Skill(name)` allow + bare `Skill` deny}, which is broken (cortex#706).
+   *
+   * Only honoured when `settingsIsolation` is on (the default). A
+   * principal-as-self session (`settingsIsolation:false`) inherits the
+   * principal's full skill set and does not register the gate.
+   */
+  allowedSkills?: string[];
 }
 
 export interface CCSessionResult {
@@ -123,12 +145,42 @@ export class CCSession extends EventEmitter {
     // are appended to additionalArgs so they sit before `-p <prompt>`
     // (buildClaudeArgs puts the prompt last).
     const isolate = this.opts.settingsIsolation !== false;
+    // cortex#710 — per-skill grants. Non-empty → curated settings registers
+    // the Skill Guard hook AND the grant list is exported to it via env. The
+    // two MUST move together (the #706 atomicity lesson).
+    const skillGrants = this.opts.allowedSkills;
+    const hasSkillGrants =
+      isolate && skillGrants !== undefined && skillGrants.length > 0;
     const isolationArgs: string[] = [];
     if (isolate) {
       this.isolatedSettings = createIsolatedSettings(
         this.opts.claudeDir ?? `${homedir()}/.claude`,
+        skillGrants,
       );
       isolationArgs.push(...this.isolatedSettings.args);
+    }
+
+    // cortex#710 — when grants are present, the bare `Skill` tool must be
+    // PERMITTED at the permission layer so the Skill Guard hook (registered
+    // in the curated settings) is the real gate. Normalise the tool lists
+    // here so CCSession is self-consistent regardless of which caller built
+    // them (harness pre-pairs them; the dispatch-handler direct paths rely on
+    // this). Strip any `Skill` deny, and add `Skill` to a NON-EMPTY allowlist
+    // that lacks it (an empty allowlist means "no --allowedTools flag →
+    // allow-by-default", which already permits the bare Skill tool).
+    let effectiveAllowedTools = this.opts.allowedTools;
+    let effectiveDisallowedTools = this.opts.disallowedTools;
+    if (hasSkillGrants) {
+      if (effectiveDisallowedTools?.includes("Skill")) {
+        effectiveDisallowedTools = effectiveDisallowedTools.filter((t) => t !== "Skill");
+      }
+      if (
+        effectiveAllowedTools !== undefined &&
+        effectiveAllowedTools.length > 0 &&
+        !effectiveAllowedTools.includes("Skill")
+      ) {
+        effectiveAllowedTools = [...effectiveAllowedTools, "Skill"];
+      }
     }
 
     // Build args from existing buildClaudeArgs, then inject stream-json
@@ -137,8 +189,8 @@ export class CCSession extends EventEmitter {
       groveChannel: this.opts.groveChannel,
       groveNetwork: this.opts.groveNetwork,
       resumeSessionId: this.opts.resumeSessionId,
-      allowedTools: this.opts.allowedTools,
-      disallowedTools: this.opts.disallowedTools,
+      allowedTools: effectiveAllowedTools,
+      disallowedTools: effectiveDisallowedTools,
       allowedDirs: this.opts.allowedDirs,
       additionalArgs: [
         "--verbose",
@@ -169,6 +221,14 @@ export class CCSession extends EventEmitter {
       ...(this.opts.project && { GROVE_PROJECT: this.opts.project }),
       ...(this.opts.entity && { GROVE_ENTITY: this.opts.entity }),
       ...(this.opts.principal && { GROVE_OPERATOR: this.opts.principal }),
+      // cortex#710 — pass the per-skill grant list to the Skill Guard hook.
+      // Only set when the curated settings actually registered the hook
+      // (hasSkillGrants), so the env var and the hook move atomically. Layered
+      // here (after scopeSessionEnv) alongside cortex's other pipeline vars; it
+      // is not a CLAUDE_* var so scoping passes it through regardless.
+      ...(hasSkillGrants && {
+        [CORTEX_SKILL_GRANTS_ENV]: JSON.stringify(skillGrants),
+      }),
     };
 
     // Pass bash allowlist config to bash-guard.hook.ts
