@@ -205,6 +205,34 @@ export const DiscordPresenceSchema = z.object({
    */
   trustedBotIds: z.array(z.coerce.string()).default([]),
   /**
+   * cortex#709 — DM stack-OWNERSHIP flag. The DM facet of the "one assistant,
+   * many stacks" model (cortex#524): one Discord bot token is logged into N
+   * cortex processes, each bound to a different `guildId`. The C-704 guild
+   * filter gates GUILD traffic by `guildId`, but `message.guildId` is `null`
+   * for DMs, so every process receives every DM and answers it — N duplicate
+   * replies. There is no per-process dedup that can help (each process has its
+   * own `recentMessageIds` Set), so the resolution must be config-driven, NOT
+   * a first-to-respond race.
+   *
+   * `dmOwner` declares whether THIS stack owns the principal's DMs. Exactly
+   * one stack in a multi-stack deployment should set it `true`; the rest set
+   * `false` and drop DM-scoped `messageCreate` early (symmetric to the guild
+   * gate). Guild routing is unaffected — this only gates the DM path.
+   *
+   * Default `true` (back-compat + safe single-stack default): a single-stack
+   * deployment, and every config that predates this field, keeps answering
+   * DMs exactly as before. A principal opts a SECONDARY stack out by setting
+   * `dmOwner: false` on its presence.
+   *
+   * Misconfiguration semantics (documented so the failure mode is legible):
+   *   - all stacks `true`  → degrades to today's double-answer bug (no worse
+   *     than the pre-#709 status quo).
+   *   - all stacks `false` → DMs go UNANSWERED. This is the deliberate
+   *     fail-safe direction: "no action" is debuggable and reversible, whereas
+   *     "duplicate action" (N agents independently acting on one DM) is not.
+   */
+  dmOwner: z.boolean().default(true),
+  /**
    * MIG-3b / cortex#205: NATS subject patterns this Discord adapter renders
    * to chat. Threaded into `DiscordAdapterInfra.surfaceSubjects` at
    * construction time and registered with the surface-router as the

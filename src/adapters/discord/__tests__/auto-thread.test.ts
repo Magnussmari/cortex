@@ -194,6 +194,7 @@ function makeAdapterWithInfra(
     contextDepth: 0,
     enableAgentLog: false,
     trustedBotIds: [],
+    dmOwner: true,
     surfaceSubjects: [],
   };
   const agent: Agent = {
