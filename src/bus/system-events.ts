@@ -1059,6 +1059,12 @@ export type SystemDispatchStage =
   | "chain-verify-start"
   | "chain-verified"
   | "chain-rejected"
+  // TC-1c (#552) — Shape B re-sign on ingest. Emitted when a signer-bearing
+  // stack re-stamps an empty-chain gateway-injected / adapter-originated
+  // envelope with its own NKey, after the chain verifier accepts it and
+  // before the policy gate. `pass` = re-stamped; `fail` = sign failed and the
+  // dispatch fell through with the original unsigned envelope.
+  | "resigned-on-ingest"
   | "policy-decision"
   | "session-spawning"
   | "started";

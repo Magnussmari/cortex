@@ -2220,6 +2220,244 @@ describe("dispatch-listener — chain verification (cortex#320)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// TC-1c (#552) — Shape B re-sign gateway-injected envelopes on ingest
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a real ed25519 keypair shaped for the dispatch-listener's
+ * `resignSigner` option (`{ rawSeedBytes, principal }`) AND the chain
+ * verifier (`nkey_pub`). Mirrors `generateEd25519KeyPairForRunner` but also
+ * returns the raw seed bytes the signer carries.
+ */
+function generateStackSignerForRunner(principal: string): {
+  signer: { rawSeedBytes: Uint8Array; principal: string };
+  nkeyPub: string;
+} {
+  const kp = createUser();
+  const nkeyPub = kp.getPublicKey();
+  const rawSeedBytes = (
+    kp as unknown as { getRawSeed(): Uint8Array }
+  ).getRawSeed();
+  return { signer: { rawSeedBytes, principal }, nkeyPub };
+}
+
+/** Read an envelope's normalised `signed_by[]` chain (single | array | none). */
+function chainOf(env: Envelope): { method?: string; identity?: string }[] {
+  const sb = env.signed_by;
+  if (sb === undefined) return [];
+  return Array.isArray(sb) ? sb : [sb];
+}
+
+describe("dispatch-listener — Shape B re-sign on ingest (TC-1c #552)", () => {
+  // Stack identity the gateway-bound stack signs with. Matches the
+  // `did:mf:<principal>-<stack>` shape `cortex.ts` derives + the own-stack
+  // short-circuit (cortex#480) so the re-stamped envelope verifies on any
+  // re-entry.
+  const STACK_IDENTITY = "did:mf:andreas-meta-factory";
+
+  /** Single-principal engine that resolves `andreas` from `originator`. */
+  function engineForGatewayPrincipal(): PolicyEngine {
+    return new PolicyEngine({
+      principals: [
+        {
+          id: "andreas",
+          home_principal: "andreas",
+          home_stack: "andreas/meta-factory",
+          role: ["operator"],
+          trust: [],
+          platform_ids: { discord: ["1134325176796987522"] },
+        },
+      ],
+      roles: [{ id: "operator", capabilities: ["dispatch.cortex"] }],
+    });
+  }
+
+  /**
+   * A gateway Shape-A injection: empty `signed_by[]` + `originator` stamped
+   * (the gateway resolved the platform author to `did:mf:andreas` and
+   * published UNSIGNED — `dispatch-source-publisher.ts`).
+   */
+  function gatewayInjectedEnvelope(): Envelope {
+    const env = makeReceivedEnvelope();
+    env.originator = {
+      identity: "did:mf:andreas",
+      attribution: "adapter-resolved",
+    };
+    return env;
+  }
+
+  test("(a) signing off (no resignSigner) → gateway-injected envelope stays UNSIGNED (pure Shape A, unchanged)", async () => {
+    // Default posture (`signing: off`) → `cortex.ts` omits `resignSigner`.
+    // The empty-chain gateway envelope flows through verify (rejectEmpty:false)
+    // and the policy gate WITHOUT acquiring any signed_by stamp — byte-
+    // identical to today's behaviour. The audit envelope carries an empty
+    // signed_by chain.
+    const { nkeyPub } = generateStackSignerForRunner(STACK_IDENTITY);
+    const cortex = agentFixtureForRunner({ id: "cortex", trust: [] });
+    const resolver = runnerResolverWith(cortex);
+
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineForGatewayPrincipal(),
+      trustResolver: resolver,
+      receivingAgentId: "cortex",
+      principalId: "andreas",
+      cryptoVerify: true,
+      stackIdentity: STACK_IDENTITY,
+      stackNKeyPub: nkeyPub,
+      // resignSigner deliberately OMITTED — models `signing: off`.
+    });
+    await listener.start();
+    await router.start();
+
+    r.trigger(gatewayInjectedEnvelope(), CANONICAL_CORTEX_CHAT_SUBJECT);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Allow path: audit + lifecycle envelopes flow (dispatch is not dropped).
+    expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.allowed",
+      "dispatch.task.started",
+      "dispatch.task.completed",
+    ]);
+    // The audit envelope carries the originating chain VERBATIM — empty,
+    // because no re-sign happened. This is the load-bearing back-compat pin.
+    const allowed = r.published.find((e) => e.type === "system.access.allowed")!;
+    const auditChain = (allowed.payload.signed_by ?? []) as unknown[];
+    expect(auditChain).toHaveLength(0);
+  });
+
+  test("(b) signing permissive + seed (resignSigner) → gateway-injected envelope carries a STACK signed_by[] stamp after ingest", async () => {
+    // Posture `permissive`/`enforce` + a loaded seed → `cortex.ts` passes
+    // `resignSigner`. The empty-chain gateway envelope is re-stamped on
+    // ingest with the stack NKey BEFORE the policy gate, so the downstream
+    // `system.access.allowed` audit envelope carries a stack signed_by[]
+    // stamp — the acceptance criterion.
+    const { signer, nkeyPub } = generateStackSignerForRunner(STACK_IDENTITY);
+    const cortex = agentFixtureForRunner({ id: "cortex", trust: [] });
+    const resolver = runnerResolverWith(cortex);
+
+    const captured: { principalId: string; intent: Intent }[] = [];
+    const engine = engineForGatewayPrincipal();
+    const origCheck = engine.check.bind(engine);
+    engine.check = (principalId, intent) => {
+      captured.push({ principalId, intent });
+      return origCheck(principalId, intent);
+    };
+
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engine,
+      trustResolver: resolver,
+      receivingAgentId: "cortex",
+      principalId: "andreas",
+      cryptoVerify: true,
+      stackIdentity: STACK_IDENTITY,
+      stackNKeyPub: nkeyPub,
+      resignSigner: signer,
+    });
+    await listener.start();
+    await router.start();
+
+    r.trigger(gatewayInjectedEnvelope(), CANONICAL_CORTEX_CHAT_SUBJECT);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Dispatch is NOT dropped — allow + lifecycle flow.
+    expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.allowed",
+      "dispatch.task.started",
+      "dispatch.task.completed",
+    ]);
+
+    // The audit envelope now carries a stack signed_by[] stamp — the
+    // gateway-injected request is cryptographically attributable to the
+    // stack. (`system.access.*` carries the originating chain verbatim via
+    // getSignedByChain, line 1375.)
+    const allowed = r.published.find((e) => e.type === "system.access.allowed")!;
+    const auditChain = (allowed.payload.signed_by ?? []) as {
+      method?: string;
+      identity?: string;
+    }[];
+    expect(auditChain).toHaveLength(1);
+    expect(auditChain[0]!.method).toBe("ed25519");
+    expect(auditChain[0]!.identity).toBe(STACK_IDENTITY);
+
+    // Policy attribution is UNCHANGED: the engine still resolved `andreas`
+    // from `originator.identity`, NOT the stack stamp at signed_by[0].
+    // Appending a stack stamp to a previously-empty chain must not change
+    // who the dispatch is attributed to.
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.principalId).toBe("andreas");
+  });
+
+  test("(c) per-stack already-signed dispatch is NOT re-stamped (empty-chain gate; no double-stamp, loop-safe)", async () => {
+    // A real per-stack dispatch already carries the stack stamp (the stack
+    // signed it via runtime.publish), OR our own re-stamped envelope
+    // re-entered the listener. Either way the chain is non-empty, so the
+    // re-sign hook MUST skip it — no double-stamp, and the re-consume loop is
+    // closed.
+    const { signer, nkeyPub } = generateStackSignerForRunner(STACK_IDENTITY);
+    const cortex = agentFixtureForRunner({ id: "cortex", trust: [] });
+    const resolver = runnerResolverWith(cortex);
+
+    const r = recordingRuntime();
+    const router = createSurfaceRouter(r.runtime);
+    const { factory } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineForGatewayPrincipal(),
+      trustResolver: resolver,
+      receivingAgentId: "cortex",
+      principalId: "andreas",
+      cryptoVerify: true,
+      stackIdentity: STACK_IDENTITY,
+      stackNKeyPub: nkeyPub,
+      resignSigner: signer,
+    });
+    await listener.start();
+    await router.start();
+
+    // Pre-sign the envelope with the SAME stack key (models the per-stack
+    // path: the stack already signed via runtime.publish). Keep the
+    // originator so policy resolves `andreas`.
+    const base = gatewayInjectedEnvelope() as Parameters<typeof signEnvelope>[0];
+    const preSigned = (await signEnvelope(
+      base,
+      Buffer.from(signer.rawSeedBytes).toString("base64"),
+      STACK_IDENTITY,
+    )) as Envelope;
+    expect(chainOf(preSigned)).toHaveLength(1);
+
+    r.trigger(preSigned, CANONICAL_CORTEX_CHAT_SUBJECT);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Allow + lifecycle (own-stack short-circuit accepts the single stamp).
+    expect(r.published.map((e) => e.type)).toEqual([
+      "system.access.allowed",
+      "dispatch.task.started",
+      "dispatch.task.completed",
+    ]);
+
+    // The audit chain is STILL length 1 — the hook did NOT append a second
+    // stamp to the already-signed envelope. No double-stamp.
+    const allowed = r.published.find((e) => e.type === "system.access.allowed")!;
+    const auditChain = (allowed.payload.signed_by ?? []) as unknown[];
+    expect(auditChain).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // cortex#346 — myelin#161 originator field consumed via getActorPrincipal
 // ---------------------------------------------------------------------------
 
