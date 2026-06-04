@@ -977,6 +977,194 @@ describe("PolicyFederatedSchema cross-validation", () => {
     expect(policy.principals).toHaveLength(1);
     expect(policy.federated?.networks).toHaveLength(1);
   });
+
+  // ─── F-3a: inline per-network nats: block (cortex#657) ─────────────────
+  // Option B (docs/design-multi-network.md §2). Additive + back-compat:
+  // a network with an inline nats: leaf parses; a network with no nats:
+  // is unchanged (rides the primary link). leaf_node is the de-dup key:
+  // networks sharing a leaf_node MUST declare consistent connections.
+
+  test("F-3a: network with an inline nats: leaf block parses", () => {
+    const policy = PolicySchema.parse({
+      federated: {
+        networks: [{
+          id: "research-collab", leaf_node: "nats-leaf-research", peers: [],
+          accept_subjects: ["federated.research-collab.>"], deny_subjects: [],
+          announce_capabilities: [], max_hop: 1,
+          nats: {
+            url: "nats://research:4222",
+            credsPath: "~/.config/cortex/creds/research.creds",
+          },
+        }],
+      },
+    });
+    const net = policy.federated?.networks[0];
+    expect(net?.nats?.url).toBe("nats://research:4222");
+    expect(net?.nats?.credsPath).toBe("~/.config/cortex/creds/research.creds");
+    // name defaults to "cortex" (mirrors NatsConfigSchema.name).
+    expect(net?.nats?.name).toBe("cortex");
+  });
+
+  test("F-3a: network with NO nats: block parses unchanged (no leaf → primary link, today's behaviour)", () => {
+    const policy = PolicySchema.parse({
+      federated: {
+        networks: [{
+          id: "research-collab", leaf_node: "leaf", peers: [],
+          accept_subjects: [], deny_subjects: [],
+          announce_capabilities: [], max_hop: 0,
+        }],
+      },
+    });
+    expect(policy.federated?.networks[0]?.nats).toBeUndefined();
+  });
+
+  test("F-3a: nats.url must start with nats:// or tls:// (mirrors NatsConfigSchema)", () => {
+    expect(() =>
+      PolicySchema.parse({
+        federated: {
+          networks: [{
+            id: "n", leaf_node: "leaf", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            nats: { url: "http://research:4222" },
+          }],
+        },
+      }),
+    ).toThrow(/network\.nats\.url must start with nats:\/\/ or tls:\/\//);
+  });
+
+  test("F-3a: nats: block is strict — an unknown key (e.g. token) is rejected", () => {
+    // token/subjects/identity/accountSigningKeyPath are deliberately NOT
+    // part of the per-network leaf subset (design §4 rule 1). The strict
+    // object rejects them rather than silently dropping.
+    expect(() =>
+      PolicySchema.parse({
+        federated: {
+          networks: [{
+            id: "n", leaf_node: "leaf", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            nats: { url: "nats://research:4222", token: "secret" },
+          }],
+        },
+      }),
+    ).toThrow();
+  });
+
+  test("F-3a: two networks sharing a leaf_node with CONSISTENT nats: blocks parse", () => {
+    const policy = PolicySchema.parse({
+      federated: {
+        networks: [
+          {
+            id: "net-a", leaf_node: "shared-leaf", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            nats: { url: "nats://shared:4222", credsPath: "~/creds/shared.creds" },
+          },
+          {
+            id: "net-b", leaf_node: "shared-leaf", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            // Byte-identical block on the same leaf_node — share one link.
+            nats: { url: "nats://shared:4222", credsPath: "~/creds/shared.creds" },
+          },
+        ],
+      },
+    });
+    expect(policy.federated?.networks).toHaveLength(2);
+  });
+
+  test("F-3a: two networks sharing a leaf_node where one omits nats: parse (rides the defined link)", () => {
+    const policy = PolicySchema.parse({
+      federated: {
+        networks: [
+          {
+            id: "net-a", leaf_node: "shared-leaf", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            nats: { url: "nats://shared:4222" },
+          },
+          {
+            id: "net-b", leaf_node: "shared-leaf", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            // No nats: — rides the link net-a defined for this leaf_node.
+          },
+        ],
+      },
+    });
+    expect(policy.federated?.networks).toHaveLength(2);
+  });
+
+  test("F-3a: two networks sharing a leaf_node with MISMATCHED nats: fail loudly", () => {
+    expect(() =>
+      PolicySchema.parse({
+        federated: {
+          networks: [
+            {
+              id: "net-a", leaf_node: "shared-leaf", peers: [],
+              accept_subjects: [], deny_subjects: [],
+              announce_capabilities: [], max_hop: 0,
+              nats: { url: "nats://shared:4222" },
+            },
+            {
+              id: "net-b", leaf_node: "shared-leaf", peers: [],
+              accept_subjects: [], deny_subjects: [],
+              announce_capabilities: [], max_hop: 0,
+              // Different url on the SAME leaf_node — one leaf can't be
+              // two connections.
+              nats: { url: "nats://other:4222" },
+            },
+          ],
+        },
+      }),
+    ).toThrow(/conflicts with the one at federated\.networks\[0\].*consistent/s);
+  });
+
+  test("F-3a: mismatched credsPath on a shared leaf_node also fails", () => {
+    expect(() =>
+      PolicySchema.parse({
+        federated: {
+          networks: [
+            {
+              id: "net-a", leaf_node: "shared-leaf", peers: [],
+              accept_subjects: [], deny_subjects: [],
+              announce_capabilities: [], max_hop: 0,
+              nats: { url: "nats://shared:4222", credsPath: "~/creds/a.creds" },
+            },
+            {
+              id: "net-b", leaf_node: "shared-leaf", peers: [],
+              accept_subjects: [], deny_subjects: [],
+              announce_capabilities: [], max_hop: 0,
+              nats: { url: "nats://shared:4222", credsPath: "~/creds/b.creds" },
+            },
+          ],
+        },
+      }),
+    ).toThrow(/conflicts with the one at federated\.networks\[0\]/);
+  });
+
+  test("F-3a: DIFFERENT leaf_node names with different nats: blocks are independent (no conflict)", () => {
+    const policy = PolicySchema.parse({
+      federated: {
+        networks: [
+          {
+            id: "net-a", leaf_node: "leaf-a", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            nats: { url: "nats://a:4222" },
+          },
+          {
+            id: "net-b", leaf_node: "leaf-b", peers: [],
+            accept_subjects: [], deny_subjects: [],
+            announce_capabilities: [], max_hop: 0,
+            nats: { url: "nats://b:4222" },
+          },
+        ],
+      },
+    });
+    expect(policy.federated?.networks).toHaveLength(2);
+  });
 });
 
 describe("PolicyFederatedPeerSchema — R2.G operator→principal v4.0.0 BREAKING CUT (cortex#436)", () => {
