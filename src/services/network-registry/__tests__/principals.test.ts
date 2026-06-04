@@ -188,6 +188,50 @@ describe("POST /principals/:id/register — auth failures", () => {
     expect(res2.status).toBe(409);
   });
 
+  test("#695 — bad-signature POST does NOT burn the nonce", async () => {
+    // The nonce cache is durable (D1, #694). Before #695 the handler
+    // recorded the nonce BEFORE verifying the signature, so a bad-sig
+    // POST permanently consumed a nonce row — a later legitimate claim
+    // reusing that nonce would then wrongly 409. After the reorder the
+    // signature is verified first, so a bad-sig POST is rejected 401
+    // WITHOUT touching the nonce cache.
+    const nonce = randomNonce();
+
+    // Bad signature: sign with the wrong key while claiming pKey's pubkey.
+    const otherKey = await makePrincipalKey();
+    const badBody = await makeSignedRegistration("andreas", otherKey, {
+      pubkeyOverride: pKey.publicKeyB64,
+      nonce,
+    });
+    const badRes = await post("/principals/andreas/register", badBody);
+    expect(badRes.status).toBe(401);
+    expect(((await badRes.json()) as { error: string }).error).toBe("signature_invalid");
+
+    // A subsequent VALID POST reusing the SAME nonce must succeed —
+    // proving the bad-sig attempt never consumed the nonce.
+    const goodBody = await makeSignedRegistration("andreas", pKey, {
+      stacks: [{ stack_id: "andreas/laptop" }],
+      nonce,
+    });
+    const goodRes = await post("/principals/andreas/register", goodBody);
+    expect(goodRes.status).toBe(201);
+  });
+
+  test("#695 — valid-sig replay still rejects 409 (nonce consumed only on authentic path)", async () => {
+    // The reorder must NOT weaken replay protection: a validly-signed
+    // claim consumes its nonce, and a second validly-signed claim reusing
+    // that same nonce is still rejected 409.
+    const nonce = randomNonce();
+    const body1 = await makeSignedRegistration("andreas", pKey, { nonce });
+    const res1 = await post("/principals/andreas/register", body1);
+    expect(res1.status).toBe(201);
+
+    const body2 = await makeSignedRegistration("andreas", pKey, { nonce });
+    const res2 = await post("/principals/andreas/register", body2);
+    expect(res2.status).toBe(409);
+    expect(((await res2.json()) as { error: string }).error).toBe("nonce_replayed");
+  });
+
   test("rejects silent pubkey rotation", async () => {
     const body1 = await makeSignedRegistration("andreas", pKey);
     const res1 = await post("/principals/andreas/register", body1);
