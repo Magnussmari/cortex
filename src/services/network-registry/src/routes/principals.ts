@@ -113,22 +113,31 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
       );
     }
 
-    // Replay check.
-    const nonceCache = getNonceCache(c.env);
-    const fresh = await nonceCache.recordIfFresh(claim.nonce, now);
-    if (!fresh) {
-      return c.json({ error: "nonce_replayed" }, 409);
-    }
-
     // Signature verification. The principal signs canonical-JSON(claim)
     // with their declared pubkey. TOFU on first register (the claim
     // tells us which key to verify against); rotation requires the
     // previous key to sign a transition claim — out of scope for v1,
     // tracked as a follow-up.
+    //
+    // #695 — verify the signature BEFORE recording the nonce. The nonce
+    // cache is durable (D1, #694), so an unsigned/bad-signature POST that
+    // recorded its nonce first would permanently burn that nonce row
+    // without ever proving authenticity. A replay is only meaningful for
+    // an authentic (validly-signed) claim, so we shed bad-sig POSTs with
+    // 401 here and only consume a nonce on the authentic path below.
     const message = new TextEncoder().encode(canonicalJSON(claim));
     const valid = await verifyEd25519(claim.principal_pubkey, signed.signature, message);
     if (!valid) {
       return c.json({ error: "signature_invalid" }, 401);
+    }
+
+    // Replay check — only reached once the signature is proven valid, so
+    // a nonce row is consumed exclusively on the authentic path. A legit
+    // replay (valid signature, previously-seen nonce) still rejects 409.
+    const nonceCache = getNonceCache(c.env);
+    const fresh = await nonceCache.recordIfFresh(claim.nonce, now);
+    if (!fresh) {
+      return c.json({ error: "nonce_replayed" }, 409);
     }
 
     // Pubkey rotation policy for v1:
