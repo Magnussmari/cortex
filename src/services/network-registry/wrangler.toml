@@ -49,6 +49,34 @@ routes = [
 ENVIRONMENT = "development"
 
 # ──────────────────────────────────────────────────────────────────
+# #680 — App-layer rate limiting (PARITY GUARD: dev == prod).
+#
+# These two bindings MUST stay byte-identical to the [env.production]
+# block below in `limit` and `period` and in which endpoints they
+# guard. `network-dev.meta-factory.ai` and `network.meta-factory.ai`
+# are BOTH public internet endpoints; dev is NOT a laxer posture.
+# If you change a limit, change it in BOTH blocks.
+#
+# The only legitimate per-env difference is `namespace_id` (CF requires
+# a distinct ratelimit namespace id per environment). The LIMIT VALUES
+# are also mirrored in code (src/rate-limit.ts RATE_LIMITS) which is the
+# active fallback where the native binding is absent (wrangler dev / test).
+#
+#   RL_REGISTER → POST /principals/:id/register   (strict: 5 / 60s)
+#   RL_READ     → GET resolve / roster / capabilities (loose: 120 / 60s)
+[[env.dev.unsafe.bindings]]
+name = "RL_REGISTER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }
+
+[[env.dev.unsafe.bindings]]
+name = "RL_READ"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 120, period = 60 }
+
+# ──────────────────────────────────────────────────────────────────
 # Environment: Production (network.meta-factory.ai)
 # ──────────────────────────────────────────────────────────────────
 [env.production]
@@ -65,6 +93,30 @@ routes = [
 
 [env.production.vars]
 ENVIRONMENT = "production"
+
+# ──────────────────────────────────────────────────────────────────
+# #680 — App-layer rate limiting (PARITY GUARD: prod == dev).
+#
+# These two bindings MUST stay byte-identical to the [env.dev] block
+# above in `limit` and `period` and in which endpoints they guard.
+# Both hostnames are public; prod is NOT a stricter posture and dev is
+# NOT a laxer one — they are the SAME. The only per-env difference is
+# `namespace_id` (CF requires a distinct ratelimit namespace per env).
+# If you change a limit, change it in BOTH blocks.
+#
+#   RL_REGISTER → POST /principals/:id/register   (strict: 5 / 60s)
+#   RL_READ     → GET resolve / roster / capabilities (loose: 120 / 60s)
+[[env.production.unsafe.bindings]]
+name = "RL_REGISTER"
+type = "ratelimit"
+namespace_id = "2001"
+simple = { limit = 5, period = 60 }
+
+[[env.production.unsafe.bindings]]
+name = "RL_READ"
+type = "ratelimit"
+namespace_id = "2002"
+simple = { limit = 120, period = 60 }
 
 # Secrets (set via `wrangler secret put --env production`):
 #   REGISTRY_SIGNING_KEY  — base64-encoded PKCS#8 Ed25519 private key used
