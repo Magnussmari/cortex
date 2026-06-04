@@ -689,6 +689,28 @@ export type FederationGateDecision =
     };
 
 /**
+ * ⚠️ ADR 0001 (supersedes cortex#661) GRAMMAR MISMATCH — REWORK IN cortex#686.
+ *
+ * This gate still parses subject segment[1] as a `{network_id}` (the cortex#661
+ * wire grammar). ADR 0001 removed the network from the wire: an inbound
+ * federated subject is now `federated.{principal}.{stack}.…` where segment[1] is
+ * the RECEIVING principal, not a network id. Against the new grammar this gate
+ * looks up `networksById.get(<principal>)`, finds nothing (network ids and
+ * principal ids share a namespace but differ in value), and DENIES every
+ * conformant inbound federated envelope as `peer_not_in_accept_list`
+ * (`unknown_network: true`).
+ *
+ * This FAILS CLOSED (no cross-network leak — the safe direction) but it is a
+ * functional break for the inbound federated path. It is dormant only because
+ * no federated dispatch consumer exists yet (ADR 0001 §Consequences); the
+ * conformant rework lands in lockstep with the federated review consumer
+ * (cortex#686) + pilot#149. Until then, do NOT rely on this gate's accept path
+ * for ADR-0001 traffic. The cross-principal TRUST decision the gate is meant to
+ * own moves to: the per-leaf inbound subscription scope (`runtime.ts`), the
+ * `verify-signed-by-chain` peer-pubkey lookup keyed off `sourceLink`, and the
+ * `peers[]` topology — re-derive the gate's accept/deny check on the
+ * `{principal}.{stack}` grammar there.
+ *
  * Parse `federated.{network_id}.<...>` and check the subject against
  * the resolved network's policy. Pure function — exported so tests can
  * probe each branch in isolation without spinning up a runtime + router.

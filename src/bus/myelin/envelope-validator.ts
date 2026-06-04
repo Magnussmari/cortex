@@ -557,28 +557,28 @@ export type Classification = Envelope["sovereignty"]["classification"];
  *
  *   - `classification === "local"`     → `local.{principal}.{type}` (legacy)
  *                                      → `local.{principal}.{stack}.{type}` when `stack` supplied (myelin#113)
- *   - `classification === "federated"` → `federated.{network_id}.{type}` / `federated.{network_id}.{stack}.{type}`
+ *   - `classification === "federated"` → `federated.{principal}.{type}` / `federated.{principal}.{stack}.{type}`
  *   - `classification === "public"`    → `public.{type}` (no org, no stack — public is global)
  *
- * For `local.*` the `{principal}` segment is the first dotted segment of
- * `envelope.source` (the same value cortex's MyelinRuntime captures from the
- * boot-resolved `principal.id` at startup, so subject and source stay
+ * For `local.*` AND `federated.*` the `{principal}` segment is the first dotted
+ * segment of `envelope.source` (the same value cortex's MyelinRuntime captures
+ * from the boot-resolved `principal.id` at startup, so subject and source stay
  * symmetrical).
  *
- * **cortex#661 — federated subjects are network-scoped, not principal-scoped.**
- * For `federated.*` the SECOND segment is the TARGET `{network_id}`, NOT the
- * source principal. This is the grammar the design (`docs/design-multi-network.md`
- * §3.2) mandates and the side that already routes/subscribes: `selectLink`
- * (`runtime.ts`), the surface-router federation gate `evaluateFederationGate`,
- * and the per-leaf `federated.{network_id}.>` inbound subscriptions all key
- * segment[1] as the network id. Sourcing `{network_id}` from the principal here
- * (the pre-#661 bug) produced subjects that matched no leaf's network id → the
- * publish hit the unknown-network skip and was DROPPED (harmless only while
- * zero-leaf deployments short-circuit before reading segment[1]). The network id
- * is read from `extensions.network_id` — the canonical target-network metadata a
- * federated emit site stamps (e.g. pilot's `buildReviewRequestedEnvelope`). A
- * `federated` envelope that names no network is an EMIT ERROR and throws (see
- * {@link networkIdFromEnvelope}); there is NO silent principal fallback.
+ * **ADR 0001 (supersedes cortex#661) — federated subjects carry `{principal}.{stack}`,
+ * the SAME identity segments as `local.*`; only the scope prefix differs.** The
+ * network is NEVER on the wire — it is resolved from the target principal via
+ * deployment topology (`policy.federated.networks[].peers[]`) at the routing
+ * layer (`selectLink` in `runtime.ts`), NOT carried as a subject segment.
+ * `CONTEXT.md` is unambiguous: "A network is NOT a subject segment … Cross-principal
+ * reach is the `federated.` scope prefix, never a network name on the wire."
+ *
+ * cortex#661 had drifted by slotting the target `network_id` (from
+ * `extensions.network_id`) into segment[1] — a transport-topology value leaking
+ * into the L7 identity address. ADR 0001 reverts that: federated subjects address
+ * by IDENTITY (the target principal/stack), and `selectLink` resolves which leaf
+ * from the `peers[]` topology map. `extensions.network_id` MAY still travel as a
+ * routing HINT but is no longer a wire segment (see {@link networkIdFromEnvelope}).
  *
  * `{stack}` is the principal's stack identity — supplied by the caller when in
  * stack-aware mode (IAW A.5), omitted in the legacy migration window.
@@ -637,46 +637,44 @@ export function principalFromConfig(principalId: string | undefined): string {
 }
 
 /**
- * IAW cortex#661 — federated subjects are NETWORK-scoped: segment[1] is the
- * target `{network_id}`, not the source principal. Extract it from the
- * canonical `extensions.network_id` routing-hint a federated emit site stamps
- * (e.g. pilot's `buildReviewRequestedEnvelope` sets `extensions.network_id`).
+ * ADR 0001 (supersedes cortex#661) — extract the OPTIONAL `extensions.network_id`
+ * routing HINT, or `undefined` when absent/malformed.
  *
- * This is the publish-side counterpart to `selectLink`/`evaluateFederationGate`
- * reading `subject.split(".")[1]` as the network id (design §3.2). Emit and
- * route therefore agree on what a federated subject's network segment is.
+ * The network is NO LONGER a subject segment (`deriveNatsSubject` derives
+ * `federated.{principal}.{stack}.{type}` from `envelope.source`, identical to
+ * `local.*`). `extensions.network_id` MAY still travel on a federated envelope
+ * as a deployment-topology hint, but it is NOT load-bearing for subject
+ * derivation: a federated envelope that omits it derives a perfectly valid
+ * subject. Routing (`selectLink` in `runtime.ts`) resolves the target leaf from
+ * the target PRINCIPAL (subject segment[1]) via `policy.federated.networks[].peers[]`,
+ * NOT from this hint.
  *
- * **Fails loudly** when a `federated` envelope carries no usable
- * `extensions.network_id`: a federated envelope MUST name its target network,
- * or there is no link to route it to. Throwing here surfaces the emit-site bug
- * at the publish call rather than silently falling back to the principal (the
- * pre-#661 behaviour that produced un-routable subjects). Mirrors
- * {@link firstSegment}'s fail-fast invariant posture.
+ * Returns the trimmed hint string, or `undefined` when `extensions.network_id`
+ * is absent, non-string, or empty. cortex#661's fail-loud throw is retired —
+ * an absent network hint is no longer an emit error under ADR 0001, because the
+ * subject no longer needs the network.
  *
  * `extensions` is the envelope's freeform `Record<string, unknown>` extension
- * point, so `network_id` is `unknown` and the lookup is defensively typed: a
- * missing key, a non-string value, or an empty string all throw.
+ * point, so `network_id` is `unknown` and the read is defensively typed.
  */
-export function networkIdFromEnvelope(envelope: Envelope): string {
+export function networkIdFromEnvelope(envelope: Envelope): string | undefined {
   const raw = envelope.extensions?.network_id;
   if (typeof raw !== "string" || raw.length === 0) {
-    throw new Error(
-      `deriveNatsSubject: federated envelope (id=${envelope.id}, type=${envelope.type}) has no extensions.network_id — a federated envelope MUST name its target network. Set extensions.network_id at the emit site (cortex#661).`,
-    );
+    return undefined;
   }
   return raw;
 }
 
 export function deriveNatsSubject(envelope: Envelope, stack?: string): string {
   const classification = envelope.sovereignty.classification;
-  // cortex#661 — federated subjects key segment[1] on the TARGET network id
-  // (from extensions.network_id), NOT the source principal. local.* keeps the
-  // principal segment (byte-identical pre/post #661); public.* carries neither.
-  const segment1 =
-    classification === "federated"
-      ? networkIdFromEnvelope(envelope)
-      : firstSegment(envelope.source);
-  return deriveSubject(classification, segment1, envelope.type, stack);
+  // ADR 0001 (supersedes cortex#661) — federated subjects carry the SAME
+  // identity segments as local.*: segment[1] is the `{principal}` from
+  // `envelope.source`, NEVER the network. The network is resolved from the
+  // target principal at the routing layer (`selectLink` → `peers[]`), not put
+  // on the wire. `deriveSubject` ignores the `{principal}` argument for
+  // public.* (public is global — no principal, no stack).
+  const principal = firstSegment(envelope.source);
+  return deriveSubject(classification, principal, envelope.type, stack);
 }
 
 /**

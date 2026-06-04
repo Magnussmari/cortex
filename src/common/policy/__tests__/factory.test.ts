@@ -907,53 +907,31 @@ describe("PolicyFederatedSchema cross-validation", () => {
     }
   });
 
-  test("rejects accept_subjects[] entry not prefixed with federated.{network.id}. (Echo cortex#223 round 1)", () => {
-    expect(() =>
-      PolicySchema.parse({
-        federated: {
-          networks: [{
-            id: "research-collab", leaf_node: "leaf", peers: [],
-            // Out-of-scope subject — surface-router would have to
-            // defend at runtime. Schema rejects.
-            accept_subjects: ["internal.private.>"],
-            deny_subjects: [],
-            announce_capabilities: [], max_hop: 0,
-          }],
-        },
-      }),
-    ).toThrow(/must begin with.*federated.*research-collab/);
-  });
-
-  test("rejects deny_subjects[] entry not prefixed with federated.{network.id}. (Echo cortex#223 round 1)", () => {
-    expect(() =>
-      PolicySchema.parse({
-        federated: {
-          networks: [{
-            id: "research-collab", leaf_node: "leaf", peers: [],
-            accept_subjects: ["federated.research-collab.>"],
-            deny_subjects: ["local.metafactory.>"],
-            announce_capabilities: [], max_hop: 0,
-          }],
-        },
-      }),
-    ).toThrow(/must begin with.*federated.*research-collab/);
-  });
-
-  test("accepts subject patterns within the network's own federated.{id}. scope", () => {
+  // ADR 0001 (supersedes cortex#661) — the accept/deny SUBJECT-SCOPE
+  // cross-validation moved OFF `PolicySchema` (which can't see the receiving
+  // principal/stack) and ONTO the top-level `CortexConfigSchema.superRefine`,
+  // where it scopes to `federated.{my-principal}.{my-stack}.` (the receiving
+  // stack's own identity — the conformant grammar). The principal/stack-scoped
+  // rejection tests therefore live in `cortex-config.test.ts`; at the
+  // `PolicySchema` level no subject-scope check applies anymore, so a pattern
+  // that the old cortex#661 network-id check would have rejected now parses
+  // cleanly here (the typo-guard fires at the top-level layer instead).
+  test("PolicySchema no longer enforces a per-network subject-scope prefix (moved to CortexConfigSchema per ADR 0001)", () => {
     const policy = PolicySchema.parse({
       federated: {
         networks: [{
           id: "research-collab", leaf_node: "leaf", peers: [],
-          accept_subjects: [
-            "federated.research-collab.tasks.code-review.*",
-            "federated.research-collab.>",
-          ],
-          deny_subjects: ["federated.research-collab.tasks.*.private.*"],
+          // Under cortex#661 this would have been rejected (not
+          // `federated.research-collab.`); under ADR 0001 the scope check is
+          // principal/stack-based and lives at the top level, so PolicySchema
+          // accepts it standalone.
+          accept_subjects: ["federated.andreas.research.>"],
+          deny_subjects: ["federated.andreas.research.tasks.*.private.*"],
           announce_capabilities: [], max_hop: 0,
         }],
       },
     });
-    expect(policy.federated?.networks[0]?.accept_subjects).toHaveLength(2);
+    expect(policy.federated?.networks[0]?.accept_subjects).toHaveLength(1);
   });
 
   test("federated block plus principals + roles parses cleanly together", () => {
