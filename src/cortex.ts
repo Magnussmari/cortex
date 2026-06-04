@@ -657,6 +657,17 @@ export async function startCortex(
         // (publish unsigned on transient sign failure). Ignored by the
         // runtime when no signer is attached.
         signFailureMode: signingKnobs.signFailureMode,
+        // IAW Phase F-3b (cortex#659) — the federation networks the runtime
+        // builds its LinkPool from. Each network declaring an inline `nats:`
+        // block (F-3a) contributes one leaf NatsLink; networks without it
+        // ride the primary link. Zero per-network `nats:` ⇒ primary-only
+        // pool ⇒ today's single-link behaviour byte-for-byte. Sourced from
+        // the SAME `policy.federated.networks[]` the surface-router gate
+        // keys off — NEVER `config.networks[]` (the legacy grove
+        // cloud-publish table; design §3.2 NAME-COLLISION).
+        ...(options.policy?.federated?.networks !== undefined && {
+          federatedNetworks: options.policy.federated.networks,
+        }),
       });
     } catch (err) {
       console.error("cortex: myelin runtime startup error (non-fatal):", err instanceof Error ? err.message : err);
