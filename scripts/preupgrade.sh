@@ -3,11 +3,17 @@ set -e
 
 # Cortex preupgrade — stop daemons before symlinks change.
 # Mirrors grove-v2's preupgrade.sh under cortex names.
+#
+# cortex#700: records the set of stacks that were running to a temp state
+# file so postupgrade.sh can restore exactly that set (no stack left down;
+# none started that wasn't running before the upgrade).
 
 echo "Stopping Cortex services for upgrade (${PAI_OLD_VERSION:-?} → ${PAI_NEW_VERSION:-?})..."
 
 if [ "$(uname)" = "Darwin" ]; then
   LAUNCH_DIR="${HOME}/Library/LaunchAgents"
+  CONFIG_DIR="${HOME}/.config/cortex"
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
   # Kill running cortex agent processes before upgrading symlinks.
   # Holly cortex#52 round 1 nit-3: previous `pgrep -f "cortex start"` matched
@@ -87,27 +93,42 @@ if [ "$(uname)" = "Darwin" ]; then
     echo "  ✓ Removed legacy ${legacy_plist}"
   done
 
-  # cortex#251: bot plist renamed to meta-factory. Unload the new
-  # label here; the old-label sweep one section above this picks up
-  # any lingering pre-rename plists on first upgrade after merge.
-  # Anchor on column 3 (registered label) to avoid partial-match
-  # false-positives — same pattern as the legacy sweep.
-  if launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "ai.meta-factory.cortex.meta-factory"; then
-    launchctl unload "${LAUNCH_DIR}/ai.meta-factory.cortex.meta-factory.plist" 2>/dev/null || true
-    echo "  ✓ Meta-factory daemon stopped"
-  fi
+  # cortex#700: source slug-discovery helpers from plist-render.sh.
+  # Only the discovery functions are used here — no plist is rendered.
+  source "${SCRIPT_DIR}/lib/plist-render.sh"
 
-  # cortex#244: optional work stack — only unload if the operator
-  # has it.
-  if launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "ai.meta-factory.cortex.work"; then
-    launchctl unload "${LAUNCH_DIR}/ai.meta-factory.cortex.work.plist" 2>/dev/null || true
-    echo "  ✓ Work daemon stopped"
-  fi
+  # Write running-stacks state to a well-known temp path so postupgrade.sh
+  # can restore exactly the stacks that were running before the upgrade.
+  # Symmetry guarantee: no stack left down; none started that wasn't running.
+  # One slug per line (e.g. "meta-factory", "work", "halden").
+  RUNNING_STACKS_FILE="${TMPDIR:-/tmp}/cortex-upgrade-running-stacks"
+  : > "${RUNNING_STACKS_FILE}"
 
+  # Relay — handled separately (always stopped/started; not included in the
+  # per-stack state file; postupgrade always restarts it unconditionally).
   if launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "ai.meta-factory.cortex.relay"; then
     launchctl unload "${LAUNCH_DIR}/ai.meta-factory.cortex.relay.plist" 2>/dev/null || true
     echo "  ✓ Relay daemon stopped"
   fi
+
+  # cortex#700: enumerate discovered stacks and stop each that is currently
+  # registered with launchd. Replace the three hardcoded unload calls (meta-
+  # factory / work and the now-removed halden gap) with a single loop driven
+  # by discover_stack_slugs. discover_stack_slugs globs cortex*.yaml so any
+  # new stack config is automatically included — no script edit required.
+  while IFS= read -r slug; do
+    label="ai.meta-factory.cortex.${slug}"
+    plist="${LAUNCH_DIR}/${label}.plist"
+    if launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "${label}"; then
+      launchctl unload "${plist}" 2>/dev/null || true
+      printf '%s\n' "${slug}" >> "${RUNNING_STACKS_FILE}"
+      echo "  ✓ ${slug} daemon stopped (recorded for restart)"
+    else
+      echo "  ⊘ ${slug} daemon not running — will not be restarted by postupgrade"
+    fi
+  done < <(discover_stack_slugs "${CONFIG_DIR}")
+
+  echo "  ✓ Running stacks recorded → ${RUNNING_STACKS_FILE}"
 fi
 
 echo "  ✓ Services stopped — safe to upgrade"
