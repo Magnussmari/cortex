@@ -352,4 +352,61 @@ describe("CloudPublisher", () => {
     // Should NOT throw — errors are logged, not propagated
     await CloudPublisher.checkEndpoints(resolver, ["default"]);
   });
+
+  // ---------------------------------------------------------------------------
+  // TC-4e (#627 Phase 4): cloud-publisher mTLS on the →Worker HTTPS leg
+  // ---------------------------------------------------------------------------
+
+  const MTLS_MATERIAL = {
+    cert: "-----BEGIN CERTIFICATE-----\nCRT\n-----END CERTIFICATE-----\n",
+    key: "-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n",
+    ca: "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n",
+  };
+
+  test("attaches the client-cert tls block to the ingest POST when mtls set", async () => {
+    pushOk();
+    const pub = new CloudPublisher({
+      networkResolver: createTestNetworkResolver("https://grove-api.example.com", "grove_sk_test123", "andreas"),
+      batchIntervalMs: 60_000,
+      mtls: MTLS_MATERIAL,
+    });
+    pub.publish(makeEvent());
+    await pub.flush();
+
+    expect(fetchCalls.length).toBe(1);
+    const init = fetchCalls[0]!.init as RequestInit & { tls?: typeof MTLS_MATERIAL };
+    expect(init.tls).toBeDefined();
+    expect(init.tls?.cert).toBe(MTLS_MATERIAL.cert);
+    expect(init.tls?.key).toBe(MTLS_MATERIAL.key);
+    expect(init.tls?.ca).toBe(MTLS_MATERIAL.ca);
+    // Hard line — no skip-verify field ever rides along.
+    expect(JSON.stringify(init)).not.toContain("rejectUnauthorized");
+    pub.close();
+  });
+
+  test("omits tls (ordinary server-auth HTTPS) when mtls is NOT configured — back-compat", async () => {
+    pushOk();
+    const pub = new CloudPublisher({
+      networkResolver: createTestNetworkResolver("https://grove-api.example.com", "grove_sk_test123", "andreas"),
+      batchIntervalMs: 60_000,
+    });
+    pub.publish(makeEvent());
+    await pub.flush();
+
+    expect(fetchCalls.length).toBe(1);
+    const init = fetchCalls[0]!.init as RequestInit & { tls?: unknown };
+    expect(init.tls).toBeUndefined();
+    pub.close();
+  });
+
+  test("checkEndpoints attaches the client-cert tls block to the health probe", async () => {
+    pushOk();
+    const resolver = createTestNetworkResolver("https://grove-api.example.com", "grove_sk_test123", "andreas");
+    await CloudPublisher.checkEndpoints(resolver, ["default"], MTLS_MATERIAL);
+
+    expect(fetchCalls.length).toBe(1);
+    expect(fetchCalls[0]!.url).toBe("https://grove-api.example.com/api/health");
+    const init = fetchCalls[0]!.init as RequestInit & { tls?: typeof MTLS_MATERIAL };
+    expect(init.tls?.cert).toBe(MTLS_MATERIAL.cert);
+  });
 });

@@ -27,6 +27,7 @@ import { loadConfigWithAgents, loadAgentsDirectory, expandTilde, FragmentLoadErr
 import { ConfigWatcher } from "./common/config/watcher";
 import { type AgentConfig, getAllRepos } from "./common/types/config";
 import { resolveSigningKnobs } from "./common/security-posture";
+import { buildHttpsMtlsMaterial } from "./common/config/transport-mtls";
 import { fetchWithTimeout } from "./common/timeout";
 import { UsageMonitor } from "./common/usage/monitor";
 import { AgentRegistry } from "./common/agents/registry";
@@ -678,6 +679,18 @@ export async function startCortex(
         ...(options.policy?.federated?.networks !== undefined && {
           federatedNetworks: options.policy.federated.networks,
         }),
+        // TC-4d/4e (#627 Phase 4) — transport-mTLS posture for the LinkPool
+        // (primary + every federated leaf). Default `off` ⇒ no tls block on
+        // any link, byte-identical to today; `require` fails closed at connect.
+        // The federated-leaf-cleartext warning fires from the runtime
+        // regardless of mode. `config.security` is always populated (TC-0
+        // schema default), so this is safe for legacy bot.yaml input too.
+        transportMtls: {
+          mode: config.security.transport.mtls,
+          ...(config.security.transport.tls !== undefined && {
+            paths: config.security.transport.tls,
+          }),
+        },
       });
     } catch (err) {
       console.error("cortex: myelin runtime startup error (non-fatal):", err instanceof Error ? err.message : err);
@@ -1525,10 +1538,23 @@ export async function startCortex(
   const hasCloudNetworks = config.networks.some((n) => !!n.cloud);
   if (hasCloudNetworks) {
     const networkResolver = createNetworkResolver(config);
-    cloudPublisher = new CloudPublisher({ networkResolver });
+    // TC-4e (#627 Phase 4) — optional client-cert material for the
+    // publisher→Worker HTTPS leg, gated by the same `security.transport.mtls`
+    // posture as the bus links. `off` (default) ⇒ undefined ⇒ ordinary
+    // server-auth HTTPS, byte-identical to today; `require` fails closed at
+    // boot if the cert/key/ca are missing/invalid.
+    const cloudMtls = buildHttpsMtlsMaterial(
+      config.security.transport.mtls,
+      config.security.transport.tls,
+      { site: "cloud-publisher" },
+    );
+    cloudPublisher = new CloudPublisher({
+      networkResolver,
+      ...(cloudMtls !== undefined && { mtls: cloudMtls }),
+    });
     const networkIds = config.networks.filter((n) => n.cloud).map((n) => n.id);
     console.log(`cortex: cloud publisher active (networks: ${networkIds.join(", ")})`);
-    CloudPublisher.checkEndpoints(networkResolver, networkIds).catch((err: unknown) => {
+    CloudPublisher.checkEndpoints(networkResolver, networkIds, cloudMtls).catch((err: unknown) => {
       console.error("cortex: endpoint health check error:", err instanceof Error ? err.message : String(err));
     });
   } else if (config.api.mode === "cloud") {
