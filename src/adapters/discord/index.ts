@@ -788,8 +788,24 @@ export class DiscordAdapter implements PlatformAdapter {
   private static readonly PENDING_MAX_SIZE = 100;
   private static readonly PENDING_PRINCIPAL_MAX = 50;
 
+  /**
+   * cortex#708 — key the progress registry on the SESSION, not just the
+   * channel/thread. Two concurrent sessions in the same DM/channel resolve to
+   * the same `threadId ?? channelId` scope; without the session suffix they
+   * collapse onto one "working…" placeholder and the second session edits the
+   * first's message. `target.sessionId` is the inbound correlation id threaded
+   * by `dispatch-handler.targetFromMsg`. When it's absent (e.g. the
+   * surface-router's envelope render path, which has no inbound session) we
+   * fall back to channel-scoped keying — the pre-#708 behaviour, which is
+   * correct there because those targets aren't session-scoped.
+   */
+  private progressKey(target: ResponseTarget): string {
+    const scope = target.threadId ?? target.channelId;
+    return target.sessionId ? `${scope}:${target.sessionId}` : scope;
+  }
+
   async sendProgress(target: ResponseTarget, text: string): Promise<void> {
-    const key = target.threadId ?? target.channelId;
+    const key = this.progressKey(target);
     const existing = this.progressMessages.get(key);
     try {
       if (existing) {
@@ -813,7 +829,7 @@ export class DiscordAdapter implements PlatformAdapter {
   }
 
   async clearProgress(target: ResponseTarget): Promise<void> {
-    const key = target.threadId ?? target.channelId;
+    const key = this.progressKey(target);
     const msg = this.progressMessages.get(key);
     this.progressMessages.delete(key);
     this.progressSending.delete(key);

@@ -641,16 +641,11 @@ export class DispatchHandler extends EventEmitter {
         source: msg.platform as "discord" | "mattermost",
       }));
 
-      // MIG-3.8 / C-104 — capture the platform-native message id once so the
+      // MIG-3.8 / C-104 — capture the inbound correlation id once so the
       // `onTimeoutAbort` closure doesn't reach into `msg._native` per-fire.
-      // discord.js carries `.id` on the Message; Mattermost posts likewise.
-      // Fallback to a `synthetic:` prefix so the envelope still validates
-      // (the schema requires the field as a non-empty string) — this branch
-      // only fires for adapters that don't stamp `_native.id`, which today
-      // is only `MockAdapter` in tests.
-      const nativeId = (msg._native as { id?: string } | undefined)?.id;
-      const inboundMessageId =
-        nativeId ?? `synthetic:${adapter.instanceId}:${msg.channelId}:${msg.timestamp.toISOString()}`;
+      // See `inboundCorrelationId` for the native-id-vs-synthetic-fallback
+      // derivation (shared with the cortex#708 per-session ResponseTarget id).
+      const inboundMessageId = this.inboundCorrelationId(adapter, msg);
 
       const { prompt: attachPrompt, dirs: attachmentDirs, sessionId: attachmentSessionId } =
         await processInboundAttachments(
@@ -1450,11 +1445,35 @@ export class DispatchHandler extends EventEmitter {
   // Helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Stable correlation id for an inbound message. Prefers the platform-native
+   * message id (`msg._native.id` — discord.js Message, Mattermost post); falls
+   * back to a `synthetic:` token for adapters that don't stamp `_native.id`
+   * (today only MockAdapter in tests). The schema requires the field as a
+   * non-empty string, so the fallback keeps `system.inbound.*` envelopes
+   * valid.
+   *
+   * Single source of truth so the `inboundMessageId` stamped on
+   * `system.inbound.aborted` envelopes and the per-session id threaded onto
+   * `ResponseTarget` (cortex#708) are provably the same identity.
+   */
+  private inboundCorrelationId(adapter: PlatformAdapter, msg: InboundMessage): string {
+    const nativeId = (msg._native as { id?: string } | undefined)?.id;
+    return nativeId ?? `synthetic:${adapter.instanceId}:${msg.channelId}:${msg.timestamp.toISOString()}`;
+  }
+
   private targetFromMsg(adapter: PlatformAdapter, msg: InboundMessage): ResponseTarget {
+    // cortex#708 — thread a per-session correlation id onto the target so
+    // session-scoped adapter state (the Discord progress placeholder) is keyed
+    // per session, not per channel. Two concurrent dispatches in the same
+    // channel/DM otherwise collapse onto one channel-scoped key and the second
+    // edits the first's "working…" message. Uses the SAME id as
+    // `inboundMessageId` (the `system.inbound.*` correlation).
     return {
       instanceId: adapter.instanceId,
       channelId: msg.channelId,
       threadId: msg.threadId,
+      sessionId: this.inboundCorrelationId(adapter, msg),
       _native: msg._native,
     };
   }

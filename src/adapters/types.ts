@@ -84,6 +84,21 @@ export interface ResponseTarget {
   channelId: string;
   /** Thread to reply in (if applicable) */
   threadId?: string;
+  /**
+   * cortex#708 — session/correlation id for the dispatch that produced this
+   * target. Threaded from the inbound message's native id (`msg._native.id`,
+   * the same correlation `dispatch-handler` derives `inboundMessageId` from)
+   * so that per-session adapter state (e.g. the Discord progress placeholder)
+   * is keyed on the session rather than the channel/thread.
+   *
+   * Without it, two concurrent sessions landing in the same channel/DM share
+   * one channel-scoped key and collapse onto a single "working…" placeholder
+   * — the second session edits the first's message. Optional: undefined for
+   * targets that don't originate from an inbound dispatch (e.g. the
+   * surface-router's envelope render path), where channel-scoped keying is
+   * correct.
+   */
+  sessionId?: string;
   /** Escape hatch for platform-specific channel objects */
   _native?: unknown;
 }
