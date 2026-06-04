@@ -189,6 +189,29 @@ describe("getStore / getNonceCache backend selection", () => {
     expect(getNonceCache(env)).toBeInstanceOf(InMemoryNonceCache);
   });
 
+  test("PRODUCTION + no DB → getStore FAILS CLOSED (no silent in-memory in prod)", () => {
+    const env: StoreEnv = { ENVIRONMENT: "production" };
+    expect(() => getStore(env)).toThrow(/production but no D1|refusing to fall back/i);
+  });
+
+  test("PRODUCTION + no DB → getNonceCache FAILS CLOSED", () => {
+    const env: StoreEnv = { ENVIRONMENT: "production" };
+    expect(() => getNonceCache(env)).toThrow(/production but no D1|refusing to fall back/i);
+  });
+
+  test("PRODUCTION WITH DB → uses D1 (no throw)", () => {
+    const env: StoreEnv = { ENVIRONMENT: "production", DB: asD1(new MockD1()) };
+    expect(getStore(env)).toBeInstanceOf(D1RegistryStore);
+    _setStoreForTest(undefined);
+    _setNonceCacheForTest(undefined);
+    expect(getNonceCache(env)).toBeInstanceOf(D1NonceCache);
+  });
+
+  test("non-production + no DB → in-memory, no throw (back-compat preserved)", () => {
+    const env: StoreEnv = { ENVIRONMENT: "development" };
+    expect(getStore(env)).toBeInstanceOf(InMemoryRegistryStore);
+  });
+
   test("in-memory fallback still round-trips put/get (no D1 needed)", async () => {
     const env: StoreEnv = {};
     const store = getStore(env);

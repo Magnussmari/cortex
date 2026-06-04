@@ -45,6 +45,14 @@ export interface StoreEnv {
    * `wrangler dev` / `bun test`, where the in-memory backends are used.
    */
   DB?: D1Like;
+  /**
+   * Deploy environment (`[env.<env>.vars] ENVIRONMENT`). When this is
+   * `"production"`, durable storage is MANDATORY: a missing `DB` binding is
+   * a misconfiguration that would silently run the in-memory, non-durable
+   * backend in prod — losing registrations on isolate recycle AND dropping
+   * cross-isolate replay protection. The store factories fail CLOSED on it.
+   */
+  ENVIRONMENT?: string;
 }
 
 /**
@@ -384,8 +392,27 @@ function parseJsonArray<T>(json: string): T[] {
 let storeSingleton: RegistryStore | undefined;
 let nonceSingleton: NonceCache | undefined;
 
+/**
+ * Fail CLOSED if durable storage is required but absent. In `production`
+ * (per `env.ENVIRONMENT`) a missing `DB` binding must NOT silently fall back
+ * to the in-memory backend — that would run the trust directory non-durable
+ * and without cross-isolate replay protection. Throwing here surfaces the
+ * misconfiguration loudly at first use rather than degrading in silence.
+ */
+function assertDurableBackendInProd(env: StoreEnv): void {
+  if (!env.DB && env.ENVIRONMENT === "production") {
+    throw new Error(
+      "network-registry: ENVIRONMENT=production but no D1 `DB` binding is " +
+        "configured — refusing to fall back to the in-memory (non-durable, " +
+        "no cross-isolate replay protection) backend in production. Wire " +
+        "`[[env.production.d1_databases]]` (binding = \"DB\") in wrangler.toml.",
+    );
+  }
+}
+
 export function getStore(env: StoreEnv): RegistryStore {
   if (!storeSingleton) {
+    assertDurableBackendInProd(env);
     storeSingleton = env.DB
       ? new D1RegistryStore(env.DB)
       : new InMemoryRegistryStore();
@@ -395,6 +422,7 @@ export function getStore(env: StoreEnv): RegistryStore {
 
 export function getNonceCache(env: StoreEnv): NonceCache {
   if (!nonceSingleton) {
+    assertDurableBackendInProd(env);
     nonceSingleton = env.DB ? new D1NonceCache(env.DB) : new InMemoryNonceCache();
   }
   return nonceSingleton;
