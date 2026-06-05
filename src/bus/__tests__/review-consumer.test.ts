@@ -59,6 +59,7 @@ import {
   type ReviewRequestPayload,
   type ReviewVerdictKind,
 } from "../review-events";
+import { encodeDidSegment } from "@the-metafactory/myelin/subjects";
 import type { JsMsg } from "nats";
 import type {
   ReviewPipelineOpts,
@@ -1771,5 +1772,151 @@ describe("ReviewConsumer — federated mode (cortex#686, ADR 0002)", () => {
       "review.verdict.approved",
       "dispatch.task.completed",
     ]);
+  });
+});
+
+describe("ReviewConsumer — federated DIRECT mode (cortex#725, ADR 0001/0002 §2)", () => {
+  // pilot#149 Direct dispatch (`--reviewer echo@jc/sage-host`) lands on this
+  // stack's OWN `federated.{me}.{my-stack}.tasks.@{did-encoded-reviewer}.code-review.{flavor}`
+  // subject — the named reviewer's DID is spliced in as an `@{did}` segment
+  // AFTER `tasks.`. cortex#725's NEW subscription `federated.{me}.{my-stack}.
+  // tasks.*.code-review.>` matches it (whole-token `*` over the `@{did}`
+  // segment). The inbound subject we pass here is exactly what that subscription
+  // delivers — TARGET = us (metafactory/meta-factory), reviewer = `did:mf:echo`.
+  //
+  // The KEY invariant cortex#725 proves: the federated consumer PATH is
+  // IDENTICAL for Direct and Offer. `envelope.type` is STILL
+  // `tasks.code-review.{flavor}` (the `@{did}` lives ONLY on the subject —
+  // myelin's `type` grammar forbids `@`), so `extractFlavor`, the requester
+  // decode from `originator.identity`, the peers[] gate, and the verdict-back
+  // routing are all the SAME code. Only the inbound subject differs.
+  const REVIEWER_SEGMENT = encodeDidSegment("did:mf:echo"); // → @did-mf-echo
+  const FED_DIRECT_SUBJECT =
+    `federated.metafactory.meta-factory.tasks.${REVIEWER_SEGMENT}.code-review.typescript`;
+
+  /** Shared federated opts: federated mode + the `jc`-peer network. */
+  function federatedOpts(
+    overrides: Partial<ReviewConsumerOpts> = {},
+  ): Partial<ReviewConsumerOpts> {
+    return {
+      federated: true,
+      federatedNetworks: [makeNetwork()],
+      ...overrides,
+    };
+  }
+
+  test("the Direct subject's @{did} segment is the reviewer/target-assistant, NOT the requester", () => {
+    // Sanity-pin the fixture: the `@{did}` on the subject decodes to the
+    // reviewer (echo), proving the requester must come from `originator`
+    // (jc.sage-host), never from the subject.
+    expect(FED_DIRECT_SUBJECT).toContain(".tasks.@did-mf-echo.code-review.");
+    expect(parseRequesterFromOriginator(makeFederatedRequest())).toEqual({
+      principal: "jc",
+      stack: "sage-host",
+    });
+  });
+
+  test("DIRECT verdict path → routed to REQUESTER (from originator), identical to Offer", async () => {
+    const runtime = createRecordingRuntime();
+    const request = makeFederatedRequest();
+    const verdict = buildVerdictEnvelope(request, "approved");
+
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline((opts) => {
+            // Direct still stamps federated sovereignty.
+            expect(opts.classification).toBe("federated");
+            return { kind: "verdict", envelope: verdict };
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(
+      request,
+      FED_DIRECT_SUBJECT,
+      null,
+    );
+    expect(decision).toEqual({ kind: "ack" });
+
+    // NOTHING on the local `publish` path; everything on `publishOnSubject`.
+    expect(runtime.published).toHaveLength(0);
+    const subjects = runtime.publishedOnSubject.map((p) => p.subject);
+    const types = runtime.publishedOnSubject.map((p) => p.envelope.type);
+    expect(types).toEqual([
+      "dispatch.task.started",
+      "review.verdict.approved",
+      "dispatch.task.completed",
+    ]);
+    // Verdict-back keyed on the REQUESTER (jc.sage-host, decoded from
+    // `originator.identity`), NOT on the subject's reviewer `@{did}` and NOT on
+    // the consumer's own principal — IDENTICAL to the Offer path.
+    for (const s of subjects) {
+      expect(s.startsWith("federated.jc.sage-host.")).toBe(true);
+    }
+    expect(subjects[1]).toBe("federated.jc.sage-host.review.verdict.approved");
+    expect(subjects[2]).toBe("federated.jc.sage-host.dispatch.task.completed");
+  });
+
+  test("DIRECT request from a NON-PEER requester → DENIED + DROPPED (no spawn, no publish)", async () => {
+    const runtime = createRecordingRuntime();
+    // Well-formed DID for `mallory` (decodes cleanly) — the ONLY reason to deny
+    // is non-membership in any configured network's peers[].
+    const request = makeFederatedRequest("did:mf:mallory-host");
+
+    let pipelineRan = false;
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline(() => {
+            pipelineRan = true;
+            throw new Error("reviewer must NOT be spawned for a non-peer requester");
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(
+      request,
+      FED_DIRECT_SUBJECT,
+      null,
+    );
+    expect(decision.kind).toBe("term");
+    expect(pipelineRan).toBe(false);
+    // The verdict (carrying reviewed-code findings) never reaches an untrusted
+    // principal — same fail-closed gate as the Offer path.
+    expect(runtime.published).toHaveLength(0);
+    expect(runtime.publishedOnSubject).toHaveLength(0);
+  });
+
+  test("DIRECT request with no resolvable requester (absent originator) → DENIED + DROPPED", async () => {
+    const runtime = createRecordingRuntime();
+    const request = makeFederatedRequest(NO_ORIGINATOR);
+
+    let pipelineRan = false;
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline(() => {
+            pipelineRan = true;
+            throw new Error("reviewer must NOT be spawned for an un-attributable request");
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(
+      request,
+      FED_DIRECT_SUBJECT,
+      null,
+    );
+    expect(decision.kind).toBe("term");
+    expect(pipelineRan).toBe(false);
+    expect(runtime.published).toHaveLength(0);
+    expect(runtime.publishedOnSubject).toHaveLength(0);
   });
 });
