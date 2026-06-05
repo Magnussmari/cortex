@@ -1495,6 +1495,40 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
    * Capability set is parameterised so individual tests can flip
    * allow/deny on the role grant.
    */
+  // cortex#686 (ADR 0001) — the listener resolves the audit `source_network`
+  // from the SOURCE PRINCIPAL's `peers[]` membership in its OWN federated
+  // config (mirroring the engine's, since both come from the same cortex.yaml
+  // `policy.federated`). `makeReceivedEnvelope` signs from source principal
+  // `metafactory`, so the listener's network lists `metafactory` as a peer.
+  const FED_PEER_PUBKEY = "U" + "A".repeat(55); // 56-char U-prefixed base32 NKey.
+  function listenerFederation(networkId = "research-collab"): {
+    networks: import("../../common/types/cortex-config").PolicyFederatedNetwork[];
+  } {
+    return {
+      networks: [
+        {
+          id: networkId,
+          leaf_node: "leaf-research",
+          peers: [
+            {
+              principal_id: "metafactory",
+              stack_id: "metafactory/meta-factory",
+              principal_pubkey: FED_PEER_PUBKEY,
+            },
+          ],
+          // ADR 0001 — accept-list matches the RECEIVING subject (the target
+          // principal/stack on the wire), not the network id. Wide-open here
+          // so the gate's accept check passes and the policy engine's
+          // federation branch is what these tests exercise.
+          accept_subjects: ["federated.>"],
+          deny_subjects: [],
+          announce_capabilities: [],
+          max_hop: 5,
+        },
+      ],
+    };
+  }
+
   function engineWithFederation(opts: {
     capabilities: readonly string[];
     networkId?: string;
@@ -1570,6 +1604,9 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
       source: SOURCE,
       subjects: ["federated.partner-only.dispatch.task.received"],
       ccSessionFactory: factory,
+      // cortex#686 — listener resolves source_network from the source
+      // principal's peer membership; `metafactory` is a peer of `partner-only`.
+      federated: listenerFederation("partner-only"),
       policyEngine: engineWithFederation({
         capabilities: ["dispatch.cortex"],
         networkId: "partner-only",
@@ -1617,6 +1654,11 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
       // listener receives envelopes from networks it doesn't know.
       subjects: ["federated.>"],
       ccSessionFactory: factory,
+      // cortex#686 — the listener resolves the source principal (`metafactory`)
+      // to `phantom-network` via its peer roster, but the ENGINE only declares
+      // `research-collab`, so the engine's federation branch denies the
+      // resolved source_network as `unknown_network`.
+      federated: listenerFederation("phantom-network"),
       policyEngine: engineWithFederation({
         capabilities: ["dispatch.cortex"],
         networkId: "research-collab",
@@ -1625,11 +1667,12 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
     await listener.start();
     await router.start();
 
-    // Envelope arrives on a federated subject whose network id isn't
-    // declared in policy.federated.networks[].
+    // Envelope arrives on a conformant federated subject; the source network
+    // is resolved from the source principal's peer membership (ADR 0001), not
+    // a subject segment.
     r.trigger(
       makeReceivedEnvelope(),
-      "federated.phantom-network.dispatch.task.received",
+      "federated.andreas.meta-factory.dispatch.task.received",
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -1662,6 +1705,9 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
       source: SOURCE,
       subjects: ["federated.research-collab.dispatch.task.received"],
       ccSessionFactory: factory,
+      // cortex#686 — source principal resolves to research-collab for the
+      // audit `source_network` annotation.
+      federated: listenerFederation("research-collab"),
       policyEngine: engineWithFederation({
         // No dispatch.cortex grant — capability check misses.
         capabilities: ["other.cap"],
@@ -1748,6 +1794,9 @@ describe("dispatch-listener — policy gating (C.3.1)", () => {
       source: SOURCE,
       subjects: ["federated.research-collab.dispatch.task.received"],
       ccSessionFactory: factory,
+      // cortex#686 — source_network resolves from the source principal's peer
+      // membership in the listener's federated config.
+      federated: listenerFederation("research-collab"),
       policyEngine: engine,
     });
     await listener.start();

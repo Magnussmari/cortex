@@ -48,6 +48,7 @@ import {
 } from "./system-events";
 import {
   getSignedByChain,
+  principalFromEnvelope,
   type Envelope,
 } from "./myelin/envelope-validator";
 import type { MyelinRuntime } from "./myelin/runtime";
@@ -649,10 +650,15 @@ function emitAccessFiltered(
  * `"allow"` short-circuits all later work — the envelope flows through
  * to adapter matching exactly as it did pre-D.2.
  *
- * Every deny branch carries the network id we resolved (or attempted
- * to resolve, in the `unknown_network` case) so the audit envelope can
- * surface "peer claimed network 'x'" without `dispatch()` re-parsing
- * the subject.
+ * Every deny branch carries the network id we resolved (or, in the
+ * `unknown_network` case, the SOURCE PRINCIPAL we failed to resolve to any
+ * configured peer) so the audit envelope can surface why the envelope was
+ * rejected without `dispatch()` re-parsing the subject.
+ *
+ * cortex#686 (ADR 0001) — the `networkId` field now carries the SOURCE
+ * network id resolved from the source principal's membership in a configured
+ * network's `peers[]`, NOT a subject segment. On the `unknown_network` branch
+ * it carries the unresolved source principal as a searchable sentinel.
  */
 export type FederationGateDecision =
   | "allow"
@@ -689,49 +695,71 @@ export type FederationGateDecision =
     };
 
 /**
- * ⚠️ ADR 0001 (supersedes cortex#661) GRAMMAR MISMATCH — REWORK IN cortex#686.
+ * cortex#686 (ADR 0001) — resolve the SOURCE network from the SOURCE PRINCIPAL.
  *
- * This gate still parses subject segment[1] as a `{network_id}` (the cortex#661
- * wire grammar). ADR 0001 removed the network from the wire: an inbound
- * federated subject is now `federated.{principal}.{stack}.…` where segment[1] is
- * the RECEIVING principal, not a network id. Against the new grammar this gate
- * looks up `networksById.get(<principal>)`, finds nothing (network ids and
- * principal ids share a namespace but differ in value), and DENIES every
- * conformant inbound federated envelope as `peer_not_in_accept_list`
- * (`unknown_network: true`).
+ * Find the configured network whose `peers[]` lists `sourcePrincipal` as a
+ * `principal_id`. Returns the network + its id, or `undefined` when the source
+ * principal is in no configured network's peer list (an unknown/untrusted peer).
  *
- * This FAILS CLOSED (no cross-network leak — the safe direction) but it is a
- * functional break for the inbound federated path. It is dormant only because
- * no federated dispatch consumer exists yet (ADR 0001 §Consequences); the
- * conformant rework lands in lockstep with the federated review consumer
- * (cortex#686) + pilot#149. Until then, do NOT rely on this gate's accept path
- * for ADR-0001 traffic. The cross-principal TRUST decision the gate is meant to
- * own moves to: the per-leaf inbound subscription scope (`runtime.ts`), the
- * `verify-signed-by-chain` peer-pubkey lookup keyed off `sourceLink`, and the
- * `peers[]` topology — re-derive the gate's accept/deny check on the
- * `{principal}.{stack}` grammar there.
+ * ADR 0001 mandates that the network is resolved from deployment topology
+ * (`policy.federated.networks[].peers[]`), NOT read off the wire. A peer
+ * principal is, by config invariant, declared in at most the networks the local
+ * stack joins; first match wins (a principal appearing in multiple networks'
+ * `peers[]` is an unusual topology — the first declared network governs its
+ * accept/deny rules, matching the publish-side `principalIdToLinkId` first-wins
+ * resolution in `runtime.ts`).
  *
- * Parse `federated.{network_id}.<...>` and check the subject against
- * the resolved network's policy. Pure function — exported so tests can
- * probe each branch in isolation without spinning up a runtime + router.
+ * Pure helper — exported for tests.
+ */
+export function resolveSourceNetwork(
+  sourcePrincipal: string,
+  networksById: Map<string, PolicyFederatedNetwork>,
+): { networkId: string; network: PolicyFederatedNetwork } | undefined {
+  for (const [networkId, network] of networksById) {
+    for (const peer of network.peers) {
+      if (peer.principal_id === sourcePrincipal) {
+        return { networkId, network };
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * cortex#686 (ADR 0001, supersedes cortex#661) — federation accept/deny gate on
+ * the conformant `{principal}.{stack}` grammar.
  *
- * Decision order (matches D.2 spec semantics):
+ * The network is NO LONGER read off the wire. An inbound federated subject is
+ * `federated.{target-principal}.{stack}.…` where segment[1] is the RECEIVING
+ * principal (this stack), not a network id. The SOURCE network is resolved from
+ * the SOURCE PRINCIPAL (`principalFromEnvelope` — the leading segment of
+ * `envelope.source`) via its membership in a configured network's `peers[]`
+ * (`resolveSourceNetwork`). This is the L1/L7 separation ADR 0001 mandates:
+ * identity is on the wire (the source signs as its principal), topology
+ * (which network that principal reaches us on) is in config.
  *
- *   1. Subject must declare a network id (`federated.<id>.<...>`).
- *      Bare `federated` or `federated.` is rejected as
- *      `peer_not_in_accept_list` with `unknown_network: true`.
- *   2. The network id must be in `policy.federated.networks[]`.
- *      Missing → same deny kind with `unknown_network: true`.
- *   3. `deny_subjects[]` is checked BEFORE `accept_subjects[]` —
- *      principal intent on the deny list overrides any accept hit.
- *      D.2 spec: "A match here overrides accept_subjects[]".
- *   4. `accept_subjects[]` must contain a matching pattern. Empty
- *      accept list means "accept nothing" (D.1 schema doc); the
- *      envelope is rejected even when no deny pattern matched.
- *   5. Hop budget last — by spec it's the cheapest check but
- *      conceptually it's "you're allowed but you've travelled too
- *      far", so running it after the accept-list keeps the deny
- *      reason precedence intuitive (accept-misses report first).
+ * Pure function — exported so tests can probe each branch in isolation without
+ * spinning up a runtime + router.
+ *
+ * Decision order (matches D.2 spec semantics, re-derived on the ADR-0001 grammar):
+ *
+ *   1. The source principal must resolve to a configured network via its
+ *      `peers[]` membership. An unresolved source principal (in no configured
+ *      network's peer list) is rejected as `peer_not_in_accept_list` with
+ *      `unknown_network: true`, carrying the unresolved source principal as the
+ *      searchable `networkId` sentinel.
+ *   2. `deny_subjects[]` is checked BEFORE `accept_subjects[]` — principal
+ *      intent on the deny list overrides any accept hit (D.2: "A match here
+ *      overrides accept_subjects[]").
+ *   3. `accept_subjects[]` must contain a matching pattern. Empty accept list
+ *      means "accept nothing" (D.1 schema doc); the envelope is rejected even
+ *      when no deny pattern matched.
+ *   4. Hop budget last — "you're allowed but you've travelled too far", run
+ *      after the accept-list so the deny-reason precedence stays intuitive.
+ *
+ * The F-3d anti-spoof `sourceLink` cross-check now asserts the RESOLVED source
+ * network's `leaf_node` equals the delivering link — a subject that arrived on a
+ * leaf not owning the resolved network is a cross-network spoof.
  */
 export function evaluateFederationGate(
   subject: string,
@@ -751,18 +779,10 @@ export function evaluateFederationGate(
   }
 
   const parts = subject.split(".");
-  // `federated.{id}.<...>` requires at least 3 segments — `federated`,
-  // `{id}`, and one or more rest segments. A 2-segment `federated.x`
-  // is technically a network announcement subject but D.2 only gates
-  // dispatch traffic, which always has trailing segments. We deny
-  // the malformed shape to fail closed.
-  //
-  // Echo cortex#226 round 1: report a sentinel `"<malformed>"` rather
-  // than the literal empty string for the network id — principals
-  // filtering the access stream by `payload.network_id` get a
-  // searchable token instead of an empty cell. `unknown_network: true`
-  // still flags this branch separately from "id present but not
-  // declared" so the dashboard can render the more specific message.
+  // `federated.{target-principal}.{stack}.<...>` requires at least 3 segments.
+  // A bare `federated` / `federated.` is malformed dispatch traffic — fail
+  // closed with the `<malformed>` sentinel so principals filtering the access
+  // stream by `payload.network_id` get a searchable token, not an empty cell.
   if (parts.length < 3 || parts[1] === undefined || parts[1].length === 0) {
     return {
       kind: "peer_not_in_accept_list",
@@ -771,23 +791,32 @@ export function evaluateFederationGate(
     };
   }
 
-  const networkId = parts[1];
-  const network = networksById.get(networkId);
-  if (!network) {
+  // ADR 0001 — resolve the SOURCE network from the SOURCE PRINCIPAL (the leading
+  // segment of `envelope.source`), NOT from subject segment[1] (which is the
+  // RECEIVING principal under the conformant grammar). A source principal that
+  // matches no configured network's `peers[]` is an unknown/untrusted peer.
+  const sourcePrincipal = principalFromEnvelope(envelope);
+  const resolved = resolveSourceNetwork(sourcePrincipal, networksById);
+  if (resolved === undefined) {
     return {
       kind: "peer_not_in_accept_list",
-      networkId,
+      // Carry the unresolved source principal as the searchable sentinel —
+      // the audit stream's `network_id` now reads "peer principal X is in no
+      // configured network's peers[]" rather than a stale subject segment.
+      networkId: sourcePrincipal,
       unknown_network: true,
     };
   }
+  const { networkId, network } = resolved;
 
-  // IAW Phase F-3d (cortex#666) — anti-spoof cross-check (design §3.3 / §5
-  // isolation layer 2). When the runtime supplied a LEAF delivering-link
-  // attribution, the subject's claimed network MUST be served by that exact
-  // leaf: the network's `leaf_node` has to equal `sourceLink`. A subject
-  // claiming `federated.{X}.…` that arrived on a different leaf is a
-  // cross-network spoof and is denied BEFORE deny/accept/hop checks — the
-  // delivering link is more authoritative than any subject-pattern rule.
+  // IAW Phase F-3d (cortex#666), reworked for ADR 0001 (cortex#686) — anti-spoof
+  // cross-check (design §3.3 / §5 isolation layer 2). When the runtime supplied a
+  // LEAF delivering-link attribution, the RESOLVED source network (from the source
+  // principal's `peers[]` membership) MUST be served by that exact leaf: the
+  // network's `leaf_node` has to equal `sourceLink`. A source principal whose
+  // resolved network rides a different leaf than the one it arrived on is a
+  // cross-network spoof, denied BEFORE deny/accept/hop checks — the delivering
+  // link is more authoritative than any subject-pattern or topology rule.
   //
   // SKIPPED in two cases (both back-compat-preserving):
   //   1. `sourceLink === undefined` — no attribution (pre-F-3d callers,
