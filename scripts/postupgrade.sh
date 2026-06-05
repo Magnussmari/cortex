@@ -39,22 +39,29 @@ echo "  ✓ Nested symlinks refreshed"
 # in. Idempotent — skipped when the field is already set.
 #
 # cortex#700: loop over all discovered stacks rather than hardcoding
-# cortex.yaml + cortex.work.yaml. Derive the nkey basename from the config
-# filename: cortex.yaml → "cortex", cortex.{slug}.yaml → "cortex-{slug}".
+# cortex.yaml + cortex.work.yaml. Derive the nkey basename from the slug:
+# meta-factory → "cortex", {slug} → "cortex-{slug}".
+#
+# cortex#717: target the file that actually carries the `stack:` block,
+# layout-aware. Under the directory layout that is stacks/<slug>.yaml (the
+# sentinel <slug>.yaml is a pointer with no stack block); under the legacy
+# monolith it is the monolith itself. resolve_stack_agent_config_path() gives
+# us that path — the same file extract_agent_name reads agents[].id from, and
+# the file where stack.id lives.
 echo "  Provisioning stack signing identity..."
 source "${SCRIPT_DIR}/lib/stack-identity-provision.sh"
 source "${SCRIPT_DIR}/lib/plist-render.sh"
 
 while IFS= read -r slug; do
-  local_config_file="$(slug_to_config_file "${slug}")"
-  # nkey basename: cortex.yaml → "cortex", cortex.{slug}.yaml → "cortex-{slug}".
+  stack_config="$(resolve_stack_agent_config_path "${CONFIG_DIR}" "${slug}")"
+  # nkey basename: meta-factory → "cortex", {slug} → "cortex-{slug}".
   if [ "${slug}" = "meta-factory" ]; then
     nkey_basename="cortex"
   else
     nkey_basename="cortex-${slug}"
   fi
-  if [ -f "${CONFIG_DIR}/${local_config_file}" ]; then
-    provision_stack_identity "${CONFIG_DIR}/${local_config_file}" "${nkey_basename}" || true
+  if [ -f "${stack_config}" ]; then
+    provision_stack_identity "${stack_config}" "${nkey_basename}" || true
   fi
 done < <(discover_stack_slugs "${CONFIG_DIR}")
 
