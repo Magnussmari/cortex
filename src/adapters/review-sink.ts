@@ -56,6 +56,7 @@
 import type { Envelope } from "../bus/myelin/envelope-validator";
 import type { MyelinRuntime } from "../bus/myelin/runtime";
 import type { MyelinSubscriber } from "../bus/myelin/subscriber";
+import { dispatchCorrelationKey } from "./dispatch-sink";
 import {
   formatDispatchLifecycle,
   formatReviewVerdict,
@@ -355,7 +356,19 @@ export function createReviewSink(opts: ReviewSinkOptions): ReviewSink {
         // `started` is a progress/typing indicator (e.g. "Echo is
         // reviewing…"), not a final reply — edit-in-place so the terminal
         // verdict/failed reply is the durable message.
-        await adapter.sendProgress(target, text);
+        //
+        // cortex#721 — key the per-review progress placeholder on the
+        // lifecycle envelope's correlation id (resolved targets carry no
+        // `sessionId`), so two reviews in the same channel/thread each get
+        // their OWN "reviewing…" message instead of editing one shared
+        // placeholder. `postResponse` ignores `sessionId`; only
+        // `sendProgress` reads it via the adapter's `progressKey`.
+        const correlationKey = dispatchCorrelationKey(envelope);
+        const progressTarget: ResponseTarget =
+          correlationKey !== undefined
+            ? { ...target, sessionId: correlationKey }
+            : target;
+        await adapter.sendProgress(progressTarget, text);
         return;
       }
       // Verdict / completed / failed / aborted — the terminal reply.

@@ -58,13 +58,18 @@ function fakeRuntime(): {
   };
 }
 
-function envelope(type: string, payload: Record<string, unknown>): Envelope {
+function envelope(
+  type: string,
+  payload: Record<string, unknown>,
+  correlationId = "req-1",
+  id = "00000000-0000-4000-8000-000000000099",
+): Envelope {
   return {
-    id: "00000000-0000-4000-8000-000000000099",
+    id,
     source: "metafactory.echo.local",
     type,
     timestamp: "2026-05-29T12:00:00Z",
-    correlation_id: "req-1",
+    correlation_id: correlationId,
     sovereignty: {
       classification: "local",
       data_residency: "NZ",
@@ -240,6 +245,10 @@ describe("review-sink — lifecycle delivery", () => {
     expect(adapter.sentMessages).toHaveLength(0);
     expect(adapter.progressSent).toHaveLength(1);
     expect(adapter.progressSent[0]!.text).toContain("Luna is working");
+    // cortex#721 — progress carries the per-review correlation key on
+    // `sessionId` (resolved targets carry none), so the adapter scopes the
+    // placeholder per-review rather than per-channel.
+    expect(adapter.progressSent[0]!.target.sessionId).toBe("req-1");
   });
 
   test("dispatch.task.failed → postResponse error reply", async () => {
@@ -282,6 +291,100 @@ describe("review-sink — lifecycle delivery", () => {
 
     expect(adapter.sentMessages).toHaveLength(1);
     expect(adapter.sentMessages[0]!.text).toContain("stopped");
+  });
+});
+
+// =============================================================================
+// cortex#721 — per-review progress keying on the bus sink path
+//
+// Same defect class as the dispatch sink: `resolveTarget` returns a target
+// with NO sessionId, so two concurrent reviews in the same channel/thread
+// collapsed onto one "reviewing…" placeholder. The fix threads
+// `envelope.correlation_id` onto the progress target's `sessionId`.
+// =============================================================================
+describe("review-sink — per-review progress keying (cortex#721)", () => {
+  test("two reviews in the SAME thread get DISTINCT progress keys", async () => {
+    const { runtime, trigger } = fakeRuntime();
+    const adapter = discordMock();
+    const sink = createReviewSink({ runtime, adapters: [adapter], principal: "metafactory" });
+    await sink.start();
+
+    // Distinct envelope ids so the at-most-once `alreadyRendered` guard
+    // (keyed on `envelope.id`) doesn't drop the second `started`.
+    trigger(
+      envelope(
+        "dispatch.task.started",
+        {
+          agent_id: "luna",
+          response_routing: logicalRouting("discord", "cortex", "cortex/pr/57"),
+        },
+        "rev-A",
+        "00000000-0000-4000-8000-0000000000a1",
+      ),
+    );
+    trigger(
+      envelope(
+        "dispatch.task.started",
+        {
+          agent_id: "luna",
+          response_routing: logicalRouting("discord", "cortex", "cortex/pr/57"),
+        },
+        "rev-B",
+        "00000000-0000-4000-8000-0000000000a2",
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(adapter.progressSent).toHaveLength(2);
+    const keys = adapter.progressSent.map((p) => p.target.sessionId);
+    expect(keys).toEqual(["rev-A", "rev-B"]);
+    expect(new Set(keys).size).toBe(2); // distinct, not collapsed
+    // Same resolved channel/thread — only the session key distinguishes them.
+    expect(adapter.progressSent[0]!.target.channelId).toBe(
+      adapter.progressSent[1]!.target.channelId,
+    );
+  });
+
+  test("completed for one review's correlation clears only its own placeholder key", async () => {
+    const { runtime, trigger } = fakeRuntime();
+    const adapter = discordMock();
+    const sink = createReviewSink({ runtime, adapters: [adapter], principal: "metafactory" });
+    await sink.start();
+
+    // started for rev-A, then the terminal verdict for rev-A. Distinct
+    // envelope ids so the at-most-once guard doesn't drop the verdict.
+    trigger(
+      envelope(
+        "dispatch.task.started",
+        {
+          agent_id: "luna",
+          response_routing: logicalRouting("discord", "cortex", "cortex/pr/57"),
+        },
+        "rev-A",
+        "00000000-0000-4000-8000-0000000000b1",
+      ),
+    );
+    trigger(
+      envelope(
+        "review.verdict.changes-requested",
+        {
+          ...verdictPayload(),
+          response_routing: logicalRouting("discord", "cortex", "cortex/pr/57"),
+        },
+        "rev-A",
+        "00000000-0000-4000-8000-0000000000b2",
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // One progress keyed on rev-A, plus the durable verdict reply.
+    expect(adapter.progressSent).toHaveLength(1);
+    expect(adapter.progressSent[0]!.target.sessionId).toBe("rev-A");
+    expect(adapter.sentMessages).toHaveLength(1);
   });
 });
 
