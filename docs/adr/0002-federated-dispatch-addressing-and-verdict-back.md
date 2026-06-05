@@ -20,7 +20,7 @@ Getting this wrong has happened three times: cortex#661 (network on wire), pilot
 For a cross-principal dispatch:
 
 - **`envelope.source`** first segments are the **TARGET** `{principal}.{stack}` — because `deriveNatsSubject` derives the subject from `source`, and the receiver subscribes to its own identity. This is the *addressing* role.
-- **`envelope.originator.identity`** is the **REQUESTER** `{principal}/{stack}` — "who the signer is acting on behalf of" (CONTEXT.md §capability: *"only the `originator` field and the scope vary by source"*; `originator` is a signed/signable field). This is the *attribution + reply-to* role.
+- **`envelope.originator.identity`** is the **REQUESTER**, carried as the DID `did:mf:{requester-principal}-{requester-stack}` — "who the signer is acting on behalf of" (CONTEXT.md §capability: *"only the `originator` field and the scope vary by source"*; `originator` is a signed/signable field). This is the *attribution + reply-to* role. **It is NOT a bare `{principal}/{stack}` slash form:** myelin validates `originator.identity` against the `did:mf:<name>` DID grammar, which rejects `/`. The canonical encoding is `stack.id` with `/`→`-` (cortex `src/cortex.ts:483`: `did:mf:${stack.id.replace("/","-")}`; pilot's `encodeRequesterDid`: `did:mf:${principal}-${stack}`). **Decode** = strip the `did:mf:` prefix, then split the remainder on the **FIRST hyphen** into `{principal, stack}`. This rests on the **principal-carries-no-hyphen assumption**: a principal is a single hyphen-free token while a stack MAY contain hyphens, so the first hyphen is the unambiguous boundary — e.g. `did:mf:andreas-meta-factory` → principal `andreas`, stack `meta-factory`.
 - The **network is never on the wire.** No `extensions.network_id` is required for routing; `selectLink` resolves the target leaf from the target principal (subject segment[1]) via `peers[]`.
 
 ### 2. REQUEST subjects (requester → target)
@@ -31,12 +31,12 @@ For a cross-principal dispatch:
 | **Direct** | `federated.{target-principal}.{target-stack}.tasks.@{did-encoded-reviewer}.code-review.{flavor}` | `direct` |
 
 - `source = {target-principal}.{target-stack}.pilot`
-- `originator.identity = {requester-principal}/{requester-stack}`, `originator.method = federated`
+- `originator.identity = did:mf:{requester-principal}-{requester-stack}` (= `stack.id` with `/`→`-`; e.g. `did:mf:andreas-meta-factory`), `originator.method = federated`
 - `sovereignty.classification = federated`, `max_hop = 1`
 
 ### 3. VERDICT-BACK (target → requester)
 
-The target's review consumer (cortex#686) derives the requester from **`originator.identity`** (NOT the inbound subject, NOT `source`), then publishes with `source` addressing the **requester's** scope:
+The target's review consumer (cortex#686) decodes the requester from **`originator.identity`** (NOT the inbound subject, NOT `source`) — strip `did:mf:`, split on the FIRST hyphen → `{requester-principal, requester-stack}` (e.g. `did:mf:andreas-meta-factory` → `andreas` / `meta-factory`) — then publishes with `source` addressing the **requester's** scope:
 
 - verdict: `federated.{requester-principal}.{requester-stack}.review.verdict.{approved|changes-requested|commented}`
 - lifecycle: `federated.{requester-principal}.{requester-stack}.dispatch.task.{started|completed|failed|aborted}`

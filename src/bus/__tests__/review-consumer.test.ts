@@ -159,10 +159,15 @@ function makeRequest(flavor: ReviewFlavor = "typescript"): Envelope {
 /** 56-char U-prefixed base32 NKey — matches the surface-router test fixture. */
 const FED_PEER_PUBKEY = "U" + "A".repeat(55);
 
-/** The REQUESTER identity carried in `originator.identity` (ADR 0002 §1). */
+/**
+ * The REQUESTER identity carried in `originator.identity` (ADR 0002 §1) — the
+ * `did:mf:{principal}-{stack}` DID form (= `stack.id` with `/`→`-`), the exact
+ * shape pilot's `encodeRequesterDid` emits. NOT a bare `{principal}/{stack}`
+ * slash form (myelin's DID grammar rejects `/`).
+ */
 const REQUESTER_PRINCIPAL = "jc";
 const REQUESTER_STACK = "sage-host";
-const REQUESTER_IDENTITY = `${REQUESTER_PRINCIPAL}/${REQUESTER_STACK}`;
+const REQUESTER_IDENTITY = `did:mf:${REQUESTER_PRINCIPAL}-${REQUESTER_STACK}`;
 
 /**
  * A configured federation network whose `peers[]` lists the requester `jc` as a
@@ -195,8 +200,9 @@ function makeNetwork(
  *   - the subject (built by `cortex.ts`) addresses the TARGET = us
  *     (`federated.{our-principal}.{our-stack}.…`); tests pass it as the
  *     `subject` arg to `processEnvelope` (see `FED_SUBJECT`).
- *   - `originator.identity = {requester-principal}/{requester-stack}` carries
- *     the REQUESTER (who the verdict routes back to), `attribution: "federated"`.
+ *   - `originator.identity = did:mf:{requester-principal}-{requester-stack}`
+ *     (the DID form = `stack.id` with `/`→`-`) carries the REQUESTER (who the
+ *     verdict routes back to), `attribution: "federated"`.
  *
  * `createReviewRequestEvent` doesn't stamp an originator, so we set it here —
  * mirrors how the requester stack (pilot#149) populates it on the wire.
@@ -1450,16 +1456,32 @@ describe("ReviewConsumer — response_routing echo (cortex#502)", () => {
 // ---------------------------------------------------------------------------
 
 describe("parseRequesterFromOriginator — ADR 0002 §1 (cortex#686)", () => {
-  test("slash form `{principal}/{stack}` → {principal, stack}", () => {
+  test("DID form `did:mf:{principal}-{stack}` → {principal, stack} (first-hyphen split)", () => {
     expect(
-      parseRequesterFromOriginator(makeFederatedRequest("jc/sage-host")),
+      parseRequesterFromOriginator(makeFederatedRequest("did:mf:jc-sage-host")),
     ).toEqual({ principal: "jc", stack: "sage-host" });
   });
 
-  test("strips a `did:mf:` prefix before the slash split", () => {
+  test("first-hyphen split keeps a multi-hyphen stack intact (did:mf:andreas-meta-factory)", () => {
+    // The worked example from ADR 0002 §1: the principal is hyphen-free, so the
+    // FIRST hyphen is the boundary and every later hyphen belongs to the stack.
     expect(
-      parseRequesterFromOriginator(makeFederatedRequest("did:mf:jc/sage-host")),
-    ).toEqual({ principal: "jc", stack: "sage-host" });
+      parseRequesterFromOriginator(
+        makeFederatedRequest("did:mf:andreas-meta-factory"),
+      ),
+    ).toEqual({ principal: "andreas", stack: "meta-factory" });
+  });
+
+  test("exact inverse of pilot's encodeRequesterDid (= stack.id with /→-)", () => {
+    // pilot#149 `encodeRequesterDid(principal, stack)` = `did:mf:${principal}-${stack}`.
+    // Round-trip: encode then decode MUST recover the original pair.
+    const encode = (principal: string, stack: string) =>
+      `did:mf:${principal}-${stack}`;
+    expect(
+      parseRequesterFromOriginator(
+        makeFederatedRequest(encode("andreas", "meta-factory")),
+      ),
+    ).toEqual({ principal: "andreas", stack: "meta-factory" });
   });
 
   test("no originator block → undefined (fails closed)", () => {
@@ -1467,27 +1489,27 @@ describe("parseRequesterFromOriginator — ADR 0002 §1 (cortex#686)", () => {
     expect(parseRequesterFromOriginator(makeFederatedRequest(NO_ORIGINATOR))).toBeUndefined();
   });
 
-  test("originator identity with no slash → undefined (ambiguous principal/stack)", () => {
-    // A bare `did:mf:jc-sage-host`-style id can't split unambiguously — the very
-    // failure mode that forced the slash form. Fail closed.
-    expect(parseRequesterFromOriginator(makeFederatedRequest("jc-sage-host"))).toBeUndefined();
+  test("no `did:mf:` prefix → undefined (only the DID form is on the wire)", () => {
+    // A bare slash form `jc/sage-host` lacks the DID prefix — fail closed.
+    expect(parseRequesterFromOriginator(makeFederatedRequest("jc/sage-host"))).toBeUndefined();
   });
 
-  test("leading slash → undefined", () => {
-    expect(parseRequesterFromOriginator(makeFederatedRequest("/sage-host"))).toBeUndefined();
+  test("DID body with no hyphen → undefined (ambiguous principal/stack)", () => {
+    // `did:mf:sagehost` can't split principal from stack — fail closed.
+    expect(parseRequesterFromOriginator(makeFederatedRequest("did:mf:sagehost"))).toBeUndefined();
   });
 
-  test("trailing slash → undefined", () => {
-    expect(parseRequesterFromOriginator(makeFederatedRequest("jc/"))).toBeUndefined();
+  test("leading hyphen → undefined", () => {
+    expect(parseRequesterFromOriginator(makeFederatedRequest("did:mf:-sage-host"))).toBeUndefined();
   });
 
-  test("multi-slash body → undefined (stack is a single segment)", () => {
-    expect(parseRequesterFromOriginator(makeFederatedRequest("jc/sage/host"))).toBeUndefined();
+  test("trailing hyphen → undefined", () => {
+    expect(parseRequesterFromOriginator(makeFederatedRequest("did:mf:jc-"))).toBeUndefined();
   });
 
   test("does NOT read the requester off the subject or source — both address the TARGET", () => {
     // The subject is irrelevant to this function; the requester is the originator.
-    const env = makeFederatedRequest("jc/sage-host");
+    const env = makeFederatedRequest("did:mf:jc-sage-host");
     // `source` addresses the target (us = metafactory), per ADR 0001/0002.
     expect(env.source.startsWith("metafactory")).toBe(true);
     expect(parseRequesterFromOriginator(env)).toEqual({
@@ -1545,9 +1567,9 @@ describe("ReviewConsumer — federated mode (cortex#686, ADR 0002)", () => {
       "review.verdict.approved",
       "dispatch.task.completed",
     ]);
-    // Every emitted subject targets the REQUESTER's identity (jc/sage-host
-    // from `originator.identity`), NOT the consumer's own principal/stack
-    // (metafactory/meta-factory) and NOT a network id.
+    // Every emitted subject targets the REQUESTER's identity (jc.sage-host,
+    // decoded from the `did:mf:jc-sage-host` `originator.identity` DID), NOT the
+    // consumer's own principal/stack (metafactory/meta-factory) and NOT a network id.
     for (const s of subjects) {
       expect(s.startsWith("federated.jc.sage-host.")).toBe(true);
     }
@@ -1635,7 +1657,8 @@ describe("ReviewConsumer — federated mode (cortex#686, ADR 0002)", () => {
   test("requester NOT in any configured network's peers[] → DENIED + DROPPED (no spawn, no publish)", async () => {
     const runtime = createRecordingRuntime();
     // Originator names a principal `mallory` that is in no network's peers[].
-    const request = makeFederatedRequest("mallory/host");
+    // Well-formed DID (decodes cleanly) so the ONLY reason to deny is non-membership.
+    const request = makeFederatedRequest("did:mf:mallory-host");
 
     let pipelineRan = false;
     const consumer = new ReviewConsumer(
@@ -1686,8 +1709,9 @@ describe("ReviewConsumer — federated mode (cortex#686, ADR 0002)", () => {
   test("self-loop (requester principal == receiving principal) → DENIED + DROPPED", async () => {
     const runtime = createRecordingRuntime();
     // SOURCE.principal is `metafactory`; an originator naming us as the
-    // requester is a self-loop — drop it.
-    const request = makeFederatedRequest("metafactory/meta-factory");
+    // requester is a self-loop — drop it. Well-formed DID so the ONLY reason
+    // to deny is the self-loop, not a decode failure.
+    const request = makeFederatedRequest("did:mf:metafactory-meta-factory");
 
     let pipelineRan = false;
     const consumer = new ReviewConsumer(

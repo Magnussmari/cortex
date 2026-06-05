@@ -238,8 +238,8 @@ export interface ReviewConsumerOpts {
    * {requester-stack}.…` grammar, instead of the consumer's own
    * `local.{my-principal}.{my-stack}.…`.
    *
-   * **The requester is derived from `envelope.originator.identity`** (the
-   * `{requester-principal}/{requester-stack}` slash form per ADR 0002 §1) —
+   * **The requester is decoded from `envelope.originator.identity`** (the
+   * `did:mf:{requester-principal}-{requester-stack}` DID form per ADR 0002 §1) —
    * NOT from the inbound subject (whose `{principal}.{stack}` segments address
    * the TARGET = this receiving stack, per ADR 0001), and NOT from
    * `envelope.source` (which also addresses the target). Reading the requester
@@ -286,20 +286,21 @@ export interface ReviewConsumerOpts {
 
 /**
  * cortex#686 (ADR 0002) — the requester's `{principal}.{stack}` identity,
- * derived from the inbound envelope's `originator.identity` (the
- * `{requester-principal}/{requester-stack}` slash form). The federated
- * consumer keys every verdict + lifecycle envelope it routes back to this
- * identity so the peer's `pilot --wait` (subscribed on
+ * decoded from the inbound envelope's `originator.identity` DID (the
+ * `did:mf:{requester-principal}-{requester-stack}` form = `stack.id` with
+ * `/`→`-`). The federated consumer keys every verdict + lifecycle envelope it
+ * routes back to this identity so the peer's `pilot --wait` (subscribed on
  * `federated.{its-principal}.{its-stack}.review.verdict.>`) resolves.
  *
  * The requester is the policy actor in `originator`, NOT the subject (which
  * addresses the TARGET) — see {@link parseRequesterFromOriginator}.
  */
 export interface FederatedRequester {
-  /** Requester principal — the segment BEFORE the `/` in `originator.identity`. */
+  /** Requester principal — the DID body segment BEFORE the FIRST `-`
+   *  (principals carry no hyphen). */
   principal: string;
-  /** Requester stack — the segment AFTER the `/`; omitted when the originator
-   *  carries only a bare principal (no stack). */
+  /** Requester stack — the DID body segment AFTER the first `-` (may itself
+   *  contain hyphens, e.g. `meta-factory`). */
   stack?: string;
 }
 
@@ -1048,7 +1049,8 @@ export class ReviewConsumer {
    * cortex#686 — when `requester` is supplied (federated mode), the envelope
    * is published on the REQUESTER-keyed `federated.{requester-principal}.
    * {requester-stack}.{type}` subject via {@link MyelinRuntime.publishOnSubject}
-   * (deriving the subject from `envelope.type` + the requester identity). The
+   * (deriving the subject from `envelope.type` + the requester identity decoded
+   * from the `did:mf:{principal}-{stack}` originator DID). The
    * runtime's `selectLink` resolves the requester principal → leaf from the
    * `peers[]` topology so the verdict reaches the peer stack's
    * `pilot --wait`. Absent `requester` → the unchanged local
@@ -1168,9 +1170,9 @@ export function extractFlavor(envelope: Envelope, _subject: string): string | nu
 }
 
 /**
- * cortex#686 (ADR 0002 §1+§3) — derive the REQUESTER's `{principal}.{stack}`
+ * cortex#686 (ADR 0002 §1+§3) — decode the REQUESTER's `{principal}.{stack}`
  * identity from an inbound FEDERATED review-request envelope's
- * `originator.identity`.
+ * `originator.identity` DID.
  *
  * **Why `originator`, not the subject or `source`.** Under ADR 0001 a federated
  * subject is `federated.{TARGET-principal}.{TARGET-stack}.tasks.code-review.…`
@@ -1181,19 +1183,30 @@ export function extractFlavor(envelope: Envelope, _subject: string): string | nu
  * BLOCKER). ADR 0002 §1 carries the requester in `originator.identity` —
  * "who the signer is acting on behalf of" — a signed/signable field.
  *
- * **Format (ADR 0002 §1, §3):** `originator.identity = {requester-principal}/
- * {requester-stack}` — slash-delimited so the principal and stack split
- * unambiguously (a `did:mf:{principal}-{stack}` DID can't: hyphens appear in
- * both). A `did:mf:` prefix, if present, is stripped before the split. The
- * dual-read of the deprecated `originator.principal` key is handled by
- * {@link getActorPrincipal}.
+ * **Format (ADR 0002 §1, §3): `originator.identity = did:mf:{requester-principal}-{requester-stack}`.**
+ * This is the requester stack's canonical signing-DID — exactly `stack.id` with
+ * `/`→`-` (cortex `src/cortex.ts:483`: `did:mf:${stack.id.replace("/","-")}`).
+ * It is NOT a bare `{principal}/{stack}` slash form: myelin validates
+ * `originator.identity` against the `did:mf:<name>` DID grammar, which rejects
+ * `/`. The encoder is pilot's `encodeRequesterDid` (pilot#149,
+ * `src/bus/publish-review-request.ts`): `did:mf:${principal}-${stack}`; this
+ * decoder is its EXACT inverse (lockstep — pilot#149 ↔ cortex#686).
  *
- * Returns `undefined` when there is no `originator` block, the identity is
- * empty, or it carries no `/` to split principal from stack — the federated
- * consumer then DENIES + DROPS the request (an un-attributable cross-principal
- * source is never reviewed; see {@link ReviewConsumer.federatedRequesterDenyReason}),
- * and `safePublish` would in any case fail closed to the local path rather than
- * guess a requester.
+ * **Decode:** require a `did:mf:` prefix, strip it, then split the remainder on
+ * the FIRST `-` into `{principal, stack}`. The first-hyphen split rests on the
+ * **principal-carries-no-hyphen assumption**: a principal segment is a single
+ * `^[a-z][a-z0-9]*$`-style token, while a STACK may itself contain hyphens
+ * (e.g. `meta-factory`). So `did:mf:andreas-meta-factory` decodes to principal
+ * `andreas` / stack `meta-factory` — the first hyphen separates the two; every
+ * later hyphen belongs to the stack. (A principal with a hyphen would be
+ * indistinguishable from a stack boundary; the wire grammar forbids it.)
+ *
+ * Returns `undefined` (→ deny + drop) when there is no `originator` block, the
+ * identity is empty, it lacks the `did:mf:` prefix, or the post-prefix body
+ * carries no `-` to split principal from stack. The federated consumer then
+ * DENIES + DROPS the request (an un-attributable / non-conformant cross-principal
+ * source is never reviewed; see {@link ReviewConsumer.federatedRequesterDenyReason}).
+ * The bare slash form is NOT accepted — only the DID form is on the wire.
  *
  * Exported for the review-consumer tests.
  */
@@ -1210,19 +1223,24 @@ export function parseRequesterFromOriginator(
   const raw = getActorPrincipal(envelope);
   if (raw === undefined || raw.length === 0) return undefined;
 
-  // Strip an optional `did:mf:` method prefix; the {principal}/{stack} body
-  // follows either way (ADR 0002 §1 writes the bare slash form).
-  const body = raw.startsWith("did:mf:") ? raw.slice("did:mf:".length) : raw;
-  const slash = body.indexOf("/");
-  if (slash <= 0 || slash === body.length - 1) {
-    // No slash, leading slash, or trailing slash → can't split an unambiguous
-    // {principal}/{stack}. Fail closed.
+  // Require the `did:mf:` method prefix — the wire carries the DID form, never
+  // a bare slash form (myelin's DID grammar rejects `/`). Fail closed otherwise.
+  const PREFIX = "did:mf:";
+  if (!raw.startsWith(PREFIX)) return undefined;
+  const body = raw.slice(PREFIX.length);
+
+  // Split on the FIRST hyphen: principal (no hyphen) | stack (may contain
+  // hyphens). `did:mf:andreas-meta-factory` → principal `andreas`, stack
+  // `meta-factory`. The exact inverse of pilot's
+  // `encodeRequesterDid` = `did:mf:${principal}-${stack}` (= stack.id `/`→`-`).
+  const hyphen = body.indexOf("-");
+  if (hyphen <= 0 || hyphen === body.length - 1) {
+    // No hyphen, leading hyphen, or trailing hyphen → can't split an
+    // unambiguous {principal}-{stack}. Fail closed.
     return undefined;
   }
-  const principal = body.slice(0, slash);
-  const stack = body.slice(slash + 1);
-  // A multi-slash body (`a/b/c`) is malformed — a stack is a single segment.
-  if (stack.includes("/")) return undefined;
+  const principal = body.slice(0, hyphen);
+  const stack = body.slice(hyphen + 1);
   return { principal, stack };
 }
 
