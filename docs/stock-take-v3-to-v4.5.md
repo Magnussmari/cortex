@@ -13,7 +13,7 @@ This is a synthesis of what cortex has become since the v3 vocabulary migration,
 | v3.0.0 | 05-21 | Vocabulary migration (BREAKING) |
 | v3.0.1–v3.0.3 | 05-26 | Sage review-bus fixes (verdict exit-code, `--post`, ack_wait dedup) |
 | v3.1.0 | 05-29 | Bot-to-bot review reply loop + Discord stability |
-| v4.0.0 | 06-01 | `operator → principal` vocabulary migration (BREAKING) |
+| v4.0.0 | 06-01 | principal-identity vocabulary migration (BREAKING) |
 | v4.1.0 | 06-03 | Unified surface gateway (inbound demux + outbound reply round-trip) |
 | v4.2.0 | 06-04 | **Trust track**, network registry & Discord multi-server |
 | v4.3.0 | 06-04 | Cross-stack guild isolation, stack-aware upgrades, nonce-before-verify |
@@ -23,12 +23,12 @@ This is a synthesis of what cortex has become since the v3 vocabulary migration,
 | v4.5.1 | 06-05 | Config-split-aware upgrade lifecycle |
 
 ### What was built, by theme
-- **Vocabulary / identity (v3.0.0, v4.0.0):** the whole stack moved to the `principal` / `stack` / `assistant` ubiquitous language (operator→principal was the breaking cut). This is the identity grammar everything else keys on.
+- **Vocabulary / identity (v3.0.0, v4.0.0):** the whole stack moved to the `principal` / `stack` / `assistant` ubiquitous language (the principal-identity cut was the breaking change). This is the identity grammar everything else keys on.
 - **Surface gateway (v4.1.0):** one assistant can front many stacks — inbound demux + outbound reply round-trip through a single gateway seam.
 - **Trust track + network registry (v4.2.0):** Ed25519 stack signing primitives (TC-1/TC-2), the cross-principal verify seam (TC-2d), and the deployed **network-registry** (`network.meta-factory.ai`, D1-durable, registry-signed assertions, proof-of-possession registration). This is the trust anchor for federation: pin the registry, resolve peers on demand — no per-assistant config.
 - **Federated subject grammar (v4.x, ADR-0001 / #691):** federated subjects carry `federated.{principal}.{stack}.…`; the **network is never on the wire** — it's resolved from topology (`peers[].principal_id`). Supersedes the earlier `{network_id}` grammar.
 - **Multi-stack / multi-network runtime:** one runtime hosts N stacks; each stack binds one NATS link per network. Stacks are a first-class, enumerable list (not three hardcoded names) — see §2.
-- **Hardening sweep (v4.3–v4.5):** cross-stack guild isolation (#704), DM stack-ownership (#709), per-session Discord progress (#708), stack-aware upgrade lifecycle (#700/#717), session **settings isolation** (#701 Part A — bot sessions no longer inherit the operator's global `~/.claude` hooks/skills), and **per-skill capability grants** via a PreToolUse hook (#710, default-deny).
+- **Hardening sweep (v4.3–v4.5):** cross-stack guild isolation (#704), DM stack-ownership (#709), per-session Discord progress (#708), stack-aware upgrade lifecycle (#700/#717), session **settings isolation** (#701 Part A — bot sessions no longer inherit the principal's global `~/.claude` hooks/skills), and **per-skill capability grants** via a PreToolUse hook (#710, default-deny).
 - **CI reliability (#699):** full-suite flakes (a real keypair-test correctness bug + subprocess/fs-watch races) fixed at the root.
 - **Config-split (migration 0003):** monolithic `cortex.{stack}.yaml` → multi-file layout (`system/` + `network/` + `surfaces/` + `stacks/` per dir), one dir = one composed stack. See §2.
 
@@ -74,7 +74,7 @@ The controls exist as toggles; the work is to **harden each, then enable it, the
 4. **At-rest field encryption (TC-4c, #638 — `future`).** High-sensitivity columns (local SQLite + D1). Last in the ramp.
 
 ### Federated path (the IoAW loop — not yet closed)
-- **#686 — federated review consumer (HELD, lockstep with pilot#149).** Built (#715) but found broken on independent review: verdict misrouted to self (requester parsed from the receiver's own subject segment, not `envelope.source`), a latent leak-shape (verdict routing not cross-checked vs source), and the `peers[]` gate isn't wired into the consumer path. Correct fix needs the pilot#149 wire contract (cross-repo). **This is the single piece between here and a working cross-operator review loop.**
+- **#686 — federated review consumer (HELD, lockstep with pilot#149).** Built (#715) but found broken on independent review: verdict misrouted to self (requester parsed from the receiver's own subject segment, not `envelope.source`), a latent leak-shape (verdict routing not cross-checked vs source), and the `peers[]` gate isn't wired into the consumer path. Correct fix needs the pilot#149 wire contract (cross-repo). **This is the single piece between here and a working cross-principal review loop.**
 - **#631 — F-3 multi-link/multi-network runtime** (one NATS leaf per network) — `next`.
 - **#681 — registry enumeration/membership-exposure policy** for list endpoints (dev=prod) — `next`.
 - **#417 — adapter payload sanitisation** (code-fence injection, Stage-4 trust model); **#413** channel-topology federation-by-default; **#404** federated CAS for attachment payloads — `future`.
@@ -93,10 +93,10 @@ Signal (telemetry/observability) hooks exist as backlog (#596 — emit gateway o
 
 ## 6. Recommended sequencing
 
-1. **Validate Mission Control** (highest unknown — it's untested and load-bearing for the operator surface).
+1. **Validate Mission Control** (highest unknown — it's untested and load-bearing for the principal-facing surface).
 2. **Close the IoAW loop:** pilot#149 ↔ #686 (federated consumer rework on the correct wire contract).
 3. **Harden → enable the trust ramp, in order:** signing (`permissive` → `enforce` → default) → mTLS (#639/#640/#685) → payload encryption (TC-3) → at-rest (#638).
 4. **Then integrate Signal** (#596/#501) once the surface is stable.
 5. **Registry hardening** (#681 enumeration policy) alongside the signing-enforce flip.
 
-The through-line: the multi-stack/multi-network surface and the trust *primitives* are built and deployed; what remains is (a) verifying the operator surface (MC), (b) closing the federated loop (cross-repo), and (c) the deliberate, staged ramp of the confidentiality controls from off to default once each is hardened.
+The through-line: the multi-stack/multi-network surface and the trust *primitives* are built and deployed; what remains is (a) verifying the principal-facing surface (MC), (b) closing the federated loop (cross-repo), and (c) the deliberate, staged ramp of the confidentiality controls from off to default once each is hardened.
