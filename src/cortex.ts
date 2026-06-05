@@ -1204,7 +1204,14 @@ export async function startCortex(
           // cortex#686 — federated consumers route the verdict back to the
           // requester's identity on the conformant `federated.{requester}.…`
           // grammar (the cortex receiver that closes the cross-principal loop).
-          ...(federated && { federated: true }),
+          // The peer topology is passed so the consumer-path `peers[]` gate
+          // (ADR 0002 §5) can deny a non-peer requester BEFORE spawning the
+          // reviewer — defense-in-depth that, under `signing: off`, is the
+          // application-layer trust boundary on the consumer path.
+          ...(federated && {
+            federated: true,
+            federatedNetworks: options.policy?.federated?.networks ?? [],
+          }),
         });
 
       const consumer = makeConsumer(false);

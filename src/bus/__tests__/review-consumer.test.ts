@@ -42,11 +42,12 @@ import {
   OFFER_DISPATCH_REVIEWER,
   failedReasonToAckDecision,
   parseReviewRequestPayload,
-  parseFederatedRequester,
+  parseRequesterFromOriginator,
   readLogicalResponseRouting,
   type ReviewConsumerAgent,
   type ReviewConsumerOpts,
 } from "../review-consumer";
+import type { PolicyFederatedNetwork } from "../../common/types/cortex-config";
 import type { DispatchTaskFailedReason } from "../dispatch-events";
 import type { AckDecision } from "../myelin/subscriber";
 import {
@@ -149,6 +150,77 @@ function makeRequest(flavor: ReviewFlavor = "typescript"): Envelope {
     flavor,
     payload: PAYLOAD,
   });
+}
+
+// ---------------------------------------------------------------------------
+// cortex#686 (ADR 0002) — federated fixtures
+// ---------------------------------------------------------------------------
+
+/** 56-char U-prefixed base32 NKey — matches the surface-router test fixture. */
+const FED_PEER_PUBKEY = "U" + "A".repeat(55);
+
+/** The REQUESTER identity carried in `originator.identity` (ADR 0002 §1). */
+const REQUESTER_PRINCIPAL = "jc";
+const REQUESTER_STACK = "sage-host";
+const REQUESTER_IDENTITY = `${REQUESTER_PRINCIPAL}/${REQUESTER_STACK}`;
+
+/**
+ * A configured federation network whose `peers[]` lists the requester `jc` as a
+ * member. The consumer-path `peers[]` gate (ADR 0002 §5) admits a requester
+ * only when it resolves here.
+ */
+function makeNetwork(
+  overrides: Partial<PolicyFederatedNetwork> = {},
+): PolicyFederatedNetwork {
+  return {
+    id: "research-collab",
+    leaf_node: "leaf-research",
+    peers: [
+      {
+        principal_id: REQUESTER_PRINCIPAL,
+        stack_id: `${REQUESTER_PRINCIPAL}/${REQUESTER_STACK}`,
+        principal_pubkey: FED_PEER_PUBKEY,
+      },
+    ],
+    accept_subjects: ["federated.jc.sage-host.tasks.code-review.>"],
+    deny_subjects: [],
+    announce_capabilities: [],
+    max_hop: 1,
+    ...overrides,
+  };
+}
+
+/**
+ * Build an inbound FEDERATED review-request envelope per ADR 0002:
+ *   - the subject (built by `cortex.ts`) addresses the TARGET = us
+ *     (`federated.{our-principal}.{our-stack}.…`); tests pass it as the
+ *     `subject` arg to `processEnvelope` (see `FED_SUBJECT`).
+ *   - `originator.identity = {requester-principal}/{requester-stack}` carries
+ *     the REQUESTER (who the verdict routes back to), `attribution: "federated"`.
+ *
+ * `createReviewRequestEvent` doesn't stamp an originator, so we set it here —
+ * mirrors how the requester stack (pilot#149) populates it on the wire.
+ */
+/** Sentinel for "stamp no originator block at all" (distinct from the default). */
+const NO_ORIGINATOR = Symbol("no-originator");
+
+function makeFederatedRequest(
+  identity: string | typeof NO_ORIGINATOR = REQUESTER_IDENTITY,
+  flavor: ReviewFlavor = "typescript",
+): Envelope {
+  const env = createReviewRequestEvent({
+    source: SOURCE,
+    flavor,
+    classification: "federated",
+    payload: PAYLOAD,
+  });
+  if (identity !== NO_ORIGINATOR) {
+    (env as { originator?: unknown }).originator = {
+      identity,
+      attribution: "federated",
+    };
+  }
+  return env;
 }
 
 /**
@@ -1377,65 +1449,88 @@ describe("ReviewConsumer — response_routing echo (cortex#502)", () => {
 // cortex#686 (ADR 0001) — FEDERATED review consumer
 // ---------------------------------------------------------------------------
 
-describe("parseFederatedRequester — ADR 0001 grammar (cortex#686)", () => {
-  test("stack-aware subject → {principal, stack} from segment[1]/[2]", () => {
+describe("parseRequesterFromOriginator — ADR 0002 §1 (cortex#686)", () => {
+  test("slash form `{principal}/{stack}` → {principal, stack}", () => {
     expect(
-      parseFederatedRequester(
-        "federated.jc.sage-host.tasks.code-review.typescript",
-      ),
+      parseRequesterFromOriginator(makeFederatedRequest("jc/sage-host")),
     ).toEqual({ principal: "jc", stack: "sage-host" });
   });
 
-  test("stack-less 5-segment subject → {principal} only", () => {
+  test("strips a `did:mf:` prefix before the slash split", () => {
     expect(
-      parseFederatedRequester("federated.jc.tasks.code-review.typescript"),
-    ).toEqual({ principal: "jc" });
+      parseRequesterFromOriginator(makeFederatedRequest("did:mf:jc/sage-host")),
+    ).toEqual({ principal: "jc", stack: "sage-host" });
   });
 
-  test("non-federated subject → undefined (falls through to local publish)", () => {
-    expect(
-      parseFederatedRequester("local.andreas.meta-factory.tasks.code-review.ts"),
-    ).toBeUndefined();
+  test("no originator block → undefined (fails closed)", () => {
+    // NO_ORIGINATOR leaves the originator unset.
+    expect(parseRequesterFromOriginator(makeFederatedRequest(NO_ORIGINATOR))).toBeUndefined();
   });
 
-  test("bare `federated.` → undefined", () => {
-    expect(parseFederatedRequester("federated.")).toBeUndefined();
+  test("originator identity with no slash → undefined (ambiguous principal/stack)", () => {
+    // A bare `did:mf:jc-sage-host`-style id can't split unambiguously — the very
+    // failure mode that forced the slash form. Fail closed.
+    expect(parseRequesterFromOriginator(makeFederatedRequest("jc-sage-host"))).toBeUndefined();
   });
 
-  test("federated subject with no tasks segment → undefined (not dispatch traffic)", () => {
-    expect(parseFederatedRequester("federated.jc.sage-host")).toBeUndefined();
+  test("leading slash → undefined", () => {
+    expect(parseRequesterFromOriginator(makeFederatedRequest("/sage-host"))).toBeUndefined();
   });
 
-  test("does NOT treat a network id as a segment — principal is segment[1]", () => {
-    // The network is NEVER on the wire (ADR 0001). segment[1] is the requester
-    // principal, not a network id.
-    const r = parseFederatedRequester(
-      "federated.jc.sage-host.tasks.code-review.bun",
-    );
-    expect(r?.principal).toBe("jc");
-    expect(r?.stack).toBe("sage-host");
+  test("trailing slash → undefined", () => {
+    expect(parseRequesterFromOriginator(makeFederatedRequest("jc/"))).toBeUndefined();
+  });
+
+  test("multi-slash body → undefined (stack is a single segment)", () => {
+    expect(parseRequesterFromOriginator(makeFederatedRequest("jc/sage/host"))).toBeUndefined();
+  });
+
+  test("does NOT read the requester off the subject or source — both address the TARGET", () => {
+    // The subject is irrelevant to this function; the requester is the originator.
+    const env = makeFederatedRequest("jc/sage-host");
+    // `source` addresses the target (us = metafactory), per ADR 0001/0002.
+    expect(env.source.startsWith("metafactory")).toBe(true);
+    expect(parseRequesterFromOriginator(env)).toEqual({
+      principal: "jc",
+      stack: "sage-host",
+    });
   });
 });
 
-describe("ReviewConsumer — federated mode (cortex#686)", () => {
-  /** Inbound federated review-request subject keyed to the REQUESTER `jc/sage-host`. */
-  const FED_SUBJECT = "federated.jc.sage-host.tasks.code-review.typescript";
+describe("ReviewConsumer — federated mode (cortex#686, ADR 0002)", () => {
+  // Inbound subject addresses the TARGET (us = metafactory/meta-factory), the
+  // way cortex.ts builds the federated subscription. The REQUESTER lives in
+  // `originator.identity`, NOT here.
+  const FED_SUBJECT =
+    "federated.metafactory.meta-factory.tasks.code-review.typescript";
 
-  test("verdict path → ALL envelopes routed via publishOnSubject on federated.{requester}.{stack}.{type}", async () => {
+  /** Shared federated opts: federated mode + the `jc`-peer network. */
+  function federatedOpts(
+    overrides: Partial<ReviewConsumerOpts> = {},
+  ): Partial<ReviewConsumerOpts> {
+    return {
+      federated: true,
+      federatedNetworks: [makeNetwork()],
+      ...overrides,
+    };
+  }
+
+  test("verdict path → ALL envelopes routed via publishOnSubject on federated.{requester}.{stack}.{type} (requester from originator)", async () => {
     const runtime = createRecordingRuntime();
-    const request = makeRequest("typescript");
+    const request = makeFederatedRequest();
     const verdict = buildVerdictEnvelope(request, "approved");
 
     const consumer = new ReviewConsumer(
-      baseOpts({
-        runtime,
-        federated: true,
-        pipelineRunner: fixedPipeline((opts) => {
-          // cortex#686 — the pipeline is told to stamp federated sovereignty.
-          expect(opts.classification).toBe("federated");
-          return { kind: "verdict", envelope: verdict };
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline((opts) => {
+            // cortex#686 — the pipeline is told to stamp federated sovereignty.
+            expect(opts.classification).toBe("federated");
+            return { kind: "verdict", envelope: verdict };
+          }),
         }),
-      }),
+      ),
     );
 
     const decision = await consumer.processEnvelope(request, FED_SUBJECT, null);
@@ -1450,8 +1545,9 @@ describe("ReviewConsumer — federated mode (cortex#686)", () => {
       "review.verdict.approved",
       "dispatch.task.completed",
     ]);
-    // Every emitted subject targets the REQUESTER's identity (jc/sage-host),
-    // NOT the consumer's own principal/stack and NOT a network id.
+    // Every emitted subject targets the REQUESTER's identity (jc/sage-host
+    // from `originator.identity`), NOT the consumer's own principal/stack
+    // (metafactory/meta-factory) and NOT a network id.
     for (const s of subjects) {
       expect(s.startsWith("federated.jc.sage-host.")).toBe(true);
     }
@@ -1461,14 +1557,15 @@ describe("ReviewConsumer — federated mode (cortex#686)", () => {
 
   test("correlation_id preserved across the federated verdict + lifecycle envelopes", async () => {
     const runtime = createRecordingRuntime();
-    const request = makeRequest("typescript");
+    const request = makeFederatedRequest();
     const verdict = buildVerdictEnvelope(request, "approved");
     const consumer = new ReviewConsumer(
-      baseOpts({
-        runtime,
-        federated: true,
-        pipelineRunner: fixedPipeline(() => ({ kind: "verdict", envelope: verdict })),
-      }),
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline(() => ({ kind: "verdict", envelope: verdict })),
+        }),
+      ),
     );
     await consumer.processEnvelope(request, FED_SUBJECT, null);
     for (const { envelope } of runtime.publishedOnSubject) {
@@ -1476,24 +1573,21 @@ describe("ReviewConsumer — federated mode (cortex#686)", () => {
     }
   });
 
-  test("pre-pipeline failure (bad payload) → failed envelope routed on federated subject", async () => {
+  test("pre-pipeline failure (bad payload) → failed envelope routed on requester subject", async () => {
     const runtime = createRecordingRuntime();
-    // A review-typed envelope with an unparseable payload.
-    const bad = createReviewRequestEvent({
-      source: SOURCE,
-      flavor: "typescript",
-      payload: PAYLOAD,
-    });
+    // A review-typed federated envelope (good originator) with bad payload.
+    const bad = makeFederatedRequest();
     (bad as { payload: Record<string, unknown> }).payload = { nonsense: true };
 
     const consumer = new ReviewConsumer(
-      baseOpts({
-        runtime,
-        federated: true,
-        pipelineRunner: fixedPipeline(() => {
-          throw new Error("pipeline must not run on a bad payload");
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline(() => {
+            throw new Error("pipeline must not run on a bad payload");
+          }),
         }),
-      }),
+      ),
     );
 
     const decision = await consumer.processEnvelope(bad, FED_SUBJECT, null);
@@ -1507,32 +1601,124 @@ describe("ReviewConsumer — federated mode (cortex#686)", () => {
 
   test("federated emitted envelopes declare federated sovereignty", async () => {
     const runtime = createRecordingRuntime();
-    const request = makeRequest("typescript");
+    const request = makeFederatedRequest();
     const verdict = buildVerdictEnvelope(request, "commented");
     const consumer = new ReviewConsumer(
-      baseOpts({
-        runtime,
-        federated: true,
-        pipelineRunner: fixedPipeline((opts) => ({
-          kind: "verdict",
-          // Echo the pipeline's classification onto the verdict so the test
-          // sees federated sovereignty end-to-end.
-          envelope: createReviewVerdictEvent({
-            source: SOURCE,
-            kind: "commented",
-            correlationId: request.id,
-            ...(opts.classification !== undefined && {
-              classification: opts.classification,
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline((opts) => ({
+            kind: "verdict",
+            // Echo the pipeline's classification onto the verdict so the test
+            // sees federated sovereignty end-to-end.
+            envelope: createReviewVerdictEvent({
+              source: SOURCE,
+              kind: "commented",
+              correlationId: request.id,
+              ...(opts.classification !== undefined && {
+                classification: opts.classification,
+              }),
+              payload: (verdict.payload as never),
             }),
-            payload: (verdict.payload as never),
-          }),
-        })),
-      }),
+          })),
+        }),
+      ),
     );
     await consumer.processEnvelope(request, FED_SUBJECT, null);
     for (const { envelope } of runtime.publishedOnSubject) {
       expect(envelope.sovereignty.classification).toBe("federated");
     }
+  });
+
+  // ---- ADR 0002 §5 — peers[] membership gate (defense-in-depth) ----------
+
+  test("requester NOT in any configured network's peers[] → DENIED + DROPPED (no spawn, no publish)", async () => {
+    const runtime = createRecordingRuntime();
+    // Originator names a principal `mallory` that is in no network's peers[].
+    const request = makeFederatedRequest("mallory/host");
+
+    let pipelineRan = false;
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline(() => {
+            pipelineRan = true;
+            throw new Error("reviewer must NOT be spawned for a non-peer requester");
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(request, FED_SUBJECT, null);
+    expect(decision.kind).toBe("term");
+    expect(pipelineRan).toBe(false);
+    // NOTHING published on either path — the verdict (which carries reviewed-code
+    // findings) never reaches an untrusted principal.
+    expect(runtime.published).toHaveLength(0);
+    expect(runtime.publishedOnSubject).toHaveLength(0);
+  });
+
+  test("federated request with NO resolvable requester (absent originator) → DENIED + DROPPED", async () => {
+    const runtime = createRecordingRuntime();
+    const request = makeFederatedRequest(NO_ORIGINATOR); // no originator block
+
+    let pipelineRan = false;
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline(() => {
+            pipelineRan = true;
+            throw new Error("reviewer must NOT be spawned for an un-attributable request");
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(request, FED_SUBJECT, null);
+    expect(decision.kind).toBe("term");
+    expect(pipelineRan).toBe(false);
+    expect(runtime.published).toHaveLength(0);
+    expect(runtime.publishedOnSubject).toHaveLength(0);
+  });
+
+  test("self-loop (requester principal == receiving principal) → DENIED + DROPPED", async () => {
+    const runtime = createRecordingRuntime();
+    // SOURCE.principal is `metafactory`; an originator naming us as the
+    // requester is a self-loop — drop it.
+    const request = makeFederatedRequest("metafactory/meta-factory");
+
+    let pipelineRan = false;
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          // Add metafactory to peers so the only reason to deny is the self-loop.
+          federatedNetworks: [
+            makeNetwork({
+              peers: [
+                {
+                  principal_id: "metafactory",
+                  stack_id: "metafactory/meta-factory",
+                  principal_pubkey: FED_PEER_PUBKEY,
+                },
+              ],
+            }),
+          ],
+          pipelineRunner: fixedPipeline(() => {
+            pipelineRan = true;
+            throw new Error("reviewer must NOT be spawned for a self-loop");
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(request, FED_SUBJECT, null);
+    expect(decision.kind).toBe("term");
+    expect(pipelineRan).toBe(false);
+    expect(runtime.published).toHaveLength(0);
+    expect(runtime.publishedOnSubject).toHaveLength(0);
   });
 
   test("local mode (federated: false) is byte-for-byte unchanged — uses runtime.publish", async () => {
