@@ -72,6 +72,32 @@ function readResponseRouting(envelope: Envelope): WireResponseRouting | null {
   };
 }
 
+/**
+ * cortex#721 — derive the per-dispatch correlation key for progress keying.
+ *
+ * The Discord adapter keys its "working…" progress placeholder on
+ * `target.sessionId` (`progressKey` = `sessionId ? scope:sessionId : scope`).
+ * The in-process dispatch-handler path (cortex#708/#713) threads the inbound
+ * correlation onto `sessionId`; the BUS sink path never did, so every
+ * dispatch's `started` progress fell back to channel-scope and collapsed
+ * onto ONE edited-in-place message.
+ *
+ * The lifecycle envelope already carries a per-dispatch correlation: the
+ * UUID-shaped `envelope.correlation_id` (set to the task UUID by
+ * `dispatch-events.buildBaseEnvelope`), with `payload.task_id` as the
+ * belt-and-braces fallback (the same `correlation_id ?? task_id` join the
+ * runner uses). Returns `undefined` only when neither is present — then
+ * channel-scoped keying is the correct (pre-#708) behaviour.
+ */
+export function dispatchCorrelationKey(envelope: Envelope): string | undefined {
+  if (typeof envelope.correlation_id === "string" && envelope.correlation_id.length > 0) {
+    return envelope.correlation_id;
+  }
+  const taskId = envelope.payload.task_id;
+  if (typeof taskId === "string" && taskId.length > 0) return taskId;
+  return undefined;
+}
+
 /** Lifecycle event types the sink delivers. */
 const LIFECYCLE_TYPE_PREFIX = "dispatch.task.";
 
@@ -267,7 +293,19 @@ export function createDispatchSink(opts: DispatchSinkOptions): DispatchSink {
         // A `started` event is a progress/typing indicator, not a final
         // reply — edit-in-place so the terminal `completed`/`failed`
         // reply is the durable message in the channel.
-        await adapter.sendProgress(target, text);
+        //
+        // cortex#721 — key per-dispatch progress on the lifecycle envelope's
+        // correlation id so two dispatches in the same channel/thread each
+        // get their OWN "working…" placeholder instead of editing one shared
+        // message. Set `sessionId` ONLY on the progress target: `postResponse`
+        // ignores it, and only `sendProgress` (edit-in-place) reads it via
+        // the adapter's `progressKey`.
+        const correlationKey = dispatchCorrelationKey(envelope);
+        const progressTarget: ResponseTarget =
+          correlationKey !== undefined
+            ? { ...target, sessionId: correlationKey }
+            : target;
+        await adapter.sendProgress(progressTarget, text);
         return;
       }
       // `completed` / `failed` / `aborted` — the terminal reply.
