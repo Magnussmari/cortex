@@ -711,9 +711,26 @@ export class DispatchHandler extends EventEmitter {
       // includes /Users/... paths (PII-008). See grove#179.
       const filterResult = scanPrompt(parsed.content, msg.platform);
       if (!filterResult.allowed) {
-        const target = this.targetFromMsg(adapter, msg);
-        await adapter.postResponse(target, `I can't process that message. ${filterResult.reason ?? ""}`);
-        return;
+        // cortex#723 — trust-scope the hard-block. A prompt-injection filter
+        // gates UNTRUSTED content (cross-principal, relayed, webhook); the home
+        // principal commands their OWN assistant and cannot "inject" it.
+        // Hard-blocking the principal's direct messages is a category error
+        // that breaks principal control (live FP: PI-002 "act as a jumphost" —
+        // legit infra language). `isPrincipalDM` (set above) is true only when
+        // an adapter classified the sender as the home principal via the
+        // PolicyEngine principal-role capability — the authoritative trust
+        // signal. For that sender, log the match for visibility and ALLOW.
+        // Untrusted senders (unknown / cross-principal without trust) stay
+        // hard-blocked exactly as before — the filter is NOT weakened for them.
+        if (isPrincipalDM) {
+          console.log(
+            `dispatch-handler: [PROMPT-FILTER] allowing home-principal message despite match (${filterResult.reason ?? "unspecified"}) — the principal commands their own assistant (cortex#723): "${parsed.content.slice(0, 100)}"`,
+          );
+        } else {
+          const target = this.targetFromMsg(adapter, msg);
+          await adapter.postResponse(target, `I can't process that message. ${filterResult.reason ?? ""}`);
+          return;
+        }
       }
 
       // 11. Build CC invocation options

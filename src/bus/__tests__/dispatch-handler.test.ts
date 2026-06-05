@@ -928,6 +928,134 @@ describe("DispatchHandler — chat-path CC failure retry (cortex#360)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// cortex#723 — prompt-injection filter is trust-scoped at the dispatch-handler
+// caller. The filter (@metafactory/content-filter, scanPrompt) gates UNTRUSTED
+// inbound content; the home principal commands their OWN assistant and must not
+// be hard-blocked by it. The live FP that motivated this: PI-002 role_play_trigger
+// matched "…would act as a jumphost" (legit infra language) in Andreas's own DM.
+//
+// Contract:
+//   - home-principal DM whose content matches a block pattern → PROCESSED
+//     (reaches the CC path, NO "I can't process that message" reply), and the
+//     match is LOGGED for principal visibility.
+//   - untrusted sender's role-play injection → still BLOCKED (posts the
+//     "I can't process that message" reply, never reaches CC).
+//
+// The scanner itself is unchanged — the trust decision belongs at the caller,
+// which holds the policy context (sender principal/role via `msg.dmType`).
+// ---------------------------------------------------------------------------
+
+describe("DispatchHandler — prompt-filter trust scope (cortex#723)", () => {
+  // Content that reliably trips PI-002 (role_play_trigger, "act as") in the
+  // real @metafactory/content-filter — the exact FP class from the issue.
+  const ACT_AS_CONTENT =
+    "Dig deeper — the probe is not the jump host. A different machine would act as a jumphost.";
+
+  let originalWarn: typeof console.warn;
+  let originalError: typeof console.error;
+  let originalLog: typeof console.log;
+  let logLines: string[];
+
+  beforeEach(() => {
+    originalWarn = console.warn;
+    originalError = console.error;
+    originalLog = console.log;
+    logLines = [];
+    console.warn = () => {};
+    console.error = () => {};
+    // Capture log output so we can assert the home-principal match is logged
+    // for principal visibility (the issue's "log/flag for visibility" clause).
+    console.log = (...args: unknown[]) => {
+      logLines.push(args.map((a) => String(a)).join(" "));
+    };
+  });
+
+  afterEach(() => {
+    console.warn = originalWarn;
+    console.error = originalError;
+    console.log = originalLog;
+  });
+
+  test("home-principal DM matching a block pattern is PROCESSED (not blocked) and the match is logged for visibility", async () => {
+    const { factory, spawnCount } = makeStubFactory([
+      successResult({ response: "On it — here's the jumphost answer." }),
+    ]);
+
+    const adapter = new MockAdapter();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      ccSessionFactory: factory,
+    });
+
+    await handler.handleMessage(
+      adapter,
+      makeMsg({
+        platform: "discord",
+        authorId: "principal1",
+        content: ACT_AS_CONTENT,
+        isDM: true,
+        dmType: "principal",
+      }),
+    );
+
+    // The message reached the CC path — the filter did NOT short-circuit it.
+    expect(spawnCount()).toBe(1);
+
+    const texts = adapter.sentMessages.map((m) => m.text);
+    // No filter-block reply was posted to the principal.
+    expect(texts.some((t) => t.includes("I can't process that message"))).toBe(false);
+    expect(texts.some((t) => t.includes("Content filter blocked"))).toBe(false);
+    // The CC response (success path) was posted instead.
+    expect(texts).toContain("On it — here's the jumphost answer.");
+
+    // The match is still logged for principal visibility (cortex#723).
+    expect(
+      logLines.some(
+        (l) => l.includes("[PROMPT-FILTER]") && l.includes("home-principal"),
+      ),
+    ).toBe(true);
+
+    await handler.shutdown();
+  });
+
+  test("untrusted sender's role-play injection is still BLOCKED (posts the can't-process reply, no CC spawn)", async () => {
+    const { factory, spawnCount } = makeStubFactory([
+      successResult({ response: "should never run" }),
+    ]);
+
+    const adapter = new MockAdapter();
+    const handler = new DispatchHandler({
+      config: makeConfig(),
+      securityPreamble: "",
+      ccSessionFactory: factory,
+    });
+
+    // Same block-triggering content, but from an untrusted (non-principal)
+    // sender — a plain guild message, not a principal DM. Must stay blocked.
+    await handler.handleMessage(
+      adapter,
+      makeMsg({
+        platform: "discord",
+        authorId: "user999",
+        authorName: "Stranger",
+        content: ACT_AS_CONTENT,
+      }),
+    );
+
+    // The filter short-circuited before any CC spawn.
+    expect(spawnCount()).toBe(0);
+
+    const texts = adapter.sentMessages.map((m) => m.text);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain("I can't process that message");
+    expect(texts[0]).toContain("Content filter blocked");
+
+    await handler.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Direction A Stage 4-B (cortex#409) — publishInboundDispatchEnvelope
 //
 // Dispatch-source path. The handler publishes chat/direct dispatches as
