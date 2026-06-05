@@ -114,8 +114,10 @@ if [ "$(uname)" = "Darwin" ]; then
   # cortex#700: enumerate discovered stacks and stop each that is currently
   # registered with launchd. Replace the three hardcoded unload calls (meta-
   # factory / work and the now-removed halden gap) with a single loop driven
-  # by discover_stack_slugs. discover_stack_slugs globs cortex*.yaml so any
-  # new stack config is automatically included — no script edit required.
+  # by discover_stack_slugs. cortex#717: discover_stack_slugs is now config-
+  # split-aware (per-stack dirs win over retained root monoliths), so the
+  # recorded running-set matches what postupgrade renders + restarts. Any new
+  # stack (dir or monolith) is automatically included — no script edit needed.
   while IFS= read -r slug; do
     label="ai.meta-factory.cortex.${slug}"
     plist="${LAUNCH_DIR}/${label}.plist"

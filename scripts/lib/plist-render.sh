@@ -103,21 +103,107 @@ slug_to_config_file() {
   fi
 }
 
-# Discover all stack slugs from config files under CONFIG_DIR.
-# Prints one slug per line. Never includes the relay daemon.
+# Resolve the `--config` path a stack's plist should point at, layout-aware
+# (cortex#717 / migration 0003).
+#
+# Two layouts coexist during the config-split transition:
+#   - Directory layout: <config_dir>/<slug>/system/system.yaml exists. The
+#     plist must point at the per-stack SENTINEL <config_dir>/<slug>/<slug>.yaml
+#     (the loader resolves configDir = dirname(<sentinel>) and composes the
+#     dir). This preserves the unique cortex-<slug>.pid naming — the
+#     PID-collision lesson from migration 0003.
+#   - Legacy monolith: no per-stack dir. The plist points at the root monolith
+#     <config_dir>/cortex[.<slug>].yaml.
+#
+# Prints the absolute config path. Directory layout takes precedence.
 #
 # Args:
-#   $1 CONFIG_DIR — directory containing cortex*.yaml files
+#   $1 CONFIG_DIR — cortex config dir
+#   $2 SLUG       — stack slug
+resolve_stack_config_path() {
+  local config_dir="$1"
+  local slug="$2"
+  if [ -f "${config_dir}/${slug}/system/system.yaml" ]; then
+    # Directory layout — point at the per-stack sentinel.
+    printf '%s' "${config_dir}/${slug}/${slug}.yaml"
+  else
+    # Legacy monolith.
+    printf '%s' "${config_dir}/$(slug_to_config_file "${slug}")"
+  fi
+}
+
+# Resolve the config file the agent id should be read FROM, layout-aware.
+#
+# Under the directory layout the sentinel <slug>/<slug>.yaml is a pointer and
+# carries no agents; `agents[].id` lives in <slug>/stacks/<slug>.yaml. Under
+# the legacy monolith the agents block is in the monolith itself.
+#
+# Prints the absolute path of the file to parse for the agent id. The caller
+# must tolerate a missing file (extract_agent_name falls back to "cortex").
+#
+# Args:
+#   $1 CONFIG_DIR — cortex config dir
+#   $2 SLUG       — stack slug
+resolve_stack_agent_config_path() {
+  local config_dir="$1"
+  local slug="$2"
+  if [ -f "${config_dir}/${slug}/system/system.yaml" ]; then
+    # Directory layout — agents[].id lives in stacks/<slug>.yaml.
+    printf '%s' "${config_dir}/${slug}/stacks/${slug}.yaml"
+  else
+    # Legacy monolith.
+    printf '%s' "${config_dir}/$(slug_to_config_file "${slug}")"
+  fi
+}
+
+# Discover all stack slugs under CONFIG_DIR. Prints one slug per line, sorted,
+# deduplicated. Never includes the relay daemon.
+#
+# cortex#717 / migration 0003 — two layouts coexist during the config-split
+# transition, and a stack may appear in BOTH (the split retains the root
+# monolith as a rollback anchor):
+#
+#   1. Directory layout: a subdir <config_dir>/<slug>/ containing
+#      system/system.yaml (the directory-layout marker). slug = dir basename.
+#   2. Legacy monolith: a root <config_dir>/cortex[.<slug>].yaml file.
+#
+# Precedence: the DIRECTORY LAYOUT WINS. If <config_dir>/<slug>/ exists for a
+# slug, the retained root monolith for that same slug is ignored (not double-
+# discovered) so `arc upgrade` doesn't re-point a split stack at its monolith.
+#
+# Args:
+#   $1 CONFIG_DIR — cortex config dir
 discover_stack_slugs() {
   local config_dir="$1"
-  # Use find + sort for deterministic ordering (glob expansion order is
-  # filesystem-dependent on some macOS versions).
+
+  # Pass 1: per-stack directories (the split layout). These take precedence.
+  # Marker: <config_dir>/<slug>/system/system.yaml. slug = the dir basename
+  # (parent of system/). find + sort gives deterministic ordering (glob order
+  # is filesystem-dependent on some macOS versions).
+  local dir_slugs=""
+  local marker slug
+  while IFS= read -r marker; do
+    [ -z "${marker}" ] && continue
+    slug="$(basename "$(dirname "$(dirname "${marker}")")")"
+    dir_slugs="${dir_slugs}${slug}"$'\n'
+    printf '%s\n' "${slug}"
+  done < <(find "${config_dir}" -mindepth 3 -maxdepth 3 -path '*/system/system.yaml' 2>/dev/null | sort)
+
+  # Pass 2: legacy root monoliths. Emit a monolith's slug ONLY when no per-stack
+  # dir already claimed it (dir wins → dedupe).
+  local cfg
   while IFS= read -r cfg; do
-    local slug
+    [ -z "${cfg}" ] && continue
     if slug="$(config_file_to_slug "${cfg}")"; then
+      # Skip if a per-stack dir already emitted this slug. -F: treat the slug
+      # as a fixed string (a slug is [a-zA-Z0-9_-] so this is belt-and-braces
+      # against any regex metachar leaking through).
+      if printf '%s' "${dir_slugs}" | grep -qxF "${slug}"; then
+        continue
+      fi
       printf '%s\n' "${slug}"
     fi
-  done < <(find "${config_dir}" -maxdepth 1 -name 'cortex*.yaml' | sort)
+  done < <(find "${config_dir}" -maxdepth 1 -name 'cortex*.yaml' 2>/dev/null | sort)
 }
 
 # Render the plist for a single stack slug into LAUNCH_DIR. Idempotent —
@@ -125,13 +211,19 @@ discover_stack_slugs() {
 #
 # Slug-to-template mapping:
 #   meta-factory → src/services/ai.meta-factory.cortex.meta-factory.plist
-#                  (has __AGENT_NAME__ extracted from cortex.yaml)
+#                  (has __AGENT_NAME__ + __CONFIG_PATH__)
 #   work         → src/services/ai.meta-factory.cortex.work.plist
+#                  (has __CONFIG_PATH__)
 #   <other>      → src/services/ai.meta-factory.cortex.stack.plist
-#                  (generic template; uses __STACK_SLUG__ + __CONFIG_FILE__)
+#                  (generic template; uses __STACK_SLUG__ + __CONFIG_PATH__)
 #
-# For any slug: if the config yaml is absent the plist is removed (same
-# stale-plist guard as the original cortex#244 work-stack logic, now
+# All templates carry __CONFIG_PATH__ — the layout-aware absolute --config
+# path (cortex#717): the per-stack sentinel under the directory layout, or the
+# legacy root monolith. This is what stops `arc upgrade` reverting the
+# config-split.
+#
+# For any slug: if the resolved config yaml is absent the plist is removed
+# (same stale-plist guard as the original cortex#244 work-stack logic, now
 # generalised to all stacks).
 #
 # Args:
@@ -149,10 +241,12 @@ render_stack_plist() {
 
   local dst="${launch_dir}/ai.meta-factory.cortex.${slug}.plist"
 
-  # Derive config filename from slug via the shared inverse function.
-  local config_file
-  config_file="$(slug_to_config_file "${slug}")"
-  local config_yaml="${config_dir}/${config_file}"
+  # Resolve the layout-aware --config path (cortex#717): per-stack sentinel
+  # when the directory layout exists, else the legacy root monolith. This is
+  # the path stamped into the plist's --config arg and the path whose
+  # existence gates the stale-plist guard below.
+  local config_yaml
+  config_yaml="$(resolve_stack_config_path "${config_dir}" "${slug}")"
 
   # If the config no longer exists, remove any stale rendered plist so
   # launchd doesn't crash-loop trying to start a daemon whose --config
@@ -161,9 +255,9 @@ render_stack_plist() {
     if [ -f "${dst}" ]; then
       launchctl unload "${dst}" 2>/dev/null || true
       rm -f "${dst}"
-      echo "  ⊘ ${slug} plist removed — ${config_file} not present (stack un-scaffolded)"
+      echo "  ⊘ ${slug} plist removed — ${config_yaml} not present (stack un-scaffolded)"
     else
-      echo "  ⊘ ${slug} plist skipped — ${config_file} not present"
+      echo "  ⊘ ${slug} plist skipped — ${config_yaml} not present"
     fi
     return 0
   fi
@@ -176,14 +270,19 @@ render_stack_plist() {
         echo "  ⚠ Template missing: ${src}" >&2
         return 1
       fi
+      # Agent id lives in stacks/<slug>.yaml under the dir layout, or the
+      # monolith under the legacy layout (cortex#717).
+      local agent_config
+      agent_config="$(resolve_stack_agent_config_path "${config_dir}" "${slug}")"
       local agent_name
-      agent_name="$(extract_agent_name "${config_yaml}")" || return 1
+      agent_name="$(extract_agent_name "${agent_config}")" || return 1
       sed -e "s|__CORTEX_DIR__|${cortex_dir}|g" \
           -e "s|__BUN_PATH__|${bun_path}|g" \
           -e "s|__HOME__|${HOME}|g" \
+          -e "s|__CONFIG_PATH__|${config_yaml}|g" \
           -e "s|__AGENT_NAME__|${agent_name}|g" \
           "${src}" > "${dst}"
-      echo "  ✓ meta-factory plist rendered → ${dst} (agent=${agent_name})"
+      echo "  ✓ meta-factory plist rendered → ${dst} (agent=${agent_name}, config=${config_yaml})"
       ;;
     work)
       local src="${cortex_dir}/src/services/ai.meta-factory.cortex.work.plist"
@@ -194,8 +293,9 @@ render_stack_plist() {
       sed -e "s|__CORTEX_DIR__|${cortex_dir}|g" \
           -e "s|__BUN_PATH__|${bun_path}|g" \
           -e "s|__HOME__|${HOME}|g" \
+          -e "s|__CONFIG_PATH__|${config_yaml}|g" \
           "${src}" > "${dst}"
-      echo "  ✓ work plist rendered → ${dst}"
+      echo "  ✓ work plist rendered → ${dst} (config=${config_yaml})"
       ;;
     *)
       # Generic stack — use the parameterised stack template.
@@ -208,9 +308,9 @@ render_stack_plist() {
           -e "s|__BUN_PATH__|${bun_path}|g" \
           -e "s|__HOME__|${HOME}|g" \
           -e "s|__STACK_SLUG__|${slug}|g" \
-          -e "s|__CONFIG_FILE__|${config_file}|g" \
+          -e "s|__CONFIG_PATH__|${config_yaml}|g" \
           "${src}" > "${dst}"
-      echo "  ✓ ${slug} plist rendered → ${dst}"
+      echo "  ✓ ${slug} plist rendered → ${dst} (config=${config_yaml})"
       ;;
   esac
 }
@@ -218,14 +318,16 @@ render_stack_plist() {
 # Render plists for relay + all discovered stacks into ${LAUNCH_DIR}.
 # Idempotent — overwrites any previous render of the same filename.
 #
-# cortex#700: stacks are now discovered from cortex*.yaml globs, not a
-# hardcoded list. Adding a new stack = adding its config; no script edit
-# needed.
+# cortex#700: stacks are discovered, not a hardcoded list. cortex#717:
+# discovery is config-split-aware — per-stack dirs (<slug>/system/system.yaml)
+# take precedence over retained root monoliths, and each plist's --config
+# points at the per-stack sentinel under the dir layout. Adding a new stack =
+# adding its config (dir or monolith); no script edit needed.
 #
 # Args:
 #   $1 CORTEX_DIR  — repo root (provides plist templates under src/services/)
 #   $2 LAUNCH_DIR  — target dir (typically ${HOME}/Library/LaunchAgents)
-#   $3 CONFIG_DIR  — cortex config dir (provides cortex*.yaml for discovery)
+#   $3 CONFIG_DIR  — cortex config dir (per-stack dirs and/or cortex*.yaml)
 render_cortex_plists() {
   local cortex_dir="$1"
   local launch_dir="$2"
@@ -250,8 +352,8 @@ render_cortex_plists() {
     echo "  ✓ Relay plist rendered → ${relay_dst}"
   fi
 
-  # Stack plists — one per discovered cortex*.yaml config (cortex#700).
-  # cortex.yaml → meta-factory, cortex.{slug}.yaml → {slug}
+  # Stack plists — one per discovered stack (cortex#700 + cortex#717).
+  # Per-stack dirs (<slug>/system/system.yaml) win over root monoliths.
   local rendered_count=0
   while IFS= read -r slug; do
     render_stack_plist "${cortex_dir}" "${launch_dir}" "${config_dir}" "${slug}" "${bun_path}" || true
@@ -259,6 +361,6 @@ render_cortex_plists() {
   done < <(discover_stack_slugs "${config_dir}")
 
   if [ "${rendered_count}" -eq 0 ]; then
-    echo "  ⚠ No cortex*.yaml configs found in ${config_dir} — no stack plists rendered" >&2
+    echo "  ⚠ No stacks discovered in ${config_dir} (no per-stack dirs or cortex*.yaml) — no stack plists rendered" >&2
   fi
 }
