@@ -998,6 +998,23 @@ export async function startCortex(
   const federationConfigured =
     (options.policy?.federated?.networks ?? []).length > 0;
   const reviewFederatedSubjectPattern = `federated.${reviewPrincipalId}.${derivedStack.stack}.tasks.code-review.>`;
+  // cortex#725 (ADR 0001/0002 §2) — the FEDERATED **Direct** review pattern.
+  // pilot#149's `--reviewer {name}@{principal}/{stack}` Direct dispatch lands
+  // on `federated.{me}.{my-stack}.tasks.@{did-encoded-reviewer}.code-review.{flavor}`:
+  // the named reviewer's DID is spliced in as an `@{did}` segment AFTER `tasks.`
+  // (pilot's `deriveReviewRequestSubject`). The Offer filter above expects
+  // `code-review` in that position, so it never matches a Direct request —
+  // `pilot --reviewer name@p/s --wait` hangs (the cortex#725 gap).
+  //
+  // NATS whole-token `*` matches the entire `@{did-encoded-reviewer}` segment
+  // (same convention the LOCAL Direct dispatch uses: `local.{p}.{s}.tasks.*.>`
+  // in `dispatch-listener.ts`); the trailing literal `code-review` + `>`
+  // narrows to code-review flavors only (not every capability). The
+  // `envelope.type` of a Direct request is STILL `tasks.code-review.{flavor}`
+  // (the `@{did}` lives ONLY on the subject — myelin's `type` grammar forbids
+  // `@`), so `extractFlavor` + the whole federated consumer path work
+  // unchanged: only this extra subscription differs from the Offer path.
+  const reviewFederatedDirectSubjectPattern = `federated.${reviewPrincipalId}.${derivedStack.stack}.tasks.*.code-review.>`;
   const reviewConfig = options.bus?.review;
   const reviewStream = reviewConfig?.stream.name ?? "CODE_REVIEW";
   const reviewStreamMaxAgeNs =
@@ -1026,8 +1043,16 @@ export async function startCortex(
   // patterns, so an inbound `federated.{me}.{stack}.tasks.code-review.…`
   // request from a peer is captured by the same JetStream stream the local
   // consumer binds. A parallel federated DURABLE (per agent) binds below.
+  // cortex#725 — the Direct federated pattern joins the stream filter too, so
+  // an inbound `federated.{me}.{stack}.tasks.@{did}.code-review.…` Direct
+  // request is captured by the same CODE_REVIEW stream the Offer + local
+  // consumers bind. A parallel Direct DURABLE (per agent) binds below.
   const reviewStreamSubjects = federationConfigured
-    ? [reviewSubjectPattern, reviewFederatedSubjectPattern]
+    ? [
+        reviewSubjectPattern,
+        reviewFederatedSubjectPattern,
+        reviewFederatedDirectSubjectPattern,
+      ]
     : [reviewSubjectPattern];
 
   if (reviewJsm !== null) {
@@ -1298,47 +1323,75 @@ export async function startCortex(
       // flag). Only wired when a `federated:` policy block is declared — a
       // non-federating deployment skips this entirely (back-compat).
       if (federationConfigured) {
-        const federatedConsumer = makeConsumer(true);
-        reviewConsumers.push(federatedConsumer);
-        const federatedDurable = `cortex-review-consumer-federated-${reviewPrincipalId}-${agent.id}`;
-        if (reviewJsm !== null) {
-          try {
-            const outcome = await provisionReviewConsumer({
-              jsm: reviewJsm,
-              stream: reviewStream,
-              durable: federatedDurable,
-              maxDeliver: reviewConsumerMaxDeliver,
-            });
-            if (outcome === "created") {
-              console.log(
-                `cortex: provisioned JetStream durable "${federatedDurable}" on stream "${reviewStream}"`,
-              );
-            } else if (outcome === "updated") {
-              console.log(
-                `cortex: reconciled JetStream durable "${federatedDurable}" ack_wait (cortex#422) on stream "${reviewStream}"`,
+        // cortex#686 + cortex#725 — wire BOTH federated consumers (Offer +
+        // Direct) for this agent. They share the `makeConsumer(true)`
+        // construction (same reviewer, verifier, peers gate, verdict-back) and
+        // the SAME CODE_REVIEW stream; they differ ONLY in the subscription
+        // pattern + the durable (so Offer and Direct traffic ack independently).
+        // Factored into a closure so the two can't drift on provisioning /
+        // start / log wiring.
+        const startFederatedConsumer = async (
+          mode: "offer" | "direct",
+          pattern: string,
+          durable: string,
+        ): Promise<void> => {
+          const federatedConsumer = makeConsumer(true);
+          reviewConsumers.push(federatedConsumer);
+          if (reviewJsm !== null) {
+            try {
+              const outcome = await provisionReviewConsumer({
+                jsm: reviewJsm,
+                stream: reviewStream,
+                durable,
+                maxDeliver: reviewConsumerMaxDeliver,
+              });
+              if (outcome === "created") {
+                console.log(
+                  `cortex: provisioned JetStream durable "${durable}" on stream "${reviewStream}"`,
+                );
+              } else if (outcome === "updated") {
+                console.log(
+                  `cortex: reconciled JetStream durable "${durable}" ack_wait (cortex#422) on stream "${reviewStream}"`,
+                );
+              }
+            } catch (provisionErr) {
+              process.stderr.write(
+                `cortex: provisionReviewConsumer failed for "${durable}": ` +
+                  `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
               );
             }
-          } catch (provisionErr) {
-            process.stderr.write(
-              `cortex: provisionReviewConsumer failed for "${federatedDurable}": ` +
-                `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+          }
+          const federatedStarted = await federatedConsumer.start({
+            pattern,
+            stream: reviewStream,
+            durable,
+          });
+          if (federatedStarted.subscribed) {
+            console.log(
+              `cortex: federated review consumer (${mode}) ready for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} pattern=${pattern}`,
+            );
+          } else {
+            console.log(
+              `cortex: federated review consumer (${mode}) DORMANT for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} — cortex MyelinRuntime subscriptions disabled (federated.* code-review envelopes will not be claimed by this consumer)`,
             );
           }
-        }
-        const federatedStarted = await federatedConsumer.start({
-          pattern: reviewFederatedSubjectPattern,
-          stream: reviewStream,
-          durable: federatedDurable,
-        });
-        if (federatedStarted.subscribed) {
-          console.log(
-            `cortex: federated review consumer ready for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} pattern=${reviewFederatedSubjectPattern}`,
-          );
-        } else {
-          console.log(
-            `cortex: federated review consumer DORMANT for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} substrate=${substrate} — cortex MyelinRuntime subscriptions disabled (federated.* code-review envelopes will not be claimed by this consumer)`,
-          );
-        }
+        };
+
+        // cortex#686 (ADR 0001) — Offer: `federated.{me}.{stack}.tasks.code-review.>`.
+        await startFederatedConsumer(
+          "offer",
+          reviewFederatedSubjectPattern,
+          `cortex-review-consumer-federated-${reviewPrincipalId}-${agent.id}`,
+        );
+        // cortex#725 (ADR 0001/0002 §2) — Direct: this stack's OWN
+        // `federated.{me}.{stack}.tasks.@{did}.code-review.>` (the `@{did}` is
+        // the named reviewer/target-assistant). Routes the verdict back to the
+        // REQUESTER (from `originator.identity`) identically to the Offer path.
+        await startFederatedConsumer(
+          "direct",
+          reviewFederatedDirectSubjectPattern,
+          `cortex-review-consumer-federated-direct-${reviewPrincipalId}-${agent.id}`,
+        );
       }
     } catch (err) {
       // Per CLAUDE.md: log every error. A single agent's consumer crash
