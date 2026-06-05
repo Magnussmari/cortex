@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-0001 put `federated.{principal}.{stack}.…` on the wire and took the network **off** the wire (resolved from topology via `policy.federated.networks[].peers[]` at `selectLink`). That settled the *grammar*. It did **not** settle two application questions the cross-operator review loop hinges on:
+ADR-0001 put `federated.{principal}.{stack}.…` on the wire and took the network **off** the wire (resolved from topology via `policy.federated.networks[].peers[]` at `selectLink`). That settled the *grammar*. It did **not** settle two application questions the cross-principal review loop hinges on:
 
 1. **How does a cross-principal REQUEST address the TARGET** when `myelin.deriveNatsSubject` builds the subject's `{principal}.{stack}` from **`envelope.source`'s first segments**, and the receiver subscribes to `federated.{its-own-principal}.{its-stack}.…`?
 2. **How is the REQUESTER carried** so the target can route the verdict **back** to the right principal?
