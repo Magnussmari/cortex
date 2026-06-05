@@ -65,8 +65,12 @@
  */
 
 import type { ConsumerMessages, JsMsg } from "nats";
+import { deriveSubject } from "@the-metafactory/myelin/subjects";
 import type { MyelinRuntime } from "./myelin/runtime";
 import type { Envelope } from "./myelin/envelope-validator";
+import { getActorPrincipal } from "./myelin/envelope-validator";
+import { resolveSourceNetwork } from "./surface-router";
+import type { PolicyFederatedNetwork } from "../common/types/cortex-config";
 import type { MyelinSubscriber } from "./myelin/subscriber";
 import type { AckDecision } from "./myelin/subscriber";
 import {
@@ -227,10 +231,77 @@ export interface ReviewConsumerOpts {
    */
   signatureVerifier?: SignatureVerifier;
   /**
+   * cortex#686 (ADR 0002) — FEDERATED routing mode. When `true`, the consumer
+   * treats every inbound envelope as a cross-principal (federated) review
+   * request and routes ALL emitted lifecycle + verdict envelopes back to the
+   * REQUESTER's identity on the conformant `federated.{requester-principal}.
+   * {requester-stack}.…` grammar, instead of the consumer's own
+   * `local.{my-principal}.{my-stack}.…`.
+   *
+   * **The requester is decoded from `envelope.originator.identity`** (the
+   * `did:mf:{requester-principal}-{requester-stack}` DID form per ADR 0002 §1) —
+   * NOT from the inbound subject (whose `{principal}.{stack}` segments address
+   * the TARGET = this receiving stack, per ADR 0001), and NOT from
+   * `envelope.source` (which also addresses the target). Reading the requester
+   * off the subject — as cortex#715 originally did — routes every verdict to
+   * SELF and the loop never closes (the cortex#686 BLOCKER this rework fixes).
+   *
+   * The emitted envelopes are stamped `classification: "federated"` and
+   * published via {@link MyelinRuntime.publishOnSubject} on the requester-keyed
+   * subject; the runtime's `selectLink` resolves the requester principal → leaf
+   * from the `peers[]` topology. This is the cortex receiver that closes the
+   * cross-principal review loop so the peer's `pilot --wait` resolves.
+   *
+   * Default `false` → the existing local-consumer behaviour (publish via
+   * `runtime.publish`, deriving `local.{my-principal}.{my-stack}.…`),
+   * byte-for-byte unchanged.
+   */
+  federated?: boolean;
+  /**
+   * cortex#686 (ADR 0002 §5) — the federation peer topology, used by the
+   * defense-in-depth `peers[]` membership gate the federated consumer runs
+   * BEFORE spawning the reviewer. Resolved from
+   * `policy.federated.networks[]` at boot. The gate resolves the REQUESTER
+   * principal (from `originator.identity`) against these networks' `peers[]`
+   * and fails closed (deny + drop, no CC spawn, no publish) when the requester
+   * is not a configured peer.
+   *
+   * Under `signing: off` this membership check is the application-layer trust
+   * boundary; under `enforce` the `signed_by` chain + the (signed) originator
+   * field add the crypto check on top. Empty / undefined → no live federated
+   * traffic is admitted (a federated consumer with no declared peers denies
+   * every requester — fail closed), but in practice the consumer is only wired
+   * with `federated: true` when at least one network is configured (see
+   * `src/cortex.ts` `federationConfigured`).
+   *
+   * Only consulted in federated mode; ignored on the local path.
+   */
+  federatedNetworks?: readonly PolicyFederatedNetwork[];
+  /**
    * Test seam — clock. Defaults to `() => new Date()`. Tests inject a
    * fixed clock so emitted `startedAt`/`completedAt` are deterministic.
    */
   clock?: () => Date;
+}
+
+/**
+ * cortex#686 (ADR 0002) — the requester's `{principal}.{stack}` identity,
+ * decoded from the inbound envelope's `originator.identity` DID (the
+ * `did:mf:{requester-principal}-{requester-stack}` form = `stack.id` with
+ * `/`→`-`). The federated consumer keys every verdict + lifecycle envelope it
+ * routes back to this identity so the peer's `pilot --wait` (subscribed on
+ * `federated.{its-principal}.{its-stack}.review.verdict.>`) resolves.
+ *
+ * The requester is the policy actor in `originator`, NOT the subject (which
+ * addresses the TARGET) — see {@link parseRequesterFromOriginator}.
+ */
+export interface FederatedRequester {
+  /** Requester principal — the DID body segment BEFORE the FIRST `-`
+   *  (principals carry no hyphen). */
+  principal: string;
+  /** Requester stack — the DID body segment AFTER the first `-` (may itself
+   *  contain hyphens, e.g. `meta-factory`). */
+  stack?: string;
 }
 
 /**
@@ -314,6 +385,14 @@ export class ReviewConsumer {
   ) => Promise<ReviewPipelineResult>;
   /** Optional inbound signature verifier (cortex#327). Undefined disables the gate. */
   private readonly signatureVerifier: SignatureVerifier | undefined;
+  /** cortex#686 — federated routing mode (verdict back to the requester). */
+  private readonly federated: boolean;
+  /**
+   * cortex#686 (ADR 0002 §5) — federation peer topology indexed by network id,
+   * for the `peers[]` membership gate. Empty in local mode / when no networks
+   * are configured.
+   */
+  private readonly federatedNetworksById: Map<string, PolicyFederatedNetwork>;
   private readonly clock: () => Date;
 
   /** Promises for in-flight pipelines so `stop()` can drain. */
@@ -339,6 +418,14 @@ export class ReviewConsumer {
     }
     this.pipelineRunner = opts.pipelineRunner ?? runReviewPipeline;
     this.signatureVerifier = opts.signatureVerifier;
+    this.federated = opts.federated ?? false;
+    // cortex#686 (ADR 0002 §5) — index the peer topology by network id once at
+    // construction so the consumer-path gate is O(networks) per envelope. Built
+    // even in local mode (cheap, empty); only consulted when `federated`.
+    this.federatedNetworksById = new Map<string, PolicyFederatedNetwork>();
+    for (const network of opts.federatedNetworks ?? []) {
+      this.federatedNetworksById.set(network.id, network);
+    }
     this.clock = opts.clock ?? (() => new Date());
 
     this.flavors = deriveFlavors(opts.agent.capabilities);
@@ -441,6 +528,54 @@ export class ReviewConsumer {
     // envelopes (the verdict still reaches pilot via correlation_id).
     const responseRouting = readLogicalResponseRouting(envelope) ?? undefined;
 
+    // cortex#686 (ADR 0002) — in federated mode, derive the REQUESTER
+    // `{principal}.{stack}` from the inbound envelope's `originator.identity`
+    // ONCE so every emitted envelope routes back to the requester on the
+    // conformant `federated.{requester}.{stack}.…` grammar.
+    //
+    // The requester is the POLICY ACTOR in `originator`, NOT the subject: under
+    // ADR 0001 the subject's `{principal}.{stack}` segments address the TARGET
+    // (this receiving stack), and `envelope.source` likewise addresses the
+    // target. Reading the requester off the subject (the cortex#715 BLOCKER)
+    // routes every verdict to SELF and the loop never closes.
+    //
+    // `undefined` in local mode, OR (in federated mode) when
+    // `originator.identity` is absent / malformed. An un-attributable federated
+    // request is DENIED + DROPPED by the gate below (we never even reach
+    // `safePublish`); the `safePublish` local fall-through remains the
+    // belt-and-braces backstop for the non-denied path against a runtime that
+    // lacks `publishOnSubject` (a disabled runtime / legacy stub — never a live
+    // wire), so a verdict is never guessed onto a cross-principal target.
+    const requester = this.federated
+      ? parseRequesterFromOriginator(envelope)
+      : undefined;
+
+    // cortex#686 (ADR 0002 §5) — defense-in-depth `peers[]` gate ON THE CONSUMER
+    // PATH. Run the membership check BEFORE spawning the reviewer or emitting
+    // anything: the requester principal MUST be a configured peer in some
+    // `policy.federated.networks[].peers[]`. A non-peer requester (or a
+    // federated request with no resolvable requester) is DENIED and DROPPED —
+    // no CC subprocess, no verdict, no lifecycle envelope. Under `signing: off`
+    // this membership check is the application-layer trust boundary; under
+    // `enforce` the signed_by chain + signed originator add the crypto check.
+    if (this.federated) {
+      const denyReason = this.federatedRequesterDenyReason(requester);
+      if (denyReason !== null) {
+        process.stderr.write(
+          `cortex/review-consumer: federated request DENIED (dropped) for ` +
+            `agent="${this.agent.id}" subject=${subject} envelope=${envelope.id} — ${denyReason}\n`,
+        );
+        // Term so JetStream removes the message (permanent — a non-peer
+        // requester won't become a peer on redelivery) WITHOUT emitting any
+        // verdict/lifecycle envelope to a principal we don't trust.
+        return { kind: "term", reason: `federated requester denied: ${denyReason}` };
+      }
+    }
+
+    // Stamp federated sovereignty on every emitted envelope so the wire is
+    // self-consistent with the `federated.*` subject it lands on.
+    const classification = requester !== undefined ? "federated" : undefined;
+
     const deliveryCount = redeliveryCountFrom(msg);
     if (deliveryCount > 1) {
       await this.safePublish(
@@ -453,8 +588,10 @@ export class ReviewConsumer {
           abortedAt: this.clock(),
           reason: `redelivery (attempt ${deliveryCount})`,
           ...(responseRouting !== undefined && { responseRouting }),
+          ...(classification !== undefined && { classification }),
         }),
         "dispatch.task.aborted",
+        requester,
       );
       // Note: we continue with pipeline processing. The aborted envelope
       // is advisory; the pipeline's terminal envelope (verdict/failed)
@@ -472,6 +609,7 @@ export class ReviewConsumer {
         },
         `unrecognised review subject: ${subject}`,
         responseRouting,
+        requester,
       );
       return { kind: "term", reason: "non-review subject" };
     }
@@ -487,6 +625,7 @@ export class ReviewConsumer {
         },
         `bad payload for ${subject}`,
         responseRouting,
+        requester,
       );
       return { kind: "term", reason: "payload validation failed" };
     }
@@ -525,6 +664,7 @@ export class ReviewConsumer {
           { kind: "cant_do", detail: failureDetail },
           `chain verification failed for ${subject}`,
           responseRouting,
+          requester,
         );
         return { kind: "term", reason: failureDetail };
       }
@@ -542,6 +682,7 @@ export class ReviewConsumer {
         },
         `no capability match for code-review.${flavor}`,
         responseRouting,
+        requester,
       );
       return { kind: "term", reason: "no capability match" };
     }
@@ -564,6 +705,7 @@ export class ReviewConsumer {
         },
         "review consumer at maxConcurrent",
         responseRouting,
+        requester,
       );
       return { kind: "nak", delayMs: retryAfterMs };
     }
@@ -579,8 +721,10 @@ export class ReviewConsumer {
         correlationId: envelope.id,
         startedAt,
         ...(responseRouting !== undefined && { responseRouting }),
+        ...(classification !== undefined && { classification }),
       }),
       "dispatch.task.started",
+      requester,
     );
 
     // 6. Run the pipeline. Track the promise for `stop()` drain.
@@ -589,6 +733,7 @@ export class ReviewConsumer {
       payload,
       startedAt,
       responseRouting,
+      requester,
     );
     const tracked: Promise<{ decision: AckDecision }> = pipelinePromise.then(
       (decision) => ({ decision }),
@@ -642,6 +787,44 @@ export class ReviewConsumer {
   // Internals
   // -------------------------------------------------------------------------
 
+  /**
+   * cortex#686 (ADR 0002 §5) — the federated `peers[]` membership gate.
+   * Returns a human-readable deny reason when the inbound federated request
+   * must be DROPPED, or `null` when it may proceed to the reviewer.
+   *
+   * Deny when:
+   *   1. No requester could be derived from `originator.identity` (absent /
+   *      malformed) — we can't name (or trust) the cross-principal source, so
+   *      fail closed. (`safePublish` would already fall back to the local path,
+   *      but a federated consumer must not even spawn the reviewer for an
+   *      un-attributable request.)
+   *   2. The requester is THIS receiving stack's own principal — a self-loop
+   *      (an envelope that named us as the requester). Drop rather than review
+   *      our own request and route the verdict to ourselves.
+   *   3. The requester principal resolves to NO configured network's `peers[]`
+   *      — an unknown / untrusted peer.
+   *
+   * Pure-ish (reads only `this.*` config + the argument); no side effects.
+   */
+  private federatedRequesterDenyReason(
+    requester: FederatedRequester | undefined,
+  ): string | null {
+    if (requester === undefined) {
+      return "no requester in originator.identity (absent or malformed)";
+    }
+    if (requester.principal === this.source.principal) {
+      return `self-loop: requester principal "${requester.principal}" is this receiving stack`;
+    }
+    const resolved = resolveSourceNetwork(
+      requester.principal,
+      this.federatedNetworksById,
+    );
+    if (resolved === undefined) {
+      return `requester principal "${requester.principal}" is in no configured network's peers[]`;
+    }
+    return null;
+  }
+
   /** Capability claim: exact `code-review.<flavor>` or generic `code-review`. */
   private claims(flavor: string): boolean {
     const exact = `code-review.${flavor}`;
@@ -667,7 +850,12 @@ export class ReviewConsumer {
     payload: ReviewRequestPayload,
     startedAt: Date,
     responseRouting?: LogicalResponseRouting,
+    requester?: FederatedRequester,
   ): Promise<AckDecision> {
+    // cortex#686 — federated mode stamps every emitted envelope with federated
+    // sovereignty so the wire is self-consistent with the requester-keyed
+    // `federated.*` subject `safePublish` routes it on.
+    const classification = requester !== undefined ? "federated" : undefined;
     if (this.stopped) {
       // Mid-shutdown: don't start new pipeline runs. Nak with a 0 hint
       // so the survivor (or the next boot) picks it up. We still publish
@@ -681,6 +869,7 @@ export class ReviewConsumer {
         },
         "consumer shutting down before pipeline start",
         responseRouting,
+        requester,
       );
       return { kind: "nak", delayMs: 0 };
     }
@@ -702,6 +891,9 @@ export class ReviewConsumer {
         // cortex#502 — pass the logical routing into the pipeline so the
         // verdict + failed terminal envelopes it builds carry it.
         ...(responseRouting !== undefined && { responseRouting }),
+        // cortex#686 — federated reviews stamp the pipeline's terminal
+        // (verdict/failed) envelopes with federated sovereignty.
+        ...(classification !== undefined && { classification }),
         // cortex#361 — attach a bus-side heartbeat ticker to the CC
         // session so `system.agent.heartbeat` envelopes flow while the
         // review is in flight. The hook keeps `runtime.publish` calls
@@ -727,6 +919,8 @@ export class ReviewConsumer {
           retry_after_ms: 0,
         },
         `pipeline runner threw: ${detail}`,
+        responseRouting,
+        requester,
       );
       return { kind: "nak", delayMs: 0 };
     }
@@ -735,7 +929,7 @@ export class ReviewConsumer {
       // §8.2 — verdict FIRST, then dispatch.task.completed. Pilot's
       // "first matching event wins" treats the verdict as the primary
       // signal and `completed` as the crash-resilience close.
-      await this.safePublish(result.envelope, "review.verdict.*");
+      await this.safePublish(result.envelope, "review.verdict.*", requester);
       await this.safePublish(
         createDispatchTaskCompletedEvent({
           source: this.source,
@@ -746,8 +940,10 @@ export class ReviewConsumer {
           completedAt: this.clock(),
           resultSummary: extractSummary(result.envelope),
           ...(responseRouting !== undefined && { responseRouting }),
+          ...(classification !== undefined && { classification }),
         }),
         "dispatch.task.completed",
+        requester,
       );
       return { kind: "ack" };
     }
@@ -775,15 +971,17 @@ export class ReviewConsumer {
           resultSummary: firstLine(result.presentation),
           chatResponse: result.presentation,
           ...(responseRouting !== undefined && { responseRouting }),
+          ...(classification !== undefined && { classification }),
         }),
         "dispatch.task.completed",
+        requester,
       );
       return { kind: "ack" };
     }
 
     // result.kind === "failed" — publish the failed envelope and pick
     // the JetStream control per the four-way nak taxonomy (§7).
-    await this.safePublish(result.envelope, "dispatch.task.failed");
+    await this.safePublish(result.envelope, "dispatch.task.failed", requester);
     return failedReasonToAckDecision(reasonOf(result.envelope));
   }
 
@@ -801,8 +999,12 @@ export class ReviewConsumer {
     reason: DispatchTaskFailedReason,
     errorSummary: string,
     responseRouting?: LogicalResponseRouting,
+    requester?: FederatedRequester,
   ): Promise<void> {
     const now = this.clock();
+    // cortex#686 — federated failures declare federated sovereignty so they
+    // route back to the requester self-consistently with the subject.
+    const classification = requester !== undefined ? "federated" : undefined;
     const failed = createReviewTaskFailedEvent({
       source: this.source,
       taskId: crypto.randomUUID(),
@@ -816,8 +1018,9 @@ export class ReviewConsumer {
       // failures (bad subject/payload, no capability, backpressure) still
       // render to the originating thread.
       ...(responseRouting !== undefined && { responseRouting }),
+      ...(classification !== undefined && { classification }),
     });
-    await this.safePublish(failed, "dispatch.task.failed");
+    await this.safePublish(failed, "dispatch.task.failed", requester);
   }
 
   /**
@@ -834,20 +1037,54 @@ export class ReviewConsumer {
    *
    * **SINGLE PUBLISH PATH (cortex#340).** Every lifecycle + verdict
    * envelope ReviewConsumer emits routes through this method —
-   * `runtime.publish` is the only legitimate exit. Adding a direct
+   * `runtime.publish` (local) or `runtime.publishOnSubject` (federated, since
+   * cortex#686) are the only legitimate exits. Adding a direct
    * `link.publish` or `nc.publish` call would bypass the error trap
    * AND the recording-runtime test fixture, both of which we rely on
    * for the publish-routing audit covered by parametric tests in
    * `__tests__/review-consumer.test.ts`. If a future feature needs a
    * publish from inside this class, extend `safePublish` rather than
    * introducing a sibling path.
+   *
+   * cortex#686 — when `requester` is supplied (federated mode), the envelope
+   * is published on the REQUESTER-keyed `federated.{requester-principal}.
+   * {requester-stack}.{type}` subject via {@link MyelinRuntime.publishOnSubject}
+   * (deriving the subject from `envelope.type` + the requester identity decoded
+   * from the `did:mf:{principal}-{stack}` originator DID). The
+   * runtime's `selectLink` resolves the requester principal → leaf from the
+   * `peers[]` topology so the verdict reaches the peer stack's
+   * `pilot --wait`. Absent `requester` → the unchanged local
+   * `runtime.publish` path (derives `local.{my-principal}.{my-stack}.…`).
    */
   private async safePublish(
     envelope: Envelope,
     label: string,
+    requester?: FederatedRequester,
   ): Promise<void> {
     try {
-      await this.runtime.publish(envelope);
+      if (requester !== undefined && this.runtime.publishOnSubject !== undefined) {
+        // ADR 0001 — federated subject carries the REQUESTER's identity
+        // (`{principal}.{stack}`), NEVER a network id. `deriveSubject` builds
+        // the same `{principal}.{stack}` grammar as `local.*`, only the scope
+        // prefix differs; routing (which leaf) is resolved from topology by
+        // `selectLink`, not from the wire.
+        const subject = deriveSubject(
+          "federated",
+          requester.principal,
+          envelope.type,
+          requester.stack,
+        );
+        await this.runtime.publishOnSubject(envelope, subject);
+      } else {
+        // Local mode, OR federated mode against a runtime that doesn't ship
+        // `publishOnSubject`. The latter only happens on a DISABLED runtime
+        // (its `publish` is itself a no-op) or a legacy test stub — in both
+        // cases falling through here cannot misroute a live federated verdict
+        // onto a local subject, because no live publish occurs. Every
+        // production (enabled) runtime ships `publishOnSubject`, so federated
+        // mode always takes the branch above on the wire.
+        await this.runtime.publish(envelope);
+      }
     } catch (err) {
       process.stderr.write(
         `review-consumer: publish failed for ${label} (agent=${this.agent.id}): ` +
@@ -930,6 +1167,81 @@ export function extractFlavor(envelope: Envelope, _subject: string): string | nu
   const flavor = t.slice("tasks.code-review.".length);
   if (flavor.length === 0 || flavor.includes(".")) return null;
   return flavor;
+}
+
+/**
+ * cortex#686 (ADR 0002 §1+§3) — decode the REQUESTER's `{principal}.{stack}`
+ * identity from an inbound FEDERATED review-request envelope's
+ * `originator.identity` DID.
+ *
+ * **Why `originator`, not the subject or `source`.** Under ADR 0001 a federated
+ * subject is `federated.{TARGET-principal}.{TARGET-stack}.tasks.code-review.…`
+ * and `deriveNatsSubject` derives that from `envelope.source` — so BOTH the
+ * subject's `{principal}.{stack}` segments AND `envelope.source` address the
+ * TARGET (this receiving stack), not the requester. Reading the requester off
+ * either routes the verdict to SELF and the loop never closes (the cortex#715
+ * BLOCKER). ADR 0002 §1 carries the requester in `originator.identity` —
+ * "who the signer is acting on behalf of" — a signed/signable field.
+ *
+ * **Format (ADR 0002 §1, §3): `originator.identity = did:mf:{requester-principal}-{requester-stack}`.**
+ * This is the requester stack's canonical signing-DID — exactly `stack.id` with
+ * `/`→`-` (cortex `src/cortex.ts:483`: `did:mf:${stack.id.replace("/","-")}`).
+ * It is NOT a bare `{principal}/{stack}` slash form: myelin validates
+ * `originator.identity` against the `did:mf:<name>` DID grammar, which rejects
+ * `/`. The encoder is pilot's `encodeRequesterDid` (pilot#149,
+ * `src/bus/publish-review-request.ts`): `did:mf:${principal}-${stack}`; this
+ * decoder is its EXACT inverse (lockstep — pilot#149 ↔ cortex#686).
+ *
+ * **Decode:** require a `did:mf:` prefix, strip it, then split the remainder on
+ * the FIRST `-` into `{principal, stack}`. The first-hyphen split rests on the
+ * **principal-carries-no-hyphen assumption**: a principal segment is a single
+ * `^[a-z][a-z0-9]*$`-style token, while a STACK may itself contain hyphens
+ * (e.g. `meta-factory`). So `did:mf:andreas-meta-factory` decodes to principal
+ * `andreas` / stack `meta-factory` — the first hyphen separates the two; every
+ * later hyphen belongs to the stack. (A principal with a hyphen would be
+ * indistinguishable from a stack boundary; the wire grammar forbids it.)
+ *
+ * Returns `undefined` (→ deny + drop) when there is no `originator` block, the
+ * identity is empty, it lacks the `did:mf:` prefix, or the post-prefix body
+ * carries no `-` to split principal from stack. The federated consumer then
+ * DENIES + DROPS the request (an un-attributable / non-conformant cross-principal
+ * source is never reviewed; see {@link ReviewConsumer.federatedRequesterDenyReason}).
+ * The bare slash form is NOT accepted — only the DID form is on the wire.
+ *
+ * Exported for the review-consumer tests.
+ */
+export function parseRequesterFromOriginator(
+  envelope: Envelope,
+): FederatedRequester | undefined {
+  // getActorPrincipal precedence: originator.identity → originator.principal
+  // (deprecated dual-read) → signed_by[0].identity. For a federated dispatch
+  // the requester is the originator; the signed_by[0] fallback is the relaying
+  // stack, which for a self-signed cross-principal hop is also the requester
+  // stack — but we require the originator block to be present so an un-stamped
+  // envelope fails closed rather than borrowing the signer as the requester.
+  if (envelope.originator === undefined) return undefined;
+  const raw = getActorPrincipal(envelope);
+  if (raw === undefined || raw.length === 0) return undefined;
+
+  // Require the `did:mf:` method prefix — the wire carries the DID form, never
+  // a bare slash form (myelin's DID grammar rejects `/`). Fail closed otherwise.
+  const PREFIX = "did:mf:";
+  if (!raw.startsWith(PREFIX)) return undefined;
+  const body = raw.slice(PREFIX.length);
+
+  // Split on the FIRST hyphen: principal (no hyphen) | stack (may contain
+  // hyphens). `did:mf:andreas-meta-factory` → principal `andreas`, stack
+  // `meta-factory`. The exact inverse of pilot's
+  // `encodeRequesterDid` = `did:mf:${principal}-${stack}` (= stack.id `/`→`-`).
+  const hyphen = body.indexOf("-");
+  if (hyphen <= 0 || hyphen === body.length - 1) {
+    // No hyphen, leading hyphen, or trailing hyphen → can't split an
+    // unambiguous {principal}-{stack}. Fail closed.
+    return undefined;
+  }
+  const principal = body.slice(0, hyphen);
+  const stack = body.slice(hyphen + 1);
+  return { principal, stack };
 }
 
 /**

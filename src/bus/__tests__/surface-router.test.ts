@@ -1432,11 +1432,24 @@ function makeSignedByChain(principals: string[]): SignedBy[] {
   }));
 }
 
+// cortex#686 (ADR 0001) — the source network is now resolved from the SOURCE
+// PRINCIPAL's `peers[]` membership, not a subject segment. `makeFederatedEnvelope`
+// signs from source `metafactory.pilot.local` (principal `metafactory`), so the
+// default network lists `metafactory` as a configured peer — the resolution that
+// the gate now keys on.
+const FED_PEER_PUBKEY = "U" + "A".repeat(55); // 56-char U-prefixed base32 NKey.
+
 function makeNetwork(overrides: Partial<PolicyFederatedNetwork> = {}): PolicyFederatedNetwork {
   return {
     id: "research-collab",
     leaf_node: "leaf-research",
-    peers: [],
+    peers: [
+      {
+        principal_id: "metafactory",
+        stack_id: "metafactory/meta-factory",
+        principal_pubkey: FED_PEER_PUBKEY,
+      },
+    ],
     accept_subjects: ["federated.research-collab.tasks.code-review.>"],
     deny_subjects: [],
     announce_capabilities: [],
@@ -1521,34 +1534,49 @@ describe("evaluateFederationGate — deny-list precedence", () => {
   });
 });
 
-describe("evaluateFederationGate — unknown network", () => {
-  test("no network entry → peer_not_in_accept_list with unknown_network: true", () => {
+describe("evaluateFederationGate — ADR 0001 source-principal resolution (cortex#686)", () => {
+  test("source principal in a configured network's peers[] → resolves + allows on accept-list match", () => {
+    // Source `metafactory` is a peer of `research-collab`; the subject targets
+    // this stack (`andreas/meta-factory`) and matches the accept-list pattern.
     const decision = evaluateFederationGate(
-      "federated.unknown-net.tasks.x",
+      "federated.andreas.meta-factory.tasks.code-review.typescript",
       makeFederatedEnvelope(),
+      networksMap([
+        makeNetwork({
+          accept_subjects: ["federated.andreas.meta-factory.tasks.code-review.>"],
+        }),
+      ]),
+    );
+    expect(decision).toBe("allow");
+  });
+
+  test("source principal in NO configured network's peers[] → peer_not_in_accept_list (unknown_network, sentinel=source principal)", () => {
+    const decision = evaluateFederationGate(
+      "federated.andreas.meta-factory.tasks.code-review.ts",
+      makeFederatedEnvelope({ source: "stranger.pilot.local" }),
       networksMap([makeNetwork()]),
     );
     expect(decision).toEqual({
       kind: "peer_not_in_accept_list",
-      networkId: "unknown-net",
+      networkId: "stranger", // the unresolved SOURCE PRINCIPAL, not a subject segment.
       unknown_network: true,
     });
   });
 
-  test("empty networks map → unknown_network for every federated subject", () => {
+  test("empty networks map → unknown_network for every federated subject (source resolves to nothing)", () => {
     const decision = evaluateFederationGate(
-      "federated.research-collab.tasks.code-review.ts",
+      "federated.andreas.meta-factory.tasks.code-review.ts",
       makeFederatedEnvelope(),
       new Map(),
     );
     expect(decision).toEqual({
       kind: "peer_not_in_accept_list",
-      networkId: "research-collab",
+      networkId: "metafactory", // the unresolved source principal.
       unknown_network: true,
     });
   });
 
-  test("malformed subject (no network id segment) → unknown_network with <malformed> sentinel", () => {
+  test("malformed subject (no target/stack segment) → unknown_network with <malformed> sentinel", () => {
     const decision = evaluateFederationGate(
       "federated.",
       makeFederatedEnvelope(),
@@ -1815,7 +1843,7 @@ describe("createSurfaceRouter — D.2 federation gating end-to-end", () => {
     expect(published).toHaveLength(0);
   });
 
-  test("unknown network id in subject → denied with unknown_network: true", async () => {
+  test("source principal not a configured peer → denied with unknown_network: true (ADR 0001)", async () => {
     const { runtime, published } = fakeRuntimeWithPublishLog();
     const router = createSurfaceRouter(runtime, {
       systemEventSource: TEST_SYSTEM_EVENT_SOURCE,
@@ -1827,9 +1855,12 @@ describe("createSurfaceRouter — D.2 federation gating end-to-end", () => {
     });
     router.register(a.adapter);
 
+    // Source `stranger` is in no configured network's peers[] → the gate
+    // can't resolve a source network and denies as unknown_network, carrying
+    // the unresolved SOURCE PRINCIPAL (not a subject segment) as the sentinel.
     await router.dispatch(
-      makeFederatedEnvelope({ type: "tasks.x" }),
-      "federated.some-other-net.tasks.x",
+      makeFederatedEnvelope({ type: "tasks.x", source: "stranger.pilot.local" }),
+      "federated.andreas.meta-factory.tasks.x",
     );
 
     expect(a.calls).toHaveLength(0);
@@ -1837,7 +1868,7 @@ describe("createSurfaceRouter — D.2 federation gating end-to-end", () => {
     expect(published).toHaveLength(1);
     expect(published[0]?.payload).toMatchObject({
       reason: { kind: "peer_not_in_accept_list", unknown_network: true },
-      network_id: "some-other-net",
+      network_id: "stranger",
     });
   });
 

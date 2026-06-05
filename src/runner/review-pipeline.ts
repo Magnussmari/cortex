@@ -75,7 +75,7 @@
  * consumer.
  */
 
-import type { Envelope } from "../bus/myelin/envelope-validator";
+import type { Classification, Envelope } from "../bus/myelin/envelope-validator";
 import {
   createReviewTaskFailedEvent,
   createReviewVerdictEvent,
@@ -228,6 +228,16 @@ export interface ReviewPipelineOpts {
    * (pilot-only / bus-peer / Offer path unchanged).
    */
   responseRouting?: AnyResponseRouting;
+  /**
+   * cortex#686 — sovereignty classification for the terminal envelopes the
+   * pipeline builds (`review.verdict.<kind>` + `dispatch.task.failed`).
+   * Defaults to `"local"` (the local review-consumer path, unchanged). The
+   * FEDERATED review consumer sets `"federated"` so the verdict + failed
+   * envelopes it routes back to a cross-principal requester declare federated
+   * sovereignty self-consistently with the `federated.*` subject they publish
+   * on. Threaded into both builders verbatim; the pipeline never inspects it.
+   */
+  classification?: Classification;
   /**
    * cortex#361 — optional lifecycle hook fired after the CC session is
    * constructed + `start()` is called, before `wait()` resolves. The
@@ -472,6 +482,10 @@ export async function runReviewPipeline(
       ...(opts.responseRouting !== undefined && {
         responseRouting: opts.responseRouting,
       }),
+      // cortex#686 — federated verdict declares federated sovereignty.
+      ...(opts.classification !== undefined && {
+        classification: opts.classification,
+      }),
       payload,
     });
   } catch (err) {
@@ -526,6 +540,10 @@ function failed(
     // review sink can render the error to the originating thread.
     ...(opts.responseRouting !== undefined && {
       responseRouting: opts.responseRouting,
+    }),
+    // cortex#686 — federated failed terminal declares federated sovereignty.
+    ...(opts.classification !== undefined && {
+      classification: opts.classification,
     }),
   });
   return { kind: "failed", envelope };
