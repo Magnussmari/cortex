@@ -9,7 +9,7 @@
         <string>__HOME__/bin/cortex</string>
         <string>start</string>
         <string>--config</string>
-        <string>__HOME__/.config/cortex/cortex.work.yaml</string>
+        <string>__CONFIG_PATH__</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__CORTEX_DIR__</string>

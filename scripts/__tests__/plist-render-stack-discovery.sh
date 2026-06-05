@@ -271,6 +271,136 @@ else
   printf '  ⊘ render_cortex_plists integration test skipped (non-Darwin host)\n'
 fi
 
+# ─── Section 8: config-split (directory layout) — cortex#717 ─────
+printf '\n=== config-split layout: discovery + render (cortex#717) ===\n'
+
+# Build a config dir that mirrors TONIGHT'S LIVE STATE after migration 0003:
+#   - per-stack dirs (meta-factory/, work/, halden/) each with
+#     system/system.yaml + a <slug>.yaml sentinel + stacks/<slug>.yaml
+#   - retained root monoliths (cortex.yaml, cortex.work.yaml,
+#     cortex.halden.yaml) left as rollback anchors.
+# Expected: discover {meta-factory, work, halden} from the DIRS (not doubled),
+# the root monoliths IGNORED, and each plist --config = the per-stack sentinel.
+SPLIT_DIR="${TMPBASE}/split-config"
+SPLIT_LAUNCH="${TMPBASE}/split-LaunchAgents"
+mkdir -p "${SPLIT_LAUNCH}"
+
+for s in meta-factory work halden; do
+  mkdir -p "${SPLIT_DIR}/${s}/system" "${SPLIT_DIR}/${s}/stacks"
+  # Directory-layout marker.
+  cat > "${SPLIT_DIR}/${s}/system/system.yaml" <<EOF
+nats:
+  url: nats://127.0.0.1:4222
+EOF
+  # Per-stack sentinel (pointer; loader resolves dir = dirname).
+  printf '' > "${SPLIT_DIR}/${s}/${s}.yaml"
+  # The composed stack file — carries stack.id + agents[].id.
+  cat > "${SPLIT_DIR}/${s}/stacks/${s}.yaml" <<EOF
+stack:
+  id: andreas/${s}
+agents:
+  - id: agent-${s}
+    token: "fake"
+EOF
+done
+
+# Retained root monoliths (rollback anchors) — MUST be ignored.
+printf 'agents:\n  - id: monolith-agent\n' > "${SPLIT_DIR}/cortex.yaml"
+printf 'agents:\n  - id: monolith-agent\n' > "${SPLIT_DIR}/cortex.work.yaml"
+printf 'agents:\n  - id: monolith-agent\n' > "${SPLIT_DIR}/cortex.halden.yaml"
+
+# --- discovery: exactly the three dir slugs, monoliths deduped away ---
+SPLIT_SLUGS="$(discover_stack_slugs "${SPLIT_DIR}")"
+assert_contains "split: discovers meta-factory (from dir)" "meta-factory" "${SPLIT_SLUGS}"
+assert_contains "split: discovers work (from dir)" "work" "${SPLIT_SLUGS}"
+assert_contains "split: discovers halden (from dir)" "halden" "${SPLIT_SLUGS}"
+SPLIT_COUNT="$(discover_stack_slugs "${SPLIT_DIR}" | wc -l | tr -d ' ')"
+assert_eq "split: 3 dirs + 3 monoliths → 3 slugs (not doubled)" "3" "${SPLIT_COUNT}"
+
+# --- resolve_stack_config_path: per-stack sentinel, NOT the monolith ---
+assert_eq "split: meta-factory --config = dir sentinel" \
+  "${SPLIT_DIR}/meta-factory/meta-factory.yaml" \
+  "$(resolve_stack_config_path "${SPLIT_DIR}" "meta-factory")"
+assert_eq "split: work --config = dir sentinel" \
+  "${SPLIT_DIR}/work/work.yaml" \
+  "$(resolve_stack_config_path "${SPLIT_DIR}" "work")"
+assert_eq "split: halden --config = dir sentinel" \
+  "${SPLIT_DIR}/halden/halden.yaml" \
+  "$(resolve_stack_config_path "${SPLIT_DIR}" "halden")"
+
+# --- resolve_stack_agent_config_path: stacks/<slug>.yaml under dir layout ---
+assert_eq "split: meta-factory agent-config = stacks/<slug>.yaml" \
+  "${SPLIT_DIR}/meta-factory/stacks/meta-factory.yaml" \
+  "$(resolve_stack_agent_config_path "${SPLIT_DIR}" "meta-factory")"
+
+# --- render meta-factory: --config points at sentinel; agent id from stacks/ ---
+render_stack_plist "${REPO_ROOT}" "${SPLIT_LAUNCH}" "${SPLIT_DIR}" "meta-factory" "${MOCK_BIN}/bun"
+MF_SPLIT="${SPLIT_LAUNCH}/ai.meta-factory.cortex.meta-factory.plist"
+assert_file_exists "split: meta-factory plist rendered" "${MF_SPLIT}"
+assert_contains "split: meta-factory --config = sentinel" \
+  "${SPLIT_DIR}/meta-factory/meta-factory.yaml" "$(cat "${MF_SPLIT}")"
+assert_not_contains "split: meta-factory --config is NOT the monolith" \
+  "<string>${SPLIT_DIR}/cortex.yaml</string>" "$(cat "${MF_SPLIT}")"
+assert_contains "split: meta-factory agent id read from stacks/<slug>.yaml" \
+  "agent-meta-factory" "$(cat "${MF_SPLIT}")"
+assert_not_contains "split: meta-factory did NOT read monolith agent id" \
+  "monolith-agent" "$(cat "${MF_SPLIT}")"
+assert_not_contains "split: meta-factory no leftover __CONFIG_PATH__" \
+  "__CONFIG_PATH__" "$(cat "${MF_SPLIT}")"
+
+# --- render work: --config = sentinel ---
+render_stack_plist "${REPO_ROOT}" "${SPLIT_LAUNCH}" "${SPLIT_DIR}" "work" "${MOCK_BIN}/bun"
+WORK_SPLIT="${SPLIT_LAUNCH}/ai.meta-factory.cortex.work.plist"
+assert_contains "split: work --config = sentinel" \
+  "${SPLIT_DIR}/work/work.yaml" "$(cat "${WORK_SPLIT}")"
+assert_not_contains "split: work no leftover __CONFIG_PATH__" \
+  "__CONFIG_PATH__" "$(cat "${WORK_SPLIT}")"
+
+# --- render halden (generic template): --config = sentinel; unique PID name ---
+render_stack_plist "${REPO_ROOT}" "${SPLIT_LAUNCH}" "${SPLIT_DIR}" "halden" "${MOCK_BIN}/bun"
+HALDEN_SPLIT="${SPLIT_LAUNCH}/ai.meta-factory.cortex.halden.plist"
+assert_contains "split: halden --config = sentinel" \
+  "${SPLIT_DIR}/halden/halden.yaml" "$(cat "${HALDEN_SPLIT}")"
+# PID-collision lesson (migration 0003): each stack's log/PID name carries the
+# unique slug, never cortex-cortex*. The generic template keys log paths off
+# __STACK_SLUG__, so assert the slug-unique name is present and no collision.
+assert_contains "split: halden log path uses unique cortex-halden name" \
+  "cortex-halden.log" "$(cat "${HALDEN_SPLIT}")"
+assert_not_contains "split: halden no cortex-cortex PID collision" \
+  "cortex-cortex" "$(cat "${HALDEN_SPLIT}")"
+assert_not_contains "split: halden no leftover __CONFIG_PATH__" \
+  "__CONFIG_PATH__" "$(cat "${HALDEN_SPLIT}")"
+
+# ─── Section 9: dir-wins dedup when only ONE stack is split ───────
+printf '\n=== config-split layout: mixed (one split, others monolith) ===\n'
+
+# work is split (dir), meta-factory + halden remain pure monoliths. Expect all
+# three discovered, work from the dir, the other two from monoliths.
+MIXED_DIR="${TMPBASE}/mixed-config"
+mkdir -p "${MIXED_DIR}/work/system" "${MIXED_DIR}/work/stacks"
+cat > "${MIXED_DIR}/work/system/system.yaml" <<EOF
+nats:
+  url: nats://127.0.0.1:4222
+EOF
+printf '' > "${MIXED_DIR}/work/work.yaml"
+printf 'stack:\n  id: andreas/work\nagents:\n  - id: agent-work\n' > "${MIXED_DIR}/work/stacks/work.yaml"
+# Monoliths for all three (work's monolith is the retained rollback anchor).
+printf 'agents:\n  - id: m\n' > "${MIXED_DIR}/cortex.yaml"
+printf 'agents:\n  - id: m\n' > "${MIXED_DIR}/cortex.work.yaml"
+printf 'agents:\n  - id: m\n' > "${MIXED_DIR}/cortex.halden.yaml"
+
+MIXED_COUNT="$(discover_stack_slugs "${MIXED_DIR}" | wc -l | tr -d ' ')"
+assert_eq "mixed: 3 slugs (work deduped to dir, mf+halden from monolith)" "3" "${MIXED_COUNT}"
+assert_eq "mixed: work resolves to dir sentinel" \
+  "${MIXED_DIR}/work/work.yaml" \
+  "$(resolve_stack_config_path "${MIXED_DIR}" "work")"
+assert_eq "mixed: meta-factory resolves to monolith (no dir)" \
+  "${MIXED_DIR}/cortex.yaml" \
+  "$(resolve_stack_config_path "${MIXED_DIR}" "meta-factory")"
+assert_eq "mixed: halden resolves to monolith (no dir)" \
+  "${MIXED_DIR}/cortex.halden.yaml" \
+  "$(resolve_stack_config_path "${MIXED_DIR}" "halden")"
+
 # ─── Summary ──────────────────────────────────────────────────────
 printf '\n'
 printf 'Results: %d passed, %d failed\n' "${PASS}" "${FAIL}"
