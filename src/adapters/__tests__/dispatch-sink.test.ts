@@ -64,13 +64,14 @@ function fakeRuntime(): {
 function lifecycleEnvelope(
   type: string,
   payload: Record<string, unknown>,
+  correlationId = "task-1",
 ): Envelope {
   return {
     id: "00000000-0000-4000-8000-000000000099",
     source: "metafactory.runner.local",
     type,
     timestamp: "2026-05-09T12:00:00Z",
-    correlation_id: "task-1",
+    correlation_id: correlationId,
     sovereignty: {
       classification: "local",
       data_residency: "NZ",
@@ -221,6 +222,126 @@ describe("dispatch-sink — delivery to the originating target", () => {
     expect(adapter.sentMessages).toHaveLength(0);
     expect(adapter.progressSent).toHaveLength(1);
     expect(adapter.progressSent[0]!.text).toBe("Luna is working...");
+    // cortex#721 — progress carries the per-dispatch correlation key on
+    // `sessionId` so the adapter's `progressKey` scopes it per-dispatch.
+    expect(adapter.progressSent[0]!.target.sessionId).toBe("task-1");
+  });
+});
+
+// =============================================================================
+// cortex#721 — per-dispatch progress keying on the bus sink path
+//
+// The Discord adapter keys its "working…" placeholder on `target.sessionId`
+// (`progressKey` = `sessionId ? scope:sessionId : scope`). The bus sink built
+// the progress target with NO sessionId, so every dispatch's `started`
+// progress fell back to channel-scope and collapsed onto ONE edited message.
+// The fix threads `envelope.correlation_id` onto `sessionId`.
+// =============================================================================
+describe("dispatch-sink — per-dispatch progress keying (cortex#721)", () => {
+  test("two dispatches in the SAME channel get DISTINCT progress keys", async () => {
+    const { runtime, trigger } = fakeRuntime();
+    const adapter = new MockAdapter("discord-pai-collab");
+    const sink = createDispatchSink({ runtime, adapters: [adapter], principal: "metafactory" });
+    await sink.start();
+
+    // Two `started` envelopes, SAME channel/thread, DIFFERENT correlation_id.
+    trigger(
+      lifecycleEnvelope(
+        "dispatch.task.started",
+        {
+          agent_id: "luna",
+          response_routing: routing("discord-pai-collab", "C123", "T456"),
+        },
+        "corr-A",
+      ),
+    );
+    trigger(
+      lifecycleEnvelope(
+        "dispatch.task.started",
+        {
+          agent_id: "luna",
+          response_routing: routing("discord-pai-collab", "C123", "T456"),
+        },
+        "corr-B",
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Two SEPARATE progress messages, not one edited-in-place: the adapter
+    // would compute `progressKey` = `T456:corr-A` vs `T456:corr-B`.
+    expect(adapter.progressSent).toHaveLength(2);
+    const keys = adapter.progressSent.map((p) => p.target.sessionId);
+    expect(keys).toEqual(["corr-A", "corr-B"]);
+    expect(new Set(keys).size).toBe(2); // distinct
+    // Same channel/thread — only the session key distinguishes them.
+    expect(adapter.progressSent[0]!.target.channelId).toBe("C123");
+    expect(adapter.progressSent[1]!.target.channelId).toBe("C123");
+    expect(adapter.progressSent[0]!.target.threadId).toBe("T456");
+    expect(adapter.progressSent[1]!.target.threadId).toBe("T456");
+  });
+
+  test("falls back to payload.task_id when envelope.correlation_id is absent", async () => {
+    const { runtime, trigger } = fakeRuntime();
+    const adapter = new MockAdapter("discord-pai-collab");
+    const sink = createDispatchSink({ runtime, adapters: [adapter], principal: "metafactory" });
+    await sink.start();
+
+    // Build an envelope with NO top-level correlation_id; carry task_id instead.
+    const env = lifecycleEnvelope(
+      "dispatch.task.started",
+      {
+        agent_id: "luna",
+        task_id: "task-99",
+        response_routing: routing("discord-pai-collab", "C1"),
+      },
+      "task-1",
+    );
+    delete (env as { correlation_id?: string }).correlation_id;
+    trigger(env);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(adapter.progressSent).toHaveLength(1);
+    expect(adapter.progressSent[0]!.target.sessionId).toBe("task-99");
+  });
+
+  test("the terminal completed reply clears nothing extra and posts once per correlation", async () => {
+    const { runtime, trigger } = fakeRuntime();
+    const adapter = new MockAdapter("discord-pai-collab");
+    const sink = createDispatchSink({ runtime, adapters: [adapter], principal: "metafactory" });
+    await sink.start();
+
+    // started for corr-A, then completed for corr-A only.
+    trigger(
+      lifecycleEnvelope(
+        "dispatch.task.started",
+        {
+          agent_id: "luna",
+          response_routing: routing("discord-pai-collab", "C123"),
+        },
+        "corr-A",
+      ),
+    );
+    trigger(
+      lifecycleEnvelope(
+        "dispatch.task.completed",
+        {
+          agent_id: "luna",
+          chat_response: "done A",
+          response_routing: routing("discord-pai-collab", "C123"),
+        },
+        "corr-A",
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // One progress (corr-A) + one durable reply (the terminal completed).
+    expect(adapter.progressSent).toHaveLength(1);
+    expect(adapter.progressSent[0]!.target.sessionId).toBe("corr-A");
+    expect(adapter.sentMessages).toHaveLength(1);
+    expect(adapter.sentMessages[0]!.text).toBe("done A");
   });
 });
 
@@ -471,6 +592,8 @@ describe("dispatch-sink — gateway multi-stack subscription (a.3d)", () => {
     expect(adapterA.progressSent[0]!.target).toEqual({
       instanceId: "discord:guild-A",
       channelId: "C-A",
+      // cortex#721 — progress carries the per-dispatch correlation key.
+      sessionId: "task-1",
     });
     expect(adapterB.progressSent).toHaveLength(0);
   });
