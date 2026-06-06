@@ -24,6 +24,7 @@ import { parse as parseYaml } from "yaml";
 import type { TextChannel } from "discord.js";
 
 import { loadConfigWithAgents, loadAgentsDirectory, expandTilde, FragmentLoadError } from "./common/config/loader";
+import { dispatchNetwork } from "./cli/cortex/commands/network";
 import { ConfigWatcher } from "./common/config/watcher";
 import { type AgentConfig, getAllRepos } from "./common/types/config";
 import { resolveSigningKnobs } from "./common/security-posture";
@@ -3346,6 +3347,20 @@ if (import.meta.main) {
       };
       process.on("SIGINT", () => { void shutdown(); });
       process.on("SIGTERM", () => { void shutdown(); });
+    });
+
+  program
+    .command("network", { hidden: false })
+    .description("Join, leave, and inspect federated networks")
+    .allowUnknownOption(true)
+    .allowExcessArguments(true)
+    .helpOption(false)
+    .argument("[args...]", "network command arguments")
+    .action(async (args: string[]) => {
+      const result = await dispatchNetwork(args);
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      process.exit(result.exitCode);
     });
 
   program
