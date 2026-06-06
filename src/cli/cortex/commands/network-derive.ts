@@ -5,7 +5,7 @@
  *     cortex network join <network> [--apply]
  *
  * Everything the join needs — principal, stack, signing seed, registry pin +
- * endpoint, and the per-stack nats-server infra paths (config / plist /
+ * endpoint, and the per-stack nats-server infra paths (config / service /
  * account / creds) — derives from the stack's loaded config + conventions.
  * Flags survive ONLY as optional per-invocation overrides: a flag, when
  * present, always wins; otherwise the value derives from config; a value that
@@ -22,7 +22,9 @@
  *   | registry-url      | --registry-url    | policy.federated.registry.url                  | —                                  |
  *   | registry-pubkey   | --registry-pubkey | policy.federated.registry.pubkey               | — (TOFU when absent)               |
  *   | nats-config       | --nats-config     | stack.nats_infra.config_path                   | —                                  |
- *   | plist             | --plist           | stack.nats_infra.plist_path                     | —                                  |
+ *   | service-manager   | --service-manager | stack.nats_infra.service_manager                | auto                               |
+ *   | service-file      | --service-file    | stack.nats_infra.service_file / plist_path      | —                                  |
+ *   | plist             | --plist           | stack.nats_infra.plist_path                     | — (legacy launchd alias)           |
  *   | account           | --account         | stack.nats_infra.account                       | —                                  |
  *   | creds             | --creds           | stack.nats_infra.creds_path                     | ~/.config/nats/<network>.creds     |
  *
@@ -42,6 +44,8 @@ import type { LoadedConfig } from "../../../common/config/loader";
 // Types
 // =============================================================================
 
+export type ServiceManager = "auto" | "launchd" | "systemd" | "none";
+
 /** The five join inputs `cortex network join` previously demanded as flags. */
 export interface DerivedJoinInputs {
   principal: string;
@@ -51,7 +55,11 @@ export interface DerivedJoinInputs {
   registryUrl: string;
   registryPubkey?: string;
   natsConfigPath: string;
-  plistPath: string;
+  serviceManager: ServiceManager;
+  serviceFile?: string;
+  /** Back-compat launchd plist alias. Present when configured or flagged. */
+  plistPath?: string;
+  daemonService?: string;
   account: string;
   credsPath: string;
   /**
@@ -69,7 +77,10 @@ export interface DerivedLeaveInputs {
   principal: string;
   stack: string;
   natsConfigPath: string;
-  plistPath: string;
+  serviceManager: ServiceManager;
+  serviceFile?: string;
+  plistPath?: string;
+  daemonService?: string;
 }
 
 /** Flag overrides — any field present on the CLI wins over config/convention. */
@@ -80,7 +91,10 @@ export interface JoinOverrides {
   registryUrl?: string;
   registryPubkey?: string;
   natsConfigPath?: string;
+  serviceManager?: ServiceManager;
+  serviceFile?: string;
   plistPath?: string;
+  daemonService?: string;
   account?: string;
   credsPath?: string;
 }
@@ -221,12 +235,10 @@ export function deriveJoinInputs(
     );
   }
 
+  const serviceManager = overrides.serviceManager ?? natsInfra?.service_manager ?? "auto";
   const plistPath = overrides.plistPath ?? natsInfra?.plist_path;
-  if (plistPath === undefined || plistPath === "") {
-    return fail(
-      "cannot resolve plist path — pass --plist or set `stack.nats_infra.plist_path` in cortex.yaml",
-    );
-  }
+  const serviceFile = overrides.serviceFile ?? natsInfra?.service_file ?? plistPath;
+  const daemonService = overrides.daemonService ?? natsInfra?.daemon_service;
 
   const account = overrides.account ?? natsInfra?.account;
   if (account === undefined || account === "") {
@@ -257,7 +269,10 @@ export function deriveJoinInputs(
       registryUrl,
       ...(registryPubkey !== undefined && { registryPubkey }),
       natsConfigPath,
-      plistPath,
+      serviceManager,
+      ...(serviceFile !== undefined && serviceFile !== "" && { serviceFile }),
+      ...(plistPath !== undefined && plistPath !== "" && { plistPath }),
+      ...(daemonService !== undefined && daemonService !== "" && { daemonService }),
       account,
       credsPath,
       announceCapabilities,
@@ -275,7 +290,7 @@ export function deriveJoinInputs(
  * include + plist). Same override-then-config-then-convention precedence.
  */
 export function deriveLeaveInputs(
-  overrides: Pick<JoinOverrides, "principal" | "stack" | "natsConfigPath" | "plistPath">,
+  overrides: Pick<JoinOverrides, "principal" | "stack" | "natsConfigPath" | "serviceManager" | "serviceFile" | "plistPath" | "daemonService">,
   configPath: string,
   load: ConfigReader,
 ): DeriveResult<DerivedLeaveInputs> {
@@ -298,12 +313,21 @@ export function deriveLeaveInputs(
     );
   }
 
+  const serviceManager = overrides.serviceManager ?? natsInfra?.service_manager ?? "auto";
   const plistPath = overrides.plistPath ?? natsInfra?.plist_path;
-  if (plistPath === undefined || plistPath === "") {
-    return fail(
-      "cannot resolve plist path — pass --plist or set `stack.nats_infra.plist_path` in cortex.yaml",
-    );
-  }
+  const serviceFile = overrides.serviceFile ?? natsInfra?.service_file ?? plistPath;
+  const daemonService = overrides.daemonService ?? natsInfra?.daemon_service;
 
-  return { ok: true, inputs: { principal, stack, natsConfigPath, plistPath } };
+  return {
+    ok: true,
+    inputs: {
+      principal,
+      stack,
+      natsConfigPath,
+      serviceManager,
+      ...(serviceFile !== undefined && serviceFile !== "" && { serviceFile }),
+      ...(plistPath !== undefined && plistPath !== "" && { plistPath }),
+      ...(daemonService !== undefined && daemonService !== "" && { daemonService }),
+    },
+  };
 }

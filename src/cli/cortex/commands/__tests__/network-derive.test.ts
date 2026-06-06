@@ -80,6 +80,8 @@ describe("deriveJoinInputs — config-only (the one-liner)", () => {
       registryUrl: "https://registry.meta-factory.ai",
       registryPubkey: "A".repeat(43) + "=",
       natsConfigPath: "~/.config/nats/local.conf",
+      serviceManager: "auto",
+      serviceFile: "~/Library/LaunchAgents/nats.plist",
       plistPath: "~/Library/LaunchAgents/nats.plist",
       account: "A" + "B".repeat(55),
       credsPath: "~/.config/nats/mf.creds",
@@ -232,6 +234,8 @@ describe("deriveJoinInputs — flag overrides win", () => {
       registryUrl: "https://flag.registry",
       registryPubkey: "Z".repeat(43) + "=",
       natsConfigPath: "/flag/local.conf",
+      serviceManager: "auto",
+      serviceFile: "/flag/nats.plist",
       plistPath: "/flag/nats.plist",
       account: "A" + "F".repeat(55),
       credsPath: "/flag/x.creds",
@@ -261,6 +265,31 @@ describe("deriveJoinInputs — flag overrides win", () => {
     expect(res.ok).toBe(true);
     expect(res.inputs?.principal).toBe("andreas");
     expect(res.inputs?.stack).toBe("andreas/default");
+  });
+
+  test("#760 — systemd service metadata works without a plist", () => {
+    const res = deriveJoinInputs(
+      "metafactory",
+      {
+        principal: "jc",
+        stack: "jc/default",
+        seedPath: "/home/clawbox/.config/nats/cortex.nk",
+        registryUrl: "https://network.meta-factory.ai",
+        natsConfigPath: "/home/clawbox/.config/nats/local.conf",
+        serviceManager: "systemd",
+        serviceFile: "/home/clawbox/.config/systemd/user/nats-server.service",
+        daemonService: "cortex-bot.service",
+        account: "A" + "H".repeat(55),
+        credsPath: "/home/clawbox/.config/nats/jc.creds",
+      },
+      "/cfg",
+      reader(loaded({})),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.inputs?.serviceManager).toBe("systemd");
+    expect(res.inputs?.serviceFile).toBe("/home/clawbox/.config/systemd/user/nats-server.service");
+    expect(res.inputs?.plistPath).toBeUndefined();
+    expect(res.inputs?.daemonService).toBe("cortex-bot.service");
   });
 });
 
@@ -338,6 +367,8 @@ describe("deriveLeaveInputs", () => {
       principal: "andreas",
       stack: "andreas/meta-factory",
       natsConfigPath: "~/.config/nats/local.conf",
+      serviceManager: "auto",
+      serviceFile: "~/Library/LaunchAgents/nats.plist",
       plistPath: "~/Library/LaunchAgents/nats.plist",
     });
   });

@@ -71,6 +71,21 @@ function barePlist(): string {
   ].join("\n");
 }
 
+function bareSystemdUnit(): string {
+  return [
+    "[Unit]",
+    "Description=NATS Server",
+    "",
+    "[Service]",
+    "ExecStart=/home/clawbox/bin/nats-server -js",
+    "Restart=always",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+}
+
 function cfgFor(plistPath: string): LivePortsConfig {
   return {
     networkId: "metafactory",
@@ -537,6 +552,62 @@ describe("#757 nats-server restart port", () => {
     const res = await ports.natsServer!.restart();
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toContain("Label");
+  });
+
+  test("#760 systemd service-file gets the nats config arg idempotently", () => {
+    const dir = freshDir();
+    const unitPath = join(dir, "nats-server.service");
+    const natsConfig = "/home/clawbox/.config/nats/local.conf";
+    writeFileSync(unitPath, bareSystemdUnit(), "utf-8");
+
+    const ports = buildLivePorts({
+      networkId: "metafactory",
+      principalId: "jc",
+      stackId: "jc/default",
+      natsConfigPath: natsConfig,
+      serviceManager: "systemd",
+      serviceFile: unitPath,
+      daemonService: "cortex-bot.service",
+    });
+
+    ports.plist.ensureConfigLoaded(natsConfig);
+    const first = readFileSync(unitPath, "utf-8");
+    expect(first).toContain(`ExecStart=/home/clawbox/bin/nats-server -js -c ${natsConfig}`);
+
+    ports.plist.ensureConfigLoaded(natsConfig);
+    expect(readFileSync(unitPath, "utf-8")).toBe(first);
+
+    ports.plist.dropConfigArg(natsConfig);
+    expect(readFileSync(unitPath, "utf-8")).toContain("ExecStart=/home/clawbox/bin/nats-server -js");
+    expect(readFileSync(unitPath, "utf-8")).not.toContain(` -c ${natsConfig}`);
+  });
+
+  test("#760 systemd dry-run needs no plist or service file", async () => {
+    const ports = buildDryRunPorts({
+      networkId: "metafactory",
+      principalId: "jc",
+      stackId: "jc/default",
+      natsConfigPath: "/home/clawbox/.config/nats/local.conf",
+      serviceManager: "systemd",
+    });
+
+    ports.plist.ensureConfigLoaded("/home/clawbox/.config/nats/local.conf");
+    const res = await ports.natsServer!.restart();
+    expect(res.ok).toBe(true);
+  });
+
+  test("#760 systemd live restart fails clearly when service_file is missing", async () => {
+    const ports = buildLivePorts({
+      networkId: "metafactory",
+      principalId: "jc",
+      stackId: "jc/default",
+      natsConfigPath: "/home/clawbox/.config/nats/local.conf",
+      serviceManager: "systemd",
+    });
+
+    const res = await ports.natsServer!.restart();
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain("service file");
   });
 });
 

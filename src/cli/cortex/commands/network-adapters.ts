@@ -28,7 +28,7 @@ import {
   rmSync,
   writeFileSync,
 } from "fs";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
@@ -82,7 +82,10 @@ export interface LivePortsConfig {
   registryPubkey?: string;
   seedPath?: string;
   natsConfigPath?: string;
+  serviceManager?: "auto" | "launchd" | "systemd" | "none";
+  serviceFile?: string;
   plistPath?: string;
+  daemonService?: string;
   monitorUrl?: string;
   /**
    * #762 — the capability ids this stack announces INTO `networkId`, sourced
@@ -95,6 +98,30 @@ export interface LivePortsConfig {
    * preserves any existing hand-pins rather than wiping them.
    */
   announceCapabilities?: string[];
+}
+
+type ResolvedServiceManager = "launchd" | "systemd" | "none" | "unsupported";
+
+function serviceFilePath(cfg: LivePortsConfig): string | undefined {
+  return cfg.serviceFile ?? cfg.plistPath;
+}
+
+function resolveServiceManager(cfg: LivePortsConfig): ResolvedServiceManager {
+  const configured = cfg.serviceManager ?? "auto";
+  if (configured !== "auto") return configured;
+  const file = serviceFilePath(cfg);
+  if (file !== undefined) {
+    if (file.endsWith(".service")) return "systemd";
+    if (file.endsWith(".plist")) return "launchd";
+  }
+  if (process.platform === "darwin") return "launchd";
+  if (process.platform === "linux") return "systemd";
+  return "unsupported";
+}
+
+function missingServiceFileReason(cfg: LivePortsConfig): string {
+  const manager = resolveServiceManager(cfg);
+  return `no nats-server service file configured for ${manager}; pass --service-file or set stack.nats_infra.service_file`;
 }
 
 // =============================================================================
@@ -292,8 +319,8 @@ function writeProgramArguments(plistPath: string, nextArgs: string[]): void {
   writeFileSync(plistPath, next, "utf-8");
 }
 
-function buildPlistPort(cfg: LivePortsConfig, mutate: boolean): PlistPort {
-  const plistPath = expandTilde(cfg.plistPath ?? "");
+function buildLaunchdConfigPort(cfg: LivePortsConfig, mutate: boolean): PlistPort {
+  const plistPath = expandTilde(serviceFilePath(cfg) ?? "");
   return {
     ensureConfigLoaded(configPath) {
       if (!existsSync(plistPath)) return;
@@ -316,6 +343,95 @@ function buildPlistPort(cfg: LivePortsConfig, mutate: boolean): PlistPort {
       writeProgramArguments(plistPath, next);
     },
   };
+}
+
+function escapeRegExp(v: string): string {
+  return v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function systemdArg(configPath: string): string {
+  return /[\s"'\\]/.test(configPath)
+    ? `"${configPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+    : configPath;
+}
+
+function systemdConfigArgPresent(execStart: string, configPath: string): boolean {
+  const p = escapeRegExp(configPath);
+  return new RegExp(`(?:^|\\s)(?:-c|--config)(?:\\s+${p}|=${p})(?:\\s|$)`).test(execStart);
+}
+
+function ensureSystemdExecStartConfig(execStart: string, configPath: string): string {
+  if (systemdConfigArgPresent(execStart, configPath)) return execStart;
+  // If the unit already points at a different config, keep the operator's
+  // choice intact rather than guessing how to rewrite an arbitrary shell line.
+  if (/(?:^|\s)(?:-c|--config)(?:\s+|=)/.test(execStart)) return execStart;
+  return `${execStart} -c ${systemdArg(configPath)}`;
+}
+
+function dropSystemdExecStartConfig(execStart: string, configPath: string): string {
+  const p = escapeRegExp(configPath);
+  return execStart
+    .replace(new RegExp(`\\s+(?:-c|--config)\\s+${p}(?=\\s|$)`), "")
+    .replace(new RegExp(`\\s+--config=${p}(?=\\s|$)`), "");
+}
+
+function rewriteSystemdExecStart(
+  unitPath: string,
+  transform: (execStart: string) => string,
+): void {
+  const unit = readFileSync(unitPath, "utf-8");
+  let found = false;
+  const next = unit.replace(/^([ \t]*ExecStart=)(.*)$/m, (_line, prefix: string, value: string) => {
+    found = true;
+    return `${prefix}${transform(value.trim())}`;
+  });
+  if (!found) {
+    throw new Error(`systemd unit ${unitPath} has no ExecStart= line`);
+  }
+  if (next !== unit) writeFileSync(unitPath, next, "utf-8");
+}
+
+function buildSystemdConfigPort(cfg: LivePortsConfig, mutate: boolean): PlistPort {
+  const unitPath = serviceFilePath(cfg) === undefined
+    ? undefined
+    : expandTilde(serviceFilePath(cfg)!);
+  return {
+    ensureConfigLoaded(configPath) {
+      if (!mutate) return;
+      if (unitPath === undefined || !existsSync(unitPath)) {
+        throw new Error(missingServiceFileReason(cfg));
+      }
+      rewriteSystemdExecStart(unitPath, (execStart) =>
+        ensureSystemdExecStartConfig(execStart, configPath),
+      );
+    },
+    dropConfigArg(configPath) {
+      if (!mutate) return;
+      if (unitPath === undefined || !existsSync(unitPath)) return;
+      rewriteSystemdExecStart(unitPath, (execStart) =>
+        dropSystemdExecStartConfig(execStart, configPath),
+      );
+    },
+  };
+}
+
+function buildNoopServiceConfigPort(): PlistPort {
+  return {
+    ensureConfigLoaded() {},
+    dropConfigArg() {},
+  };
+}
+
+function buildServiceConfigPort(cfg: LivePortsConfig, mutate: boolean): PlistPort {
+  switch (resolveServiceManager(cfg)) {
+    case "launchd":
+      return buildLaunchdConfigPort(cfg, mutate);
+    case "systemd":
+      return buildSystemdConfigPort(cfg, mutate);
+    case "none":
+    case "unsupported":
+      return buildNoopServiceConfigPort();
+  }
 }
 
 // =============================================================================
@@ -384,21 +500,59 @@ function buildConfigStorePort(cfg: LivePortsConfig, mutate: boolean): ConfigStor
 // Daemon port — launchctl kickstart of the stack daemon.
 // =============================================================================
 
+async function spawnChecked(
+  args: string[],
+  failurePrefix: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const code = await proc.exited;
+  if (code !== 0) {
+    const err = await new Response(proc.stderr).text();
+    return { ok: false, reason: `${failurePrefix} exited ${code.toString()}: ${err.trim()}` };
+  }
+  return { ok: true };
+}
+
+function launchdTarget(label: string): string {
+  return `gui/${process.getuid?.() ?? 501}/${label}`;
+}
+
+async function restartSystemdUserService(serviceName: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const reload = await spawnChecked(
+    ["systemctl", "--user", "daemon-reload"],
+    "systemctl --user daemon-reload",
+  );
+  if (!reload.ok) return reload;
+  return spawnChecked(
+    ["systemctl", "--user", "restart", serviceName],
+    `systemctl --user restart ${serviceName}`,
+  );
+}
+
 function buildDaemonPort(cfg: LivePortsConfig, mutate: boolean): DaemonPort {
   return {
     async restart() {
       if (!mutate) return { ok: true }; // dry-run: pretend success.
-      const label = `ai.meta-factory.cortex.${cfg.stackId.split("/")[1] ?? "default"}`;
-      const proc = Bun.spawn(["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? 501}/${label}`], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const code = await proc.exited;
-      if (code !== 0) {
-        const err = await new Response(proc.stderr).text();
-        return { ok: false, reason: `launchctl kickstart exited ${code.toString()}: ${err.trim()}` };
+      switch (resolveServiceManager(cfg)) {
+        case "launchd": {
+          const label = cfg.daemonService ?? `ai.meta-factory.cortex.${cfg.stackId.split("/")[1] ?? "default"}`;
+          return spawnChecked(
+            ["launchctl", "kickstart", "-k", launchdTarget(label)],
+            `launchctl kickstart ${label}`,
+          );
+        }
+        case "systemd": {
+          const service = cfg.daemonService ?? "cortex-bot.service";
+          return restartSystemdUserService(service);
+        }
+        case "none":
+          return { ok: true };
+        case "unsupported":
+          return {
+            ok: false,
+            reason: `service manager auto cannot manage platform ${process.platform}; pass --service-manager launchd|systemd|none`,
+          };
       }
-      return { ok: true };
     },
   };
 }
@@ -423,30 +577,39 @@ function readPlistLabel(plistPath: string): string | undefined {
 }
 
 function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerPort {
-  const plistPath = expandTilde(cfg.plistPath ?? "");
+  const file = serviceFilePath(cfg);
+  const servicePath = file === undefined ? undefined : expandTilde(file);
   return {
     async restart() {
       if (!mutate) return { ok: true }; // dry-run: pretend success, touch nothing.
-      if (cfg.plistPath === undefined || !existsSync(plistPath)) {
-        return { ok: false, reason: `nats-server plist not found at ${plistPath}` };
+      switch (resolveServiceManager(cfg)) {
+        case "launchd": {
+          if (servicePath === undefined || !existsSync(servicePath)) {
+            return { ok: false, reason: `nats-server plist not found at ${servicePath ?? ""}` };
+          }
+          const label = readPlistLabel(servicePath);
+          if (label === undefined) {
+            return { ok: false, reason: `no <key>Label</key> in nats-server plist ${servicePath}` };
+          }
+          return spawnChecked(
+            ["launchctl", "kickstart", "-k", launchdTarget(label)],
+            `launchctl kickstart ${label}`,
+          );
+        }
+        case "systemd": {
+          if (servicePath === undefined || !existsSync(servicePath)) {
+            return { ok: false, reason: missingServiceFileReason(cfg) };
+          }
+          return restartSystemdUserService(basename(servicePath));
+        }
+        case "none":
+          return { ok: true };
+        case "unsupported":
+          return {
+            ok: false,
+            reason: `service manager auto cannot manage platform ${process.platform}; pass --service-manager launchd|systemd|none`,
+          };
       }
-      const label = readPlistLabel(plistPath);
-      if (label === undefined) {
-        return { ok: false, reason: `no <key>Label</key> in nats-server plist ${plistPath}` };
-      }
-      const proc = Bun.spawn(
-        ["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? 501}/${label}`],
-        { stdout: "pipe", stderr: "pipe" },
-      );
-      const code = await proc.exited;
-      if (code !== 0) {
-        const err = await new Response(proc.stderr).text();
-        return {
-          ok: false,
-          reason: `launchctl kickstart ${label} exited ${code.toString()}: ${err.trim()}`,
-        };
-      }
-      return { ok: true };
     },
   };
 }
@@ -493,7 +656,7 @@ function buildPorts(cfg: LivePortsConfig, mutate: boolean): NetworkPorts {
   return {
     registry: buildRegistryPort(cfg),
     leafFile: buildLeafFilePort(cfg, mutate),
-    plist: buildPlistPort(cfg, mutate),
+    plist: buildServiceConfigPort(cfg, mutate),
     configStore: buildConfigStorePort(cfg, mutate),
     daemon: buildDaemonPort(cfg, mutate),
     natsServer: buildNatsServerPort(cfg, mutate),

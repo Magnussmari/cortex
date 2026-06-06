@@ -114,6 +114,16 @@ describe("join usage", () => {
     expect(res.stderr).toContain("mutually exclusive");
   });
 
+  test("#760 rejects malformed --service-manager (exit 2)", async () => {
+    const res = await dispatchNetwork([
+      "join", "metafactory",
+      "--principal", "andreas",
+      "--service-manager", "systmd",
+    ], EMPTY_READER);
+    expect(res.exitCode).toBe(2);
+    expect(res.stderr).toContain("--service-manager");
+  });
+
   test("rejects --stack whose prefix mismatches --principal (exit 2)", async () => {
     const res = await dispatchNetwork([
       "join", "metafactory",
@@ -136,6 +146,27 @@ describe("join usage", () => {
 // =============================================================================
 
 describe("join dry-run safety", () => {
+  test("#760 systemd dry-run does not require --plist", async () => {
+    const dir = freshDir();
+    const res = await dispatchNetwork([
+      "join", "metafactory",
+      "--principal", "jc",
+      "--registry-url", "http://127.0.0.1:0",
+      "--seed-path", join(dir, "seed.nk"),
+      "--creds", join(dir, "jc.creds"),
+      "--account", "A" + "B".repeat(55),
+      "--nats-config", join(dir, "local.conf"),
+      "--service-manager", "systemd",
+      "--dry-run",
+    ], EMPTY_READER);
+
+    // It fails operationally because the seed/registry are fake, but the old
+    // launchd-only "--plist is required" usage gate is gone.
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).not.toContain("--plist");
+    expect(res.stderr).toContain("dry-run");
+  });
+
   test("dry-run join does NOT write the leaf file, plist, or config (no --apply)", async () => {
     const dir = freshDir();
     const seedPath = join(dir, "seed.nk");
@@ -293,7 +324,6 @@ describe("join public usage", () => {
       "--registry-url", "http://127.0.0.1:0", // unreachable by construction
       "--seed-path", join(dir, "seed.nk"),
       "--nats-config", join(dir, "local.conf"),
-      "--plist", join(dir, "nats.plist"),
       "--capabilities", "code-review.typescript",
     ]);
     // It will FAIL at announce (no seed / unreachable registry) — exit 1 — but
@@ -301,6 +331,7 @@ describe("join public usage", () => {
     expect(res.exitCode).not.toBe(2);
     expect(res.stderr).not.toContain("--creds");
     expect(res.stderr).not.toContain("--account");
+    expect(res.stderr).not.toContain("--plist");
   });
 });
 
@@ -318,7 +349,6 @@ describe("join public dry-run safety (OQ1 + no live mutation)", () => {
       "--registry-url", "http://127.0.0.1:0",
       "--seed-path", join(dir, "seed.nk"),
       "--nats-config", natsConfig,
-      "--plist", plist,
       "--capabilities", "code-review.typescript",
     ]);
 
@@ -342,7 +372,6 @@ describe("leave public", () => {
       "--registry-url", "http://127.0.0.1:0",
       "--seed-path", join(dir, "seed.nk"),
       "--nats-config", join(dir, "local.conf"),
-      "--plist", join(dir, "nats.plist"),
     ], EMPTY_READER);
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toContain("nothing to do");

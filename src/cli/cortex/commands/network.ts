@@ -49,6 +49,7 @@ import {
   deriveLeaveInputs,
   tolerantReader,
   type ConfigReader,
+  type ServiceManager,
 } from "./network-derive";
 
 /**
@@ -127,7 +128,10 @@ const SPEC: SubcommandSpec<NetworkSubcommand> = {
         "--creds": "value",
         "--account": "value",
         "--nats-config": "value",
+        "--service-manager": "value",
+        "--service-file": "value",
         "--plist": "value",
+        "--daemon-service": "value",
         "--max-hop": "value",
         "--leaf-node": "value",
         // S5 (#739) — public-scope flags. `--capabilities` (comma-separated)
@@ -150,7 +154,10 @@ const SPEC: SubcommandSpec<NetworkSubcommand> = {
         "--registry-url": "value",
         "--seed-path": "value",
         "--nats-config": "value",
+        "--service-manager": "value",
+        "--service-file": "value",
         "--plist": "value",
+        "--daemon-service": "value",
         "--apply": "bool",
         "--dry-run": "bool",
       },
@@ -187,6 +194,20 @@ function optionalValueFlag(
 ): string | undefined {
   const v = flags[name];
   return typeof v === "string" ? v : undefined;
+}
+
+function optionalServiceManagerFlag(
+  flags: Record<string, string | true>,
+): { ok: true; value?: ServiceManager } | { ok: false; reason: string } {
+  const value = optionalValueFlag(flags, "--service-manager");
+  if (value === undefined) return { ok: true };
+  if (value === "auto" || value === "launchd" || value === "systemd" || value === "none") {
+    return { ok: true, value };
+  }
+  return {
+    ok: false,
+    reason: `--service-manager "${value}" must be auto, launchd, systemd, or none`,
+  };
 }
 
 /**
@@ -272,6 +293,8 @@ async function runJoin(
   // errors (bad YAML, schema violations) surface as an op-error with the
   // loader's message; a derivable-but-missing required value surfaces as a
   // usage error naming the config field.
+  const serviceManager = optionalServiceManagerFlag(flags);
+  if (!serviceManager.ok) return usageError("join", serviceManager.reason, json);
   let derived;
   try {
     derived = deriveJoinInputs(
@@ -283,7 +306,10 @@ async function runJoin(
         ...readOverride(flags, "--registry-url", "registryUrl"),
         ...readOverride(flags, "--registry-pubkey", "registryPubkey"),
         ...readOverride(flags, "--nats-config", "natsConfigPath"),
+        ...(serviceManager.value !== undefined && { serviceManager: serviceManager.value }),
+        ...readOverride(flags, "--service-file", "serviceFile"),
         ...readOverride(flags, "--plist", "plistPath"),
+        ...readOverride(flags, "--daemon-service", "daemonService"),
         ...readOverride(flags, "--account", "account"),
         ...readOverride(flags, "--creds", "credsPath"),
       },
@@ -351,6 +377,8 @@ async function runLeave(
   }
 
   // #753 — derive principal / stack / nats-config / plist (the leave subset).
+  const serviceManager = optionalServiceManagerFlag(flags);
+  if (!serviceManager.ok) return usageError("leave", serviceManager.reason, json);
   let derived;
   try {
     derived = deriveLeaveInputs(
@@ -358,7 +386,10 @@ async function runLeave(
         ...readOverride(flags, "--principal"),
         ...readOverride(flags, "--stack", "stack"),
         ...readOverride(flags, "--nats-config", "natsConfigPath"),
+        ...(serviceManager.value !== undefined && { serviceManager: serviceManager.value }),
+        ...readOverride(flags, "--service-file", "serviceFile"),
         ...readOverride(flags, "--plist", "plistPath"),
+        ...readOverride(flags, "--daemon-service", "daemonService"),
       },
       expandTilde(optionalValueFlag(flags, "--config") ?? DEFAULT_CONFIG_PATH),
       load,
@@ -381,7 +412,10 @@ async function runLeave(
     principalId: inputs.principal,
     stackId: `${inputs.principal}/${slugRes.slug}`,
     natsConfigPath: inputs.natsConfigPath,
+    serviceManager: inputs.serviceManager,
+    serviceFile: inputs.serviceFile,
     plistPath: inputs.plistPath,
+    daemonService: inputs.daemonService,
   };
   const ports = applyRes.apply ? buildLivePorts(cfg) : buildDryRunPorts(cfg);
 
@@ -452,9 +486,9 @@ async function runJoinPublic(
   if (!slugRes.ok) return usageError("join", slugRes.reason, json);
 
   // Public-path required flags: registry (announce), seed (proof-of-possession),
-  // nats-config (subscribe public.>), plist (daemon arg). NOT creds/account —
+  // nats-config (subscribe public.>). NOT creds/account —
   // public has no leaf.
-  for (const required of ["--registry-url", "--seed-path", "--nats-config", "--plist"]) {
+  for (const required of ["--registry-url", "--seed-path", "--nats-config"]) {
     const r = requireValueFlag(flags, required);
     if (!r.ok) return usageError("join", r.reason, json);
   }
@@ -477,6 +511,8 @@ async function runJoinPublic(
 
   const applyRes = resolveApply(flags);
   if (!applyRes.ok) return usageError("join", applyRes.reason, json);
+  const serviceManager = optionalServiceManagerFlag(flags);
+  if (!serviceManager.ok) return usageError("join", serviceManager.reason, json);
 
   const cfg = portsConfig("public", principalRes.value, slugRes.slug, flags);
   const ports = applyRes.apply ? buildLivePublicPorts(cfg) : buildDryRunPublicPorts(cfg);
@@ -498,12 +534,14 @@ async function runLeavePublic(
   if (!principalRes.ok) return usageError("leave", principalRes.reason, json);
   const slugRes = resolveStackSlug(principalRes.value, optionalValueFlag(flags, "--stack"));
   if (!slugRes.ok) return usageError("leave", slugRes.reason, json);
-  for (const required of ["--registry-url", "--seed-path", "--nats-config", "--plist"]) {
+  for (const required of ["--registry-url", "--seed-path", "--nats-config"]) {
     const r = requireValueFlag(flags, required);
     if (!r.ok) return usageError("leave", r.reason, json);
   }
   const applyRes = resolveApply(flags);
   if (!applyRes.ok) return usageError("leave", applyRes.reason, json);
+  const serviceManager = optionalServiceManagerFlag(flags);
+  if (!serviceManager.ok) return usageError("leave", serviceManager.reason, json);
 
   const cfg = portsConfig("public", principalRes.value, slugRes.slug, flags);
   const ports = applyRes.apply ? buildLivePublicPorts(cfg) : buildDryRunPublicPorts(cfg);
@@ -524,6 +562,7 @@ function portsConfig(
   stackSlug: string,
   flags: Record<string, string | true>,
 ): LivePortsConfig {
+  const serviceManager = optionalServiceManagerFlag(flags);
   return {
     networkId,
     principalId,
@@ -532,7 +571,10 @@ function portsConfig(
     registryPubkey: optionalValueFlag(flags, "--registry-pubkey"),
     seedPath: optionalValueFlag(flags, "--seed-path"),
     natsConfigPath: optionalValueFlag(flags, "--nats-config"),
+    serviceManager: serviceManager.ok ? serviceManager.value : undefined,
+    serviceFile: optionalValueFlag(flags, "--service-file"),
     plistPath: optionalValueFlag(flags, "--plist"),
+    daemonService: optionalValueFlag(flags, "--daemon-service"),
     monitorUrl: optionalValueFlag(flags, "--monitor-url"),
   };
 }
@@ -557,7 +599,10 @@ function portsConfigFromInputs(
     ...(inputs.registryPubkey !== undefined && { registryPubkey: inputs.registryPubkey }),
     seedPath: inputs.seedPath,
     natsConfigPath: inputs.natsConfigPath,
+    serviceManager: inputs.serviceManager,
+    serviceFile: inputs.serviceFile,
     plistPath: inputs.plistPath,
+    daemonService: inputs.daemonService,
     monitorUrl: optionalValueFlag(flags, "--monitor-url"),
     // #762 — caps the join announces INTO the network so the principal joins
     // the roster (registry control-plane; never on the wire).
@@ -677,8 +722,8 @@ Usage:
 The one-liner (#753): \`cortex network join <network>\` derives EVERYTHING from
 the loaded cortex.yaml — principal (principal.id), stack (stack.id), signing
 seed (stack.nkey_seed_path), registry (policy.federated.registry.{url,pubkey}),
-and the nats-server infra (stack.nats_infra.{config_path,plist_path,account,
-creds_path}). Pass --config <p> to point at a non-default cortex.yaml
+and the nats-server infra (stack.nats_infra.{config_path,service_manager,
+service_file,plist_path,account,creds_path}). Pass --config <p> to point at a non-default cortex.yaml
 (default: ~/.config/cortex/cortex.yaml). The flags below are OPTIONAL
 OVERRIDES: a passed flag wins; otherwise the value derives from config (or, for
 creds, the convention ~/.config/nats/<network>.creds). A required value that is
@@ -687,12 +732,12 @@ neither flagged nor derivable fails with a clear error naming the config field.
 Subcommands:
   join    Register → pull the SIGNED+VERIFIED network descriptor (DD-9; cached
           fallback on registry outage, DD-10) → render the nats-server leaf +
-          ensure the plist loads it (DD-6) → write policy.federated.networks[]
+          ensure the nats service loads it (DD-6) → write policy.federated.networks[]
           with registry-resolved peers (DD-5) + the stack's OWN accept-subject
           → restart. Idempotent (re-running converges).
   status  Show joined networks, peers, accept-subjects, leaf link state + counters.
   leave   Reverse a join cleanly: remove the network + leaf include, drop the
-          plist -c arg if no networks remain, restart. Idempotent.
+          service -c arg if no networks remain, restart. Idempotent.
 
   join public   (S5, #739) Opt into the PUBLIC scope — the open square of the
           Internet of Agentic Work. Announces --capabilities to the registry
@@ -720,7 +765,10 @@ Flags (all OPTIONAL OVERRIDES — derived from cortex.yaml when omitted; #753):
   --creds <p>             Override stack.nats_infra.creds_path (default: ~/.config/nats/<network>.creds).
   --account <nkey-U>      Override stack.nats_infra.account (A… nkey-U the leaf binds to).
   --nats-config <p>       Override stack.nats_infra.config_path (nats-server -c config).
-  --plist <p>             Override stack.nats_infra.plist_path (nats-server launchd plist).
+  --service-manager <m>   Override stack.nats_infra.service_manager: auto, launchd, systemd, none.
+  --service-file <p>      Override stack.nats_infra.service_file (launchd plist or systemd user unit).
+  --plist <p>             Legacy launchd alias for --service-file / stack.nats_infra.plist_path.
+  --daemon-service <name> Override cortex daemon service (launchd label or systemd unit).
   --leaf-node <name>      Leaf connection name on the network entry (default: network id).
   --max-hop <n>           Hop budget written on the network (default: 1).
   --capabilities <csv>    (join public) Comma-separated capability ids to announce

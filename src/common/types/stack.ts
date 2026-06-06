@@ -51,9 +51,9 @@ import { NKEY_PUBKEY_REGEX } from "./nkey";
  * leaf account that `cortex network join`/`leave` need to render the leaf
  * include file, ensure the plist loads it, and bind the leaf to the local
  * account. These are set ONCE per stack (they describe where the stack's
- * nats-server config + launchd plist live on disk and which account its leaf
+ * nats-server config + service file live on disk and which account its leaf
  * binds to), then every `cortex network join <network>` derives its
- * `--nats-config` / `--plist` / `--account` / `--creds` from this block.
+ * `--nats-config` / service metadata / `--account` / `--creds` from this block.
  *
  * #753 — the friction-removal block. Before this, every `cortex network join`
  * had to pass `--nats-config --plist --account --creds` on the command line;
@@ -75,10 +75,28 @@ export const StackNatsInfraSchema = z.object({
    */
   config_path: z.string().min(1).optional(),
   /**
-   * Path to the nats-server launchd plist `cortex network join` ensures loads
-   * the config (and reloads on join/leave). Maps to the `--plist` flag.
+   * Platform service manager for the nats-server service. `auto` derives from
+   * the host platform and `plist_path`/`service_file`; `launchd` edits/restarts
+   * a macOS plist, `systemd` edits/restarts a Linux user unit, and `none`
+   * leaves service management to the principal.
+   */
+  service_manager: z.enum(["auto", "launchd", "systemd", "none"]).optional(),
+  /**
+   * Path to the nats-server service file. On macOS this is the launchd plist;
+   * on Linux this is the systemd user unit. Maps to `--service-file`.
+   */
+  service_file: z.string().min(1).optional(),
+  /**
+   * Back-compat alias for the nats-server launchd plist. Maps to the legacy
+   * `--plist` flag and implies `launchd` when no service manager is declared.
    */
   plist_path: z.string().min(1).optional(),
+  /**
+   * Optional cortex daemon service name for reload after nats-server has
+   * reloaded the leaf. Launchd defaults to `ai.meta-factory.cortex.<slug>`;
+   * systemd defaults to `cortex-bot.service`.
+   */
+  daemon_service: z.string().min(1).optional(),
   /**
    * The local NATS account (`A…` nkey-U) the network's leaf binds to. Maps to
    * the `--account` flag. Same 56-char U-prefixed base32 NKey grammar as every

@@ -89,6 +89,23 @@ describe("StackConfigSchema", () => {
     expect(parsed.nkey_pub).toBe(VALID_NKEY);
   });
 
+  test("#760 accepts platform-neutral nats_infra service metadata", () => {
+    const parsed = StackConfigSchema.parse({
+      id: "jc/default",
+      nats_infra: {
+        config_path: "/home/clawbox/.config/nats/local.conf",
+        service_manager: "systemd",
+        service_file: "/home/clawbox/.config/systemd/user/nats-server.service",
+        daemon_service: "cortex-bot.service",
+        account: "A" + "B".repeat(55),
+        creds_path: "/home/clawbox/.config/nats/jc.creds",
+      },
+    });
+    expect(parsed.nats_infra?.service_manager).toBe("systemd");
+    expect(parsed.nats_infra?.service_file).toBe("/home/clawbox/.config/systemd/user/nats-server.service");
+    expect(parsed.nats_infra?.daemon_service).toBe("cortex-bot.service");
+  });
+
   test("rejects uppercase principal segment", () => {
     expect(() =>
       StackConfigSchema.parse({ id: "Andreas/research" }),
