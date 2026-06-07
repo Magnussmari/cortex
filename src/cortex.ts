@@ -101,7 +101,10 @@ import { refreshCockpit, defaultWorkItemSourceFor } from "./surface/mc/refresh";
 import { startCockpitRefreshLoop, type CockpitRefreshLoop } from "./surface/mc/refresh-loop";
 import type { Database as BunDatabase } from "bun:sqlite";
 import { isGatewayEnabled } from "./gateway/gateway-bootstrap";
-import { gatewayOwnedSurfaceKeys } from "./gateway/gateway-adapters";
+import {
+  gatewayAdapterInstanceCollisions,
+  planSurfaceOwnership,
+} from "./gateway/surface-ownership-plan";
 import type { Surfaces } from "./common/types/surfaces";
 import type { SurfaceGateway } from "./gateway/surface-gateway";
 
@@ -1723,24 +1726,26 @@ export async function startCortex(
   const adapters: PlatformAdapter[] = [];
   const adapterCleanup: (() => void)[] = [];
 
-  // GW.a.3b.2c (cortex#524) — the per-stack adapter suppression set. When
+  // GW.a.3b.2c (cortex#524) — the surface ownership plan. When
   // `CORTEX_GATEWAY` is set, the shared surface gateway (constructed below via
   // `startGatewayIfEnabled`) builds ONE adapter per `surfaces:` binding on the
   // SAME bot token the fold also wrote into `agents[].presence.{platform}`.
   // Starting the per-stack adapter too would double-connect that bot identity
-  // and double-deliver every message (the §1.2 bug). Each loop below skips an
-  // instance whose `{platform}:{agent.id}` is in this set, yielding that
-  // surface to the gateway.
+  // and double-deliver every message (the §1.2 bug). The plan is the single
+  // place that computes the per-stack suppression keys, Gateway adapter ids,
+  // and outbound stack pairs.
   //
-  // SAFETY: `gatewayOwnedSurfaceKeys` returns an EMPTY set when the flag is off
-  // (or no surfaces are configured). An empty set makes every `.has(...)` below
+  // SAFETY: the plan returns an EMPTY suppression set when the flag is off (or
+  // no surfaces are configured). An empty set makes every `.has(...)` below
   // false → no `continue` → the per-stack loops are byte-identical to the
   // pre-GW boot. `CORTEX_GATEWAY` is off on every live stack, so this is a
   // true no-op on the live boot path.
-  const gatewayOwned = gatewayOwnedSurfaceKeys(
-    options.surfaces,
-    isGatewayEnabled(process.env),
-  );
+  const surfaceOwnershipPlan = planSurfaceOwnership({
+    surfaces: options.surfaces,
+    gatewayEnabled: isGatewayEnabled(process.env),
+    principal: principalId,
+  });
+  const gatewayOwned = surfaceOwnershipPlan.ownedSurfaceKeys;
 
   // MIG-7.2e: per-instance agent lookup. When cortex.yaml supplies
   // `inlineAgents` (reused from the registry-merge block above), each
@@ -2646,6 +2651,7 @@ export async function startCortex(
     // additive args, no behaviour change on a dormant stack.
     source: systemEventSource,
     policyEngine: adapterPolicyEngine,
+    ownershipPlan: surfaceOwnershipPlan,
   });
   const gw: SurfaceGateway | undefined = startedGateway?.gateway;
 
@@ -2670,10 +2676,10 @@ export async function startCortex(
   // `{platform}:{demuxKey}` form would collide and let one envelope post to two
   // channels. Assert disjointness LOUDLY at boot rather than trust convention.
   if (startedGateway !== undefined) {
-    const perStackInstances = new Set(adapters.map((a) => a.instanceId));
-    const collisions = startedGateway.adapters
-      .map((a) => a.instanceId)
-      .filter((id) => perStackInstances.has(id));
+    const collisions = gatewayAdapterInstanceCollisions(
+      adapters,
+      startedGateway.adapters,
+    );
     if (collisions.length > 0) {
       throw new Error(
         `cortex: gateway adapter instanceId(s) ${collisions.map((c) => `"${c}"`).join(", ")} ` +
