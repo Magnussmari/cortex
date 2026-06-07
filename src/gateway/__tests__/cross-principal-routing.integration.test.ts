@@ -37,8 +37,8 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { startGatewayIfEnabled } from "../start-gateway";
 import { BusInboundSink } from "../bus-inbound-sink";
+import { startGatewayWithPlan } from "./start-gateway-test-helper";
 import { createDispatchSink } from "../../adapters/dispatch-sink";
 import { MockAdapter } from "../../adapters/mock";
 import type { GatewayAdapterFactory } from "../gateway-adapters";
@@ -257,7 +257,7 @@ describe("F-2 — cross-principal collaboration through one gateway (unsigned)",
 
     let started;
     try {
-      started = await startGatewayIfEnabled({
+      started = await startGatewayWithPlan({
         env: { CORTEX_GATEWAY: "1", CORTEX_GATEWAY_PUBLISH: "1" },
         surfaces: TWO_PRINCIPAL_SURFACES,
         principal: "andreas", // gateway principal; joel is cross-principal
@@ -419,7 +419,7 @@ describe("F-2 — cross-principal collaboration through one gateway (unsigned)",
     process.stderr.write = (): boolean => true; // mute the F-1 cross-principal WARN
     let started;
     try {
-      started = await startGatewayIfEnabled({
+      started = await startGatewayWithPlan({
         env: { CORTEX_GATEWAY: "1", CORTEX_GATEWAY_PUBLISH: "1" },
         surfaces: TWO_PRINCIPAL_SURFACES,
         principal: "andreas",

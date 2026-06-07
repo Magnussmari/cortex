@@ -2,10 +2,9 @@
  * GW.a.3b.2b — flag-gated gateway start orchestration (cortex#524).
  *
  * `startGatewayIfEnabled` is the ONE call cortex.ts makes to (maybe) stand up
- * the shared surface gateway. It keeps the boot path thin: cortex.ts adds a
- * single guarded `const gw = await startGatewayIfEnabled(...)` after its
- * per-stack adapters are built, and registers `gw?.stop()` in the existing
- * shutdown sequence. All flag-on orchestration lives HERE.
+ * the shared surface gateway. Cortex computes the pure ownership plan once
+ * before per-stack adapter boot, then passes the same plan here for Gateway
+ * start and outbound subject derivation.
  *
  * ## HARD SAFETY CONTRACT
  *
@@ -41,11 +40,11 @@
  * platform adapters opens no connection (start is deferred) — still, building
  * zero-value adapters for a no-binding config is pointless work, and the
  * factory-never-called invariant in the no-binding case keeps the contract
- * crisp + testable. We compute `hasBindings` up front and short-circuit.
+ * crisp + testable. The ownership plan computes `hasSurfaceBindings` up front,
+ * and this start path short-circuits from that decision.
  */
 
 import {
-  isGatewayEnabled,
   isGatewayPublishEnabled,
   maybeCreateSurfaceGateway,
 } from "./gateway-bootstrap";
@@ -55,12 +54,8 @@ import {
   type GatewayAdapterFactory,
 } from "./gateway-adapters";
 import { BusInboundSink } from "./bus-inbound-sink";
-import {
-  distinctBoundStacks,
-  distinctBoundPrincipalStacks,
-  crossPrincipalBindings,
-  type BoundPrincipalStack,
-} from "./binding-resolver";
+import type { BoundPrincipalStack } from "./binding-resolver";
+import type { SurfaceOwnershipPlan } from "./surface-ownership-plan";
 import type { SurfaceGateway } from "./surface-gateway";
 import type { Surfaces } from "../common/types/surfaces";
 import type { MyelinRuntime } from "../bus/myelin/runtime";
@@ -105,6 +100,12 @@ export interface StartGatewayOpts {
   factory?: GatewayAdapterFactory;
   /** Optional unroutable-message hook forwarded to the gateway. */
   onUnroutable?: (msg: InboundMessage, reason: string) => void;
+  /**
+   * Precomputed pure ownership plan from the boot path. Required so Gateway
+   * start, per-stack suppression, and outbound sink subject derivation all use
+   * the same ownership decision.
+   */
+  ownershipPlan: SurfaceOwnershipPlan;
 }
 
 /**
@@ -147,15 +148,6 @@ export interface StartedGateway {
   principalStacks: readonly BoundPrincipalStack[];
 }
 
-/** Count the total bindings across all platforms in a `Surfaces` map. */
-function countBindings(surfaces: Surfaces): number {
-  return (
-    (surfaces.discord?.length ?? 0) +
-    (surfaces.slack?.length ?? 0) +
-    (surfaces.mattermost?.length ?? 0)
-  );
-}
-
 /**
  * Flag-gated: maybe construct + start the shared surface gateway.
  *
@@ -171,10 +163,10 @@ function countBindings(surfaces: Surfaces): number {
 export async function startGatewayIfEnabled(
   opts: StartGatewayOpts,
 ): Promise<StartedGateway | undefined> {
-  const enabled = isGatewayEnabled(opts.env);
+  const { ownershipPlan } = opts;
 
   // ── Path 1: flag off → true no-op. Construct NOTHING. ─────────────────────
-  if (!enabled) {
+  if (!ownershipPlan.gatewayEnabled) {
     return undefined;
   }
 
@@ -182,7 +174,7 @@ export async function startGatewayIfEnabled(
   // Short-circuit BEFORE buildGatewayAdapters so the factory is never called
   // when there is nothing to demux (keeps the no-binding invariant crisp).
   const { surfaces } = opts;
-  if (surfaces === undefined || countBindings(surfaces) === 0) {
+  if (!ownershipPlan.gatewayStartEligible) {
     // maybeCreateSurfaceGateway emits the principal-facing stderr warning for
     // the no-binding case AND returns `undefined` (zero bindings). Call it for
     // that one-place log side-effect, then return `undefined` — there is no
@@ -194,6 +186,11 @@ export async function startGatewayIfEnabled(
       ...(opts.onUnroutable !== undefined && { onUnroutable: opts.onUnroutable }),
     });
     return undefined;
+  }
+  if (surfaces === undefined) {
+    throw new Error(
+      "surface-gateway ownership plan is start-eligible but surfaces are undefined",
+    );
   }
 
   // ── Path 3: flag on + bindings → build, construct, start. ─────────────────
@@ -212,7 +209,7 @@ export async function startGatewayIfEnabled(
   // untrusted peers until signing is layered on (cortex#552 / cortex#635).
   // `crossPrincipalBindings` stays the detector — only this consumer changed
   // from throw→warn.
-  const crossPrincipal = crossPrincipalBindings(surfaces, opts.principal);
+  const crossPrincipal = ownershipPlan.crossPrincipalBindings;
   if (crossPrincipal.length > 0) {
     process.stderr.write(
       `[surface-gateway] WARNING: cross-principal surface bindings are UNSIGNED/UNAUTHENTICATED ` +
@@ -290,7 +287,7 @@ export async function startGatewayIfEnabled(
   return {
     gateway: gw,
     adapters,
-    stacks: distinctBoundStacks(surfaces),
-    principalStacks: distinctBoundPrincipalStacks(surfaces, opts.principal),
+    stacks: ownershipPlan.outboundStacks,
+    principalStacks: ownershipPlan.outboundPrincipalStacks,
   };
 }
