@@ -13,9 +13,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { startGatewayIfEnabled } from "../start-gateway";
 import { SurfaceGateway, LoggingInboundSink } from "../surface-gateway";
 import { BusInboundSink } from "../bus-inbound-sink";
+import { startGatewayWithPlan } from "./start-gateway-test-helper";
 import type { GatewayAdapterFactory } from "../gateway-adapters";
 import type { PlatformAdapter } from "../../adapters/types";
 import type { Surfaces } from "../../common/types/surfaces";
@@ -127,7 +127,7 @@ describe("startGatewayIfEnabled — flag off", () => {
   test("CORTEX_GATEWAY unset → returns undefined, constructs NOTHING", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: {}, // flag unset
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -145,7 +145,7 @@ describe("startGatewayIfEnabled — flag off", () => {
   test("CORTEX_GATEWAY='0' → returns undefined, constructs NOTHING", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "0" },
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -162,7 +162,7 @@ describe("startGatewayIfEnabled — flag off", () => {
   test("CORTEX_GATEWAY='true' → returns undefined (only '1' is truthy)", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "true" },
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -180,7 +180,7 @@ describe("startGatewayIfEnabled — flag on", () => {
   test("flag on + surfaces → builds adapters, returns a started SurfaceGateway", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1" },
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -235,7 +235,7 @@ describe("startGatewayIfEnabled — flag on", () => {
         },
       ],
     };
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1" },
       surfaces: multiStack,
       principal: "andreas",
@@ -293,7 +293,7 @@ describe("startGatewayIfEnabled — flag on", () => {
 
     let gw;
     try {
-      gw = await startGatewayIfEnabled({
+      gw = await startGatewayWithPlan({
         env: { CORTEX_GATEWAY: "1" },
         surfaces: multiPrincipal,
         // gateway principal "andreas" — "robin" is cross-principal
@@ -350,7 +350,7 @@ describe("startGatewayIfEnabled — flag on", () => {
     try {
       // F-1 (cortex#629): a cross-principal binding is no longer a hard throw —
       // the gateway starts and the binding is allowed (UNSIGNED/dev-only).
-      gw = await startGatewayIfEnabled({
+      gw = await startGatewayWithPlan({
         env: { CORTEX_GATEWAY: "1" },
         surfaces: crossPrincipal,
         principal: "andreas",
@@ -385,7 +385,7 @@ describe("startGatewayIfEnabled — flag on", () => {
   test("flag on but surfaces undefined → returns undefined (graceful degrade)", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1" },
       surfaces: undefined,
       principal: "andreas",
@@ -403,7 +403,7 @@ describe("startGatewayIfEnabled — flag on", () => {
   test("flag on but surfaces empty → returns undefined", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1" },
       surfaces: {},
       principal: "andreas",
@@ -419,7 +419,7 @@ describe("startGatewayIfEnabled — flag on", () => {
   test("the returned gateway can be stopped", async () => {
     const started: string[] = [];
     const { factory } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1" },
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -442,7 +442,7 @@ describe("startGatewayIfEnabled — sink selection (CORTEX_GATEWAY_PUBLISH)", ()
   test("publish flag OFF (gateway on) → gateway uses LoggingInboundSink (SHADOW)", async () => {
     const started: string[] = [];
     const { factory } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1" }, // publish flag absent
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -461,7 +461,7 @@ describe("startGatewayIfEnabled — sink selection (CORTEX_GATEWAY_PUBLISH)", ()
   test("publish flag '0' (gateway on) → still SHADOW (only '1' is truthy)", async () => {
     const started: string[] = [];
     const { factory } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1", CORTEX_GATEWAY_PUBLISH: "0" },
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -476,7 +476,7 @@ describe("startGatewayIfEnabled — sink selection (CORTEX_GATEWAY_PUBLISH)", ()
   test("publish flag 'true' (gateway on) → still SHADOW (only '1' is truthy)", async () => {
     const started: string[] = [];
     const { factory } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1", CORTEX_GATEWAY_PUBLISH: "true" },
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -491,7 +491,7 @@ describe("startGatewayIfEnabled — sink selection (CORTEX_GATEWAY_PUBLISH)", ()
   test("BOTH flags '1' → gateway uses BusInboundSink (LIVE — publishing)", async () => {
     const started: string[] = [];
     const { factory } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1", CORTEX_GATEWAY_PUBLISH: "1" },
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -508,7 +508,7 @@ describe("startGatewayIfEnabled — sink selection (CORTEX_GATEWAY_PUBLISH)", ()
   test("publish flag '1' but gateway flag OFF → undefined (gateway gate still wins)", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY_PUBLISH: "1" }, // gateway flag absent
       surfaces: DISCORD_SURFACES,
       principal: "andreas",
@@ -527,7 +527,7 @@ describe("startGatewayIfEnabled — sink selection (CORTEX_GATEWAY_PUBLISH)", ()
   test("both flags '1' but no bindings → undefined, never reaches BusInboundSink", async () => {
     const started: string[] = [];
     const { factory, constructed } = makeCountingFactory(started);
-    const gw = await startGatewayIfEnabled({
+    const gw = await startGatewayWithPlan({
       env: { CORTEX_GATEWAY: "1", CORTEX_GATEWAY_PUBLISH: "1" },
       surfaces: {}, // no bindings → Path-2 degrade, no publish
       principal: "andreas",
