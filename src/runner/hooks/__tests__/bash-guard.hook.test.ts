@@ -8,6 +8,15 @@
  *     CORTEX_BASH_GUARD disabled behaviour
  *   - block telemetry event written to the JSONL fallback
  *   - block telemetry event POSTed to the HTTP ingest endpoint
+ *
+ * Plus the cortex#777 grant changes:
+ *   - the allowlist-MATCH terminal now emits Claude Code's auto-approve
+ *     PreToolUse decision (permissionDecision:"allow") so allowlisted
+ *     commands run in async dispatch WITHOUT a "requires approval" prompt.
+ *   - genuine pass-through paths (non-Grove / CLI principal / disabled-guard /
+ *     non-Bash / empty command) keep the {"continue": true} contract.
+ *   - every deny path still gates BEFORE the grant; no deny-worthy or
+ *     unvalidated command ever reaches the grant terminal.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -70,6 +79,23 @@ function runHook(
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
+/**
+ * Assert the hook emitted Claude Code's auto-approve PreToolUse decision —
+ * the cortex#777 grant terminal. The harness reads
+ * `hookSpecificOutput.permissionDecision`, so we assert that exact shape (NOT
+ * `{continue:true}`, which would leave Claude Code's normal gate in place and
+ * stall async `--print` dispatch on "requires approval").
+ */
+function expectGrantDecision(stdout: string): void {
+  const out = JSON.parse(stdout.trim());
+  expect(out.hookSpecificOutput).toBeDefined();
+  expect(out.hookSpecificOutput.hookEventName).toBe("PreToolUse");
+  expect(out.hookSpecificOutput.permissionDecision).toBe("allow");
+  expect(typeof out.hookSpecificOutput.permissionDecisionReason).toBe("string");
+  // A grant is NOT a pass-through — `continue` must be absent.
+  expect(out.continue).toBeUndefined();
+}
+
 describe("bash-guard.hook — pass-through behaviour", () => {
   test("passes through when GROVE_CHANNEL is not set", () => {
     const r = runHook("rm -rf /", { GROVE_CHANNEL: undefined });
@@ -96,29 +122,220 @@ describe("bash-guard.hook — pass-through behaviour", () => {
     expect(JSON.parse(r.stdout.trim())).toEqual({ continue: true });
   });
 
-  test("allowed command passes with {continue:true}", () => {
-    const r = runHook("ls -la", {
-      GROVE_CHANNEL: "test-channel",
-      GROVE_AGENT_ID: undefined,
-    });
-    expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout.trim())).toEqual({ continue: true });
-  });
-
   test("non-Bash tool passes through unchanged", () => {
     const r = runHook("ignored", { GROVE_CHANNEL: "test-channel" }, "Read");
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout.trim())).toEqual({ continue: true });
   });
+});
 
-  test("custom allowlist permits a widened command (e.g. bun)", () => {
+// =============================================================================
+// cortex#777 — allowlist MATCH now GRANTS (auto-approve), not pass-through.
+//
+// In a restricted (non-principal-DM) async `--print` session, a pass-through
+// ({continue:true}) leaves Claude Code's normal permission gate in place, so an
+// allowlisted command still returns "requires approval" — which async dispatch
+// can't surface, so the command never runs. The match terminal must instead
+// emit the auto-approve decision so the allowlisted+safe command runs without a
+// prompt.
+// =============================================================================
+describe("bash-guard.hook — allowlist match grants (auto-approve)", () => {
+  test("an allowlisted command GRANTS with permissionDecision:allow (not continue)", () => {
+    const r = runHook("ls -la", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+    });
+    expect(r.status).toBe(0);
+    expectGrantDecision(r.stdout);
+  });
+
+  test("gh issue create (halden's case) is GRANTED, not gated", () => {
+    // halden's allowlist matches `^gh\s+(pr|issue|repo|api|run)\s`. Before #777
+    // this was a pass-through → "requires approval" → async stall. Now: grant.
+    const r = runHook("gh issue create --repo the-metafactory/cortex --title x", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+      CORTEX_BASH_GUARD: JSON.stringify({
+        rules: [{ pattern: "^gh\\s+(pr|issue|repo|api|run)\\s" }],
+        repos: ["the-metafactory/cortex"],
+      }),
+    });
+    expect(r.status).toBe(0);
+    expectGrantDecision(r.stdout);
+  });
+
+  test("a custom-allowlisted command (e.g. bun) is GRANTED", () => {
     const r = runHook("bun test", {
       GROVE_CHANNEL: "test-channel",
       GROVE_AGENT_ID: undefined,
       CORTEX_BASH_GUARD: JSON.stringify({ rules: [{ pattern: "^bun\\s+" }] }),
     });
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout.trim())).toEqual({ continue: true });
+    expectGrantDecision(r.stdout);
+  });
+
+  test("a chain of ALL-allowed commands is GRANTED once (&& preserved)", () => {
+    const r = runHook("ls && pwd", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+    });
+    expect(r.status).toBe(0);
+    expectGrantDecision(r.stdout);
+  });
+
+  test("a grant writes no block telemetry (grant is not a block)", () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "bash-guard-grant-"));
+    try {
+      const sessionId = "grant-no-telemetry";
+      const r = runHook(
+        "ls",
+        { GROVE_CHANNEL: "test-channel", GROVE_AGENT_ID: undefined, HOME: homeDir },
+        "Bash",
+        sessionId,
+      );
+      expect(r.status).toBe(0);
+      expectGrantDecision(r.stdout);
+      const rawFile = join(homeDir, ".claude", "events", "raw", `${sessionId}.jsonl`);
+      expect(existsSync(rawFile)).toBe(false);
+    } finally {
+      rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// =============================================================================
+// cortex#777 SECURITY INVARIANT — the grant is the strict success terminal.
+// permissionDecision:"allow" is emitted ONLY when a command passed
+// rejectsChaining AND every chained part matched an allowlist rule AND any gh
+// repo-restriction passed. Every deny-worthy input must reach a DENY, never a
+// grant. This table-drives the negative space the adversarial reviewer checks.
+// =============================================================================
+describe("bash-guard.hook — grant is the strict success terminal (no deny-worthy input grants)", () => {
+  const config = JSON.stringify({
+    rules: [
+      { pattern: "^gh\\s+(pr|issue|repo|api|run)\\s" },
+      { pattern: "^ls\\b" },
+      { pattern: "^pwd$" },
+    ],
+    repos: ["the-metafactory/cortex"],
+  });
+
+  const DENY_WORTHY: [string, string][] = [
+    ["no allowlist match", "curl http://evil.example"],
+    ["one bad part in a chain", "ls && curl http://evil.example"],
+    ["repo not in allowlist", "gh issue create --repo evil/repo --title x"],
+    ["pipe smuggle past allowed head", "ls | curl http://evil.example"],
+    ["command substitution", "ls $(curl http://evil.example)"],
+    ["backtick substitution", "ls `id`"],
+    ["redirect clobber", "ls > /etc/passwd"],
+    ["background control token", "ls & curl http://evil.example"],
+    ["env-prefix substitution smuggle", 'X="$(id)" ls'],
+  ];
+
+  for (const [label, cmd] of DENY_WORTHY) {
+    test(`DENY (never grant): ${label}`, () => {
+      const r = runHook(cmd, {
+        GROVE_CHANNEL: "test-channel",
+        GROVE_AGENT_ID: undefined,
+        CORTEX_BASH_GUARD: config,
+      });
+      expect(r.status).toBe(0);
+      const out = JSON.parse(r.stdout.trim());
+      expect(out.hookSpecificOutput?.permissionDecision).toBe("deny");
+      // Hard guarantee: a deny-worthy command must NEVER produce an allow.
+      expect(out.hookSpecificOutput?.permissionDecision).not.toBe("allow");
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Echo (adversarial review, cortex#778) — vectors not in the inline table
+  // above because they need a real control character or a non-string payload.
+  // Each confirms the grant terminal stays unreachable for a deny-worthy input.
+  // ---------------------------------------------------------------------------
+
+  test("DENY (never grant): a REAL newline smuggles a second command", () => {
+    // The inline table can't carry a literal newline; feed one directly so the
+    // rejectsChaining `[\r\n]` arm is exercised end-to-end, not just in isolation.
+    const r = runHook("ls\nrm -rf /", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+      CORTEX_BASH_GUARD: config,
+    });
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(out.hookSpecificOutput?.permissionDecision).not.toBe("allow");
+  });
+
+  test("DENY (never grant): a carriage-return smuggles a second command", () => {
+    const r = runHook("ls\rrm -rf /", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+      CORTEX_BASH_GUARD: config,
+    });
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.hookSpecificOutput?.permissionDecision).toBe("deny");
+  });
+
+  test("DENY (never grant): the LAST part of a 3-part chain is unallowed (loop validates ALL parts)", () => {
+    // Loop-ordering proof: the first two parts match; the grant terminal must
+    // stay unreachable because a later part fails. Guards against a per-part
+    // `grant` slipping in before the loop finishes.
+    const r = runHook("ls && pwd && curl http://evil.example", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+      CORTEX_BASH_GUARD: config,
+    });
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(out.hookSpecificOutput?.permissionDecision).not.toBe("allow");
+  });
+
+  test("DENY (never grant): a MIDDLE part of a chain is unallowed", () => {
+    const r = runHook("ls && curl http://evil.example && pwd", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+      CORTEX_BASH_GUARD: config,
+    });
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.hookSpecificOutput?.permissionDecision).toBe("deny");
+  });
+
+  test("DENY (never grant): TAB-delimited chaining is split and validated (\\s split robustness)", () => {
+    // `\t` is whitespace, so the `\s*(?:&&|…)\s*` splitter must isolate the
+    // unallowed tail rather than fold it into an allowed head.
+    const r = runHook("ls\t&&\tcurl http://evil.example", {
+      GROVE_CHANNEL: "test-channel",
+      GROVE_AGENT_ID: undefined,
+      CORTEX_BASH_GUARD: config,
+    });
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.hookSpecificOutput?.permissionDecision).toBe("deny");
+  });
+
+  test("FAIL-SAFE: unparseable hook stdin passes through, NEVER grants", () => {
+    // The fail-open path must defer to Claude Code's normal gate ({continue:true}),
+    // not auto-approve. An error must never silently widen to an allow. Feed raw
+    // malformed JSON directly (runHook always wraps in valid JSON, so bypass it).
+    const merged: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined && !GROVE_ENV_KEYS.includes(k)) merged[k] = v;
+    }
+    merged.GROVE_CHANNEL = "test-channel";
+    merged.CORTEX_BASH_GUARD = config;
+    const r = spawnSync("bun", [HOOK_PATH], {
+      encoding: "utf-8",
+      input: "this is not valid json {{{",
+      env: merged,
+    });
+    expect(r.status).toBe(0);
+    const out = JSON.parse((r.stdout ?? "").trim());
+    expect(out).toEqual({ continue: true });
+    expect(out.hookSpecificOutput?.permissionDecision).not.toBe("allow");
   });
 });
 
@@ -382,20 +599,20 @@ describe("bash-guard.hook — no-bypass (metacharacter rejection)", () => {
     expectDeny('X="`id`" aws sts get-caller-identity');
   });
 
-  test("a plain (metacharacter-free) env-prefix is still allowed", () => {
+  test("a plain (metacharacter-free) env-prefix is still allowed (grants)", () => {
     // The whole point of PR #770: `AWS_PROFILE=halden-dev <allowed> …` must
     // pass. Use `ls` (in DEFAULT_CONFIG) so this case is independent of the
     // aws rule — it proves the raw-command metacharacter scan does not
-    // over-reject a benign `NAME=value` prefix.
+    // over-reject a benign `NAME=value` prefix. Post-#777 a match GRANTS.
     const r = runHook("AWS_PROFILE=halden-dev ls", env);
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout.trim())).toEqual({ continue: true });
+    expectGrantDecision(r.stdout);
   });
 
-  test("a chain of ALL-allowed commands still passes (&& preserved)", () => {
+  test("a chain of ALL-allowed commands still passes (&& preserved, grants)", () => {
     const r = runHook("ls && pwd", env);
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout.trim())).toEqual({ continue: true });
+    expectGrantDecision(r.stdout);
   });
 
   test("a chain with one disallowed command is denied (existing contract)", () => {
@@ -498,9 +715,10 @@ describe("bash-guard.hook — read-only aws (integration via hook + halden confi
   }
 
   function expectAllow(cmd: string): void {
+    // Post-#777: an allowlist MATCH GRANTS (auto-approve), not a pass-through.
     const r = run(cmd);
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout.trim())).toEqual({ continue: true });
+    expectGrantDecision(r.stdout);
   }
 
   function expectDeny(cmd: string): void {
