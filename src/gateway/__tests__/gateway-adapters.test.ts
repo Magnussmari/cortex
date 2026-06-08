@@ -36,6 +36,8 @@ interface FactoryCall {
   /** The credential block handed to the factory (presence-shaped). */
   binding: Record<string, unknown>;
   runtime: MyelinRuntime | undefined;
+  allowedGuildIds?: string[];
+  presenceByGuildId?: Record<string, { agentChannelId: string; logChannelId: string }>;
 }
 
 function makeFakeAdapter(
@@ -70,12 +72,23 @@ function makeRecordingFactory(): {
   const calls: FactoryCall[] = [];
   const factory: GatewayAdapterFactory = {
     discord: (args) => {
+      const presenceByGuildId = Object.fromEntries(
+        [...args.presenceByGuildId].map(([guildId, presence]) => [
+          guildId,
+          {
+            agentChannelId: presence.agentChannelId,
+            logChannelId: presence.logChannelId,
+          },
+        ]),
+      );
       calls.push({
         platform: "discord",
         instanceId: args.instanceId,
         source: args.source,
         binding: args.binding,
         runtime: args.runtime,
+        allowedGuildIds: [...args.allowedGuildIds].sort(),
+        presenceByGuildId,
       });
       return makeFakeAdapter("discord", args.instanceId);
     },
@@ -131,6 +144,56 @@ const DISCORD_SURFACES: Surfaces = {
         guildId: "111222333444555666",
         agentChannelId: "aaa000000000000001",
         logChannelId: "bbb000000000000002",
+      },
+    },
+  ],
+};
+
+const SAME_TOKEN_DISCORD_SURFACES: Surfaces = {
+  discord: [
+    {
+      agent: "juniper",
+      stack: "jc/default",
+      binding: {
+        token: "tok-juniper",
+        guildId: "1487023327791808592",
+        agentChannelId: "1487023328324616266",
+        logChannelId: "1487023328324616266",
+      },
+    },
+    {
+      agent: "juniper",
+      stack: "jc/default",
+      binding: {
+        token: "tok-juniper",
+        guildId: "1505549701674700991",
+        agentChannelId: "1513296336739635322",
+        logChannelId: "1513296336739635322",
+      },
+    },
+  ],
+};
+
+const SAME_TOKEN_DIFFERENT_STACKS_DISCORD_SURFACES: Surfaces = {
+  discord: [
+    {
+      agent: "juniper",
+      stack: "jc/default",
+      binding: {
+        token: "tok-juniper",
+        guildId: "1487023327791808592",
+        agentChannelId: "1487023328324616266",
+        logChannelId: "1487023328324616266",
+      },
+    },
+    {
+      agent: "juniper",
+      stack: "jc/research",
+      binding: {
+        token: "tok-juniper",
+        guildId: "1505549701674700991",
+        agentChannelId: "1513296336739635322",
+        logChannelId: "1513296336739635322",
       },
     },
   ],
@@ -223,6 +286,48 @@ describe("buildGatewayAdapters", () => {
     const { factory, calls } = makeRecordingFactory();
     buildGatewayAdapters(DISCORD_SURFACES, makeDeps(factory));
     expect(calls[0]?.runtime).toBe(RUNTIME_STUB);
+  });
+
+  test("same Discord token across two guild bindings → one adapter with both guilds allowed", () => {
+    const { factory, calls } = makeRecordingFactory();
+    const adapters = buildGatewayAdapters(SAME_TOKEN_DISCORD_SURFACES, makeDeps(factory));
+
+    expect(adapters.length).toBe(1);
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.platform).toBe("discord");
+    expect(calls[0]?.instanceId).toMatch(/^discord:token:[0-9a-f]{12}$/);
+    expect(calls[0]?.allowedGuildIds).toEqual([
+      "1487023327791808592",
+      "1505549701674700991",
+    ]);
+    expect(calls[0]?.presenceByGuildId).toEqual({
+      "1487023327791808592": {
+        agentChannelId: "1487023328324616266",
+        logChannelId: "1487023328324616266",
+      },
+      "1505549701674700991": {
+        agentChannelId: "1513296336739635322",
+        logChannelId: "1513296336739635322",
+      },
+    });
+  });
+
+  test("same Discord token across two stacks → separate stack-scoped adapters", () => {
+    const { factory, calls } = makeRecordingFactory();
+    const adapters = buildGatewayAdapters(
+      SAME_TOKEN_DIFFERENT_STACKS_DISCORD_SURFACES,
+      makeDeps(factory),
+    );
+
+    expect(adapters.length).toBe(2);
+    expect(calls.map((call) => call.instanceId)).toEqual([
+      "discord:1487023327791808592",
+      "discord:1505549701674700991",
+    ]);
+    expect(calls.map((call) => call.allowedGuildIds)).toEqual([
+      ["1487023327791808592"],
+      ["1505549701674700991"],
+    ]);
   });
 
   test("mixed surfaces → one adapter per binding, correct platforms", () => {

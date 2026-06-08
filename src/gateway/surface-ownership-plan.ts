@@ -17,6 +17,7 @@ import {
   distinctBoundStacks,
   type BoundPrincipalStack,
 } from "./binding-resolver";
+import { groupDiscordBindingsByToken } from "./discord-token-groups";
 
 export interface SurfaceOwnershipPlan {
   /** True when `CORTEX_GATEWAY` selected the Gateway path. */
@@ -67,8 +68,8 @@ function ownedKeys(surfaces: Surfaces | undefined): Set<string> {
 function gatewayInstanceIds(surfaces: Surfaces | undefined): string[] {
   const ids: string[] = [];
   if (surfaces === undefined) return ids;
-  for (const entry of surfaces.discord ?? []) {
-    ids.push(`discord:${entry.binding.guildId}`);
+  for (const group of groupDiscordBindingsByToken(surfaces.discord ?? [])) {
+    ids.push(group.instanceId);
   }
   for (const entry of surfaces.slack ?? []) {
     ids.push(`slack:${entry.binding.workspaceId}`);
