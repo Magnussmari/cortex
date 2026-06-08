@@ -113,6 +113,16 @@ const DEFAULT_REGISTRY_URL = "https://network.meta-factory.ai";
  */
 const DEFAULT_CONFIG_PATH = "~/.config/cortex/cortex.yaml";
 
+/**
+ * #800 — the cortex.yaml the stack's CORTEX daemon loads (the join's `--config`,
+ * default {@link DEFAULT_CONFIG_PATH}). Threaded into the ports config so the
+ * daemon-restart can LOCATE the daemon's launchd/systemd service by its
+ * `--config` arg instead of guessing `ai.meta-factory.cortex.<stack-slug>`.
+ */
+function cortexConfigPathFromFlags(flags: Record<string, string | true>): string {
+  return expandTilde(optionalValueFlag(flags, "--config") ?? DEFAULT_CONFIG_PATH);
+}
+
 const NETWORK_ID_RE = /^[a-z][a-z0-9-]*$/;
 const PRINCIPAL_ID_RE = /^[a-z][a-z0-9-]*$/;
 // S5 — capability id grammar (`<domain>.<entity>`, matches the schema's
@@ -427,6 +437,8 @@ async function runLeave(
     ...(inputs.plistPath !== undefined && { plistPath: inputs.plistPath }),
     ...(inputs.unitPath !== undefined && { unitPath: inputs.unitPath }),
     platform: inputs.platform,
+    // #800 — locate the daemon service for the post-leave restart.
+    cortexConfigPath: cortexConfigPathFromFlags(flags),
   };
   const ports = applyRes.apply ? buildLivePorts(cfg) : buildDryRunPorts(cfg);
 
@@ -720,6 +732,7 @@ function portsConfig(
     natsConfigPath: optionalValueFlag(flags, "--nats-config"),
     plistPath: optionalValueFlag(flags, "--plist"),
     monitorUrl: optionalValueFlag(flags, "--monitor-url"),
+    cortexConfigPath: cortexConfigPathFromFlags(flags),
   };
 }
 
@@ -757,6 +770,8 @@ function portsConfigFromInputs(
     ...(inputs.unitPath !== undefined && { unitPath: inputs.unitPath }),
     platform: inputs.platform,
     monitorUrl: optionalValueFlag(flags, "--monitor-url"),
+    // #800 — locate the daemon service for the post-join restart.
+    cortexConfigPath: cortexConfigPathFromFlags(flags),
     // #762 — caps the join announces INTO the network so the principal joins
     // the roster (registry control-plane; never on the wire).
     announceCapabilities: inputs.announceCapabilities,
