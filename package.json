@@ -2,6 +2,7 @@
   "name": "@the-metafactory/cortex",
   "module": "index.ts",
   "type": "module",
+  "license": "AGPL-3.0-only",
   "private": true,
   "exports": {
     "./bus": {
