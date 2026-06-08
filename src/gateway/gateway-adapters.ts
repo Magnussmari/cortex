@@ -67,6 +67,7 @@ import {
 } from "../common/types/cortex-config";
 import type { SystemEventSource } from "../bus/system-events";
 import type { MyelinRuntime } from "../bus/myelin/runtime";
+import { groupDiscordBindingsByToken } from "./discord-token-groups";
 // Back-compat re-export for callers that still import the old suppression helper here.
 export { gatewayOwnedSurfaceKeys } from "./surface-ownership-plan";
 
@@ -92,6 +93,10 @@ interface FactoryArgsBase {
 
 interface DiscordFactoryArgs extends FactoryArgsBase {
   presence: DiscordPresence;
+  /** Discord guild ids accepted by this gateway-owned token connection. */
+  allowedGuildIds: ReadonlySet<string>;
+  /** Per-guild presence config for grouped token connections. */
+  presenceByGuildId: ReadonlyMap<string, DiscordPresence>;
 }
 interface SlackFactoryArgs extends FactoryArgsBase {
   presence: SlackPresence;
@@ -158,12 +163,14 @@ function syntheticGatewayAgent(
  * adapters are CONSTRUCTED only — `buildGatewayAdapters` does not start them.
  */
 export const defaultGatewayAdapterFactory: GatewayAdapterFactory = {
-  discord: ({ instanceId, source, presence, runtime }) =>
+  discord: ({ instanceId, source, presence, runtime, allowedGuildIds, presenceByGuildId }) =>
     new DiscordAdapter(syntheticGatewayAgent(source.agent, { discord: presence }), presence, {
       instanceId,
       principal: {},
       ...(runtime !== undefined && { runtime }),
       systemEventSource: source,
+      allowedGuildIds,
+      presenceByGuildId,
     }),
 
   slack: ({ instanceId, source, presence, runtime }) =>
@@ -217,17 +224,28 @@ export function buildGatewayAdapters(
   const { principal, runtime, factory } = deps;
   const adapters: PlatformAdapter[] = [];
 
-  // ── Discord — demux key = guildId ─────────────────────────────────────────
-  for (const entry of surfaces.discord ?? []) {
-    const presence = DiscordPresenceSchema.parse(entry.binding);
-    const instanceId = `discord:${presence.guildId}`;
+  // ── Discord — one gateway connection per bot token ────────────────────────
+  //
+  // Discord delivers every guild event for a bot token over that token's one
+  // gateway session. Surface routing remains guild-keyed, but the platform
+  // connection is token-keyed so one assistant can serve multiple guilds
+  // without opening duplicate sessions for the same bot identity.
+  for (const group of groupDiscordBindingsByToken(surfaces.discord ?? [])) {
+    const presences = group.entries.map((entry) => DiscordPresenceSchema.parse(entry.binding));
+    const presence = presences[0];
+    const firstBinding = group.entries[0]?.binding;
+    if (!presence || !firstBinding) continue;
+    const presenceByGuildId = new Map(presences.map((p) => [p.guildId, p] as const));
+    const allowedGuildIds = new Set(presenceByGuildId.keys());
     adapters.push(
       factory.discord({
-        instanceId,
-        source: gatewaySource(principal, instanceId),
-        binding: entry.binding,
+        instanceId: group.instanceId,
+        source: gatewaySource(principal, group.instanceId),
+        binding: firstBinding,
         runtime,
         presence,
+        allowedGuildIds,
+        presenceByGuildId,
       }),
     );
   }
