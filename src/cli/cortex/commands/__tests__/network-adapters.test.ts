@@ -25,7 +25,6 @@ import {
   buildLeafStatePort,
   buildLivePorts,
   DEFAULT_MONITOR_URL,
-  resolveDaemonLabel,
   type LivePortsConfig,
 } from "../network-adapters";
 import { leaveNetwork } from "../network-lib";
@@ -1175,101 +1174,6 @@ describe("C-797 buildLeafStatePort (/leafz monitor)", () => {
   });
 });
 
-// =============================================================================
-// #800 — the cortex DAEMON restart target is resolved from the configured
-// nats plist's <key>Label</key> (suffix-shared with the cortex daemon label),
-// NOT from the stack slug. The peer bug: slug `default`, but the real plists
-// are `…cortex.meta-factory` / `…nats.meta-factory` → a slug-derived
-// `…cortex.default` label always 113/503s.
-// =============================================================================
-
-/** A nats-server plist whose Label is `ai.meta-factory.nats.<suffix>`. */
-function natsPlistWithLabel(suffix: string): string {
-  return [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    '<plist version="1.0">',
-    "<dict>",
-    "\t<key>Label</key>",
-    `\t<string>ai.meta-factory.nats.${suffix}</string>`,
-    "\t<key>ProgramArguments</key>",
-    "\t<array><string>/opt/homebrew/bin/nats-server</string></array>",
-    "</dict>",
-    "</plist>",
-    "",
-  ].join("\n");
-}
-
-describe("#800 daemon restart label resolves from nats_infra.plist_path", () => {
-  test("slug ≠ plist suffix → daemon label uses the PLIST suffix, not the slug", () => {
-    const dir = freshDir();
-    const plistPath = join(dir, "nats.plist");
-    // The peer case: real nats plist suffix is `meta-factory`...
-    writeFileSync(plistPath, natsPlistWithLabel("meta-factory"), "utf-8");
-
-    const cfg: LivePortsConfig = {
-      networkId: "metafactory-community",
-      principalId: "jc",
-      // ...but the stack slug is `default` (the slug-guess bug source).
-      stackId: "jc/default",
-      natsConfigPath: "/Users/jc/.config/nats/local.conf",
-      plistPath,
-      platform: "darwin",
-    };
-
-    // The daemon label maps `…nats.meta-factory` → `…cortex.meta-factory`,
-    // NOT the slug-derived `…cortex.default`.
-    expect(resolveDaemonLabel(cfg)).toBe("ai.meta-factory.cortex.meta-factory");
-    expect(resolveDaemonLabel(cfg)).not.toBe("ai.meta-factory.cortex.default");
-  });
-
-  test("slug == plist suffix → unchanged (label matches the slug, as before)", () => {
-    const dir = freshDir();
-    const plistPath = join(dir, "nats.plist");
-    writeFileSync(plistPath, natsPlistWithLabel("community"), "utf-8");
-    const cfg: LivePortsConfig = {
-      networkId: "community",
-      principalId: "andreas",
-      stackId: "andreas/community",
-      natsConfigPath: "/x/local.conf",
-      plistPath,
-      platform: "darwin",
-    };
-    expect(resolveDaemonLabel(cfg)).toBe("ai.meta-factory.cortex.community");
-  });
-
-  test("a plist already carrying a `.cortex.` label is used verbatim", () => {
-    const dir = freshDir();
-    const plistPath = join(dir, "daemon.plist");
-    writeFileSync(
-      plistPath,
-      natsPlistWithLabel("x").replace("nats.x", "cortex.work"),
-      "utf-8",
-    );
-    const cfg: LivePortsConfig = {
-      networkId: "n",
-      principalId: "andreas",
-      stackId: "andreas/default",
-      natsConfigPath: "/x/local.conf",
-      plistPath,
-      platform: "darwin",
-    };
-    expect(resolveDaemonLabel(cfg)).toBe("ai.meta-factory.cortex.work");
-  });
-
-  test("no readable plist label → falls back to the slug-derived label", () => {
-    const cfg: LivePortsConfig = {
-      networkId: "n",
-      principalId: "jc",
-      stackId: "jc/default",
-      natsConfigPath: "/x/local.conf",
-      plistPath: "/nonexistent/nats.plist",
-      platform: "darwin",
-    };
-    // No plist to read → the slug fallback (best effort) rather than a guess at
-    // the suffix.
-    expect(resolveDaemonLabel(cfg)).toBe("ai.meta-factory.cortex.default");
-  });
-});
 
 // =============================================================================
 // #799 — the live leaf-file port renders a NO-ACCOUNT remote for a $G/default
@@ -1472,5 +1376,54 @@ describe("#801 leave preserves the base -c arg (nats stays startable)", () => {
     expect(confAfter).not.toContain('include "leafnodes-metafactory.conf"');
     expect(confAfter).toContain("system_account: ADSYS"); // base config intact
     expect(existsSync(join(dir, "leafnodes-metafactory.conf"))).toBe(false);
+  });
+});
+
+// =============================================================================
+// #800 — the daemon-restart port resolves the cortex daemon's service from the
+// `--config` arg (cortexConfigPath), NOT the guessed `cortex.<slug>` label. The
+// dry-run port is inert; error branches (no config threaded / no matching
+// service) never spawn launchctl. The resolution logic itself is covered by
+// daemon-locator.test.ts; here we pin the PORT's behaviour + reasons.
+// =============================================================================
+
+describe("#800 daemon restart port", () => {
+  test("dry-run daemon restart is inert (no spawn, ok)", async () => {
+    const ports = buildDryRunPorts({
+      networkId: "metafactory",
+      principalId: "jc",
+      stackId: "jc/default",
+      cortexConfigPath: "/Users/jc/.config/cortex/cortex.yaml",
+      platform: "darwin",
+    });
+    const res = await ports.daemon.restart();
+    expect(res.ok).toBe(true);
+  });
+
+  test("live restart fails cleanly when no cortex config path is threaded", async () => {
+    const ports = buildLivePorts({
+      networkId: "metafactory",
+      principalId: "jc",
+      stackId: "jc/default",
+      platform: "darwin",
+      // cortexConfigPath intentionally unset.
+    });
+    const res = await ports.daemon.restart();
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain("cortexConfigPath");
+  });
+
+  test("live restart fails cleanly when no installed service matches the config (no spawn)", async () => {
+    const ports = buildLivePorts({
+      networkId: "metafactory",
+      principalId: "jc",
+      stackId: "jc/default",
+      // A config path no installed plist/unit references → resolves to nothing.
+      cortexConfigPath: "/tmp/cortex-c800-nonexistent-config.yaml",
+      platform: "darwin",
+    });
+    const res = await ports.daemon.restart();
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain("no cortex daemon service found");
   });
 });
