@@ -108,7 +108,13 @@ export interface SignedRegistrationBody {
 export interface RegistrationClaimShape {
   principal_id: string;
   principal_pubkey: string;
-  stacks: { stack_id: string; display_name?: string; metadata?: Record<string, string> }[];
+  stacks: {
+    stack_id: string;
+    /** C-787 — per-stack signing pubkey (base64 ed25519). */
+    stack_pubkey?: string;
+    display_name?: string;
+    metadata?: Record<string, string>;
+  }[];
   capabilities: { id: string; description?: string; networks?: string[] }[];
   issued_at: string;
   nonce: string;
@@ -320,13 +326,45 @@ export function materialFromSeedString(seed: string): StackIdentityMaterial {
 export interface BuildRegistrationClaimOptions {
   /** The principal this stack belongs to (`{principal_id}`). */
   readonly principalId: string;
-  /** The stack identity material (carries the seed to sign with). */
+  /**
+   * The stack identity material. Carries the stack's signing key.
+   *
+   * For a FIRST registration (no {@link rootMaterial}) this key is BOTH the
+   * claim's `principal_pubkey` (root) AND the key that signs the claim —
+   * proof-of-possession of the principal root, exactly as pre-C-787.
+   *
+   * For an ADD-STACK (with {@link rootMaterial}) this key is the NEW stack's
+   * per-stack signing key — its base64 pubkey becomes the new stack's
+   * `stack_pubkey`. It does NOT sign the claim; the root does.
+   */
   readonly material: StackIdentityMaterial;
+  /**
+   * C-787 — the principal ROOT/authority material (the FIRST stack's seed),
+   * present ONLY for an ADD-STACK against an already-registered principal.
+   *
+   * When supplied:
+   *   - the claim's `principal_pubkey` is the ROOT pubkey (so the registry's
+   *     rotation gate sees the same root already on record and admits it),
+   *   - the claim is SIGNED by the root key (so signature verification against
+   *     `principal_pubkey` succeeds — the add-stack authorization the registry
+   *     requires), and
+   *   - the joining stack in `stacks[]` carries `material`'s OWN pubkey as its
+   *     `stack_pubkey` (the root ATTESTS that key by signing the claim).
+   *
+   * This is the impersonation defense at the client: only a holder of the
+   * principal root seed can mint a claim the registry will accept for a new
+   * stack. A holder of merely the new stack's key cannot (the registry rejects
+   * a claim whose `principal_pubkey` ≠ the registered root).
+   */
+  readonly rootMaterial?: StackIdentityMaterial;
   /**
    * The stack ids to register. Each MUST be `{principalId}/{slug}` — the
    * registry rejects a prefix mismatch (forged-attribution guard).
+   *
+   * C-787 — a `stack_pubkey` may be set per stack. When omitted on the
+   * add-stack path, the joining stack inherits `material.pubkeyB64`.
    */
-  readonly stacks: { stack_id: string; display_name?: string }[];
+  readonly stacks: { stack_id: string; display_name?: string; stack_pubkey?: string }[];
   /** Capabilities to advertise (optional). */
   readonly capabilities?: { id: string; description?: string; networks?: string[] }[];
   /**
@@ -355,18 +393,35 @@ export interface BuildRegistrationClaimOptions {
 export async function buildRegistrationClaim(
   opts: BuildRegistrationClaimOptions,
 ): Promise<SignedRegistrationBody> {
+  // C-787 — the AUTHORITY key is the root when adding a stack, else the stack's
+  // own key (first-register / single-stack). The claim's `principal_pubkey` is
+  // the authority pubkey, and the claim is SIGNED by the authority — so the
+  // registry verifies the signature against `principal_pubkey` and admits the
+  // claim only from a holder of that authority key.
+  const authority = opts.rootMaterial ?? opts.material;
+
+  // On the add-stack path, the joining stack carries its OWN pubkey (the stack
+  // material's key) as `stack_pubkey` unless the caller set one explicitly. On
+  // the first-register path with no per-stack key set, the stack inherits the
+  // authority pubkey (the registry route also backfills this, but stamping it
+  // here keeps the signed bytes explicit and the wire self-describing).
+  const stacks = opts.stacks.map((s) => ({
+    ...s,
+    stack_pubkey: s.stack_pubkey ?? opts.material.pubkeyB64,
+  }));
+
   const claim: RegistrationClaimShape = {
     principal_id: opts.principalId,
-    principal_pubkey: opts.material.pubkeyB64,
-    stacks: opts.stacks,
+    principal_pubkey: authority.pubkeyB64,
+    stacks,
     capabilities: opts.capabilities ?? [],
     issued_at: opts.issuedAt ?? new Date().toISOString(),
     nonce: opts.nonce ?? randomNonce(),
   };
 
-  // Re-derive the KeyPair from the in-memory seed to sign. We sign over the
-  // SAME canonical-JSON the registry route reconstructs and verifies.
-  const kp = fromSeed(new TextEncoder().encode(opts.material.seed.trim()));
+  // Re-derive the AUTHORITY KeyPair from its in-memory seed to sign. We sign
+  // over the SAME canonical-JSON the registry route reconstructs and verifies.
+  const kp = fromSeed(new TextEncoder().encode(authority.seed.trim()));
   const message = new TextEncoder().encode(canonicalJSON(claim));
   const signature = await signWithNKey(kp, message);
 
@@ -514,6 +569,121 @@ export async function postNetworkCreate(
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const url = `${opts.registryUrl.replace(/\/+$/, "")}/networks/${encodeURIComponent(opts.networkId)}`;
   return postSigned(fetchImpl, url, opts.body, opts.timeoutMs);
+}
+
+// =============================================================================
+// C-787 — fetch existing stacks (read side of the add-stack fetch+merge)
+// =============================================================================
+
+/** One element of a principal's registered `stacks[]`. */
+export interface StackEntryShape {
+  readonly stack_id: string;
+  /** Per-stack signing pubkey (base64 ed25519). Always present post-C-787. */
+  readonly stack_pubkey?: string;
+  readonly display_name?: string;
+  readonly metadata?: Record<string, string>;
+}
+
+export interface FetchExistingStacksOptions {
+  /** Registry base URL (no trailing slash needed). */
+  readonly registryUrl: string;
+  /** The principal id (the `:principal_id` path segment). */
+  readonly principalId: string;
+  /** Injected fetch (tests). Defaults to global fetch. @internal */
+  readonly fetchImpl?: typeof globalThis.fetch;
+  /** Request timeout (ms). Default 10s. */
+  readonly timeoutMs?: number;
+}
+
+/**
+ * Outcome of {@link fetchExistingStacks}. Discriminated so the add-stack
+ * caller can branch CORRECTLY rather than guess:
+ *   - `present`  — the principal exists; `stacks` is its current registered set
+ *                  (each entry carries its `stack_pubkey`). The caller MERGES
+ *                  the new stack in and re-attests the COMPLETE set.
+ *   - `absent`   — the registry returned 404 (first registration). The caller
+ *                  proceeds with just the new stack, as pre-C-787.
+ *   - `error`    — the registry was unreachable / returned a non-200/404 / a
+ *                  malformed body. The caller MUST abort with a clear error
+ *                  rather than send a partial set that would DROP existing
+ *                  stacks (the data-loss the C-787 review flagged on #790).
+ */
+export type FetchExistingStacksResult =
+  | { kind: "present"; stacks: StackEntryShape[] }
+  | { kind: "absent" }
+  | { kind: "error"; reason: string };
+
+/**
+ * C-787 — `GET /principals/{principalId}` and extract the registered
+ * `stacks[]`. The READ half of the add-stack fetch+merge: the register route
+ * does a FULL-OVERWRITE upsert of the `stacks` column, so an add-stack claim
+ * MUST carry the complete intended set or it silently drops every stack it
+ * omits. This read lets the caller rebuild that complete set (existing +
+ * new) and have the root re-attest it.
+ *
+ * Distinguishes 404 (`absent` → first registration) from every other failure
+ * (`error`) so the caller never sends a partial set on a transient outage.
+ * The GET payload is a `SignedAssertion<PrincipalRecord>`; we read
+ * `payload.stacks` WITHOUT verifying the registry signature here — this is a
+ * convenience read to AVOID DATA LOSS, not a trust decision: the stacks we
+ * merge are re-attested by the principal ROOT signature on the register POST,
+ * and the registry re-verifies that. (A tampered GET could at worst cause the
+ * root to re-attest a stack it did not intend; the principal running the root
+ * reviews the merged set, and federated VERIFY still resolves per-stack keys from the
+ * registry-signed record. Signature-verifying this read is a possible
+ * hardening follow-up, not required to close the data-loss blocker.)
+ */
+export async function fetchExistingStacks(
+  opts: FetchExistingStacksOptions,
+): Promise<FetchExistingStacksResult> {
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const url = `${opts.registryUrl.replace(/\/+$/, "")}/principals/${encodeURIComponent(opts.principalId)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, opts.timeoutMs ?? 10_000);
+  let res: Response;
+  try {
+    res = await fetchImpl(url, { method: "GET", signal: controller.signal });
+  } catch (err) {
+    return {
+      kind: "error",
+      reason: `GET ${url} failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (res.status === 404) return { kind: "absent" };
+  if (!res.ok) {
+    return { kind: "error", reason: `GET ${url} returned HTTP ${res.status.toString()}` };
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch (err) {
+    return {
+      kind: "error",
+      reason: `GET ${url} returned non-JSON body: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  // Shape: SignedAssertion<PrincipalRecord> → body.payload.stacks[].
+  const payload = (body as { payload?: unknown } | null)?.payload;
+  const stacksRaw = (payload as { stacks?: unknown } | null | undefined)?.stacks;
+  if (!Array.isArray(stacksRaw)) {
+    return {
+      kind: "error",
+      reason: `GET ${url} payload had no stacks[] array (malformed registry response)`,
+    };
+  }
+  // Narrow each entry defensively — only keep well-formed stack records.
+  const stacks: StackEntryShape[] = [];
+  for (const s of stacksRaw) {
+    if (typeof s === "object" && s !== null && typeof (s as { stack_id?: unknown }).stack_id === "string") {
+      stacks.push(s as StackEntryShape);
+    }
+  }
+  return { kind: "present", stacks };
 }
 
 /** Shared POST-JSON-with-timeout used by both register + network-create. */
