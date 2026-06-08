@@ -207,5 +207,8 @@ ones most often activated here:
 
 ## License
 
-[MIT](LICENSE). See [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for
-upstream patterns + code incorporated into cortex.
+[AGPL-3.0-only](LICENSE). cortex is the M7 **reference implementation** of the
+metafactory stack; the AGPL's network-use copyleft (§13) keeps modifications
+shared when cortex is run as a service. See
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for upstream patterns +
+code incorporated into cortex.
