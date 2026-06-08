@@ -44,12 +44,15 @@ import {
 import {
   bunExecRunner,
   currentServicePlatform,
-  readPlistLabel,
   selectNatsServiceManager,
   type NatsServiceManager,
   type ServicePlatform,
 } from "../../../common/nats/nats-service-manager";
 import { NetworkRegistryClient } from "../../../common/registry/network-client";
+import {
+  findCortexDaemonDescriptor,
+  type DaemonLocatorIO,
+} from "./daemon-locator";
 import {
   buildRegistrationClaim,
   materialFromSeedString,
@@ -125,6 +128,16 @@ export interface LivePortsConfig {
    */
   platform?: ServicePlatform;
   monitorUrl?: string;
+  /**
+   * #800 — the cortex.yaml the stack's CORTEX daemon loads (the join's
+   * `--config`, default `~/.config/cortex/cortex.yaml`). Used to LOCATE the
+   * daemon's launchd/systemd service for the restart: the daemon is the service
+   * whose argv carries `--config <cortexConfigPath>`. Without it the restart
+   * fell back to guessing `ai.meta-factory.cortex.<stack-slug>`, which fails
+   * whenever the slug differs from the plist suffix (e.g. `jc/default` →
+   * `ai.meta-factory.cortex.meta-factory`).
+   */
+  cortexConfigPath?: string;
   /**
    * #762 — the capability ids this stack announces INTO `networkId`, sourced
    * from the network's `announce_capabilities[]` policy block. The federated
@@ -531,57 +544,76 @@ function buildConfigStorePort(cfg: LivePortsConfig, mutate: boolean): ConfigStor
 }
 
 // =============================================================================
-// Daemon port — launchctl kickstart of the stack daemon.
+// Daemon port — restart the stack's CORTEX daemon (#800).
+//
+// We DISCOVER the daemon's launchd/systemd service by matching the descriptor
+// whose argv carries `--config <cortexConfigPath>` (the cortex.yaml the daemon
+// loads), then restart it via its real `<key>Label</key>` / unit id through the
+// shared {@link selectNatsServiceManager} mechanism. The pre-#800 code guessed
+// `ai.meta-factory.cortex.<stack-slug>`, which fails (113/503) whenever the slug
+// differs from the plist suffix — the `jc/default` → `…cortex.meta-factory`
+// case. We no longer guess: an unresolvable daemon returns a CLEAR reason rather
+// than kickstarting a fabricated label.
 // =============================================================================
 
-/**
- * #800 — resolve the cortex DAEMON launchctl label.
- *
- * The bug: the label was derived as `ai.meta-factory.cortex.<stack-slug>`. When
- * the slug ≠ the plist suffix (the peer case — slug `default`, but the real
- * plists are `…cortex.meta-factory` / `…nats.meta-factory`) the kickstart always
- * 113/503s against a service that does not exist.
- *
- * The cortex daemon plist and the nats-server plist share a SUFFIX
- * (`ai.meta-factory.cortex.<suffix>` ↔ `ai.meta-factory.nats.<suffix>`). The
- * configured `stack.nats_infra.plist_path` is the authority for that suffix, so
- * we read the nats plist's `<key>Label</key>` and swap its service segment
- * (`…nats.<suffix>` → `…cortex.<suffix>`) to name the cortex daemon. The slug is
- * only a last-resort fallback when no plist label can be read (e.g. a Linux
- * stack with a unit, or a missing plist).
- */
-export function resolveDaemonLabel(cfg: LivePortsConfig): string {
-  const slugFallback = `ai.meta-factory.cortex.${cfg.stackId.split("/")[1] ?? "default"}`;
-  const plistPath = cfg.plistPath !== undefined ? expandTilde(cfg.plistPath) : undefined;
-  if (plistPath === undefined) return slugFallback;
-  const natsLabel = readPlistLabel(plistPath);
-  if (natsLabel === undefined) return slugFallback;
-  // Map the nats-server service segment to the cortex daemon segment, preserving
-  // the shared suffix: `<prefix>.nats.<suffix>` → `<prefix>.cortex.<suffix>`.
-  // If the label is already a `.cortex.` label (a stack that points plist_path
-  // at the cortex daemon plist directly), use it verbatim.
-  if (natsLabel.includes(".cortex.")) return natsLabel;
-  if (natsLabel.includes(".nats.")) return natsLabel.replace(/\.nats\./, ".cortex.");
-  // An unrecognised label shape — fall back to the slug-derived label rather
-  // than kickstart an unexpected service.
-  return slugFallback;
-}
+/** Live {@link DaemonLocatorIO} backed by real `fs`. */
+const liveDaemonLocatorIO: DaemonLocatorIO = {
+  listDir(dir) {
+    try {
+      return readdirSync(dir);
+    } catch (_err) {
+      // Missing/unreadable dir → no candidates here. Caller treats as "not found".
+      return [];
+    }
+  },
+  readFile(path) {
+    return readFileSync(path, "utf-8");
+  },
+  exists(path) {
+    return existsSync(path);
+  },
+};
 
 function buildDaemonPort(cfg: LivePortsConfig, mutate: boolean): DaemonPort {
   return {
     async restart() {
       if (!mutate) return { ok: true }; // dry-run: pretend success.
-      const label = resolveDaemonLabel(cfg);
-      const proc = Bun.spawn(["launchctl", "kickstart", "-k", `gui/${process.getuid?.() ?? 501}/${label}`], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const code = await proc.exited;
-      if (code !== 0) {
-        const err = await new Response(proc.stderr).text();
-        return { ok: false, reason: `launchctl kickstart ${label} exited ${code.toString()}: ${err.trim()}` };
+      const platform = cfg.platform ?? currentServicePlatform();
+      if (cfg.cortexConfigPath === undefined) {
+        return {
+          ok: false,
+          reason:
+            "cannot locate the cortex daemon service: no cortex config path threaded " +
+            "(internal: LivePortsConfig.cortexConfigPath unset)",
+        };
       }
-      return { ok: true };
+      const descriptorPath = findCortexDaemonDescriptor({
+        platform,
+        cortexConfigPath: cfg.cortexConfigPath,
+        launchAgentsDir: expandTilde("~/Library/LaunchAgents"),
+        systemdUserDir: expandTilde("~/.config/systemd/user"),
+        io: liveDaemonLocatorIO,
+      });
+      if (descriptorPath === undefined) {
+        const where = platform === "darwin" ? "~/Library/LaunchAgents" : "~/.config/systemd/user";
+        return {
+          ok: false,
+          reason:
+            `no cortex daemon service found referencing --config ${cfg.cortexConfigPath} ` +
+            `under ${where} — is the stack daemon installed? (arc upgrade Cortex)`,
+        };
+      }
+      let mgr;
+      try {
+        // NB: `selectNatsServiceManager` is named for its original nats-server
+        // caller, but it's generic — it restarts ANY launchd/systemd descriptor
+        // by reading its `<key>Label</key>` / unit id. Here we hand it the CORTEX
+        // daemon descriptor we just discovered, not a nats-server one.
+        mgr = selectNatsServiceManager({ descriptorPath, platform, mutate, exec: bunExecRunner });
+      } catch (err) {
+        return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+      return mgr.restart();
     },
   };
 }
