@@ -27,7 +27,7 @@
  * unit-testable function with no dependence on the host's `~/Library/LaunchAgents`.
  */
 
-import { join } from "path";
+import { join, resolve } from "path";
 
 import { expandTilde } from "../../../common/config/loader";
 import type { ServicePlatform } from "../../../common/nats/nats-service-manager";
@@ -92,9 +92,17 @@ export function parseUnitExecStartArgs(unitText: string): string[] {
     .filter((t) => t.length > 0);
 }
 
-/** Two config paths point at the same file once `~` is expanded. */
+/**
+ * Two config paths point at the same file. We `expandTilde` then `resolve` both
+ * sides, so a relative `--config`, a trailing slash, or a `.`/`..` segment still
+ * matches the absolute path arc renders into the plist. NOTE: this does NOT
+ * resolve symlinks (e.g. macOS `/var`→`/private/var`) — that would need a
+ * realpath syscall, which the injected-IO purity here deliberately avoids; arc
+ * renders a non-symlinked absolute path and the join expands the same default,
+ * so the symlinked-HOME edge is a known, accepted gap (PR #806 review note).
+ */
 function sameConfig(a: string, b: string): boolean {
-  return expandTilde(a) === expandTilde(b);
+  return resolve(expandTilde(a)) === resolve(expandTilde(b));
 }
 
 /**

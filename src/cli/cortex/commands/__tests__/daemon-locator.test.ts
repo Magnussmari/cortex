@@ -181,6 +181,22 @@ describe("#800 findCortexDaemonDescriptor (darwin)", () => {
     expect(found).toBeDefined();
   });
 
+  test("matches despite a non-normalised config path (`.` segment / trailing slash)", () => {
+    const io = fakeIO({
+      [LA]: { "ai.meta-factory.cortex.meta-factory.plist": daemonPlist(CFG) },
+    });
+    // The plist stores the clean absolute path; the query carries a `.` segment.
+    // path.resolve on both sides normalises them to the same file.
+    const found = findCortexDaemonDescriptor({
+      platform: "darwin",
+      cortexConfigPath: "/Users/jc/.config/cortex/./cortex.yaml",
+      launchAgentsDir: LA,
+      systemdUserDir: "/unused",
+      io,
+    });
+    expect(found).toBe(`${LA}/ai.meta-factory.cortex.meta-factory.plist`);
+  });
+
   test("returns undefined when no installed plist references the config", () => {
     const io = fakeIO({
       [LA]: {

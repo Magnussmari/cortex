@@ -605,6 +605,10 @@ function buildDaemonPort(cfg: LivePortsConfig, mutate: boolean): DaemonPort {
       }
       let mgr;
       try {
+        // NB: `selectNatsServiceManager` is named for its original nats-server
+        // caller, but it's generic — it restarts ANY launchd/systemd descriptor
+        // by reading its `<key>Label</key>` / unit id. Here we hand it the CORTEX
+        // daemon descriptor we just discovered, not a nats-server one.
         mgr = selectNatsServiceManager({ descriptorPath, platform, mutate, exec: bunExecRunner });
       } catch (err) {
         return { ok: false, reason: err instanceof Error ? err.message : String(err) };
