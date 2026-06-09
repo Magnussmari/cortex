@@ -28,9 +28,9 @@ import {
   rmSync,
   writeFileSync,
 } from "fs";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { parse as parseYaml, parseDocument } from "yaml";
 
 import { expandTilde } from "../../../common/config/loader";
 import {
@@ -149,6 +149,19 @@ export interface LivePortsConfig {
    * preserves any existing hand-pins rather than wiping them.
    */
   announceCapabilities?: string[];
+  /**
+   * #813 — test-only seam for the fail-closed daemon guard
+   * ({@link assertDaemonLoadsConfig}). In production this is absent and the
+   * guard scans the real `~/Library/LaunchAgents` / `~/.config/systemd/user`
+   * via {@link liveDaemonLocatorIO}. Tests inject a fake `io` (+ dirs) so they
+   * can exercise the live write path without a real installed daemon — and can
+   * assert the refuse-on-mismatch branch deterministically.
+   */
+  daemonLocatorOverride?: {
+    io: DaemonLocatorIO;
+    launchAgentsDir?: string;
+    systemdUserDir?: string;
+  };
 }
 
 // =============================================================================
@@ -486,37 +499,116 @@ function buildPlistPort(cfg: LivePortsConfig, mutate: boolean): PlistPort {
 // =============================================================================
 
 /**
- * The stack-scoped config file that carries policy.federated.networks[] (#756).
+ * The config file that carries `policy.federated.networks[]`, resolved from the
+ * daemon's REAL `--config` ({@link LivePortsConfig.cortexConfigPath}) — NOT from
+ * `cfg.stackId` (#805 / #807).
  *
- * Two layouts, resolved the same way the loader's composer resolves its
- * ingestion path (`LAYOUT_MARKER = system/system.yaml`):
+ * The split-brain bug (#805): the join used to derive its write target from the
+ * `stackId` slug + a hardcoded `~/.config/cortex`, ignoring the daemon's actual
+ * `--config`. On JC's single-file deployment (`cortex.yaml`, stack.id
+ * `jc/default`) the join wrote `~/.config/cortex/stacks/default.yaml` while the
+ * daemon read `~/.config/cortex/cortex.yaml` — status said "joined", the leaf
+ * never linked. We now resolve the target from `cortexConfigPath`, the same path
+ * the daemon loads, so the policy block always lands where the daemon reads it.
  *
- *   - **config-split (current, migration 0003 / #714):** per-stack dirs. Each
- *     stack lives at `~/.config/cortex/<slug>/`, with its policy block in
- *     `~/.config/cortex/<slug>/stacks/<slug>.yaml`. This is the file the daemon
- *     actually composes + loads, so the join's `policy.federated.networks[]`
- *     MUST land here. Detected by the per-stack marker
- *     `~/.config/cortex/<slug>/system/system.yaml`.
- *   - **flat (legacy):** `~/.config/cortex/stacks/<slug>.yaml`. The pre-split
- *     path; used only as a fallback when the per-stack dir is absent.
+ * Layout-aware, mirroring the daemon's composer read path (`loader.ts`
+ * `composeRawConfig`), which the shell `resolve_stack_config_path` also targets
+ * in the canonical `<slug>/<slug>.yaml` render — the daemon and the join MUST
+ * agree on which file holds the `policy:` block:
  *
- * Before #756 the join wrote the FLAT path unconditionally, so on a config-split
- * deployment the policy block landed as a stray orphan the daemon never read.
- * We now prefer the split layout whenever its per-stack dir exists.
+ *   - **config-split (migration 0003 / #714):** the dir of `cortexConfigPath`
+ *     contains `system/system.yaml` (the layout marker the loader's composer
+ *     keys on). The `policy:` block lives in `<dir>/stacks/<basename>.yaml`,
+ *     where `<basename>` is the `cortexConfigPath` filename without `.yaml`.
+ *     The slug is the pointer BASENAME, not `cfg.stackId` — that decoupling is
+ *     exactly #807's directory-layout drift corner (dir `meta-factory`,
+ *     stack.id `jc/default` → target keyed off the dir/basename, not `default`).
+ *     INVARIANT: the composer wholesale-replaces `policy.federated.networks` by
+ *     sort-order across `stacks/*.yaml`, so the `stacks/` dir is expected to
+ *     carry exactly ONE policy-bearing file; a second one would override the
+ *     join's write (merge-by-id is a tracked follow-up, not handled here).
+ *   - **monolith (single-file, legacy):** no `system/system.yaml` beside it. The
+ *     `policy:` block lives in the monolith file itself = `cortexConfigPath`.
+ *     This is the #805 single-file fix — the daemon reads `cortex.yaml`, so
+ *     policy must land in `cortex.yaml`.
+ *
+ * Read + write both call this, so the change keeps them symmetric. Falls back to
+ * the pre-#805 behaviour (slug + `~/.config/cortex`) only when `cortexConfigPath`
+ * is empty — which in practice never happens, since the CLI always sets it
+ * (defaults to the expanded {@link DEFAULT_CONFIG_PATH} via
+ * `cortexConfigPathFromFlags`).
  */
 function stackConfigPath(cfg: LivePortsConfig): string {
-  const slug = cfg.stackId.split("/")[1] ?? "default";
-  const cortexDir = expandTilde("~/.config/cortex");
-  // Config-split: the per-stack dir is marked by `<slug>/system/system.yaml`
-  // (the same marker the loader's composer keys on). When present, the policy
-  // block belongs in the per-stack `stacks/<slug>.yaml` the daemon composes.
-  const perStackDir = join(cortexDir, slug);
-  const splitMarker = join(perStackDir, "system", "system.yaml");
-  if (existsSync(splitMarker)) {
-    return join(perStackDir, "stacks", `${slug}.yaml`);
+  const cortexConfigPath = cfg.cortexConfigPath;
+  // Pre-#805 fallback: only when no --config is threaded. The CLI always sets
+  // it (default DEFAULT_CONFIG_PATH), so this branch is effectively unreachable
+  // in production — it's a belt-and-braces guard for direct port construction.
+  if (cortexConfigPath === undefined || cortexConfigPath === "") {
+    const slug = cfg.stackId.split("/")[1] ?? "default";
+    const cortexDir = expandTilde("~/.config/cortex");
+    const perStackDir = join(cortexDir, slug);
+    if (existsSync(join(perStackDir, "system", "system.yaml"))) {
+      return join(perStackDir, "stacks", `${slug}.yaml`);
+    }
+    return join(cortexDir, "stacks", `${slug}.yaml`);
   }
-  // Flat (legacy) fallback.
-  return join(cortexDir, "stacks", `${slug}.yaml`);
+
+  // #805/#807 — resolve from the daemon's real --config, layout-aware.
+  const configPath = expandTilde(cortexConfigPath); // defensive; CLI pre-expands
+  const configDir = dirname(configPath);
+  // Config-split: the per-stack dir is marked by `<dir>/system/system.yaml`
+  // (the same marker the loader's composer keys on). The `policy:` block belongs
+  // in `<dir>/stacks/<basename>.yaml` — the file the composer reads it from. The
+  // slug is the pointer BASENAME (not cfg.stackId — #807's drift corner).
+  const splitMarker = join(configDir, "system", "system.yaml");
+  if (existsSync(splitMarker)) {
+    const base = basename(configPath).replace(/\.ya?ml$/i, "");
+    return join(configDir, "stacks", `${base}.yaml`);
+  }
+  // Monolith (single-file, legacy) — policy lands in the monolith itself, the
+  // file the daemon reads (#805). No <dir>/system/system.yaml beside it.
+  return configPath;
+}
+
+/**
+ * #813 — fail-closed guard against the RESIDUAL split-brain (adversarial CASE N).
+ *
+ * `stackConfigPath` trusts the passed `--config`. When the principal OMITS
+ * `--config`, `cortexConfigPathFromFlags` defaults to `~/.config/cortex/
+ * cortex.yaml`; for a config-split stack living in a SUBDIR the resolved write
+ * then lands on the default monolith path while the daemon reads
+ * `<dir>/<slug>.yaml` — a silent re-split (and a regression vs the old
+ * stackId-slug logic, which handled aligned subdir stacks).
+ *
+ * BEFORE any live policy write we confirm a running cortex daemon actually
+ * loads the resolved `--config`, reusing the SAME discovery the restart step
+ * uses ({@link findCortexDaemonDescriptor}). If NO daemon matches we THROW —
+ * the join/leave orchestrator's write `try/catch` converts that into a clean
+ * `{ ok: false }` abort BEFORE `writeFileSync`, so no orphan policy block is
+ * left behind. Only the LIVE path runs this (mutate=true); dry-run returns
+ * early and injected test ports never reach this adapter.
+ */
+function assertDaemonLoadsConfig(cfg: LivePortsConfig): void {
+  // No `--config` threaded → nothing to verify against; the daemon-restart step
+  // already surfaces the unset-config error, so don't double-fail here.
+  if (cfg.cortexConfigPath === undefined || cfg.cortexConfigPath === "") return;
+  const platform = cfg.platform ?? currentServicePlatform();
+  const override = cfg.daemonLocatorOverride;
+  const descriptorPath = findCortexDaemonDescriptor({
+    platform,
+    cortexConfigPath: cfg.cortexConfigPath,
+    launchAgentsDir: override?.launchAgentsDir ?? expandTilde("~/Library/LaunchAgents"),
+    systemdUserDir: override?.systemdUserDir ?? expandTilde("~/.config/systemd/user"),
+    io: override?.io ?? liveDaemonLocatorIO,
+  });
+  if (descriptorPath === undefined) {
+    const resolved = expandTilde(cfg.cortexConfigPath);
+    throw new Error(
+      `no running cortex daemon loads --config ${resolved}; ` +
+        `pass --config <the path your daemon uses> ` +
+        `(e.g. ~/.config/cortex/<stack>/<stack>.yaml)`,
+    );
+  }
 }
 
 function buildConfigStorePort(cfg: LivePortsConfig, mutate: boolean): ConfigStorePort {
@@ -531,14 +623,18 @@ function buildConfigStorePort(cfg: LivePortsConfig, mutate: boolean): ConfigStor
     },
     writeNetworks(networks) {
       if (!mutate) return;
-      const raw = existsSync(path)
-        ? ((parseYaml(readFileSync(path, "utf-8")) ?? {}) as Record<string, unknown>)
-        : {};
-      const policy = (raw.policy ??= {}) as Record<string, unknown>;
-      const federated = ((policy as { federated?: unknown }).federated ??= {}) as Record<string, unknown>;
-      federated.networks = networks;
+      // #813 — fail closed before mutating the principal's config in place.
+      assertDaemonLoadsConfig(cfg);
+      // #813 — preserve comments: the join now rewrites the principal's
+      // hand-maintained monolith in place. parseDocument + setIn keeps the
+      // header/inline comments (incl. `# DO NOT EDIT BY HAND`) that
+      // parseYaml→stringifyYaml would strip.
+      const doc = existsSync(path)
+        ? parseDocument(readFileSync(path, "utf-8"))
+        : parseDocument("");
+      doc.setIn(["policy", "federated", "networks"], networks);
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, stringifyYaml(raw), "utf-8");
+      writeFileSync(path, doc.toString(), "utf-8");
     },
   };
 }
@@ -801,25 +897,30 @@ function buildPublicSubscribePort(mutate: boolean): PublicSubscribePort {
     },
     addPublicSubscription() {
       if (!mutate) return;
-      const raw = existsSync(path)
-        ? ((parseYaml(readFileSync(path, "utf-8")) ?? {}) as Record<string, unknown>)
-        : {};
-      const nats = (raw.nats ??= {}) as Record<string, unknown>;
-      const subjects = Array.isArray(nats.subjects) ? (nats.subjects as string[]) : [];
+      // #813 — preserve comments via the Document API (parseYaml→stringifyYaml
+      // strips the principal's hand-maintained system.yaml comments in place).
+      const doc = existsSync(path)
+        ? parseDocument(readFileSync(path, "utf-8"))
+        : parseDocument("");
+      const subjects = readSubjects();
       // Idempotent — never double-bind (the cortex#491 double-message footgun).
       if (!subjects.includes(PUBLIC_SUBSCRIBE)) subjects.push(PUBLIC_SUBSCRIBE);
-      nats.subjects = subjects;
+      doc.setIn(["nats", "subjects"], subjects);
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, stringifyYaml(raw), "utf-8");
+      writeFileSync(path, doc.toString(), "utf-8");
     },
     removePublicSubscription() {
       if (!mutate) return;
       if (!existsSync(path)) return;
-      const raw = (parseYaml(readFileSync(path, "utf-8")) ?? {}) as Record<string, unknown>;
-      const nats = raw.nats as { subjects?: string[] } | undefined;
-      if (nats?.subjects === undefined) return;
-      nats.subjects = nats.subjects.filter((s) => s !== PUBLIC_SUBSCRIBE);
-      writeFileSync(path, stringifyYaml(raw), "utf-8");
+      // #813 — preserve comments via the Document API.
+      const doc = parseDocument(readFileSync(path, "utf-8"));
+      const subjects = readSubjects().filter((s) => s !== PUBLIC_SUBSCRIBE);
+      // Only the array exists to rewrite if there were subjects; if `nats.subjects`
+      // was absent, readSubjects() returned [] and setIn writes an empty array —
+      // matching the prior parseYaml behaviour's early-return on undefined.
+      if (doc.getIn(["nats", "subjects"]) === undefined) return;
+      doc.setIn(["nats", "subjects"], subjects);
+      writeFileSync(path, doc.toString(), "utf-8");
     },
   };
 }
@@ -838,18 +939,21 @@ function buildPublicPolicyPort(cfg: LivePortsConfig, mutate: boolean): PublicPol
     },
     writePublic(next) {
       if (!mutate) return;
-      const raw = existsSync(path)
-        ? ((parseYaml(readFileSync(path, "utf-8")) ?? {}) as Record<string, unknown>)
-        : {};
-      const policy = (raw.policy ??= {}) as Record<string, unknown>;
+      // #813 — fail closed before mutating the principal's config in place (same
+      // policy file as ConfigStorePort.writeNetworks).
+      assertDaemonLoadsConfig(cfg);
+      // #813 — preserve comments via the Document API.
+      const doc = existsSync(path)
+        ? parseDocument(readFileSync(path, "utf-8"))
+        : parseDocument("");
       if (next === undefined) {
         // Leave teardown — drop the block entirely.
-        delete (policy as { public?: unknown }).public;
+        doc.deleteIn(["policy", "public"]);
       } else {
-        (policy as { public?: unknown }).public = next;
+        doc.setIn(["policy", "public"], next);
       }
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, stringifyYaml(raw), "utf-8");
+      writeFileSync(path, doc.toString(), "utf-8");
     },
   };
 }
