@@ -129,6 +129,8 @@ import type {
   RegistryClientReader,
   FederatedPeerResolution,
 } from "./common/registry";
+import { resolveBootFederatedPeers } from "./common/registry/resolve-federated-peers-boot";
+import type { NetworkRosterProvider } from "./common/registry/resolve-federated-peers";
 import { JsonlReader } from "./taps/cc-events/lib/jsonl-reader";
 import { PublishedEventSchema } from "./taps/cc-events/hooks/lib/event-types";
 import { formatEventForDiscord } from "./adapters/discord/event-formatter";
@@ -273,6 +275,16 @@ export interface StartCortexOptions {
    * @internal — not part of the public API; semver does not apply.
    */
   injectRuntime?: MyelinRuntime;
+  /**
+   * S4 (Network Join Control Plane, epic #733) — inject a roster provider for
+   * the boot-path federated-peer resolution instead of building a live
+   * `NetworkRegistryClient` from `policy.federated.registry`. Tests pass a
+   * fixture/stub provider so the DD-5/DD-10/DD-11 boot wiring runs with NO
+   * network I/O and NO `~/.config` cache touch. Production omits this.
+   *
+   * @internal — not part of the public API; semver does not apply.
+   */
+  bootFederatedRosterProvider?: NetworkRosterProvider;
   /**
    * Override the 15s shutdown timeout. Tests use a small value (50–200ms)
    * to exercise the abandoned-set tracking path without holding the test
@@ -638,6 +650,44 @@ export async function startCortex(
         "  `stack.nkey_seed_path` (+ optionally `stack.nkey_pub`) to cortex.yaml.\n" +
         "  See docs/sop-stack-identity.md for the full SOP.\n",
     );
+  }
+
+  // S4 (Network Join Control Plane, epic #733; DD-5 wiring) — resolve the
+  // federated `peers[]` from the registry roster BEFORE any consumer reads
+  // them. Joining a network names the NETWORK, not each principal: a peer may
+  // declare just `principal_id` + `stack_id` and have its `principal_pubkey`
+  // filled here from the verified registry roster (DD-5). Hand-pins are kept as
+  // the offline fallback; a hand-pin that DISAGREES with the registry-resolved
+  // key fails that peer closed (DD-11); a registry outage falls back to the
+  // cached roster + a loud warn (DD-10). The resolved networks are written back
+  // onto `options.policy.federated.networks` so EVERY downstream consumer (the
+  // runtime LinkPool below, the surface-router + dispatch-listener membership
+  // gates, the review-consumer subjects, the public index) reads the SAME
+  // resolved set — DD-5: no separate registry-resolved code path. NEVER throws;
+  // closes the `cortex-config.ts` "WIRING STATUS (S2)" gap.
+  {
+    const bootResolve = await resolveBootFederatedPeers(options.policy, {
+      warn: (message) => {
+        // Loud — drops + DD-10 fallback must be visible in the daemon logs.
+        process.stderr.write(`cortex: federated-peer boot resolve — ${message}\n`);
+      },
+      // Test-only seam: inject a fixture roster provider so the boot wiring runs
+      // with NO network I/O and NO `~/.config` cache touch. Production omits
+      // this and a live `NetworkRegistryClient` is built from the registry block.
+      ...(options.bootFederatedRosterProvider !== undefined && {
+        rosterProvider: options.bootFederatedRosterProvider,
+      }),
+    });
+    // Rewrite the single field every consumer reads. When federation/registry
+    // is absent this is the input policy returned unchanged (no-op).
+    options.policy = bootResolve.policy;
+    if (bootResolve.errors.length > 0) {
+      console.error(
+        `cortex: ${bootResolve.errors.length.toString()} federated peer(s) ` +
+          `failed closed at boot and were dropped from the membership gate ` +
+          `(see stderr warnings above for per-peer detail).`,
+      );
+    }
   }
 
   // Bus runtime (M2-M6) — no-op when `config.nats?` is absent. Tests inject

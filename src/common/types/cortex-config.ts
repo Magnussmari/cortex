@@ -1440,19 +1440,20 @@ export const PolicyFederatedPeerSchema = z.object({
    * `resolveSourceNetwork`, which key on `stack_id` membership) denies its
    * federated traffic as `unknown_network`.
    *
-   * WIRING STATUS (S2): the resolver is shipped + unit-tested but is not
-   * yet invoked on the boot path — per the epic-#733 slice matrix, wiring
-   * the S1–S3 pieces into `cortex.ts` config-load is **S4's** deliverable
-   * ("PR-4 join/leave/status wiring S1–S3"). Until S4 lands, this field is
-   * forward-declared: no runtime gate reads a config peer's
-   * `principal_pubkey` (the membership gate keys on `stack_id`;
-   * `buildIdentityRegistry` is built from the agent registry + local stack,
-   * and federated peer pubkeys are resolved on demand via the TC-2d
-   * `MultiPrincipalIdentityRegistry` resolver, not from this field). So a
-   * keyless peer admitted by the relaxed schema cannot fail open today —
-   * it simply isn't consumed yet. The S4 wiring MUST feed the resolver's
-   * output into the same gate/verify path a hand-pin would feed (DD-5: no
-   * separate registry-resolved code path).
+   * WIRING STATUS (S4 — WIRED): the resolver is now invoked on the boot path.
+   * `startCortex` calls `resolveBootFederatedPeers`
+   * (`src/common/registry/resolve-federated-peers-boot.ts`) BEFORE any consumer
+   * reads `policy.federated.networks[]`, and rewrites that field with the
+   * resolved set. A pubkey-less peer has THIS field filled from the verified
+   * roster (DD-5); a hand-pin that disagrees with the roster fails the peer
+   * closed and DROPS it from `peers[]` (DD-11); a registry outage falls back to
+   * the cached roster + a loud warn (DD-10). The resolved networks feed the SAME
+   * downstream consumers — the runtime LinkPool, the surface-router +
+   * dispatch-listener membership gates (`evaluateFederationGate` /
+   * `resolveSourceNetwork`, which key on `peers[].principal_id`), the
+   * review-consumer subjects, and the public index — so there is NO separate
+   * registry-resolved code path (DD-5). A keyless peer is never admitted to the
+   * gate (fail-closed): it is either resolved to a key or dropped.
    */
   principal_pubkey: z.string().regex(
     NKEY_PUBKEY_REGEX,
