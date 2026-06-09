@@ -189,6 +189,48 @@ export interface LeafFilePort {
    * creds path; `account` is the candidate nkey-U (or `undefined`).
    */
   resolveBindMode(account: string | undefined, hasCreds: boolean): LeafBindMode;
+  /**
+   * #821 — pre-flight: does the leaf `.creds` file at `path` actually EXIST on
+   * disk? `nats-server -c <cfg> -t` only validates HOCON syntax — it does NOT
+   * dereference a leaf remote's `credentials` path, so a remote pointing at a
+   * NON-EXISTENT creds file passes `-t` yet makes nats-server fail at runtime
+   * (the leaf can never authenticate). The community incident pointed at
+   * `~/.config/nats/metafactory-community.creds`, which did not exist. The
+   * orchestrator calls this BEFORE writing the include + restarting, and REFUSES
+   * when the creds file is missing — a READ, identical in live + dry-run.
+   */
+  credsExist(path: string): boolean;
+  /**
+   * #821 — restart-safety SNAPSHOT. Capture the current on-disk leaf state for
+   * `networkId` (the per-network include file + the base nats config's `include`
+   * directive presence) so a failed nats-server restart can be ROLLED BACK to
+   * the prior working bytes via {@link restoreLeafState}. Returned as an opaque
+   * token. A READ — taken BEFORE the join mutates anything.
+   */
+  snapshotLeafState(networkId: string): LeafStateSnapshot;
+  /**
+   * #821 — restart-safety ROLLBACK. Restore the leaf state captured by
+   * {@link snapshotLeafState}: rewrite (or delete) the per-network include file
+   * and the base config's `include` directive to exactly the snapshot's bytes.
+   * Called ONLY when a nats-server restart left the bus down, so the next
+   * restart brings the bus back to its prior working state. Idempotent.
+   */
+  restoreLeafState(snapshot: LeafStateSnapshot): void;
+}
+
+/**
+ * #821 — opaque rollback token for {@link LeafFilePort.snapshotLeafState} /
+ * {@link LeafFilePort.restoreLeafState}. Captures whether the per-network leaf
+ * include file existed (+ its bytes) and whether the base nats config carried
+ * the `include` directive (+ its full bytes), so a failed restart can be
+ * reverted to exactly the pre-join state.
+ */
+export interface LeafStateSnapshot {
+  networkId: string;
+  /** The per-network include file's prior contents, or `undefined` if absent. */
+  includeFile: string | undefined;
+  /** The base nats config's prior contents, or `undefined` if the file was absent. */
+  natsConfig: string | undefined;
 }
 
 /**
@@ -253,6 +295,36 @@ export interface DaemonPort {
 export interface NatsServerPort {
   /** Restart nats-server so it reloads `local.conf` (the new leaf include). */
   restart(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * #821 MAJOR-1 — a cheap PRE-RESTART config-syntax gate: run `nats-server -c
+   * <cfg> -t` (the upstream config-test flag) so an obviously-broken config is
+   * caught BEFORE the restart that would otherwise crash the bus. NOTE: `-t` is
+   * a SYNTAX check — it does NOT dereference leaf creds paths or resolve a
+   * leaf-remote's account against the account tree, so it PASSED for the original
+   * #821 crash. It is therefore NECESSARY-NOT-SUFFICIENT: a cheap extra gate
+   * layered ON TOP of the account-required + creds-exist + health-probe defenses,
+   * never the primary defense. A dry-run is inert (returns ok). When `nats-server`
+   * is not on PATH the gate is SKIPPED (returns ok) rather than blocking the join.
+   */
+  validateConfig(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * #821 — restart-safety HEALTH PROBE. After a restart, confirm nats-server
+   * actually came back UP (its monitor port is listening / the process is
+   * healthy). `launchctl kickstart` / `systemctl restart` can exit 0 even when
+   * the server then crashes on the new config at runtime (the community
+   * incident: the restart "succeeded" but nats-server exited 1 on the bad leaf,
+   * leaving the bus DOWN). The orchestrator probes AFTER the restart; an
+   * unhealthy result triggers a snapshot rollback + re-restart. Returns
+   * `{ healthy: true }` when the server is reachable, else a reason.
+   *
+   * #821 NIT-2 (follow-up) — `/healthz` is a LIVENESS probe: it confirms the
+   * server process is up, but cannot distinguish "up, and the leaf connected"
+   * from "up, but the leaf remote was rejected". A stronger JOIN-verification
+   * would additionally poll `/leafz` for the expected remote (the C-797
+   * leaf-state surface). Tracked as a follow-up; liveness is sufficient to catch
+   * the #821 crash (a crashed server fails `/healthz`).
+   */
+  isHealthy(): Promise<{ healthy: true } | { healthy: false; reason: string }>;
 }
 
 /**

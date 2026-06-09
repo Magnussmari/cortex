@@ -26,6 +26,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "fs";
 import { basename, dirname, join } from "path";
@@ -35,8 +36,10 @@ import { parse as parseYaml, parseDocument } from "yaml";
 import { expandTilde } from "../../../common/config/loader";
 import {
   ensureLeafInclude,
+  leafIncludeDirectivePresent,
   leafIncludeFileName,
   natsConfigCanBindAccount,
+  natsConfigMonitorUrl,
   removeLeafInclude,
   renderLeafIncludeFile,
   resolveLeafBindMode,
@@ -129,6 +132,15 @@ export interface LivePortsConfig {
    */
   platform?: ServicePlatform;
   monitorUrl?: string;
+  /**
+   * #821 MAJOR — bound the health-probe `fetch` so a nats-server that accepts
+   * the monitor TCP connection but never RESPONDS (hung/deadlocked — exactly the
+   * failure the probe exists to catch) cannot hang `joinNetwork` forever. The
+   * probe aborts after this many ms and treats the abort as `healthy:false`.
+   * Defaults to {@link DEFAULT_HEALTH_PROBE_TIMEOUT_MS}; tests pin a short value
+   * so the timeout path is asserted without a real multi-second wait.
+   */
+  healthProbeTimeoutMs?: number;
   /**
    * #800 — the cortex.yaml the stack's CORTEX daemon loads (the join's
    * `--config`, default `~/.config/cortex/cortex.yaml`). Used to LOCATE the
@@ -486,7 +498,101 @@ function buildLeafFilePort(cfg: LivePortsConfig, mutate: boolean): LeafFilePort 
         : "";
       return resolveLeafBindMode(text, account, hasCreds);
     },
+    credsExist(path) {
+      // #821 — pure READ (identical in live + dry-run): does the leaf creds file
+      // exist AS A USABLE CREDS FILE? `nats-server -t` never dereferences it, so a
+      // missing/empty/wrong-type creds file passes `-t` yet leaves the leaf
+      // un-authenticatable. NIT-1 — beyond mere existence we require it to be a
+      // regular NON-EMPTY file (a directory or 0-byte file is a dormant trap) and
+      // sniff the `-----BEGIN NATS USER JWT-----` marker a real `.creds` carries.
+      // The path is tilde-expanded to match how nats-server resolves it.
+      const expanded = expandTilde(path);
+      if (expanded.length === 0) return false;
+      let st;
+      try {
+        st = statSync(expanded);
+      } catch (_err) {
+        return false; // ENOENT / unreadable → treat as missing.
+      }
+      if (!st.isFile() || st.size === 0) return false;
+      // Sniff the NATS user-creds marker. A genuine `.creds` from `nsc`/the
+      // provisioner carries the decorated JWT+seed block; reject a file that
+      // does not (e.g. a stray text file at the conventional path).
+      let head: string;
+      try {
+        head = readFileSync(expanded, "utf-8").slice(0, 512);
+      } catch (_err) {
+        return false;
+      }
+      return head.includes("-----BEGIN NATS USER JWT-----");
+    },
+    snapshotLeafState(networkId) {
+      // #821 — capture the per-network include file bytes + WHETHER the base nats
+      // config carried the `include` directive, so a failed restart can be rolled
+      // back. A READ. We capture the directive PRESENCE (not the whole base
+      // config bytes) so restore only ever touches the ONE directive the join
+      // adds — never the externally-owned base `local.conf` as a whole.
+      const includePath = join(dir, leafIncludeFileName(networkId));
+      const configPath = expandTilde(cfg.natsConfigPath ?? "");
+      const baseConfig =
+        configPath.length > 0 && existsSync(configPath)
+          ? readFileSync(configPath, "utf-8")
+          : undefined;
+      return {
+        networkId,
+        includeFile: existsSync(includePath)
+          ? readFileSync(includePath, "utf-8")
+          : undefined,
+        // Record only whether the include DIRECTIVE was present pre-join. We do
+        // NOT snapshot the whole base-config bytes — see restoreLeafState.
+        natsConfig:
+          baseConfig !== undefined &&
+          leafIncludeDirectivePresentInBaseConfig(baseConfig, networkId)
+            ? "directive-present"
+            : undefined,
+      };
+    },
+    restoreLeafState(snapshot) {
+      // #821 — rollback: return the leaf state to its pre-join shape. Dry-run is
+      // inert. NIT (code-review) — restore ONLY the per-network include file +
+      // the single `include` DIRECTIVE the join added; NEVER rmSync the whole
+      // base `local.conf` (it is the externally-owned `-c` config, #801, and may
+      // carry directives this join never touched). We add/remove exactly the
+      // directive via the same idempotent helpers join used.
+      if (!mutate) return;
+      const includePath = join(dir, leafIncludeFileName(snapshot.networkId));
+      if (snapshot.includeFile === undefined) {
+        // The include file did not exist pre-join — remove what the join wrote.
+        rmSync(includePath, { force: true });
+      } else {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(includePath, snapshot.includeFile, "utf-8");
+      }
+
+      // Restore the include DIRECTIVE in the base config to its pre-join presence.
+      const configPath = expandTilde(cfg.natsConfigPath ?? "");
+      if (configPath.length === 0 || !existsSync(configPath)) return;
+      const current = readFileSync(configPath, "utf-8");
+      const directiveWasPresent = snapshot.natsConfig === "directive-present";
+      const next = directiveWasPresent
+        ? ensureLeafInclude(current, snapshot.networkId) // it was there → keep it
+        : removeLeafInclude(current, snapshot.networkId); // join added it → drop it
+      if (next !== current) writeFileSync(configPath, next, "utf-8");
+    },
   };
+}
+
+/**
+ * #821 — does the base nats config already carry the `include
+ * "leafnodes-<network>.conf"` directive? Thin wrapper over
+ * {@link leafIncludeDirectivePresent} so the snapshot records directive PRESENCE
+ * (the only base-config state the join changes) rather than the whole file.
+ */
+function leafIncludeDirectivePresentInBaseConfig(
+  baseConfig: string,
+  networkId: string,
+): boolean {
+  return leafIncludeDirectivePresent(baseConfig, networkId);
 }
 
 // =============================================================================
@@ -781,6 +887,32 @@ function buildDaemonPort(cfg: LivePortsConfig, mutate: boolean): DaemonPort {
 // file name). No hardcoded service id; no platform branching here.
 // =============================================================================
 
+/**
+ * #821 MAJOR — default health-probe timeout (ms). Bounds the `/healthz` fetch so
+ * a hung monitor cannot stall the join. 5s is generous for a loopback probe yet
+ * far below any "the CLI is wedged" threshold.
+ */
+export const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * #821 MAJOR (code-review) — resolve the nats-server HTTP monitor BASE url the
+ * health probe (and leaf-state) should hit. Precedence:
+ *   1. explicit `--monitor-url` (cfg.monitorUrl) — highest, the principal's override;
+ *   2. DERIVED from the stack's nats config (`http_port`/`monitor_port`/`http`),
+ *      so a non-default bus (the community :8224) is probed on its OWN port;
+ *   3. the upstream default `:8222`.
+ * The config read is best-effort (a missing/unreadable file just falls through).
+ */
+function resolveMonitorBase(cfg: LivePortsConfig): string {
+  if (cfg.monitorUrl !== undefined && cfg.monitorUrl !== "") return cfg.monitorUrl;
+  const configPath = expandTilde(cfg.natsConfigPath ?? "");
+  if (configPath.length > 0 && existsSync(configPath)) {
+    const derived = natsConfigMonitorUrl(readFileSync(configPath, "utf-8"));
+    if (derived !== undefined) return derived;
+  }
+  return DEFAULT_MONITOR_URL;
+}
+
 function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerPort {
   return {
     async restart() {
@@ -803,6 +935,85 @@ function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerP
         };
       }
       return mgr.restart();
+    },
+    async validateConfig() {
+      // #821 MAJOR-1 — cheap pre-restart syntax gate: `nats-server -c <cfg> -t`.
+      // Dry-run is inert. The gate is NECESSARY-NOT-SUFFICIENT (a syntax check
+      // that does not resolve leaf creds/accounts — it passed for the original
+      // crash), so a non-zero exit is a HARD signal the config is broken, while a
+      // missing `nats-server` binary is SKIPPED (returns ok) rather than blocking
+      // the join on a machine where the test tool isn't installed.
+      if (!mutate) return { ok: true };
+      const configPath = expandTilde(cfg.natsConfigPath ?? "");
+      if (configPath.length === 0) {
+        // No config to test — the restart step will surface the real error.
+        return { ok: true };
+      }
+      let result: { code: number; stderr: string };
+      try {
+        result = await bunExecRunner(["nats-server", "-c", configPath, "-t"]);
+      } catch (err) {
+        // Spawn failure (e.g. binary not on PATH) → SKIP the gate, don't block.
+        process.stderr.write(
+          `network join: skipping nats-server -t gate (could not run nats-server: ${err instanceof Error ? err.message : String(err)})\n`,
+        );
+        return { ok: true };
+      }
+      if (result.code !== 0) {
+        return {
+          ok: false,
+          reason: `nats-server -c ${configPath} -t exited ${result.code.toString()}: ${result.stderr.trim()}`,
+        };
+      }
+      return { ok: true };
+    },
+    async isHealthy() {
+      // #821 — probe nats-server's HTTP monitor to confirm it actually came back
+      // UP after the restart. `launchctl kickstart` / `systemctl restart` can
+      // exit 0 even when the server then crashes on the new config at runtime
+      // (the community incident). `/healthz` is nats-server's liveness endpoint;
+      // a reachable 200 means the process is up and reading its config. A
+      // dry-run never restarts, so it is trivially "healthy".
+      if (!mutate) return { healthy: true };
+      // #821 MAJOR (code-review) — target THIS bus's OWN monitor port. The
+      // community bus monitors on :8224, not the upstream-default :8222; probing
+      // the wrong port would ECONNREFUSED and false-trip a rollback on a GOOD
+      // join. Precedence: explicit --monitor-url wins; else derive the port from
+      // the stack's nats config (`http_port`/`monitor_port`/`http`); else the
+      // upstream default.
+      const base = resolveMonitorBase(cfg).replace(/\/+$/, "");
+      // #821 MAJOR — BOUND the probe. A monitor that accepts the TCP connection
+      // but never responds (hung/deadlocked nats-server — exactly the failure the
+      // probe exists to catch) would hang an unbounded `fetch` forever and stall
+      // joinNetwork with no verdict. AbortSignal.timeout aborts after the
+      // configured budget; a timeout/abort is treated as healthy:false (the
+      // restart did NOT bring a responsive bus up).
+      const timeoutMs = cfg.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS;
+      try {
+        const res = await fetch(`${base}/healthz`, {
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!res.ok) {
+          return {
+            healthy: false,
+            reason: `nats-server monitor ${base}/healthz returned HTTP ${res.status.toString()}`,
+          };
+        }
+        return { healthy: true };
+      } catch (err) {
+        // A timeout/abort means the monitor accepted but did not respond in time
+        // — the bus is hung, NOT healthy. A connection error means it's down or
+        // the port isn't listening. Either way the restart did NOT bring a
+        // healthy bus up. Distinguish the timeout for an actionable reason.
+        const isTimeout =
+          err instanceof DOMException && err.name === "TimeoutError";
+        return {
+          healthy: false,
+          reason: isTimeout
+            ? `nats-server monitor ${base}/healthz timed out after ${timeoutMs.toString()}ms (accepted the connection but never responded — bus hung)`
+            : `nats-server monitor ${base} unreachable: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
     },
   };
 }
@@ -827,7 +1038,10 @@ export function buildLeafStatePort(cfg: LivePortsConfig): LeafStatePort {
   // C-797 — always wire the port; default to the local nats-server monitor when
   // no `--monitor-url` was supplied. (Previously: undefined ⇒ no port ⇒
   // link:unknown for everyone.)
-  const base = (cfg.monitorUrl ?? DEFAULT_MONITOR_URL).replace(/\/+$/, "");
+  // #821 MAJOR (code-review) — use the SAME monitor-base resolution as the health
+  // probe (explicit flag → derived-from-config → default), so status reads the
+  // bus's OWN monitor port (community :8224) instead of the wrong default :8222.
+  const base = resolveMonitorBase(cfg).replace(/\/+$/, "");
   return {
     async linkStates() {
       try {

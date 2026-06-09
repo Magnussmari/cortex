@@ -129,4 +129,86 @@ describe("natsConfigCanBindAccount", () => {
     const res = natsConfigCanBindAccount(eqForm, ACCOUNT);
     expect(res.canBind).toBe(true);
   });
+
+  // #821 MAJOR-2 — a false-positive bind IS the crash. A substring `includes()`
+  // match (over text that strips only `//`/`#`, not `/* */`) can claim canBind
+  // when nats-server CANNOT resolve the account → an account-bound remote →
+  // `cannot find local account` crash. These cases must all return canBind:false.
+
+  test("MAJOR-2: account named ONLY inside a `/* */` block comment → cannot bind", () => {
+    const blockCommented = [
+      "operator: /x/operator.jwt", // operator-mode so the account-tree gate passes
+      "resolver_preload: {",
+      `  /* historic: ${ACCOUNT}: "old-jwt" */`,
+      `  ${OTHER_ACCOUNT}: "eyJ..."`,
+      "}",
+      "",
+    ].join("\n");
+    const res = natsConfigCanBindAccount(blockCommented, ACCOUNT);
+    expect(res.canBind).toBe(false);
+    expect(res.reason).toContain("does not define account");
+  });
+
+  test("MAJOR-2: a multi-line `/* ... */` block hiding the account → cannot bind", () => {
+    const multiLine = [
+      "operator: /x/operator.jwt", // NSC operator JWT key
+      "/*",
+      `  decommissioned account ${ACCOUNT}`,
+      "*/",
+      "resolver_preload: {",
+      `  ${OTHER_ACCOUNT}: "eyJ..."`,
+      "}",
+      "",
+    ].join("\n");
+    const res = natsConfigCanBindAccount(multiLine, ACCOUNT);
+    expect(res.canBind).toBe(false);
+  });
+
+  test("MAJOR-2: account equal to `system_account` is NOT leaf-bindable → cannot bind", () => {
+    // SYS is the system account; a leaf cannot bind it. If the candidate account
+    // appears ONLY as the system_account value, that is not a bindable account.
+    const sysOnly = [
+      "operator: /x/operator.jwt", // NSC operator JWT key
+      `system_account: ${ACCOUNT}`,
+      "resolver_preload: {",
+      `  ${OTHER_ACCOUNT}: "eyJ..."`,
+      "}",
+      "",
+    ].join("\n");
+    const res = natsConfigCanBindAccount(sysOnly, ACCOUNT);
+    expect(res.canBind).toBe(false);
+  });
+
+  test("MAJOR-2: account as a SUBSTRING of a larger token → cannot bind (token boundary)", () => {
+    // The account string appears only embedded inside a longer base32-ish run
+    // (e.g. a JWT body), never as a standalone key. A bare includes() would
+    // false-positive; a token-boundary match must not.
+    const embedded = [
+      "operator: /x/operator.jwt", // NSC operator JWT key
+      "resolver_preload: {",
+      `  ${OTHER_ACCOUNT}: "eyJ0${ACCOUNT}MOREBASE32TRAILING0123456789ABCDEFGHIJ"`,
+      "}",
+      "",
+    ].join("\n");
+    const res = natsConfigCanBindAccount(embedded, ACCOUNT);
+    expect(res.canBind).toBe(false);
+  });
+
+  test("MAJOR-2 regression: a genuine resolver_preload key still binds", () => {
+    // The token-boundary tightening must NOT break the real bind case.
+    const res = natsConfigCanBindAccount(OPERATOR_WITH_ACCOUNT, ACCOUNT);
+    expect(res.canBind).toBe(true);
+  });
+
+  test("MAJOR-2 regression: an `accounts { ACCOUNT { ... } }` key still binds", () => {
+    const accountsBlock = [
+      "operator: /x/operator.jwt", // NSC operator JWT key
+      "accounts: {",
+      `  ${ACCOUNT}: { jetstream: enabled, users: [] }`,
+      "}",
+      "",
+    ].join("\n");
+    const res = natsConfigCanBindAccount(accountsBlock, ACCOUNT);
+    expect(res.canBind).toBe(true);
+  });
 });
