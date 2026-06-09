@@ -45,6 +45,7 @@ import { readFile } from "fs/promises";
 import { join } from "path";
 
 import { expandTilde, loadConfigWithAgents } from "../../../common/config/loader";
+import type { LoadedConfig } from "../../../common/config/loader";
 import { enforceChmod600 } from "../../../common/config/file-permissions";
 import {
   materialFromSeedString,
@@ -104,6 +105,7 @@ import {
   createLiveProbeBus,
   type LiveProbeBus,
 } from "./network-ping-adapters";
+import { buildPingSignerFromConfig } from "./network-ping-signer";
 import type { NetworkPingPorts } from "./network-ping-ports";
 
 export { type ExitResult } from "./_shared/exit-result";
@@ -615,16 +617,23 @@ function parsePeerArg(
 
 /**
  * Factory for the probe bus port. Production builds a {@link LiveProbeBus} over
- * the runtime from the loaded `AgentConfig`; tests inject a fake. Returns the
- * ports + a `stop()` to drain the runtime.
+ * the runtime from the loaded config; tests inject a fake. Receives the full
+ * {@link LoadedConfig} so the live factory can build the posture-gated stack
+ * signer (PR #822 MAJOR-1) — the probe REQUEST is signed exactly like every
+ * other federated dispatch under `permissive`/`enforce`. Returns the ports +
+ * a `stop()` to drain the runtime.
  */
 export type PingBusFactory = (
-  config: import("../../../common/types/config").AgentConfig,
+  cfg: LoadedConfig,
 ) => Promise<{ ports: NetworkPingPorts; stop: () => Promise<void> }>;
 
-/** The production factory — a live NATS-backed probe bus. */
-const DEFAULT_PING_BUS_FACTORY: PingBusFactory = async (config) => {
-  const bus: LiveProbeBus = await createLiveProbeBus(config);
+/** The production factory — a live NATS-backed probe bus, signed per posture. */
+const DEFAULT_PING_BUS_FACTORY: PingBusFactory = async (cfg) => {
+  // PR #822 MAJOR-1 — feed the plumbed signer so an enforce-posture peer
+  // accepts the probe (signed `signed_by[]` + originator). `undefined` under
+  // `signing: off` (publishes unsigned, byte-identical to pre-#822).
+  const signer = await buildPingSignerFromConfig(cfg);
+  const bus: LiveProbeBus = await createLiveProbeBus(cfg.config, signer);
   const ports: NetworkPingPorts = {
     bus,
     newNonce: () => crypto.randomUUID(),
@@ -693,10 +702,11 @@ async function runPing(
     return renderPingResult(res, inputs.targetPrincipal, inputs.targetStack, json);
   }
 
-  // Build the live (or injected) bus and fire the probe(s).
+  // Build the live (or injected) bus and fire the probe(s). The factory gets
+  // the full LoadedConfig so the live path can build the posture-gated signer.
   let busHandle;
   try {
-    busHandle = await busFactory(cfg.config);
+    busHandle = await busFactory(cfg);
   } catch (err) {
     return opError("ping", `failed to start bus: ${err instanceof Error ? err.message : String(err)}`, json);
   }

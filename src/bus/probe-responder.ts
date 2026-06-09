@@ -282,6 +282,13 @@ export interface ProbeDecisionInputs {
   rateLimiter: ProbeRateLimiter;
   /** Clock for `server_ts` + rate-limit timing. */
   clock: ProbeClock;
+  /**
+   * PR #822 NIT-2 — the RESPONDER's OWN data residency, stamped on the reply
+   * WE author. Defaults to `"NZ"` (the ecosystem default). Deliberately NOT
+   * mirrored from the inbound (requester-supplied) envelope: a reply we
+   * originate must carry our own sovereignty, not an attacker-influenced one.
+   */
+  dataResidency?: string;
 }
 
 /**
@@ -356,6 +363,26 @@ export function decideProbeResponse(
     };
   }
 
+  // (5b) PR #822 NIT-3 — bind the DID-decoded `{principal}/{stack}` to the
+  // matched peer's configured `stack_id` BEFORE composing the reply subject.
+  // `resolveSourceNetwork` keys on principal alone; the stack comes from the
+  // (DID_RE-validated, but otherwise free-form) decoded originator. Requiring
+  // an EXACT `{decoded-principal}/{decoded-stack}` === peer.stack_id match
+  // closes the latent "reflect onto a peer's unsubscribed stack subject" case:
+  // a peer that declared `jc/default` cannot elicit a reply aimed at
+  // `jc/some-other-stack`. Fail-closed on mismatch.
+  const decodedStackId = `${requesterPrincipal}/${requesterStack}`;
+  const matchedPeer = resolved.network.peers.find(
+    (p) => p.principal_id === requesterPrincipal && p.stack_id === decodedStackId,
+  );
+  if (matchedPeer === undefined) {
+    return {
+      kind: "drop",
+      reason: "non-peer",
+      detail: `decoded requester stack "${decodedStackId}" matches no configured peer stack_id (principal "${requesterPrincipal}" is a peer, but on a different stack)`,
+    };
+  }
+
   // (6) Rate-limit — per requester principal. Bounds a reflection flood.
   if (!inputs.rateLimiter.take(requesterPrincipal, inputs.clock.nowMs())) {
     return {
@@ -389,7 +416,9 @@ export function decideProbeResponse(
       }),
       sovereignty: {
         classification: "federated",
-        data_residency: envelope.sovereignty.data_residency,
+        // PR #822 NIT-2 — OUR residency, not the inbound (requester-supplied)
+        // envelope's. A reply we author carries our own sovereignty.
+        data_residency: inputs.dataResidency ?? "NZ",
         max_hop: 1,
         frontier_ok: false,
         model_class: "local-only",
@@ -433,6 +462,11 @@ export interface ProbeResponderOptions {
   rateLimiter?: ProbeRateLimiter;
   /** Optional clock (defaults to the system clock). */
   clock?: ProbeClock;
+  /**
+   * PR #822 NIT-2 — the responder's OWN data residency, stamped on replies.
+   * Defaults to `"NZ"`. `cortex.ts` passes the stack's configured residency.
+   */
+  dataResidency?: string;
 }
 
 export interface ProbeResponder {
@@ -463,6 +497,7 @@ export function createProbeResponder(
     federatedNetworksById,
     rateLimiter = new ProbeRateLimiter(),
     clock = systemClock,
+    dataResidency,
   } = opts;
 
   // Subscribe our OWN federated tasks subject (FG-2: subject addresses us).
@@ -475,12 +510,32 @@ export function createProbeResponder(
   }
   let runtimeSubscribers: RuntimeSubscriber[] = [];
 
+  // PR #822 NIT-4 — per-request idempotency guard. A bounded LRU of recently-
+  // answered envelope ids so the SAME request (a redelivery) yields at most
+  // ONE reply. Cannot manifest on the current push-mode `runtime.subscribe`
+  // (core NATS — no redelivery), but mirrors `review-consumer`'s
+  // `deliveryCount > 1` drop for symmetry + future JetStream safety. Bounded
+  // (insertion-ordered Map, oldest evicted) so it can't grow unbounded under a
+  // probe flood — the rate limiter already caps per-source volume.
+  const SEEN_CAP = 4096;
+  const seenEnvelopeIds = new Map<string, true>();
+  const alreadyAnswered = (id: string): boolean => {
+    if (seenEnvelopeIds.has(id)) return true;
+    seenEnvelopeIds.set(id, true);
+    if (seenEnvelopeIds.size > SEEN_CAP) {
+      const oldest = seenEnvelopeIds.keys().next().value;
+      if (oldest !== undefined) seenEnvelopeIds.delete(oldest);
+    }
+    return false;
+  };
+
   const decisionInputs: ProbeDecisionInputs = {
     source,
     stack,
     federatedNetworksById,
     rateLimiter,
     clock,
+    ...(dataResidency !== undefined && { dataResidency }),
   };
 
   const handle = (envelope: Envelope, subject: string): void => {
@@ -492,6 +547,16 @@ export function createProbeResponder(
     // Fast pre-filter: only probe.echo types reach the decision. (A chat
     // dispatch on this subject is the runner's concern, not ours.)
     if (!isProbeEcho(envelope.type)) return;
+
+    // PR #822 NIT-4 — drop a redelivered request (same envelope id) BEFORE
+    // minting a second reply. Checked after the cheap type pre-filter so a
+    // non-probe envelope never pollutes the seen-set.
+    if (alreadyAnswered(envelope.id)) {
+      process.stderr.write(
+        `cortex/probe-responder: DROP reason=redelivery envelope=${envelope.id} subject=${subject}\n`,
+      );
+      return;
+    }
 
     const decision = decideProbeResponse(envelope, subject, decisionInputs);
     if (decision.kind === "drop") {

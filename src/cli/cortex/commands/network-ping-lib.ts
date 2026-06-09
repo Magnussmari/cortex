@@ -450,9 +450,17 @@ export async function pingPeer(
 function aggregateVerdict(probes: PingProbeResult[]): PingVerdict {
   if (probes.some((p) => p.verdict === "reachable")) return "reachable";
   // Failure precedence — surface the most diagnostic.
+  //
+  // PR #822 NIT-5 — `refused` is RESERVED for Ping-B (P-13 roster correlation
+  // / enforce-posture gate signal) and is NOT produced by any v1 transport
+  // outcome (`classifyRoundTrip` only emits reachable / no-responder / timeout
+  // / not-configured). It stays in the precedence list so the taxonomy is
+  // complete and Ping-B is a drop-in; in v1 the `refused` branch is
+  // unreachable. `no-responder` IS reachable in v1 (a reply with a mismatched
+  // nonce / non-conformant payload).
   const order: PingVerdict[] = [
     "no-responder",
-    "refused",
+    "refused", // reserved for Ping-B (P-13 correlation); unreachable in v1
     "timeout",
     "not-configured",
   ];
@@ -470,6 +478,8 @@ function failureDetail(verdict: PingVerdict, inputs: PingInputs): string {
     case "timeout":
       return `no echo from ${peer} within ${inputs.timeoutMs}ms (peer offline, leaf down, hub partition, or not gated in)`;
     case "refused":
+      // PR #822 NIT-5 — reserved for Ping-B; v1 never emits `refused` from a
+      // transport outcome, so this detail string is currently unreachable.
       return `peer ${peer} refused the probe (we are not in its peers[], or signing posture rejected us)`;
     case "not-configured":
       return `peer ${peer} is not reachable on any configured network`;

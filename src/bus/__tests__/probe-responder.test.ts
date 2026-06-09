@@ -209,6 +209,30 @@ describe("decideProbeResponse — happy path (peer probe)", () => {
     const decision = decideProbeResponse(env, undefined, decisionInputs());
     expect(decision.kind).toBe("reply");
   });
+
+  test("NIT-2: reply data_residency is OUR OWN, not the requester-supplied one", () => {
+    const env = makeProbeRequest({});
+    // The inbound envelope claims a foreign residency; the reply must ignore it.
+    env.sovereignty = { ...env.sovereignty, data_residency: "ATTACKER-LAND" };
+    const decision = decideProbeResponse(
+      env,
+      undefined,
+      decisionInputs({ dataResidency: "NZ" }),
+    );
+    expect(decision.kind).toBe("reply");
+    if (decision.kind !== "reply") return;
+    expect(decision.envelope.sovereignty.data_residency).toBe("NZ");
+    expect(decision.envelope.sovereignty.data_residency).not.toBe("ATTACKER-LAND");
+  });
+
+  test("NIT-2: reply residency defaults to NZ when none supplied", () => {
+    const env = makeProbeRequest({});
+    const decision = decideProbeResponse(env, undefined, decisionInputs());
+    expect(decision.kind).toBe("reply");
+    if (decision.kind === "reply") {
+      expect(decision.envelope.sovereignty.data_residency).toBe("NZ");
+    }
+  });
 });
 
 describe("decideProbeResponse — fail-closed (FG-4 + no-amplification)", () => {
@@ -238,6 +262,16 @@ describe("decideProbeResponse — fail-closed (FG-4 + no-amplification)", () => 
     const decision = decideProbeResponse(env, undefined, decisionInputs());
     expect(decision.kind).toBe("drop");
     if (decision.kind === "drop") expect(decision.reason).toBe("self-loop");
+  });
+
+  test("NIT-3: REFUSES a peer-principal on a DIFFERENT stack than configured", () => {
+    // jc IS a configured peer (jc/default), but the originator decodes to
+    // jc/other-stack — the decoded {principal}/{stack} must EQUAL the peer's
+    // stack_id, else we'd reflect onto jc's unsubscribed subject. Fail-closed.
+    const env = makeProbeRequest({ requesterDid: "did:mf:jc-other-stack" });
+    const decision = decideProbeResponse(env, undefined, decisionInputs());
+    expect(decision.kind).toBe("drop");
+    if (decision.kind === "drop") expect(decision.reason).toBe("non-peer");
   });
 
   test("REFUSES a non-probe-echo type (chat dispatch)", () => {
@@ -463,6 +497,24 @@ describe("createProbeResponder — runtime", () => {
       "federated.andreas.community.tasks.@did-mf-luna.chat",
     );
     expect(r.replies).toHaveLength(0);
+    await responder.stop();
+  });
+
+  test("NIT-4: the SAME request delivered twice yields EXACTLY one reply", async () => {
+    const r = recordingRuntime();
+    const responder = createProbeResponder({
+      runtime: r.runtime,
+      source: SOURCE,
+      stack: OUR_STACK,
+      federatedNetworksById: networksWithPeers(peer("jc", "default")),
+      clock: fixedClock(),
+    });
+    await responder.start();
+    const env = makeProbeRequest({ nonce: "dup-1" });
+    // Redeliver the identical envelope (same id) — idempotency guard drops #2.
+    r.trigger(env, "federated.andreas.community.tasks.probe.echo");
+    r.trigger(env, "federated.andreas.community.tasks.probe.echo");
+    expect(r.replies).toHaveLength(1);
     await responder.stop();
   });
 

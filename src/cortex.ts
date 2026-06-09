@@ -2501,6 +2501,11 @@ export async function startCortex(
     source: systemEventSource,
     stack: derivedStack.stack,
     federatedNetworksById: probeResponderNetworks,
+    // PR #822 NIT-2 — stamp OUR residency on the replies we author (not the
+    // requester-supplied inbound one). `undefined` → the responder defaults NZ.
+    ...(systemEventSource.dataResidency !== undefined && {
+      dataResidency: systemEventSource.dataResidency,
+    }),
   });
   await probeResponder.start();
   console.log(
