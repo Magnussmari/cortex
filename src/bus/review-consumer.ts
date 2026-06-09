@@ -528,6 +528,22 @@ export class ReviewConsumer {
     // envelopes (the verdict still reaches pilot via correlation_id).
     const responseRouting = readLogicalResponseRouting(envelope) ?? undefined;
 
+    // cortex#836 (ADR 0001) — the cross-principal TRUST BOUNDARY is per-message
+    // and lives in the SUBJECT SCOPE, NOT in the coarse `this.federated` mode
+    // flag. ADR 0001: `local.` NEVER crosses the principal boundary (a
+    // same-principal self-dispatch — the requester IS self, so there is
+    // legitimately no requester in `originator.identity`), while `federated.`
+    // ALWAYS crosses it (a peer requester MUST be present + on `peers[]`).
+    //
+    // `this.federated` is set for the WHOLE consumer once a stack joins a network
+    // (≥1 network configured — see cortex.ts), so it cannot distinguish a local
+    // self-dispatch from a federated cross-principal request. Keying the
+    // requester parse + deny gate on the per-message subject scope instead means
+    // a `local.>` self-dispatch on a network-joined stack bypasses the gate
+    // (requester stays `undefined` → local-scope emission, identical to
+    // non-federated mode), while a `federated.>` request keeps the FULL gate.
+    const isFederatedRequest = subject.startsWith("federated.");
+
     // cortex#686 (ADR 0002) — in federated mode, derive the REQUESTER
     // `{principal}.{stack}` from the inbound envelope's `originator.identity`
     // ONCE so every emitted envelope routes back to the requester on the
@@ -539,16 +555,18 @@ export class ReviewConsumer {
     // target. Reading the requester off the subject (the cortex#715 BLOCKER)
     // routes every verdict to SELF and the loop never closes.
     //
-    // `undefined` in local mode, OR (in federated mode) when
+    // `undefined` for a LOCAL inbound (cortex#836: a `local.>` self-dispatch has
+    // no requester — the requester is self), OR (on the `federated.>` path) when
     // `originator.identity` is absent / malformed. An un-attributable federated
     // request is DENIED + DROPPED by the gate below (we never even reach
     // `safePublish`); the `safePublish` local fall-through remains the
     // belt-and-braces backstop for the non-denied path against a runtime that
     // lacks `publishOnSubject` (a disabled runtime / legacy stub — never a live
     // wire), so a verdict is never guessed onto a cross-principal target.
-    const requester = this.federated
-      ? parseRequesterFromOriginator(envelope)
-      : undefined;
+    const requester =
+      this.federated && isFederatedRequest
+        ? parseRequesterFromOriginator(envelope)
+        : undefined;
 
     // cortex#686 (ADR 0002 §5) — defense-in-depth `peers[]` gate ON THE CONSUMER
     // PATH. Run the membership check BEFORE spawning the reviewer or emitting
@@ -558,7 +576,12 @@ export class ReviewConsumer {
     // no CC subprocess, no verdict, no lifecycle envelope. Under `signing: off`
     // this membership check is the application-layer trust boundary; under
     // `enforce` the signed_by chain + signed originator add the crypto check.
-    if (this.federated) {
+    //
+    // cortex#836 (ADR 0001) — gated on `isFederatedRequest` so it runs ONLY for
+    // a `federated.>` inbound (cross-principal). A `local.>` self-dispatch on a
+    // network-joined stack bypasses the gate entirely — same-principal traffic
+    // never crosses the boundary the gate guards.
+    if (this.federated && isFederatedRequest) {
       const denyReason = this.federatedRequesterDenyReason(requester);
       if (denyReason !== null) {
         process.stderr.write(
