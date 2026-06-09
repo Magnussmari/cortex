@@ -384,7 +384,20 @@ export async function joinNetwork(
     // means the config is definitely broken → refuse BEFORE restarting (nothing
     // to roll back: we have not restarted yet, and the leaf write is reverted by
     // restoring the snapshot to keep the on-disk config clean for the next try).
-    const validate = await natsServer.validateConfig();
+    // #821 item-2 — never-throws contract. validateConfig (and restart, below)
+    // ultimately shell out via Bun.spawn, which THROWS SYNCHRONOUSLY on ENOENT
+    // (launchctl/systemctl/nats-server not on PATH). joinNetwork is documented
+    // "never throws", so guard the call: a thrown spawn error becomes a clean
+    // failure verdict, not an uncaught stack trace that wedges the CLI.
+    let validate: { ok: true } | { ok: false; reason: string };
+    try {
+      validate = await natsServer.validateConfig();
+    } catch (err) {
+      validate = {
+        ok: false,
+        reason: `nats-server config validation could not run: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     if (!validate.ok) {
       try {
         ports.leafFile.restoreLeafState(snapshot);
@@ -417,19 +430,31 @@ export async function joinNetwork(
     // the SAME standard — exit code is necessary-not-sufficient (#821 BLOCKER:
     // the recovery path previously trusted exit code alone and could claim the
     // bus was "restored" while it was DOWN).
+    // #821 item-2 — restartAndProbe catches INTERNALLY so BOTH call sites (the
+    // initial restart AND the rollback-recovery restart) honour the never-throws
+    // contract. NatsServiceManager.restart()/isHealthy() shell out via Bun.spawn
+    // (throws synchronously on ENOENT) / fetch; a throw here becomes a failure
+    // result, never an uncaught escape from joinNetwork.
     const restartAndProbe = async (): Promise<
       { ok: true } | { ok: false; reason: string }
     > => {
-      const r = await natsServer.restart();
-      if (!r.ok) return { ok: false, reason: r.reason };
-      const health = await natsServer.isHealthy();
-      if (!health.healthy) {
+      try {
+        const r = await natsServer.restart();
+        if (!r.ok) return { ok: false, reason: r.reason };
+        const health = await natsServer.isHealthy();
+        if (!health.healthy) {
+          return {
+            ok: false,
+            reason: `nats-server did not come back up after restart (${health.reason})`,
+          };
+        }
+        return { ok: true };
+      } catch (err) {
         return {
           ok: false,
-          reason: `nats-server did not come back up after restart (${health.reason})`,
+          reason: `nats-server restart/probe could not run: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
-      return { ok: true };
     };
 
     const initial = await restartAndProbe();

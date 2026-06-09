@@ -480,6 +480,30 @@ describe("#821 natsConfigMonitorUrl", () => {
     expect(natsConfigMonitorUrl(conf)).toBeUndefined();
   });
 
+  // #821 NIT (item 3) — an INLINE trailing comment on the `http:` directive must
+  // not defeat the port match (else → undefined → false-fallback to :8222 →
+  // false-trip rollback on a HEALTHY join). `http_port:` already tolerated this;
+  // `http:` must be symmetric.
+  test("item-3: `http: 0.0.0.0:8224 # mon` (inline #-comment) derives :8224", () => {
+    const conf = ["http: 0.0.0.0:8224 # monitor", ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("item-3: `http: 8224 // mon` (inline //-comment, bare port) derives :8224", () => {
+    const conf = ["http: 8224 // monitor", ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("item-3: `http_port: 8224 # mon` stays correct (symmetry regression)", () => {
+    const conf = ["http_port: 8224 # monitor", ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("item-3: quoted value with an inline comment after the quote derives the port", () => {
+    const conf = ['http: "localhost:8224"  # mon', ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
   test("no monitor directive → undefined (caller falls back)", () => {
     expect(natsConfigMonitorUrl(DEFAULT_G_CONF.replace(/http:.*/g, ""))).toBeUndefined();
   });

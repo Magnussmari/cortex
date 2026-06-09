@@ -746,12 +746,14 @@ export function natsConfigMonitorUrl(natsConfigText: string): string | undefined
   }
 
   // `http: <value>` — value may be a bare port (`8224`), `host:port`
-  // (`0.0.0.0:8224`), or quoted (`"localhost:8224"`). Take the trailing port.
-  const httpDirective = /^[ \t]*http[ \t]*[:=][ \t]*["']?([^"'\n]+?)["']?[ \t]*$/m.exec(
-    text,
-  );
+  // (`0.0.0.0:8224`), or quoted (`"localhost:8224"`), optionally followed by an
+  // INLINE trailing comment (`# mon` / `// mon`). Capture the rest of the line,
+  // then strip the inline comment + quotes before taking the trailing port.
+  // #821 item-3 — without stripping the inline comment the end-anchored port
+  // match failed (→ undefined → false-fallback to :8222 → false-trip rollback).
+  const httpDirective = /^[ \t]*http[ \t]*[:=][ \t]*(.+)$/m.exec(text);
   if (httpDirective?.[1] !== undefined) {
-    const value = httpDirective[1].trim();
+    const value = stripInlineComment(httpDirective[1]).replace(/["']/g, "").trim();
     // Trailing port: either `:<port>` at the end, or the whole value is a port.
     const portMatch = /(?::|^)(\d{1,5})$/.exec(value);
     if (portMatch?.[1] !== undefined) {
@@ -760,6 +762,16 @@ export function natsConfigMonitorUrl(natsConfigText: string): string | undefined
   }
 
   return undefined;
+}
+
+/**
+ * Strip a trailing inline `#` or `//` comment from a single config-line value.
+ * `0.0.0.0:8224 # mon` → `0.0.0.0:8224`. Conservative: only cuts at a `#` or
+ * `//` that is preceded by whitespace or start-of-string, so a `#`/`//` inside a
+ * value (unusual for a monitor host:port) is left alone.
+ */
+function stripInlineComment(value: string): string {
+  return value.replace(/(^|[ \t])(#|\/\/).*$/, "").trimEnd();
 }
 
 /** Build a loopback monitor url for `port`, or `undefined` if out of range. */

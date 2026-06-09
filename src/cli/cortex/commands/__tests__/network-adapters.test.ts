@@ -938,6 +938,40 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
     expect(res.healthy).toBe(true);
   });
 
+  test("MAJOR: isHealthy TIMES OUT (healthy:false) when the monitor accepts but never responds", async () => {
+    // A nats-server that accepts the monitor TCP connection but HANGS (never
+    // sends a response) is exactly the deadlock the probe exists to catch. An
+    // unbounded fetch would hang joinNetwork forever; the probe must abort and
+    // report healthy:false within its timeout. The handler returns a Promise
+    // that never resolves → the connection is accepted, the response never comes.
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Promise<Response>(() => {
+          /* never resolves — simulate a hung monitor */
+        });
+      },
+    });
+    try {
+      const cfg: LivePortsConfig = {
+        ...cfgWithConfig("/x/local.conf"),
+        monitorUrl: `http://127.0.0.1:${(server.port ?? 0).toString()}`,
+        // Short timeout so the test asserts the bound without a real 5s wait.
+        healthProbeTimeoutMs: 250,
+      };
+      const ports = buildLivePorts(cfg);
+      const started = Date.now();
+      const res = await ports.natsServer!.isHealthy();
+      const elapsed = Date.now() - started;
+      expect(res.healthy).toBe(false);
+      if (!res.healthy) expect(res.reason.toLowerCase()).toContain("timed out");
+      // Resolved promptly via the abort — well under a multi-second hang.
+      expect(elapsed).toBeLessThan(3000);
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("MAJOR: isHealthy probes the bus's OWN monitor port DERIVED from the nats config (community :8224)", async () => {
     // Stand up a probe-target server, then write a nats config naming THAT port
     // via `http_port:` — with NO --monitor-url. The probe must derive + hit it.

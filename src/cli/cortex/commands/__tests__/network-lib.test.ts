@@ -169,6 +169,10 @@ function makeFakes(opts: {
   recoveryHealthy?: boolean;
   /** #821 MAJOR-1 — make the pre-restart `nats-server -t` syntax gate FAIL. */
   validateConfigFails?: boolean;
+  /** #821 item-2 — make natsServer.restart() THROW synchronously (Bun.spawn ENOENT). */
+  restartThrows?: boolean;
+  /** #821 item-2 — make natsServer.validateConfig() THROW synchronously (spawn ENOENT). */
+  validateThrows?: boolean;
 }): { ports: NetworkPorts; rec: Recorder; storeRef: { networks: PolicyFederatedNetwork[] } } {
   const rec: Recorder = {
     registered: 0,
@@ -338,6 +342,11 @@ function makeFakes(opts: {
   const natsServer: NatsServerPort = {
     async validateConfig() {
       rec.validateConfigs++;
+      // #821 item-2 — model a SYNCHRONOUS throw escaping the port (e.g. Bun.spawn
+      // ENOENT when the test tool isn't on PATH). joinNetwork must NOT propagate.
+      if (opts.validateThrows === true) {
+        throw new Error("spawn nats-server ENOENT");
+      }
       // #821 MAJOR-1 — default: the -t syntax gate passes. A test opts into a
       // -t failure via `validateConfigFails: true`.
       return opts.validateConfigFails === true
@@ -347,6 +356,12 @@ function makeFakes(opts: {
     async restart() {
       rec.natsRestarts++;
       rec.restartOrder.push("nats");
+      // #821 item-2 — model a SYNCHRONOUS throw escaping restart() (Bun.spawn
+      // ENOENT: launchctl/systemctl not on PATH). The never-throws contract means
+      // joinNetwork must catch this and return a failure verdict, not crash.
+      if (opts.restartThrows === true) {
+        throw new Error("spawn launchctl ENOENT");
+      }
       // #821 — the SECOND nats restart is the rollback-recovery restart; let a
       // test fail it independently to exercise the worst-case "recovery also
       // failed" path. The first restart obeys `natsRestartOk`.
@@ -759,6 +774,69 @@ describe("join", () => {
       expect(rec.validateConfigs).toBe(1);
       // Order: validate (1) ran before the single restart.
       expect(rec.natsRestarts).toBe(1);
+    });
+
+    // -------------------------------------------------------------------------
+    // #821 item-2 — never-throws contract. A SYNCHRONOUS throw from the
+    // nats-server port (Bun.spawn ENOENT when launchctl/systemctl/nats-server is
+    // not on PATH) must be CAUGHT by joinNetwork and returned as a failure
+    // verdict — never propagated as an uncaught stack trace that wedges the CLI.
+    // -------------------------------------------------------------------------
+    test("item-2: a THROWING restart() → joinNetwork returns a failure verdict, does NOT throw", async () => {
+      const { ports } = makeFakes({ busType: "operator-mode", restartThrows: true });
+      let res: Awaited<ReturnType<typeof joinNetwork>> | undefined;
+      let threw = false;
+      try {
+        res = await joinNetwork("metafactory", LOCAL, ports);
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(false); // never-throws contract honoured
+      expect(res?.ok).toBe(false);
+      expect(res?.reason).toContain("ENOENT");
+    });
+
+    test("item-2: a THROWING validateConfig() → joinNetwork returns a failure verdict, does NOT throw", async () => {
+      const { ports } = makeFakes({ busType: "operator-mode", validateThrows: true });
+      let res: Awaited<ReturnType<typeof joinNetwork>> | undefined;
+      let threw = false;
+      try {
+        res = await joinNetwork("metafactory", LOCAL, ports);
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(false);
+      expect(res?.ok).toBe(false);
+      expect(res?.reason).toContain("ENOENT");
+    });
+
+    test("item-2: a throwing RECOVERY restart is still caught (rollback path never throws)", async () => {
+      // First restart down → rollback re-restarts; make THAT recovery restart
+      // throw. The existing recovery try/catch must absorb it into the verdict.
+      const { ports, rec } = makeFakes({
+        busType: "operator-mode",
+        natsHealthy: false, // first restart exits 0 but DOWN → triggers rollback
+      });
+      // Patch the fake to throw on the SECOND (recovery) restart only.
+      const realRestart = ports.natsServer!.restart.bind(ports.natsServer);
+      let calls = 0;
+      ports.natsServer!.restart = async () => {
+        calls += 1;
+        if (calls >= 2) throw new Error("spawn launchctl ENOENT");
+        return realRestart();
+      };
+      let threw = false;
+      let res: Awaited<ReturnType<typeof joinNetwork>> | undefined;
+      try {
+        res = await joinNetwork("metafactory", LOCAL, ports);
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(false);
+      expect(res?.ok).toBe(false);
+      // The rollback path absorbed the throw and escalated to manual intervention.
+      expect(res?.reason).toContain("intervene manually");
+      expect(rec.restores).toEqual(["metafactory"]);
     });
 
     test("recovery restart exits 0 AND healthy → reports 'restored to prior state'", async () => {

@@ -133,6 +133,15 @@ export interface LivePortsConfig {
   platform?: ServicePlatform;
   monitorUrl?: string;
   /**
+   * #821 MAJOR — bound the health-probe `fetch` so a nats-server that accepts
+   * the monitor TCP connection but never RESPONDS (hung/deadlocked — exactly the
+   * failure the probe exists to catch) cannot hang `joinNetwork` forever. The
+   * probe aborts after this many ms and treats the abort as `healthy:false`.
+   * Defaults to {@link DEFAULT_HEALTH_PROBE_TIMEOUT_MS}; tests pin a short value
+   * so the timeout path is asserted without a real multi-second wait.
+   */
+  healthProbeTimeoutMs?: number;
+  /**
    * #800 — the cortex.yaml the stack's CORTEX daemon loads (the join's
    * `--config`, default `~/.config/cortex/cortex.yaml`). Used to LOCATE the
    * daemon's launchd/systemd service for the restart: the daemon is the service
@@ -879,6 +888,13 @@ function buildDaemonPort(cfg: LivePortsConfig, mutate: boolean): DaemonPort {
 // =============================================================================
 
 /**
+ * #821 MAJOR — default health-probe timeout (ms). Bounds the `/healthz` fetch so
+ * a hung monitor cannot stall the join. 5s is generous for a loopback probe yet
+ * far below any "the CLI is wedged" threshold.
+ */
+export const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 5000;
+
+/**
  * #821 MAJOR (code-review) — resolve the nats-server HTTP monitor BASE url the
  * health probe (and leaf-state) should hit. Precedence:
  *   1. explicit `--monitor-url` (cfg.monitorUrl) — highest, the principal's override;
@@ -966,8 +982,17 @@ function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerP
       // the stack's nats config (`http_port`/`monitor_port`/`http`); else the
       // upstream default.
       const base = resolveMonitorBase(cfg).replace(/\/+$/, "");
+      // #821 MAJOR — BOUND the probe. A monitor that accepts the TCP connection
+      // but never responds (hung/deadlocked nats-server — exactly the failure the
+      // probe exists to catch) would hang an unbounded `fetch` forever and stall
+      // joinNetwork with no verdict. AbortSignal.timeout aborts after the
+      // configured budget; a timeout/abort is treated as healthy:false (the
+      // restart did NOT bring a responsive bus up).
+      const timeoutMs = cfg.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS;
       try {
-        const res = await fetch(`${base}/healthz`);
+        const res = await fetch(`${base}/healthz`, {
+          signal: AbortSignal.timeout(timeoutMs),
+        });
         if (!res.ok) {
           return {
             healthy: false,
@@ -976,11 +1001,17 @@ function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerP
         }
         return { healthy: true };
       } catch (err) {
-        // Monitor unreachable → the server is down (or the monitor port isn't
-        // listening). Either way the restart did NOT bring a healthy bus up.
+        // A timeout/abort means the monitor accepted but did not respond in time
+        // — the bus is hung, NOT healthy. A connection error means it's down or
+        // the port isn't listening. Either way the restart did NOT bring a
+        // healthy bus up. Distinguish the timeout for an actionable reason.
+        const isTimeout =
+          err instanceof DOMException && err.name === "TimeoutError";
         return {
           healthy: false,
-          reason: `nats-server monitor ${base} unreachable: ${err instanceof Error ? err.message : String(err)}`,
+          reason: isTimeout
+            ? `nats-server monitor ${base}/healthz timed out after ${timeoutMs.toString()}ms (accepted the connection but never responded — bus hung)`
+            : `nats-server monitor ${base} unreachable: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
     },
