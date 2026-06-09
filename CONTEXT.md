@@ -32,6 +32,24 @@ A stack **joins** a network through the **network-join control plane** — `cort
 **Federation is the default for multi-principal collaboration**, not the exception. When two principals' bots interact (e.g. Andreas's assistant replies to a message JC's user posted), the dispatch envelope MUST publish on `federated.{principal}.{stack}.…` — `local.` never crosses the principal boundary. This is the OSI/L3 routing equivalent: `local.` is one broadcast domain, `federated.` is cross-network routing. A shared platform channel (Discord, Mattermost, Slack) does NOT make cross-principal traffic intra-principal — the surface is L7; the routing happens at L1–L3 on the bus.
 _Avoid_: federation (that is the relationship, not the thing), mesh, fabric, org, cluster
 
+**Peering**:
+The per-network trust roster — a **mutual named-peer set** where each side lists the other (the trust gate). The registry resolves the roster on `cortex network join` (`membersFromPrincipals`); a hand-pinned peer pubkey is the offline fallback. Roster membership is what makes a `federated.{principal}.{stack}.…` envelope reachable across a boundary: without a *mutual* peer there is a proven wire but no counterparty. Onboarding a new community member is therefore two-sided — each side joins and pins the other.
+_Avoid_: connection, link (that is the NATS leaf), friend, follower, member (bare)
+
+#### Networks → NATS (the mapping)
+
+A network is **deployment topology, not a subject segment** — the cardinal invariant (`docs/adr/0001`, `docs/design-multi-network.md`). The network name **never appears on the wire**: a federated subject is `federated.{principal}.{stack}.…`, the *same* identity segments as `local.`, only the prefix differs. Which network's leaf a federated envelope exits is resolved by the runtime's **`selectLink`** — target principal → the `peers[]` topology **in config** — never a subject segment. *Identity on the wire; topology in config.*
+
+| Cortex term | NATS |
+|---|---|
+| **Network** | a hub (leaf-node server) stacks connect into — the federation boundary |
+| **Stack joins a network** | the runtime opens **one leaf link** to that hub |
+| **`local.` scope** | subjects that stay on the leaf — never exported over any link |
+| **`federated.{principal}.{stack}.`** | identity on the wire; `selectLink` resolves the target principal → which network's leaf from `peers[]`, and exports over that leaf. The network is **never** a subject segment. |
+| **Peering** | the mutual named-peer set — each side lists the other; the per-network trust roster |
+
+**One stack, N leaves — the link-pool model.** A single stack runs one **cortex runtime**; joining each network opens one more leaf link with its own policy slice (the F-3 link-pool). `local.` never crosses any leaf; community-bound and metafactory-bound traffic stay isolated by **per-leaf topology routing**, not by a network name in the subject — the cardinal invariant. A dedicated stack per network is a **choice, never required**: one stack with N leaves is the normal shape. You do not provision a "community stack" — you `cortex network join community` from a stack you already run, and a leaf comes up into the community hub.
+
 ### Assistants & agents
 
 **Assistant**:
@@ -180,6 +198,7 @@ _Avoid_: reading dashboard `role: operator` as the **principal**; conflating the
 - **Adapter signs as agent → stack signs, adapter populates originator (C-405 correction).** Originally Direction A Q1a pinned "adapter holds agent NKey and signs as the hosted agent". Corrected per myelin#160 (CLOSED): the **stack** signs via `runtime.publish` using the stack NKey; the **adapter** populates `originator.identity` (resolved DID) + `originator.attribution = "adapter-resolved"`. Cryptographic signer (stack) and policy actor (originator) are cleanly separated — both attestable, both inside the signature.
 - **myelin `DistributionMode` enum still ships `'broadcast'`.** cortex CONTEXT.md canonicalised that mode to **Offer**. Pending myelin-side rename (filed as a separate myelin issue). cortex maps `'broadcast'` → Offer at the boundary until myelin renames.
 - **The config file/dir name is NOT the slug authority — `stack.id` is.** A stack can end up with three disagreeing names: the arc/plist label (from the filename/dirname locator), the federation identity (from `stack.id`), and the join's write path. JC's stack surfaced this: dir/plist `meta-factory`, `stack.id` `jc/default`. Resolved: `stack.id`'s trailing segment is the canonical **stack slug** (see §"Stack slug"); the locator MUST equal it. `arc upgrade` warns on drift; reconciliation is a principal rename, not an auto-rewrite. Decision: `docs/adr/0004-stack-slug-authority.md`; cleanup tracked at cortex#810.
+- **Network ≠ stack.** Easy to conflate — they are different axes. A **network** is a federation boundary (`metafactory`, `community`); a **stack** is one principal's deployment (`andreas/halden`, `jc/default`). `andreas/halden` is a *stack*, not a "halden network"; `community` is a *network*, not a `jc/community` stack. You join a network *from* a stack; you do not "have a community stack" unless you deliberately provision one. "grove" is neither — it was the old app name (now **cortex**), never a network. A stack belongs to N networks; a network holds many principals' stacks.
 
 ## Boundary with adjacent contexts
 
