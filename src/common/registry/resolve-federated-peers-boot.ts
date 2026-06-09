@@ -12,12 +12,24 @@
  *
  * Before S4, `resolveFederatedPeers` was shipped + unit-tested but never
  * invoked on the boot path (the `cortex-config.ts` "WIRING STATUS (S2)" note):
- * the membership gate keyed on `stack_id` from the STATIC `peers[]` only, and a
- * peer that declared just `principal_id` + `stack_id` (no `principal_pubkey`)
- * was admitted by the relaxed schema but never resolved. This module closes
- * that gap by resolving at boot and feeding the resolved networks into the SAME
- * `options.policy.federated.networks[]` field every gate already reads — there
- * is no registry-resolved-specific downstream path (DD-5).
+ * the membership gate keyed on `principal_id` from the STATIC `peers[]` only,
+ * and a peer that declared just `principal_id` + `stack_id` (no
+ * `principal_pubkey`) was admitted by the relaxed schema but never resolved nor
+ * cross-checked. This module closes that gap by resolving at boot and feeding
+ * the resolved networks into the SAME `policy.federated.networks[]` view every
+ * gate already reads.
+ *
+ * ## What it ENFORCES (PR #818 review MAJOR-2 — scope honestly)
+ *
+ * The security property delivered here is the **fail-closed DROP**: a peer that
+ * is unresolvable (DD-5 `unresolved`) or whose hand-pin disagrees with the
+ * roster (DD-11 `pin_mismatch`) is REMOVED from `peers[]`, so the
+ * `principal_id`-keyed membership gate then denies its federated traffic as
+ * `unknown_network`. The filled-in `principal_pubkey` value is, today,
+ * informational — the gate keys on `principal_id` and the crypto-verify path
+ * resolves keys from the registry on-demand (`MultiPrincipalIdentityRegistry`),
+ * NOT from this config field. Wiring the resolved key into the verify path is a
+ * tracked follow-up (PR #818 body).
  *
  * ## What it does
  *
@@ -25,12 +37,16 @@
  *      (pin+verify via the S1 {@link NetworkRegistryClient}) and fill each
  *      pubkey-less peer's `principal_pubkey` from roster membership.
  *   2. **DD-11** — a hand-pinned key that DISAGREES with the registry-resolved
- *      key fails that peer closed (dropped from `peers[]`), never merged.
+ *      key fails that peer closed (dropped from `peers[]`), never merged. PR #818
+ *      review MAJOR-1: this cross-check fires for FULLY hand-pinned networks too
+ *      (the roster is fetched whenever a registry is configured), so a drifted /
+ *      tampered pin is caught rather than admitted on the stale value.
  *   3. **DD-10** — registry-unreachable falls back to the cached roster + the
  *      static/hand-pinned peers, with a loud warning; federation stays up.
  *
  * Hand-pin support is preserved end-to-end (DD-5: hand-pin is the offline
- * fallback): a fully hand-pinned network makes zero registry calls.
+ * fallback) — a hand-pin survives a total registry outage (DD-10), it is just
+ * additionally cross-checked when the registry IS reachable.
  *
  * ## Boot-safety
  *

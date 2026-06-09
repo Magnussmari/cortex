@@ -144,13 +144,10 @@ describe("resolveBootFederatedPeers — DD-5 boot wiring", () => {
 describe("resolveBootFederatedPeers — DD-11 fail-closed", () => {
   test("a hand-pin that disagrees with the roster drops the peer and reports an error", async () => {
     const policy = policyWith([
-      // A second, pubkey-less peer forces the roster fetch — without it the
-      // resolver's back-compat fast path skips the registry entirely (DD-11's
-      // cross-check only has teeth once the network opts into registry
-      // resolution by leaving at least one peer pubkey-less).
       networkWith([
         // hand-pinned to A, but the roster says B → drift/attack signal.
         { principal_id: "jcfischer", stack_id: "jcfischer/sage-host", principal_pubkey: PEER_NKEY_A },
+        // a resolvable peer alongside it — proves the drop is per-peer.
         { principal_id: "andreas", stack_id: "andreas/community" },
       ]),
     ]);
@@ -180,6 +177,37 @@ describe("resolveBootFederatedPeers — DD-11 fail-closed", () => {
     expect(peers.map((p) => p.principal_id)).toEqual(["andreas"]);
     // Aggregate summary warning emitted.
     expect(warnings.some((w) => w.includes("failed closed at") && w.includes("pin_mismatch"))).toBe(true);
+  });
+
+  test("MAJOR-1 — a FULLY hand-pinned network is cross-checked; a drifted pin is dropped", async () => {
+    // PR #818 review MAJOR-1 regression guard at the boot seam: a single
+    // hand-pinned peer (no pubkey-less peer to force a fetch) must STILL be
+    // cross-checked against the roster, and a drifted pin DROPPED. Before the
+    // fix this network made zero registry calls and the stale pin was admitted.
+    const policy = policyWith([
+      networkWith([
+        { principal_id: "jcfischer", stack_id: "jcfischer/sage-host", principal_pubkey: PEER_NKEY_A },
+      ]),
+    ]);
+    const provider = stubProvider({
+      live: {
+        status: "ok",
+        value: {
+          roster: rosterWith([{ principal_id: "jcfischer", principal_pubkey: PEER_B64_B }]),
+        },
+      },
+    });
+    const warnings: string[] = [];
+
+    const result = await resolveBootFederatedPeers(policy, {
+      rosterProvider: provider,
+      warn: (m) => warnings.push(m),
+    });
+
+    expect(provider.fetched).toEqual(["metafactory-community"]);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]?.kind).toBe("pin_mismatch");
+    expect(result.policy?.federated?.networks[0]?.peers ?? []).toHaveLength(0);
   });
 });
 

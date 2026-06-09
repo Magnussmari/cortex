@@ -111,8 +111,15 @@ function federatedEnvelopeFrom(sourcePrincipal: string): Envelope {
 async function bootWithPolicy(
   policy: Policy,
   provider: NetworkRosterProvider,
-): Promise<{ resolvedPolicy: Policy | undefined; stop: () => Promise<void> }> {
+): Promise<{
+  resolvedPolicy: Policy | undefined;
+  callerPolicyUnchanged: boolean;
+  stop: () => Promise<void>;
+}> {
   const tmpAgentsDir = mkdtempSync(join(tmpdir(), "cortex-fedboot-"));
+  // PR #818 NIT-6 — `startCortex` no longer mutates `options.policy`. Capture
+  // the resolved view via the test-only `onBootResolvedPolicy` observation seam.
+  let resolvedPolicy: Policy | undefined;
   const options: StartCortexOptions = {
     disableConfigWatcher: true,
     disableDashboard: true,
@@ -123,11 +130,15 @@ async function bootWithPolicy(
     principal: { id: "test-op" },
     policy,
     bootFederatedRosterProvider: provider,
+    onBootResolvedPolicy: (p) => {
+      resolvedPolicy = p;
+    },
   };
   const handle = await startCortex(minimalConfig(), options);
   return {
-    // `startCortex` rewrites `options.policy` in place with the resolved set.
-    resolvedPolicy: options.policy,
+    resolvedPolicy,
+    // The caller's `options.policy` reference must be UNTOUCHED (NIT-6).
+    callerPolicyUnchanged: options.policy === policy,
     stop: async () => {
       await handle.stop();
       rmSync(tmpAgentsDir, { recursive: true, force: true });
@@ -162,7 +173,10 @@ describe("startCortex — federated-peer boot resolution (DD-5 wiring)", () => {
       members: [{ principal_id: "jcfischer", principal_pubkey: PEER_B64 }],
     });
 
-    const { resolvedPolicy, stop } = await bootWithPolicy(policy, provider);
+    const { resolvedPolicy, callerPolicyUnchanged, stop } = await bootWithPolicy(
+      policy,
+      provider,
+    );
     try {
       // DD-5 — the peer's pubkey is filled from the roster (nkey-U).
       const peers = resolvedPolicy?.federated?.networks[0]?.peers ?? [];
@@ -174,6 +188,13 @@ describe("startCortex — federated-peer boot resolution (DD-5 wiring)", () => {
       // `peers[].principal_id`, populated by the resolver — same path a
       // hand-pin feeds). `allow` for an accepted subject.
       expect(gateDecision(resolvedPolicy, "jcfischer")).toBe("allow");
+
+      // PR #818 NIT-6 — the caller's `options.policy` reference is NOT mutated:
+      // the resolved view is a fresh local binding in `startCortex`. (The input
+      // peer was pubkey-less; the resolved one carries the filled key — so they
+      // are also not the same object.)
+      expect(callerPolicyUnchanged).toBe(true);
+      expect(policy.federated?.networks[0]?.peers[0]?.principal_pubkey).toBeUndefined();
     } finally {
       await stop();
     }
@@ -217,8 +238,8 @@ describe("startCortex — federated-peer boot resolution (DD-5 wiring)", () => {
       networkWith([
         // hand-pinned to PEER_NKEY, but the roster will say PEER_B64_OTHER.
         { principal_id: "jcfischer", stack_id: "jcfischer/sage-host", principal_pubkey: PEER_NKEY },
-        // a pubkey-less peer forces the roster fetch (without it the resolver's
-        // back-compat fast path skips the registry, so DD-11 wouldn't fire).
+        // a second, pubkey-less peer (resolved) — proves the mismatch drop is
+        // per-peer, not all-or-nothing.
         { principal_id: "andreas", stack_id: "andreas/community" },
       ]),
     ]);
@@ -246,6 +267,45 @@ describe("startCortex — federated-peer boot resolution (DD-5 wiring)", () => {
       }
       // andreas (resolved) is still admitted.
       expect(gateDecision(resolvedPolicy, "andreas")).toBe("allow");
+    } finally {
+      await stop();
+    }
+  });
+
+  test("DD-11 MAJOR-1 — a FULLY hand-pinned network is cross-checked; a drifted pin is dropped", async () => {
+    // PR #818 review MAJOR-1 regression guard. BEFORE the fix this network made
+    // ZERO registry calls (every peer hand-pinned ⇒ `needsRegistry` false), so a
+    // hand-pin that had drifted from a rotated/tampered roster key was admitted
+    // on the stale pin and DD-11 never fired. AFTER the fix the roster IS fetched
+    // for any non-empty network when a registry is configured, so the pin↔roster
+    // cross-check fires and the drifted peer is DROPPED.
+    const policy = policyWith([
+      networkWith([
+        // The ONLY peer — fully hand-pinned to PEER_NKEY.
+        { principal_id: "jcfischer", stack_id: "jcfischer/sage-host", principal_pubkey: PEER_NKEY },
+      ]),
+    ]);
+    // The registry serves a DIFFERENT key for the same principal (rotation /
+    // compromise): drift signal.
+    const provider = fixtureProvider({
+      network_id: "metafactory-community",
+      members: [{ principal_id: "jcfischer", principal_pubkey: PEER_B64_OTHER }],
+    });
+
+    const { resolvedPolicy, stop } = await bootWithPolicy(policy, provider);
+    try {
+      // The drifted hand-pin is DROPPED (not silently kept on the stale pin).
+      const peers = resolvedPolicy?.federated?.networks[0]?.peers ?? [];
+      expect(peers).toHaveLength(0);
+
+      // The gate denies the dropped peer as an unknown network member.
+      const denied = gateDecision(resolvedPolicy, "jcfischer");
+      expect(typeof denied).toBe("object");
+      if (typeof denied === "object" && denied.kind === "peer_not_in_accept_list") {
+        expect(denied.unknown_network).toBe(true);
+      } else {
+        throw new Error(`expected peer_not_in_accept_list, got ${JSON.stringify(denied)}`);
+      }
     } finally {
       await stop();
     }

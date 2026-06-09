@@ -1433,27 +1433,30 @@ export const PolicyFederatedPeerSchema = z.object({
    * (`src/common/registry/resolve-federated-peers.ts`): it fetches the
    * peer's pubkey from the registry-signed roster, re-encodes it to nkey-U
    * (DD-8), and fills this field. Hand-pinning stays as the offline
-   * fallback (DD-5) — a hand-pinned peer always resolves without the
-   * registry. When BOTH a hand-pin AND a registry-resolved key exist and
-   * they DIFFER, the resolver fails that peer closed (DD-11), dropping the
-   * peer from `peers[]` so the membership gate (`evaluateFederationGate` /
-   * `resolveSourceNetwork`, which key on `stack_id` membership) denies its
-   * federated traffic as `unknown_network`.
+   * fallback (DD-5) — a hand-pinned peer survives a registry outage (DD-10).
+   * When BOTH a hand-pin AND a registry-resolved key exist and they DIFFER,
+   * the resolver fails that peer closed (DD-11), dropping the peer from
+   * `peers[]` so the membership gate (`evaluateFederationGate` /
+   * `resolveSourceNetwork`, which key on `peers[].principal_id` membership)
+   * denies its federated traffic as `unknown_network`.
    *
    * WIRING STATUS (S4 — WIRED): the resolver is now invoked on the boot path.
    * `startCortex` calls `resolveBootFederatedPeers`
    * (`src/common/registry/resolve-federated-peers-boot.ts`) BEFORE any consumer
-   * reads `policy.federated.networks[]`, and rewrites that field with the
-   * resolved set. A pubkey-less peer has THIS field filled from the verified
-   * roster (DD-5); a hand-pin that disagrees with the roster fails the peer
-   * closed and DROPS it from `peers[]` (DD-11); a registry outage falls back to
-   * the cached roster + a loud warn (DD-10). The resolved networks feed the SAME
-   * downstream consumers — the runtime LinkPool, the surface-router +
-   * dispatch-listener membership gates (`evaluateFederationGate` /
-   * `resolveSourceNetwork`, which key on `peers[].principal_id`), the
-   * review-consumer subjects, and the public index — so there is NO separate
-   * registry-resolved code path (DD-5). A keyless peer is never admitted to the
-   * gate (fail-closed): it is either resolved to a key or dropped.
+   * reads `policy.federated.networks[]`, and threads the resolved set (a fresh
+   * local view; the caller's `options` is NOT mutated) to every consumer.
+   *
+   * WHAT IS ENFORCED (PR #818 review MAJOR-2 — scope honestly): the load-bearing
+   * security property is the fail-closed DROP. A pubkey-less peer that cannot be
+   * resolved (DD-5 `unresolved`) and a hand-pin that disagrees with the roster
+   * (DD-11 `pin_mismatch`, now cross-checked even for fully hand-pinned networks
+   * per MAJOR-1) are REMOVED from `peers[]`; the `principal_id`-keyed gate then
+   * denies them as `unknown_network`. The pubkey VALUE filled into THIS field is
+   * currently informational and is NOT yet read for admission — the gate +
+   * LinkPool key on `principal_id`, and the crypto-verify path resolves peer
+   * pubkeys from the registry on-demand (`MultiPrincipalIdentityRegistry`), not
+   * from this field. Wiring the resolved/pinned key into the verify path so this
+   * field becomes the trust anchor is a tracked follow-up (see the PR #818 body).
    */
   principal_pubkey: z.string().regex(
     NKEY_PUBKEY_REGEX,
