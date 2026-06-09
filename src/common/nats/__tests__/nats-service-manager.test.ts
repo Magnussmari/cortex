@@ -206,6 +206,34 @@ describe("systemd manager — ExecStart ensure-config-arg (live)", () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toContain("Failed to restart");
   });
+
+  test("item-2: restart NEVER THROWS when exec throws synchronously (systemctl ENOENT)", async () => {
+    const dir = freshDir();
+    const unitPath = join(dir, "nats-server.service");
+    writeFileSync(unitPath, bareUnit(), "utf-8");
+
+    // Bun.spawn throws synchronously on ENOENT (binary not on PATH). The manager
+    // must honour its documented "never throws" contract → { ok: false }.
+    const throwing: ExecRunner = () => {
+      throw new Error("spawn systemctl ENOENT");
+    };
+    const mgr = selectNatsServiceManager({
+      descriptorPath: unitPath,
+      platform: "linux",
+      mutate: true,
+      exec: throwing,
+    });
+    let threw = false;
+    let res: Awaited<ReturnType<typeof mgr.restart>> | undefined;
+    try {
+      res = await mgr.restart();
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+    expect(res?.ok).toBe(false);
+    if (res && !res.ok) expect(res.reason).toContain("ENOENT");
+  });
 });
 
 // =============================================================================
@@ -249,6 +277,33 @@ describe("launchd manager — plist path unchanged (regression)", () => {
     expect(calls[0]?.[0]).toBe("launchctl");
     expect(calls[0]).toContain("kickstart");
     expect(calls[0]?.join(" ")).toContain("gui/501/homebrew.mxcl.nats-server");
+  });
+
+  test("item-2: restart NEVER THROWS when exec throws synchronously (launchctl ENOENT)", async () => {
+    const dir = freshDir();
+    const plistPath = join(dir, "nats-server.plist");
+    writeFileSync(plistPath, barePlist(), "utf-8");
+
+    const throwing: ExecRunner = () => {
+      throw new Error("spawn launchctl ENOENT");
+    };
+    const mgr = selectNatsServiceManager({
+      descriptorPath: plistPath,
+      platform: "darwin",
+      mutate: true,
+      exec: throwing,
+      uid: 501,
+    });
+    let threw = false;
+    let res: Awaited<ReturnType<typeof mgr.restart>> | undefined;
+    try {
+      res = await mgr.restart();
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+    expect(res?.ok).toBe(false);
+    if (res && !res.ok) expect(res.reason).toContain("ENOENT");
   });
 });
 

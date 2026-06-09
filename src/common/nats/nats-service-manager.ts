@@ -221,7 +221,19 @@ class LaunchdServiceManager implements NatsServiceManager {
       return { ok: false, reason: `no <key>Label</key> in nats-server plist ${this.plistPath}` };
     }
     const argv = ["launchctl", "kickstart", "-k", `gui/${this.uid.toString()}/${label}`];
-    const { code, stderr } = await this.exec(argv);
+    // #821 item-2 — `exec` (Bun.spawn) THROWS SYNCHRONOUSLY on ENOENT (launchctl
+    // not on PATH). Honour the documented "never throws" contract: a spawn
+    // failure becomes a clean { ok: false }, never an uncaught escape.
+    let code: number;
+    let stderr: string;
+    try {
+      ({ code, stderr } = await this.exec(argv));
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `launchctl kickstart ${label} could not run: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     if (code !== 0) {
       return {
         ok: false,
@@ -303,7 +315,18 @@ class SystemdServiceManager implements NatsServiceManager {
       scope === "user"
         ? ["systemctl", "--user", "restart", serviceId]
         : ["systemctl", "restart", serviceId];
-    const { code, stderr } = await this.exec(argv);
+    // #821 item-2 — `exec` (Bun.spawn) THROWS SYNCHRONOUSLY on ENOENT (systemctl
+    // not on PATH). Honour the "never throws" contract → { ok: false }.
+    let code: number;
+    let stderr: string;
+    try {
+      ({ code, stderr } = await this.exec(argv));
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `systemctl ${scope === "user" ? "--user " : ""}restart ${serviceId} could not run: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     if (code !== 0) {
       return {
         ok: false,

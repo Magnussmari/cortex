@@ -412,15 +412,27 @@ export function removeLeafInclude(
 // =============================================================================
 
 /**
- * Strip line comments (`//` and `#`) from a nats config so a commented-out
- * account-tree directive or account string can't produce a false positive. We
- * strip only LINE comments (the shapes humans actually leave in `local.conf`);
- * HOCON block comments are rare and treated as content (worst case: a
- * false-positive bind decision inside a block comment, which is benign — the
- * server would simply not see a real account there and the join re-runs).
+ * Strip comments from a nats config so a commented-out account-tree directive or
+ * account string can't produce a false positive.
+ *
+ * #821 MAJOR-2 — we strip BOTH line comments (`//` and `#`) AND HOCON/C-style
+ * block comments (slash-star … star-slash, including multi-line). The earlier
+ * code stripped only line comments and called a block-commented account
+ * "benign" — that was WRONG: a false-positive bind is exactly the #821 crash (an
+ * account named only inside a block comment would make
+ * {@link natsConfigCanBindAccount} return canBind:true → an account-bound remote
+ * → `cannot find local account`). Block comments are replaced with whitespace
+ * (newlines preserved) so line structure — which the operator-mode line-anchored
+ * regexes depend on — is unchanged.
  */
 function stripConfigComments(natsConfigText: string): string {
-  return natsConfigText
+  // Strip block comments first (they may span lines), preserving newlines so the
+  // line-anchored operator-mode detectors keep their line structure. Then strip
+  // whole-line `//` / `#` comments.
+  const noBlocks = natsConfigText.replace(/\/\*[\s\S]*?\*\//g, (m) =>
+    m.replace(/[^\n]/g, " "),
+  );
+  return noBlocks
     .split("\n")
     .map((line) => {
       const trimmed = line.trimStart();
@@ -451,12 +463,16 @@ export interface AccountBindCheck {
  *     account tree (`accounts` / `resolver_preload`). A config with NONE of
  *     these is **anonymous + hard-isolated**: it defines no accounts, so the
  *     account the leaf binds can never be found → `canBind: false`.
- *   - AND the literal `account` nkey-U string must appear in the config (it is
- *     the key/value naming the account in `resolver_preload`/`accounts`). An
- *     operator-mode config that does not name THIS account also cannot bind it
- *     → `canBind: false`.
+ *   - AND the `account` nkey-U must appear as a standalone TOKEN naming the
+ *     account in `resolver_preload`/`accounts` — NOT embedded in a longer token,
+ *     and NOT only as the `system_account` value (the SYS account is not
+ *     leaf-bindable). An operator-mode config that does not name THIS account as
+ *     a bindable account cannot bind it → `canBind: false` (#821 MAJOR-2: a
+ *     false-positive bind IS the crash, so the match is token-bounded, not a
+ *     bare substring).
  *
- * Comments are stripped first so a commented-out directive never counts.
+ * Comments — line (`//`/`#`) AND block (slash-star … star-slash) — are stripped
+ * first so a commented-out directive or account string never counts (MAJOR-2).
  *
  * Pure: reads the text, writes nothing. The caller (the join orchestrator)
  * passes the resolved `config_path` contents and refuses BEFORE any mutation
@@ -490,13 +506,38 @@ export function natsConfigCanBindAccount(
     };
   }
 
-  // operator-mode, but does it name THIS account? The nkey-U appears as the
-  // key (resolver_preload) or value naming the account. A substring check is
-  // sufficient: nkey-U keys are high-entropy and won't collide with prose.
-  if (!text.includes(trimmedAccount)) {
+  // operator-mode, but does it name THIS account as a BINDABLE account?
+  //
+  // #821 MAJOR-2 — a bare `text.includes()` is unsafe (a false-positive bind IS
+  // the crash). We require the nkey-U to appear at a TOKEN BOUNDARY (not embedded
+  // inside a longer base32/alnum run — e.g. a JWT body), AND we EXCLUDE the
+  // `system_account` value (the SYS account is not leaf-bindable). nkey grammar
+  // is `A[A-Z2-7]{55}`, so the "token" charset to bound against is `[A-Za-z0-9]`
+  // (base32 ⊂ alnum); the account must not be flanked by another alnum char.
+  const tokenBoundary = new RegExp(
+    `(?<![A-Za-z0-9])${trimmedAccount}(?![A-Za-z0-9])`,
+  );
+  if (!tokenBoundary.test(text)) {
     return {
       canBind: false,
       reason: `config is operator-mode but does not define account ${trimmedAccount}`,
+    };
+  }
+
+  // The account appears as a standalone token — but if its ONLY appearance is as
+  // the `system_account` value, it is the SYS account, which a leaf cannot bind.
+  // Strip the system_account line(s) and re-test: if the token survives, there is
+  // a genuine (non-SYS) definition; if not, this account is only the SYS account.
+  const withoutSysAccount = text.replace(
+    /^[ \t]*system_account[ \t]*[:=].*$/gm,
+    "",
+  );
+  if (!tokenBoundary.test(withoutSysAccount)) {
+    return {
+      canBind: false,
+      reason:
+        `config is operator-mode but account ${trimmedAccount} is only the ` +
+        `system_account (SYS) — a leaf cannot bind the system account`,
     };
   }
 
@@ -589,25 +630,155 @@ export function resolveLeafBindMode(
     }
   }
 
-  // No account offered (or a `$G` bus where the account is moot) + creds present
-  // → bind via the creds JWT, no `account:` line.
+  // #821 — THE CRASH GUARD. No account offered. A `$G`/default bus binds via the
+  // creds JWT (creds-only). But an operator-mode bus REQUIRES every leaf remote
+  // to declare an account nkey — nats-server exits 1 at runtime (it rejects a
+  // remote with no `account:` line as requiring "account nkeys in remotes") and
+  // the bus goes DOWN. The pre-#821 code returned `creds-only` here regardless
+  // of bus type, so an operator-mode `cortex network join` run without
+  // `--account` rendered a no-account ($G) remote onto the operator-mode bus and
+  // crashed nats-server. Refuse instead, with the same actionable message as the
+  // missing-account case.
+  if (natsConfigHasAccountTree(natsConfigText)) {
+    return {
+      mode: "refuse",
+      reason:
+        "operator-mode bus requires the leaf remote to declare an account nkey, " +
+        "but none was offered (no --account and no stack.nats_infra.account). " +
+        "Rendering a no-account remote would crash nats-server (an operator-mode " +
+        "bus rejects remotes with no account nkey). Pass --account <A…> (or set " +
+        "stack.nats_infra.account).",
+    };
+  }
+
+  // `$G`/default bus + creds present → bind via the creds JWT, no `account:` line.
   return { mode: "creds-only" };
 }
 
 /**
- * True iff the config is OPERATOR-MODE — it carries an NSC operator JWT key OR
- * an account tree (`accounts` / `resolver_preload`). The negation is a
- * `$G`/default-account bus (a simple creds-authenticated leaf-client). Mirrors
- * the operator-mode signal inside {@link natsConfigCanBindAccount} (comments
- * stripped first) so the two cannot drift. (#799)
+ * True iff the config is OPERATOR-MODE — it carries any signal of an NSC
+ * account tree. The negation is a `$G`/default-account bus (a simple
+ * creds-authenticated leaf-client). Mirrors the operator-mode signal inside
+ * {@link natsConfigCanBindAccount} (comments stripped first) so the two cannot
+ * drift. (#799)
+ *
+ * #821 MAJOR-1 — the detector must recognise the FULL set of valid operator-mode
+ * shapes, not just the canonical `operator:`/`accounts`/`resolver_preload`.
+ * Missing a valid operator-mode config misclassifies it as `$G` → renders a
+ * no-account remote → the #821 crash. So we add:
+ *
+ *   - `resolver:` / `resolver {` — an NSC JWT resolver (e.g. `resolver: MEMORY`,
+ *     `resolver { type: full … }`). Present ⇒ JWT-based accounts ⇒ operator-mode.
+ *   - `system_account:` — names the SYS account; only operator-mode (account-mode)
+ *     configs declare one.
+ *   - `include "<file>"` — the account tree may be split into an included file
+ *     this pure text scanner cannot resolve. FAIL CLOSED: an `include` ⇒ assume
+ *     operator-mode ⇒ require an account. Erring toward operator-mode only
+ *     OVER-refuses (recoverable — the principal passes `--account`), and never
+ *     renders the no-account remote that crashes nats-server.
+ *
+ * Erring toward operator-mode is the SAFE direction: a false "operator-mode"
+ * blocks a join (recoverable); a false "$G" crashes the server.
  */
 export function natsConfigHasAccountTree(natsConfigText: string): boolean {
   const text = stripConfigComments(natsConfigText);
   return (
     /^[ \t]*operator[ \t]*[:=]/m.test(text) || // NSC operator JWT key
     /^[ \t]*accounts[ \t]*[:={]/m.test(text) ||
-    /^[ \t]*resolver_preload[ \t]*[:={]/m.test(text)
+    /^[ \t]*resolver_preload[ \t]*[:={]/m.test(text) ||
+    // #821 MAJOR-1 — `resolver:` / `resolver =` / `resolver {` (NSC JWT
+    // resolver). The `[ \t]+{` alt catches `resolver { … }` with a space before
+    // the brace; `resolver_preload` is excluded because `_` is not in [ \t:={].
+    /^[ \t]*resolver[ \t]*(?:[:={]|[ \t]+\{)/m.test(text) ||
+    /^[ \t]*system_account[ \t]*[:=]/m.test(text) || // names the SYS account
+    // #821 MAJOR-1 — fail-closed on a split config: an `include "<file>"` may
+    // pull in the account tree we cannot scan here. Treat as operator-mode.
+    // EXCLUDE the join's OWN per-network leaf includes (`leafnodes-<net>.conf`,
+    // {@link leafIncludeFileName}) — those carry the leaf REMOTE, never an
+    // account tree, and `ensureLeafInclude` adds one on the first join. Counting
+    // them would flip a genuine $G bus to "operator-mode" on RE-join and
+    // over-refuse it (a #803 regression). Only a NON-leafnodes include counts.
+    hasNonLeafInclude(text)
   );
+}
+
+/**
+ * True iff `text` carries an `include "<file>"` directive whose target is NOT a
+ * join-managed `leafnodes-<network>.conf` leaf fragment. Used by
+ * {@link natsConfigHasAccountTree} so the join's own leaf include (added by
+ * {@link ensureLeafInclude}) never trips the fail-closed operator-mode signal on
+ * re-join. (#821 MAJOR-1)
+ */
+function hasNonLeafInclude(text: string): boolean {
+  const re = /^[ \t]*include[ \t]+["']([^"']+)["']/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const file = m[1] ?? "";
+    // The join's own leaf fragments are `leafnodes-<network>.conf` — skip them.
+    if (/^leafnodes-[a-z][a-z0-9-]*\.conf$/.test(file)) continue;
+    return true; // a non-leaf include — the account tree may live there.
+  }
+  return false;
+}
+
+/**
+ * #821 MAJOR (code-review) — derive the nats-server HTTP MONITOR url from its
+ * config, so the post-restart health probe targets THIS bus's monitor port (the
+ * community bus monitors on :8224), not a hardcoded :8222. Returns the loopback
+ * monitor url (`http://127.0.0.1:<port>`) parsed from the config's `http_port` /
+ * `monitor_port` / `http` directive, or `undefined` when none is present (the
+ * caller falls back to an explicit `--monitor-url` then the default).
+ *
+ * We always probe LOOPBACK (`127.0.0.1`) regardless of the bind host the config
+ * names (`0.0.0.0`, a LAN ip, a hostname) — the join runs on the same host as
+ * nats-server, so loopback is the correct, security-tight probe target; we take
+ * only the PORT from the config. Comments are stripped first.
+ */
+export function natsConfigMonitorUrl(natsConfigText: string): string | undefined {
+  const text = stripConfigComments(natsConfigText);
+
+  // `http_port: <n>` / `monitor_port: <n>` — the port-only directives.
+  const portDirective = /^[ \t]*(?:http_port|monitor_port)[ \t]*[:=][ \t]*(\d{1,5})\b/m.exec(
+    text,
+  );
+  if (portDirective?.[1] !== undefined) {
+    return monitorUrlForPort(portDirective[1]);
+  }
+
+  // `http: <value>` — value may be a bare port (`8224`), `host:port`
+  // (`0.0.0.0:8224`), or quoted (`"localhost:8224"`), optionally followed by an
+  // INLINE trailing comment (`# mon` / `// mon`). Capture the rest of the line,
+  // then strip the inline comment + quotes before taking the trailing port.
+  // #821 item-3 — without stripping the inline comment the end-anchored port
+  // match failed (→ undefined → false-fallback to :8222 → false-trip rollback).
+  const httpDirective = /^[ \t]*http[ \t]*[:=][ \t]*(.+)$/m.exec(text);
+  if (httpDirective?.[1] !== undefined) {
+    const value = stripInlineComment(httpDirective[1]).replace(/["']/g, "").trim();
+    // Trailing port: either `:<port>` at the end, or the whole value is a port.
+    const portMatch = /(?::|^)(\d{1,5})$/.exec(value);
+    if (portMatch?.[1] !== undefined) {
+      return monitorUrlForPort(portMatch[1]);
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Strip a trailing inline `#` or `//` comment from a single config-line value.
+ * `0.0.0.0:8224 # mon` → `0.0.0.0:8224`. Conservative: only cuts at a `#` or
+ * `//` that is preceded by whitespace or start-of-string, so a `#`/`//` inside a
+ * value (unusual for a monitor host:port) is left alone.
+ */
+function stripInlineComment(value: string): string {
+  return value.replace(/(^|[ \t])(#|\/\/).*$/, "").trimEnd();
+}
+
+/** Build a loopback monitor url for `port`, or `undefined` if out of range. */
+function monitorUrlForPort(port: string): string | undefined {
+  const n = Number.parseInt(port, 10);
+  if (!Number.isInteger(n) || n <= 0 || n > 65535) return undefined;
+  return `http://127.0.0.1:${n.toString()}`;
 }
 
 /** Serialize one {@link LeafRemote} as a HOCON object literal (indented). */
