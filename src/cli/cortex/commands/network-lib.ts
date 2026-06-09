@@ -235,6 +235,29 @@ export async function joinNetwork(
   const leafAccount =
     bindMode.mode === "operator-account" ? bindMode.account : undefined;
 
+  // (b.6) #821 — PRE-FLIGHT the creds file BEFORE any mutation. `nats-server -c
+  // <cfg> -t` validates HOCON syntax but does NOT dereference the leaf remote's
+  // `credentials` path, so a remote pointing at a NON-EXISTENT creds file passes
+  // `-t` yet makes the leaf un-authenticatable at runtime. The community
+  // incident's rendered remote pointed at a creds file that did not exist. A
+  // READ (identical in live + dry-run); refuse here rather than render a leaf
+  // that can never connect.
+  if (!ports.leafFile.credsExist(stack.credentials)) {
+    return {
+      ok: false,
+      steps,
+      reason:
+        `leaf creds file not found at ${stack.credentials} — refusing to render a ` +
+        `leaf remote that cannot authenticate to the hub. Set stack.nats_infra.creds_path ` +
+        `(or pass --creds) to an existing .creds file (cortex#821).`,
+    };
+  }
+
+  // (b.7) #821 — SNAPSHOT the prior leaf state BEFORE any mutation, so a failed
+  // nats-server restart (step e.1) can be rolled back to the exact pre-join
+  // bytes. Captures the per-network include file + the base nats config. A READ.
+  const snapshot = ports.leafFile.snapshotLeafState(networkId);
+
   // (c) Render + write the leaf include (S3) and ensure the plist loads the
   // nats config (DD-6, closes the configured-but-dormant trap). The renderer
   // fails loud on a bad binding — surface it as a join failure, never a crash.
@@ -350,19 +373,51 @@ export async function joinNetwork(
   // Skipped only when no nats-server port is wired (a caller that doesn't mutate
   // the leaf); the live `join` path always supplies one.
   if (ports.natsServer !== undefined) {
-    const natsRestart = await ports.natsServer.restart();
+    const natsServer = ports.natsServer;
+    const natsRestart = await natsServer.restart();
+
+    // #821 — a restart that EXITS non-zero, OR one that exits 0 but leaves the
+    // server DOWN (the community crash: `launchctl kickstart` returned 0, then
+    // nats-server exited 1 on the bad leaf), must NOT be reported as success and
+    // must NOT leave the bus down. Probe health after the restart; on failure,
+    // ROLL BACK the leaf snapshot + re-restart so the bus returns to its prior
+    // working state, then report the failure.
+    let restartFailure: string | undefined;
     if (!natsRestart.ok) {
+      restartFailure = natsRestart.reason;
+    } else {
+      const health = await natsServer.isHealthy();
+      if (!health.healthy) {
+        restartFailure = `nats-server did not come back up after restart (${health.reason})`;
+      }
+    }
+
+    if (restartFailure !== undefined) {
+      // Restore the prior leaf state + re-restart to bring the bus back. A failed
+      // join MUST NEVER leave the bus down. The rollback restart's own outcome is
+      // appended to the step log so the principal sees whether recovery succeeded.
+      let rollbackNote: string;
+      try {
+        ports.leafFile.restoreLeafState(snapshot);
+        const recovery = await natsServer.restart();
+        rollbackNote = recovery.ok
+          ? "rolled back leaf config + restarted nats-server (bus restored to prior state)"
+          : `rolled back leaf config but the recovery restart ALSO failed (${recovery.reason}) — bus may be DOWN, intervene manually`;
+      } catch (err) {
+        rollbackNote = `rollback FAILED (${err instanceof Error ? err.message : String(err)}) — bus may be DOWN, intervene manually`;
+      }
+      steps.push(`WARN: ${rollbackNote}`);
       return {
         ok: false,
         steps,
-        reason: `config written but nats-server restart failed: ${natsRestart.reason}`,
+        reason: `nats-server restart failed (${restartFailure}); ${rollbackNote}`,
         network: entry,
         usedCache,
         resolvedPeers: peers.map((p) => p.principal_id),
-        ...(warnings.length > 0 && { warnings }),
+        warnings: [...warnings, rollbackNote],
       };
     }
-    steps.push("restarted nats-server to load leaf config");
+    steps.push("restarted nats-server to load leaf config (verified healthy)");
   }
 
   // (e.2) Restart the cortex daemon so it reconnects to the bus (now carrying

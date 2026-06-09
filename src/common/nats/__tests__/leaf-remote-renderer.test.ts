@@ -352,4 +352,26 @@ describe("#799 resolveLeafBindMode", () => {
     const mode = resolveLeafBindMode(otherAccountConf, VALID_ACCOUNT, true);
     expect(mode.mode).toBe("refuse");
   });
+
+  // #821 — THE INCIDENT. An operator-mode bus joined WITHOUT an account
+  // (no --account, no stack.nats_infra.account) must REFUSE, NOT fall through to
+  // creds-only. Rendering a no-account ($G) leaf onto an operator-mode bus makes
+  // nats-server exit 1 at runtime (it rejects a remote that carries no account
+  // nkey) — the crash that took the live andreas/community bus down. The
+  // pre-#821 code skipped the account branch entirely when none was offered and
+  // returned `creds-only` regardless of bus type.
+  test("operator-mode bus + NO account offered + creds → refuse (the #821 crash)", () => {
+    const mode = resolveLeafBindMode(OPERATOR_MODE_CONF, undefined, true);
+    expect(mode.mode).toBe("refuse");
+    if (mode.mode === "refuse") {
+      expect(mode.reason).toContain("operator-mode");
+      expect(mode.reason).toContain("account");
+    }
+  });
+
+  test("operator-mode bus + empty-string account + creds → refuse (#821)", () => {
+    // An empty/whitespace account is "no account offered" — same crash path.
+    const mode = resolveLeafBindMode(OPERATOR_MODE_CONF, "   ", true);
+    expect(mode.mode).toBe("refuse");
+  });
 });

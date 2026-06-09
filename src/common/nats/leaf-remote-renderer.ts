@@ -589,8 +589,28 @@ export function resolveLeafBindMode(
     }
   }
 
-  // No account offered (or a `$G` bus where the account is moot) + creds present
-  // → bind via the creds JWT, no `account:` line.
+  // #821 — THE CRASH GUARD. No account offered. A `$G`/default bus binds via the
+  // creds JWT (creds-only). But an operator-mode bus REQUIRES every leaf remote
+  // to declare an account nkey — nats-server exits 1 at runtime (it rejects a
+  // remote with no `account:` line as requiring "account nkeys in remotes") and
+  // the bus goes DOWN. The pre-#821 code returned `creds-only` here regardless
+  // of bus type, so an operator-mode `cortex network join` run without
+  // `--account` rendered a no-account ($G) remote onto the operator-mode bus and
+  // crashed nats-server. Refuse instead, with the same actionable message as the
+  // missing-account case.
+  if (natsConfigHasAccountTree(natsConfigText)) {
+    return {
+      mode: "refuse",
+      reason:
+        "operator-mode bus requires the leaf remote to declare an account nkey, " +
+        "but none was offered (no --account and no stack.nats_infra.account). " +
+        "Rendering a no-account remote would crash nats-server (an operator-mode " +
+        "bus rejects remotes with no account nkey). Pass --account <A…> (or set " +
+        "stack.nats_infra.account).",
+    };
+  }
+
+  // `$G`/default bus + creds present → bind via the creds JWT, no `account:` line.
   return { mode: "creds-only" };
 }
 

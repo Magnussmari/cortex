@@ -486,6 +486,51 @@ function buildLeafFilePort(cfg: LivePortsConfig, mutate: boolean): LeafFilePort 
         : "";
       return resolveLeafBindMode(text, account, hasCreds);
     },
+    credsExist(path) {
+      // #821 — pure READ (identical in live + dry-run): does the leaf creds file
+      // exist? `nats-server -t` never dereferences it, so a missing creds file
+      // passes `-t` yet leaves the leaf un-authenticatable. The path is
+      // tilde-expanded to match how nats-server resolves it.
+      const expanded = expandTilde(path);
+      return expanded.length > 0 && existsSync(expanded);
+    },
+    snapshotLeafState(networkId) {
+      // #821 — capture the per-network include file + the base nats config bytes
+      // so a failed restart can be rolled back. A READ.
+      const includePath = join(dir, leafIncludeFileName(networkId));
+      const configPath = expandTilde(cfg.natsConfigPath ?? "");
+      return {
+        networkId,
+        includeFile: existsSync(includePath)
+          ? readFileSync(includePath, "utf-8")
+          : undefined,
+        natsConfig: existsSync(configPath)
+          ? readFileSync(configPath, "utf-8")
+          : undefined,
+      };
+    },
+    restoreLeafState(snapshot) {
+      // #821 — rollback: rewrite (or delete) the per-network include file and the
+      // base nats config to exactly the snapshot bytes, so the next restart
+      // brings the bus back to its prior working state. Dry-run is inert.
+      if (!mutate) return;
+      const includePath = join(dir, leafIncludeFileName(snapshot.networkId));
+      if (snapshot.includeFile === undefined) {
+        // The include file did not exist pre-join — remove what the join wrote.
+        rmSync(includePath, { force: true });
+      } else {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(includePath, snapshot.includeFile, "utf-8");
+      }
+      const configPath = expandTilde(cfg.natsConfigPath ?? "");
+      if (snapshot.natsConfig === undefined) {
+        // The base config did not exist pre-join (unusual) — remove the join's write.
+        rmSync(configPath, { force: true });
+      } else {
+        mkdirSync(dirname(configPath), { recursive: true });
+        writeFileSync(configPath, snapshot.natsConfig, "utf-8");
+      }
+    },
   };
 }
 
@@ -803,6 +848,34 @@ function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerP
         };
       }
       return mgr.restart();
+    },
+    async isHealthy() {
+      // #821 — probe nats-server's HTTP monitor to confirm it actually came back
+      // UP after the restart. `launchctl kickstart` / `systemctl restart` can
+      // exit 0 even when the server then crashes on the new config at runtime
+      // (the community incident). `/healthz` is nats-server's liveness endpoint;
+      // a reachable 200 means the process is up and reading its config. A
+      // dry-run never restarts, so it is trivially "healthy". The monitor URL is
+      // the same one the leaf-state port uses (defaults to the local monitor).
+      if (!mutate) return { healthy: true };
+      const base = (cfg.monitorUrl ?? DEFAULT_MONITOR_URL).replace(/\/+$/, "");
+      try {
+        const res = await fetch(`${base}/healthz`);
+        if (!res.ok) {
+          return {
+            healthy: false,
+            reason: `nats-server monitor ${base}/healthz returned HTTP ${res.status.toString()}`,
+          };
+        }
+        return { healthy: true };
+      } catch (err) {
+        // Monitor unreachable → the server is down (or the monitor port isn't
+        // listening). Either way the restart did NOT bring a healthy bus up.
+        return {
+          healthy: false,
+          reason: `nats-server monitor ${base} unreachable: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
     },
   };
 }

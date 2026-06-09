@@ -117,6 +117,14 @@ interface Recorder {
   bindModeChecks: { account: string | undefined; hasCreds: boolean }[];
   /** C-820 — network ids the leave path asked the registry to deregister from. */
   deregistered: string[];
+  /** #821 — creds-existence paths pre-flighted. */
+  credsChecks: string[];
+  /** #821 — networks whose leaf state was snapshotted (pre-mutation). */
+  snapshots: string[];
+  /** #821 — networks whose leaf state was restored (rollback). */
+  restores: string[];
+  /** #821 — count of nats-server health probes after restart. */
+  healthProbes: number;
 }
 
 function makeFakes(opts: {
@@ -141,6 +149,16 @@ function makeFakes(opts: {
    * The fake's `resolveBindMode` mirrors the real `resolveLeafBindMode` decision.
    */
   busType?: "operator-mode" | "default-g";
+  /** #821 — model the leaf creds file as MISSING (pre-flight refuses). */
+  credsMissing?: boolean;
+  /**
+   * #821 — model nats-server's post-restart health. `false` = the restart exited
+   * 0 but the server then crashed (the community case) → orchestrator rolls back.
+   * Default: healthy.
+   */
+  natsHealthy?: boolean;
+  /** #821 — make the rollback recovery restart ALSO fail (worst-case path). */
+  recoveryRestartFails?: boolean;
 }): { ports: NetworkPorts; rec: Recorder; storeRef: { networks: PolicyFederatedNetwork[] } } {
   const rec: Recorder = {
     registered: 0,
@@ -158,6 +176,10 @@ function makeFakes(opts: {
     bindChecks: [],
     bindModeChecks: [],
     deregistered: [],
+    credsChecks: [],
+    snapshots: [],
+    restores: [],
+    healthProbes: 0,
   };
   const storeRef = { networks: opts.initialNetworks ?? [] };
   const leafFilesPresent = new Set<string>(
@@ -247,9 +269,29 @@ function makeFakes(opts: {
       if (trimmed !== undefined && trimmed.length > 0) {
         return { mode: "operator-account", account: trimmed };
       }
-      // operator-mode bus but no account offered → creds-only (the binding must
-      // ride in the creds JWT; nothing to account-bind).
-      return { mode: "creds-only" };
+      // #821 — operator-mode bus but NO account offered → REFUSE. Rendering a
+      // no-account ($G) remote onto an operator-mode bus crashes nats-server
+      // (it rejects a remote carrying no account nkey). The pre-#821 fake
+      // (and the real resolveLeafBindMode) wrongly returned creds-only here.
+      return {
+        mode: "refuse",
+        reason:
+          "operator-mode bus requires the leaf remote to declare an account nkey, " +
+          "but none was offered",
+      };
+    },
+    credsExist(path) {
+      rec.credsChecks.push(path);
+      // #821 — default: the creds file exists. A test opts into the missing-file
+      // refusal via `credsMissing: true`.
+      return opts.credsMissing !== true;
+    },
+    snapshotLeafState(networkId) {
+      rec.snapshots.push(networkId);
+      return { networkId, includeFile: undefined, natsConfig: undefined };
+    },
+    restoreLeafState(snapshot) {
+      rec.restores.push(snapshot.networkId);
     },
   };
 
@@ -286,9 +328,26 @@ function makeFakes(opts: {
     async restart() {
       rec.natsRestarts++;
       rec.restartOrder.push("nats");
+      // #821 — the SECOND nats restart is the rollback-recovery restart; let a
+      // test fail it independently to exercise the worst-case "recovery also
+      // failed" path. The first restart obeys `natsRestartOk`.
+      const isRecovery = rec.natsRestarts > 1;
+      if (isRecovery) {
+        return opts.recoveryRestartFails === true
+          ? { ok: false, reason: "recovery nats-server kickstart failed" }
+          : { ok: true };
+      }
       return opts.natsRestartOk === false
         ? { ok: false, reason: "nats-server kickstart failed" }
         : { ok: true };
+    },
+    async isHealthy() {
+      rec.healthProbes++;
+      // #821 — default: healthy. `natsHealthy: false` models the community case
+      // (restart exited 0 but the server then crashed on the bad leaf).
+      return opts.natsHealthy === false
+        ? { healthy: false, reason: "monitor port 8224 not listening" }
+        : { healthy: true };
     },
   };
 
@@ -451,6 +510,40 @@ describe("join", () => {
       if (!res.ok) expect(res.reason).toBeUndefined();
     });
 
+    // -------------------------------------------------------------------------
+    // #821 — THE INCIDENT. An operator-mode bus joined WITHOUT an account must
+    // REFUSE (and touch nothing), not fall through to a no-account ($G) leaf
+    // that crashes nats-server. This is the andreas/community crash: an
+    // operator-mode community.conf + a join run without --account rendered a
+    // no-account remote → nats-server exited 1 → the live bus went DOWN, yet
+    // join reported success.
+    // -------------------------------------------------------------------------
+    test("#821 operator-mode bus + NO account → REFUSES (the community crash)", async () => {
+      const NO_ACCOUNT: JoiningStack = {
+        principalId: "andreas",
+        stackSlug: "community",
+        credentials: "/Users/andreas/.config/nats/andreas.creds",
+        // No account — and the bus is operator-mode. Pre-#821 this fell through
+        // to creds-only and crashed nats-server.
+      };
+      const { ports, rec, storeRef } = makeFakes({ busType: "operator-mode" });
+      const res = await joinNetwork("metafactory-community", NO_ACCOUNT, ports);
+
+      expect(res.ok).toBe(false);
+      expect(res.reason).toContain("operator-mode");
+      expect(res.reason).toContain("cortex#794/#799");
+      // The bind-mode pre-flight ran with no account...
+      expect(rec.bindModeChecks).toEqual([{ account: undefined, hasCreds: true }]);
+      // ...and NOTHING was mutated — the bus is never touched.
+      expect(rec.writes.length).toBe(0); // no leaf include
+      expect(rec.includesEnsured).toEqual([]); // no local.conf include
+      expect(rec.ensured).toEqual([]); // no plist ensure
+      expect(rec.configWrites.length).toBe(0); // no federation config write
+      expect(rec.restarts).toBe(0); // no daemon restart
+      expect(rec.natsRestarts).toBe(0); // no nats-server restart
+      expect(storeRef.networks.length).toBe(0); // config untouched
+    });
+
     test("#799 REFUSES when there are NO creds (can't authenticate to the hub)", async () => {
       const NO_CREDS: JoiningStack = {
         principalId: "jc",
@@ -465,6 +558,113 @@ describe("join", () => {
       expect(rec.writes.length).toBe(0);
       expect(storeRef.networks.length).toBe(0);
       expect(rec.bindModeChecks).toEqual([{ account: undefined, hasCreds: false }]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // #821 guarantee 2 — PRE-FLIGHT the creds file BEFORE writing/restarting.
+  // ---------------------------------------------------------------------------
+  describe("#821 creds-existence pre-flight", () => {
+    test("REFUSES before any mutation when the leaf creds file is missing", async () => {
+      const { ports, rec, storeRef } = makeFakes({
+        busType: "operator-mode",
+        credsMissing: true,
+      });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+
+      expect(res.ok).toBe(false);
+      expect(res.reason).toContain("creds file not found");
+      expect(res.reason).toContain("cortex#821");
+      // The creds path was checked...
+      expect(rec.credsChecks).toEqual([LOCAL.credentials]);
+      // ...and NOTHING was written/restarted (the refusal is before any mutation).
+      expect(rec.writes.length).toBe(0);
+      expect(rec.includesEnsured).toEqual([]);
+      expect(rec.configWrites.length).toBe(0);
+      expect(rec.natsRestarts).toBe(0);
+      expect(rec.restarts).toBe(0);
+      expect(storeRef.networks.length).toBe(0);
+      // No snapshot taken (refused before the snapshot step).
+      expect(rec.snapshots).toEqual([]);
+    });
+
+    test("proceeds when the creds file exists (the happy path checks it)", async () => {
+      const { ports, rec } = makeFakes({ busType: "operator-mode" });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+      expect(res.ok).toBe(true);
+      expect(rec.credsChecks).toEqual([LOCAL.credentials]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // #821 guarantee 3 — restart safety: verify nats came back up; ROLL BACK on
+  // failure so a failed join never leaves the bus down.
+  // ---------------------------------------------------------------------------
+  describe("#821 restart safety + rollback", () => {
+    test("snapshots the prior leaf state BEFORE mutating + probes health after restart", async () => {
+      const { ports, rec } = makeFakes({ busType: "operator-mode" });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+      expect(res.ok).toBe(true);
+      // Snapshot taken before the write.
+      expect(rec.snapshots).toEqual(["metafactory"]);
+      // Health probed after the (single) restart; no rollback on the happy path.
+      expect(rec.healthProbes).toBe(1);
+      expect(rec.restores).toEqual([]);
+      expect(rec.natsRestarts).toBe(1);
+      expect(res.steps.some((s) => s.includes("verified healthy"))).toBe(true);
+    });
+
+    test("restart exits 0 but server is DOWN → ROLLS BACK + re-restarts + reports FAILURE", async () => {
+      // The community case: kickstart returned 0, nats-server then crashed on the
+      // bad leaf. Health probe catches it; the snapshot is restored + re-restarted.
+      const { ports, rec } = makeFakes({
+        busType: "operator-mode",
+        natsHealthy: false,
+      });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+
+      // The join is reported as FAILED — never success while the bus is down.
+      expect(res.ok).toBe(false);
+      expect(res.reason).toContain("did not come back up");
+      // Rollback ran: snapshot restored + a recovery restart issued.
+      expect(rec.snapshots).toEqual(["metafactory"]);
+      expect(rec.restores).toEqual(["metafactory"]);
+      // Two nats restarts: the failed one + the recovery one.
+      expect(rec.natsRestarts).toBe(2);
+      // The cortex daemon was NEVER restarted (we bailed before step e.2).
+      expect(rec.restarts).toBe(0);
+      // The recovery succeeded — the warning says the bus was restored.
+      expect(res.warnings?.some((w) => w.includes("restored to prior state"))).toBe(true);
+    });
+
+    test("restart EXITS non-zero → ROLLS BACK + re-restarts + reports FAILURE", async () => {
+      const { ports, rec } = makeFakes({
+        busType: "operator-mode",
+        natsRestartOk: false,
+      });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+
+      expect(res.ok).toBe(false);
+      expect(res.reason).toContain("nats-server restart failed");
+      // Rollback restored the prior config + re-restarted.
+      expect(rec.restores).toEqual(["metafactory"]);
+      expect(rec.natsRestarts).toBe(2);
+      expect(rec.restarts).toBe(0);
+    });
+
+    test("worst case: recovery restart ALSO fails → reports a clear manual-intervention warning", async () => {
+      const { ports, rec } = makeFakes({
+        busType: "operator-mode",
+        natsHealthy: false,
+        recoveryRestartFails: true,
+      });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+
+      expect(res.ok).toBe(false);
+      expect(rec.restores).toEqual(["metafactory"]);
+      expect(rec.natsRestarts).toBe(2);
+      expect(res.reason).toContain("recovery restart ALSO failed");
+      expect(res.warnings?.some((w) => w.includes("intervene manually"))).toBe(true);
     });
   });
 
@@ -554,12 +754,15 @@ describe("#757 nats-server restart on join", () => {
   test("step log records the nats-server restart line", async () => {
     const { ports } = makeFakes({});
     const res = await joinNetwork("metafactory", LOCAL, ports);
+    // #821 — the line now carries the post-restart health verification.
     expect(
-      res.steps.some((s) => s === "restarted nats-server to load leaf config"),
+      res.steps.some((s) => s === "restarted nats-server to load leaf config (verified healthy)"),
     ).toBe(true);
     expect(res.steps.some((s) => s === "restarted stack daemon")).toBe(true);
     // nats-server step precedes the cortex daemon step.
-    const natsIdx = res.steps.indexOf("restarted nats-server to load leaf config");
+    const natsIdx = res.steps.indexOf(
+      "restarted nats-server to load leaf config (verified healthy)",
+    );
     const cortexIdx = res.steps.indexOf("restarted stack daemon");
     expect(natsIdx).toBeLessThan(cortexIdx);
   });
@@ -574,7 +777,10 @@ describe("#757 nats-server restart on join", () => {
     expect(storeRef.networks.length).toBe(1);
     // The cortex daemon was NOT restarted — we abort on the nats failure first.
     expect(rec.restarts).toBe(0);
-    expect(rec.restartOrder).toEqual(["nats"]);
+    // #821 — the failed restart now triggers a rollback + recovery restart, so
+    // the nats service is restarted a SECOND time to bring the bus back up.
+    expect(rec.restartOrder).toEqual(["nats", "nats"]);
+    expect(rec.restores).toEqual(["metafactory"]);
   });
 
   test("absent nats-server port → restart skipped (pre-#757 caller still works)", async () => {

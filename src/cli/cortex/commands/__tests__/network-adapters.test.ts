@@ -786,6 +786,133 @@ describe("#757 nats-server restart port", () => {
 });
 
 // =============================================================================
+// #821 — live adapter: creds-existence pre-flight + leaf-state snapshot/restore
+// + the post-restart health probe. Temp dirs only; no real ~/.config/nats, no
+// real server, no real spawn.
+// =============================================================================
+
+describe("#821 live leaf-file pre-flight + rollback adapters", () => {
+  test("credsExist is true for a present file, false for a missing one", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, bareLocalConf(), "utf-8");
+    const credsPath = join(dir, "andreas.creds");
+    writeFileSync(credsPath, "-----BEGIN NATS USER JWT-----\n", "utf-8");
+
+    const ports = buildLivePorts(cfgWithConfig(conf));
+    expect(ports.leafFile.credsExist(credsPath)).toBe(true);
+    expect(ports.leafFile.credsExist(join(dir, "does-not-exist.creds"))).toBe(false);
+    // Empty path → false (never treat "" as present).
+    expect(ports.leafFile.credsExist("")).toBe(false);
+  });
+
+  test("snapshot → mutate → restore returns the leaf state to prior bytes", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    const original = bareLocalConf();
+    writeFileSync(conf, original, "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    // Take the snapshot of the PRIOR state (no include file, base config present).
+    const snap = ports.leafFile.snapshotLeafState("metafactory");
+    expect(snap.includeFile).toBeUndefined();
+    expect(snap.natsConfig).toBe(original);
+
+    // Mutate: write the leaf include file + ensure the include directive.
+    ports.leafFile.write({
+      descriptor: brandVerified(descriptorForLeaf("metafactory")),
+      binding: {
+        credentials: "/Users/andreas/.config/nats/andreas.creds",
+        account: "AADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX",
+      },
+    });
+    ports.leafFile.ensureInclude("metafactory");
+    expect(existsSync(join(dir, "leafnodes-metafactory.conf"))).toBe(true);
+    expect(readFileSync(conf, "utf-8")).toContain('include "leafnodes-metafactory.conf"');
+
+    // Roll back: the include file is removed (it didn't exist pre-join) and the
+    // base config is restored to the exact prior bytes.
+    ports.leafFile.restoreLeafState(snap);
+    expect(existsSync(join(dir, "leafnodes-metafactory.conf"))).toBe(false);
+    expect(readFileSync(conf, "utf-8")).toBe(original);
+  });
+
+  test("restore rewrites a pre-existing include file back to its prior bytes", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, bareLocalConf(), "utf-8");
+    const includePath = join(dir, "leafnodes-metafactory.conf");
+    const priorInclude = "leafnodes {\n  remotes: [ /* prior working remote */ ]\n}\n";
+    writeFileSync(includePath, priorInclude, "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    const snap = ports.leafFile.snapshotLeafState("metafactory");
+    expect(snap.includeFile).toBe(priorInclude);
+
+    // Overwrite the include file (simulating the crashing join's write)...
+    writeFileSync(includePath, "leafnodes { remotes: [ /* BAD no-account */ ] }\n", "utf-8");
+    // ...then roll back — the prior working include bytes are restored.
+    ports.leafFile.restoreLeafState(snap);
+    expect(readFileSync(includePath, "utf-8")).toBe(priorInclude);
+  });
+
+  test("dry-run restoreLeafState is inert (writes nothing)", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    const original = bareLocalConf();
+    writeFileSync(conf, original, "utf-8");
+    const ports = buildDryRunPorts(cfgWithConfig(conf));
+    const snap = ports.leafFile.snapshotLeafState("metafactory");
+    // Mutate the file out-of-band, then call the dry-run restore — it must NOT
+    // touch disk (the file keeps the out-of-band content).
+    writeFileSync(conf, "mutated\n", "utf-8");
+    ports.leafFile.restoreLeafState(snap);
+    expect(readFileSync(conf, "utf-8")).toBe("mutated\n");
+  });
+
+  test("isHealthy probes the monitor and reports healthy on a 200", async () => {
+    // Stand up a tiny local server that answers /healthz 200.
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return new URL(req.url).pathname === "/healthz"
+          ? new Response("ok", { status: 200 })
+          : new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const cfg: LivePortsConfig = {
+        ...cfgWithConfig("/x/local.conf"),
+        monitorUrl: `http://127.0.0.1:${(server.port ?? 0).toString()}`,
+      };
+      const ports = buildLivePorts(cfg);
+      const res = await ports.natsServer!.isHealthy();
+      expect(res.healthy).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("isHealthy reports UNhealthy when the monitor is unreachable (server down)", async () => {
+    const cfg: LivePortsConfig = {
+      ...cfgWithConfig("/x/local.conf"),
+      // A port nothing is listening on → connection refused → unhealthy.
+      monitorUrl: "http://127.0.0.1:1",
+    };
+    const ports = buildLivePorts(cfg);
+    const res = await ports.natsServer!.isHealthy();
+    expect(res.healthy).toBe(false);
+    if (!res.healthy) expect(res.reason).toContain("unreachable");
+  });
+
+  test("dry-run isHealthy is trivially healthy (never probes)", async () => {
+    const ports = buildDryRunPorts(cfgWithConfig("/x/local.conf"));
+    const res = await ports.natsServer!.isHealthy();
+    expect(res.healthy).toBe(true);
+  });
+});
+
+// =============================================================================
 // #762 — federated registerStack() announces caps INTO the network (roster)
 // =============================================================================
 
