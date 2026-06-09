@@ -503,6 +503,227 @@ describe("#756 config-split-aware policy write", () => {
 });
 
 // =============================================================================
+// #805 / #807 — the config-store port resolves its write target from the
+// daemon's REAL `--config` (LivePortsConfig.cortexConfigPath), layout-aware,
+// NOT from cfg.stackId + a hardcoded `~/.config/cortex`.
+//
+// The split-brain bug (#805): `cortex network join` wrote the policy block to a
+// file the daemon never read. On JC's single-file `cortex.yaml` (stack.id
+// `jc/default`) the slug-derived path was `~/.config/cortex/stacks/default.yaml`
+// while the daemon loads `~/.config/cortex/cortex.yaml`. #807 is the config-split
+// corner where the on-disk dir/basename differs from the stack.id slug. Mirror
+// `resolve_stack_agent_config_path` in scripts/lib/plist-render.sh — the daemon
+// and the join MUST agree on which file carries `policy:`.
+//
+// These fixtures pin cortexConfigPath at a tmp file and never touch
+// ~/.config/cortex (no $HOME override needed — resolution is config-path-driven).
+// =============================================================================
+
+/**
+ * A fake DaemonLocatorIO seam (#813) that reports a single installed cortex
+ * daemon whose `--config` is `loadedConfig`. Lets the live write-path tests pass
+ * the fail-closed guard without a real installed daemon. Pass a non-matching
+ * `loadedConfig` (or omit it) to exercise the refuse-on-mismatch branch.
+ */
+function fakeDaemonLocator(loadedConfig: string | undefined): LivePortsConfig["daemonLocatorOverride"] {
+  const dir = "/fake/LaunchAgents";
+  const plistName = "ai.meta-factory.cortex.stack.plist";
+  const plistXml =
+    loadedConfig === undefined
+      ? "" // no daemon
+      : [
+          "<key>ProgramArguments</key>",
+          "<array>",
+          "<string>/usr/local/bin/bun</string>",
+          "<string>run</string>",
+          "<string>src/cortex.ts</string>",
+          "<string>--config</string>",
+          `<string>${loadedConfig}</string>`,
+          "</array>",
+        ].join("\n");
+  return {
+    launchAgentsDir: dir,
+    systemdUserDir: "/fake/systemd",
+    io: {
+      exists: (p) => p === dir,
+      listDir: (p) => (p === dir && loadedConfig !== undefined ? [plistName] : []),
+      readFile: () => plistXml,
+    },
+  };
+}
+
+function cfgWithCortexConfig(stackId: string, cortexConfigPath: string): LivePortsConfig {
+  return {
+    networkId: "metafactory",
+    principalId: stackId.split("/")[0] ?? "andreas",
+    stackId,
+    natsConfigPath: NATS_CONFIG,
+    plistPath: "/nonexistent/plist",
+    platform: "darwin",
+    cortexConfigPath,
+    // #813 — a matching fake daemon so the fail-closed guard admits the write.
+    daemonLocatorOverride: fakeDaemonLocator(cortexConfigPath),
+  };
+}
+
+describe("#805/#807 policy write resolves from cortexConfigPath", () => {
+  test("#805 single-file: monolith --config → policy lands in the monolith itself", () => {
+    const dir = freshDir();
+    const monolith = join(dir, "cortex.yaml");
+    // No system/system.yaml beside it → legacy monolith layout. JC's stack.id is
+    // `jc/default`, but the slug must NOT steer the write here.
+    writeFileSync(monolith, "stack:\n  id: jc/default\n", "utf-8");
+
+    const ports = buildLivePorts(cfgWithCortexConfig("jc/default", monolith));
+    ports.configStore.writeNetworks([sampleNetwork("metafactory")]);
+
+    // The policy block landed in cortex.yaml itself (the file the daemon reads),
+    // NOT in <dir>/stacks/default.yaml (the pre-#805 split-brain orphan).
+    const parsed = parseYaml(readFileSync(monolith, "utf-8")) as {
+      stack?: { id?: string };
+      policy?: { federated?: { networks?: PolicyFederatedNetwork[] } };
+    };
+    expect(parsed.policy?.federated?.networks?.[0]?.id).toBe("metafactory");
+    // Pre-existing keys preserved (merge, not overwrite).
+    expect(parsed.stack?.id).toBe("jc/default");
+    // The split-brain orphan was NOT created.
+    expect(existsSync(join(dir, "stacks", "default.yaml"))).toBe(false);
+  });
+
+  test("#807 config-split: dir has system/system.yaml → policy lands in <dir>/stacks/<basename>.yaml", () => {
+    const tmp = freshDir();
+    const researchDir = join(tmp, "research");
+    mkdirSync(join(researchDir, "system"), { recursive: true });
+    writeFileSync(join(researchDir, "system", "system.yaml"), "{}\n", "utf-8");
+    // The daemon's --config is the per-stack sentinel <dir>/research.yaml.
+    const sentinel = join(researchDir, "research.yaml");
+    writeFileSync(sentinel, "stack:\n  id: andreas/research\n", "utf-8");
+
+    const ports = buildLivePorts(cfgWithCortexConfig("andreas/research", sentinel));
+    ports.configStore.writeNetworks([sampleNetwork("metafactory")]);
+
+    const target = join(researchDir, "stacks", "research.yaml");
+    expect(existsSync(target)).toBe(true);
+    const parsed = parseYaml(readFileSync(target, "utf-8")) as {
+      policy?: { federated?: { networks?: PolicyFederatedNetwork[] } };
+    };
+    expect(parsed.policy?.federated?.networks?.[0]?.id).toBe("metafactory");
+    // Not written to the sentinel itself.
+    const sentinelParsed = parseYaml(readFileSync(sentinel, "utf-8")) as {
+      policy?: unknown;
+    };
+    expect(sentinelParsed.policy).toBeUndefined();
+  });
+
+  test("#807 drift corner: target keyed off --config dir/basename, NOT stackId slug", () => {
+    // JC's drift: on-disk dir basename is `meta-factory`, but stack.id is
+    // `jc/default`. The write must follow the --config dir/basename
+    // (meta-factory/stacks/meta-factory.yaml), never the stackId slug (default).
+    const tmp = freshDir();
+    const metaDir = join(tmp, "meta-factory");
+    mkdirSync(join(metaDir, "system"), { recursive: true });
+    writeFileSync(join(metaDir, "system", "system.yaml"), "{}\n", "utf-8");
+    const sentinel = join(metaDir, "meta-factory.yaml");
+    writeFileSync(sentinel, "stack:\n  id: jc/default\n", "utf-8");
+
+    const ports = buildLivePorts(cfgWithCortexConfig("jc/default", sentinel));
+    ports.configStore.writeNetworks([sampleNetwork("metafactory")]);
+
+    // Keyed off the dirname/basename of --config.
+    expect(existsSync(join(metaDir, "stacks", "meta-factory.yaml"))).toBe(true);
+    // NOT keyed off the stackId slug `default`.
+    expect(existsSync(join(metaDir, "stacks", "default.yaml"))).toBe(false);
+    expect(existsSync(join(tmp, "default", "stacks", "default.yaml"))).toBe(false);
+  });
+
+  test("read/write symmetry: writeNetworks then readNetworks round-trips the same file", () => {
+    // Single-file (#805) layout — both ops must hit cortex.yaml, not diverge.
+    const dir = freshDir();
+    const monolith = join(dir, "cortex.yaml");
+    writeFileSync(monolith, "stack:\n  id: jc/default\n", "utf-8");
+
+    const ports = buildLivePorts(cfgWithCortexConfig("jc/default", monolith));
+    expect(ports.configStore.readNetworks()).toEqual([]);
+    ports.configStore.writeNetworks([sampleNetwork("metafactory")]);
+    const roundTripped = ports.configStore.readNetworks();
+    expect(roundTripped.map((n) => n.id)).toEqual(["metafactory"]);
+
+    // And the config-split layout round-trips through its <dir>/stacks file too.
+    const tmp = freshDir();
+    const splitDir = join(tmp, "research");
+    mkdirSync(join(splitDir, "system"), { recursive: true });
+    writeFileSync(join(splitDir, "system", "system.yaml"), "{}\n", "utf-8");
+    const sentinel = join(splitDir, "research.yaml");
+    writeFileSync(sentinel, "{}\n", "utf-8");
+
+    const splitPorts = buildLivePorts(cfgWithCortexConfig("andreas/research", sentinel));
+    expect(splitPorts.configStore.readNetworks()).toEqual([]);
+    splitPorts.configStore.writeNetworks([sampleNetwork("metafactory")]);
+    expect(splitPorts.configStore.readNetworks().map((n) => n.id)).toEqual(["metafactory"]);
+  });
+
+  test("#813 fail-closed: no daemon loads the resolved --config → refuse, nothing written", () => {
+    const dir = freshDir();
+    const monolith = join(dir, "cortex.yaml");
+    writeFileSync(monolith, "stack:\n  id: jc/default\n", "utf-8");
+    const original = readFileSync(monolith, "utf-8");
+
+    // No installed daemon references this --config (fakeDaemonLocator(undefined)
+    // → empty LaunchAgents). The live write path must REFUSE and not mutate.
+    const cfg: LivePortsConfig = {
+      ...cfgWithCortexConfig("jc/default", monolith),
+      daemonLocatorOverride: fakeDaemonLocator(undefined),
+    };
+    const ports = buildLivePorts(cfg);
+
+    expect(() => ports.configStore.writeNetworks([sampleNetwork("metafactory")])).toThrow(
+      /no running cortex daemon loads --config/,
+    );
+    // Actionable hint points at the per-stack path shape.
+    expect(() => ports.configStore.writeNetworks([sampleNetwork("metafactory")])).toThrow(
+      /~\/.config\/cortex\/<stack>\/<stack>\.yaml/,
+    );
+    // The principal's file is untouched — no orphan policy block.
+    expect(readFileSync(monolith, "utf-8")).toBe(original);
+  });
+
+  test("#813 comment-preservation: in-place monolith write keeps header + inline comments", () => {
+    const dir = freshDir();
+    const monolith = join(dir, "cortex.yaml");
+    // A hand-maintained monolith with a header comment (incl. DO NOT EDIT) and
+    // an inline comment on a key the join must NOT clobber.
+    const handMaintained = [
+      "# cortex.yaml — DO NOT EDIT BY HAND",
+      "# managed by the principal",
+      "stack:",
+      "  id: jc/default  # the canonical stack id",
+      "principal:",
+      "  id: jc",
+      "",
+    ].join("\n");
+    writeFileSync(monolith, handMaintained, "utf-8");
+
+    const ports = buildLivePorts(cfgWithCortexConfig("jc/default", monolith));
+    ports.configStore.writeNetworks([sampleNetwork("metafactory")]);
+
+    const after = readFileSync(monolith, "utf-8");
+    // Comments survive the in-place rewrite (parseYaml→stringifyYaml would strip).
+    expect(after).toContain("# cortex.yaml — DO NOT EDIT BY HAND");
+    expect(after).toContain("# managed by the principal");
+    expect(after).toContain("# the canonical stack id");
+    // All prior keys preserved + the policy block added.
+    const parsed = parseYaml(after) as {
+      stack?: { id?: string };
+      principal?: { id?: string };
+      policy?: { federated?: { networks?: PolicyFederatedNetwork[] } };
+    };
+    expect(parsed.stack?.id).toBe("jc/default");
+    expect(parsed.principal?.id).toBe("jc");
+    expect(parsed.policy?.federated?.networks?.[0]?.id).toBe("metafactory");
+  });
+});
+
+// =============================================================================
 // #757 — the live nats-server port restarts the service named by the --plist's
 // <key>Label</key>. The dry-run port is inert; error branches (missing plist /
 // missing label) never spawn launchctl. We do NOT exercise the real launchctl
