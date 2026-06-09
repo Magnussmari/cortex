@@ -1962,6 +1962,93 @@ describe("ReviewConsumer — per-message scope gate (cortex#836, ADR 0001)", () 
       "dispatch.task.completed",
     ]);
   });
+
+  test("6. foreign originator on a LOCAL subject is IGNORED → ACCEPTED, local-scope emission (not leaked to federated.mallory.*)", async () => {
+    const runtime = createRecordingRuntime();
+    // A LOCAL self-dispatch subject, but the envelope carries a foreign
+    // `originator.identity` for a non-peer (`mallory`). On the local path the
+    // originator MUST be ignored entirely — the requester gate never runs, so
+    // the foreign identity can neither deny the review NOR redirect the verdict
+    // onto a cross-principal `federated.mallory.*` subject. (Adversarial Attack 4.)
+    const request = makeRequest("typescript");
+    (request as { originator?: unknown }).originator = {
+      identity: "did:mf:mallory-evil",
+      attribution: "federated",
+    };
+    const verdict = buildVerdictEnvelope(request, "approved");
+
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline((opts) => {
+            // Local path → the foreign originator is never read → no requester →
+            // local-scope (classification undefined).
+            expect(opts.classification).toBeUndefined();
+            return { kind: "verdict", envelope: verdict };
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(
+      request,
+      LOCAL_SELF_SUBJECT,
+      null,
+    );
+    expect(decision).toEqual({ kind: "ack" });
+
+    // EVERY emission routes on the LOCAL path; NOTHING on `publishOnSubject` —
+    // the foreign originator was not leaked to a `federated.mallory.*` subject.
+    expect(runtime.publishedOnSubject).toHaveLength(0);
+    expect(runtime.published.map((e) => e.type)).toEqual([
+      "dispatch.task.started",
+      "review.verdict.approved",
+      "dispatch.task.completed",
+    ]);
+  });
+
+  test("7. a public.> (third-scope) subject is treated as local / fail-safe → ACCEPTED, local-scope emission", async () => {
+    const runtime = createRecordingRuntime();
+    // Public scope is a near-future spec (`{scope} ∈ local | federated | public`).
+    // `isFederatedRequest` is false for any non-`federated.` prefix, so a
+    // `public.>` inbound bypasses the cross-principal requester/deny gate and
+    // defaults to the local path — the fail-safe default we lock in now.
+    const PUBLIC_SUBJECT =
+      "public.metafactory.meta-factory.tasks.code-review.typescript";
+    const request = makeRequest("typescript");
+    const verdict = buildVerdictEnvelope(request, "approved");
+
+    let pipelineRan = false;
+    const consumer = new ReviewConsumer(
+      baseOpts(
+        federatedOpts({
+          runtime,
+          pipelineRunner: fixedPipeline((opts) => {
+            pipelineRan = true;
+            // Not the federated deny path: the review RUNS, local-scope.
+            expect(opts.classification).toBeUndefined();
+            return { kind: "verdict", envelope: verdict };
+          }),
+        }),
+      ),
+    );
+
+    const decision = await consumer.processEnvelope(
+      request,
+      PUBLIC_SUBJECT,
+      null,
+    );
+    // Did NOT hit the federated deny path (which would term + publish nothing).
+    expect(decision).toEqual({ kind: "ack" });
+    expect(pipelineRan).toBe(true);
+    expect(runtime.publishedOnSubject).toHaveLength(0);
+    expect(runtime.published.map((e) => e.type)).toEqual([
+      "dispatch.task.started",
+      "review.verdict.approved",
+      "dispatch.task.completed",
+    ]);
+  });
 });
 
 describe("ReviewConsumer — federated DIRECT mode (cortex#725, ADR 0001/0002 §2)", () => {

@@ -528,20 +528,26 @@ export class ReviewConsumer {
     // envelopes (the verdict still reaches pilot via correlation_id).
     const responseRouting = readLogicalResponseRouting(envelope) ?? undefined;
 
-    // cortex#836 (ADR 0001) — the cross-principal TRUST BOUNDARY is per-message
-    // and lives in the SUBJECT SCOPE, NOT in the coarse `this.federated` mode
-    // flag. ADR 0001: `local.` NEVER crosses the principal boundary (a
-    // same-principal self-dispatch — the requester IS self, so there is
-    // legitimately no requester in `originator.identity`), while `federated.`
-    // ALWAYS crosses it (a peer requester MUST be present + on `peers[]`).
+    // cortex#836 — the cross-principal TRUST BOUNDARY is per-message and lives in
+    // the SUBJECT SCOPE, NOT in the coarse `this.federated` mode flag (see
+    // ADR-0001 §scope: `local.` is same-principal, `federated.` is cross-principal).
     //
     // `this.federated` is set for the WHOLE consumer once a stack joins a network
     // (≥1 network configured — see cortex.ts), so it cannot distinguish a local
-    // self-dispatch from a federated cross-principal request. Keying the
-    // requester parse + deny gate on the per-message subject scope instead means
-    // a `local.>` self-dispatch on a network-joined stack bypasses the gate
-    // (requester stays `undefined` → local-scope emission, identical to
-    // non-federated mode), while a `federated.>` request keeps the FULL gate.
+    // self-dispatch from a federated cross-principal request. Keying the requester
+    // parse + deny gate on the per-message subject scope instead means a `local.>`
+    // self-dispatch on a network-joined stack bypasses the gate (requester stays
+    // `undefined` → local-scope emission, identical to non-federated mode), while a
+    // `federated.>` request keeps the FULL gate. Any non-`federated.` scope
+    // (`local.`, the near-future `public.`) is fail-safe: it defaults to the local
+    // path, never the cross-principal deny gate.
+    //
+    // SAFE because the leaf's `accept_subjects` is `federated.{me}.{stack}.>` ONLY
+    // (built at `src/cli/cortex/commands/network-lib.ts:~290`), so a `local.>`
+    // envelope is same-principal-only BY TRANSPORT CONSTRUCTION — a remote peer's
+    // leaf cannot deliver one across the boundary. A future reader MUST NOT widen
+    // `accept_subjects` to admit `local.>`/`public.>` from a peer without revisiting
+    // this gate, or the scope-based trust assumption breaks.
     const isFederatedRequest = subject.startsWith("federated.");
 
     // cortex#686 (ADR 0002) — in federated mode, derive the REQUESTER
