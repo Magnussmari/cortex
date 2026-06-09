@@ -296,6 +296,18 @@ export interface NatsServerPort {
   /** Restart nats-server so it reloads `local.conf` (the new leaf include). */
   restart(): Promise<{ ok: true } | { ok: false; reason: string }>;
   /**
+   * #821 MAJOR-1 — a cheap PRE-RESTART config-syntax gate: run `nats-server -c
+   * <cfg> -t` (the upstream config-test flag) so an obviously-broken config is
+   * caught BEFORE the restart that would otherwise crash the bus. NOTE: `-t` is
+   * a SYNTAX check — it does NOT dereference leaf creds paths or resolve a
+   * leaf-remote's account against the account tree, so it PASSED for the original
+   * #821 crash. It is therefore NECESSARY-NOT-SUFFICIENT: a cheap extra gate
+   * layered ON TOP of the account-required + creds-exist + health-probe defenses,
+   * never the primary defense. A dry-run is inert (returns ok). When `nats-server`
+   * is not on PATH the gate is SKIPPED (returns ok) rather than blocking the join.
+   */
+  validateConfig(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
    * #821 — restart-safety HEALTH PROBE. After a restart, confirm nats-server
    * actually came back UP (its monitor port is listening / the process is
    * healthy). `launchctl kickstart` / `systemctl restart` can exit 0 even when
@@ -304,6 +316,13 @@ export interface NatsServerPort {
    * leaving the bus DOWN). The orchestrator probes AFTER the restart; an
    * unhealthy result triggers a snapshot rollback + re-restart. Returns
    * `{ healthy: true }` when the server is reachable, else a reason.
+   *
+   * #821 NIT-2 (follow-up) — `/healthz` is a LIVENESS probe: it confirms the
+   * server process is up, but cannot distinguish "up, and the leaf connected"
+   * from "up, but the leaf remote was rejected". A stronger JOIN-verification
+   * would additionally poll `/leafz` for the expected remote (the C-797
+   * leaf-state surface). Tracked as a follow-up; liveness is sufficient to catch
+   * the #821 crash (a crashed server fails `/healthz`).
    */
   isHealthy(): Promise<{ healthy: true } | { healthy: false; reason: string }>;
 }

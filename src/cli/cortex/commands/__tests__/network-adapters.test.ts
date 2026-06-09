@@ -806,17 +806,17 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
     expect(ports.leafFile.credsExist("")).toBe(false);
   });
 
-  test("snapshot → mutate → restore returns the leaf state to prior bytes", () => {
+  test("snapshot → mutate → restore reverts the include file + directive to prior state", () => {
     const dir = freshDir();
     const conf = join(dir, "local.conf");
     const original = bareLocalConf();
     writeFileSync(conf, original, "utf-8");
     const ports = buildLivePorts(cfgWithConfig(conf));
 
-    // Take the snapshot of the PRIOR state (no include file, base config present).
+    // Snapshot the PRIOR state: no include file, directive NOT present.
     const snap = ports.leafFile.snapshotLeafState("metafactory");
     expect(snap.includeFile).toBeUndefined();
-    expect(snap.natsConfig).toBe(original);
+    expect(snap.natsConfig).toBeUndefined(); // directive absent pre-join
 
     // Mutate: write the leaf include file + ensure the include directive.
     ports.leafFile.write({
@@ -831,16 +831,20 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
     expect(readFileSync(conf, "utf-8")).toContain('include "leafnodes-metafactory.conf"');
 
     // Roll back: the include file is removed (it didn't exist pre-join) and the
-    // base config is restored to the exact prior bytes.
+    // join-added directive is dropped — restoring the base config to its prior
+    // bytes WITHOUT ever deleting the base file.
     ports.leafFile.restoreLeafState(snap);
     expect(existsSync(join(dir, "leafnodes-metafactory.conf"))).toBe(false);
+    expect(existsSync(conf)).toBe(true); // base config NEVER deleted
     expect(readFileSync(conf, "utf-8")).toBe(original);
   });
 
-  test("restore rewrites a pre-existing include file back to its prior bytes", () => {
+  test("restore rewrites a pre-existing include file back to its prior bytes + keeps a pre-existing directive", () => {
     const dir = freshDir();
     const conf = join(dir, "local.conf");
-    writeFileSync(conf, bareLocalConf(), "utf-8");
+    // The base config ALREADY includes the directive (a prior working join).
+    const base = bareLocalConf() + 'include "leafnodes-metafactory.conf"\n';
+    writeFileSync(conf, base, "utf-8");
     const includePath = join(dir, "leafnodes-metafactory.conf");
     const priorInclude = "leafnodes {\n  remotes: [ /* prior working remote */ ]\n}\n";
     writeFileSync(includePath, priorInclude, "utf-8");
@@ -848,12 +852,35 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
 
     const snap = ports.leafFile.snapshotLeafState("metafactory");
     expect(snap.includeFile).toBe(priorInclude);
+    expect(snap.natsConfig).toBe("directive-present"); // directive WAS present
 
     // Overwrite the include file (simulating the crashing join's write)...
     writeFileSync(includePath, "leafnodes { remotes: [ /* BAD no-account */ ] }\n", "utf-8");
-    // ...then roll back — the prior working include bytes are restored.
+    // ...then roll back — the prior working include bytes are restored AND the
+    // pre-existing directive is kept (idempotent ensure).
     ports.leafFile.restoreLeafState(snap);
     expect(readFileSync(includePath, "utf-8")).toBe(priorInclude);
+    expect(readFileSync(conf, "utf-8")).toContain('include "leafnodes-metafactory.conf"');
+  });
+
+  test("NIT: restore NEVER deletes the base config, even when its prior snapshot had no directive", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    const original = bareLocalConf();
+    writeFileSync(conf, original, "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    // Snapshot (no directive), then the join writes the include + directive...
+    const snap = ports.leafFile.snapshotLeafState("metafactory");
+    ports.leafFile.write({
+      descriptor: brandVerified(descriptorForLeaf("metafactory")),
+      binding: { credentials: "/x/andreas.creds", account: "AADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX" },
+    });
+    ports.leafFile.ensureInclude("metafactory");
+    // ...rollback. The base config must still EXIST (only the directive dropped).
+    ports.leafFile.restoreLeafState(snap);
+    expect(existsSync(conf)).toBe(true);
+    expect(readFileSync(conf, "utf-8")).toBe(original);
   });
 
   test("dry-run restoreLeafState is inert (writes nothing)", () => {
@@ -909,6 +936,118 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
     const ports = buildDryRunPorts(cfgWithConfig("/x/local.conf"));
     const res = await ports.natsServer!.isHealthy();
     expect(res.healthy).toBe(true);
+  });
+
+  test("MAJOR: isHealthy probes the bus's OWN monitor port DERIVED from the nats config (community :8224)", async () => {
+    // Stand up a probe-target server, then write a nats config naming THAT port
+    // via `http_port:` — with NO --monitor-url. The probe must derive + hit it.
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return new URL(req.url).pathname === "/healthz"
+          ? new Response("ok", { status: 200 })
+          : new Response("nf", { status: 404 });
+      },
+    });
+    try {
+      const dir = freshDir();
+      const conf = join(dir, "community.conf");
+      writeFileSync(
+        conf,
+        [
+          "operator: /x/operator.creds",
+          "system_account: ADSYSACCOUNT",
+          "port: 4224",
+          `http_port: ${(server.port ?? 0).toString()}`,
+          "",
+        ].join("\n"),
+        "utf-8",
+      );
+      // No monitorUrl flag → must derive the port from the config.
+      const ports = buildLivePorts(cfgWithConfig(conf));
+      const res = await ports.natsServer!.isHealthy();
+      expect(res.healthy).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("MAJOR: explicit --monitor-url WINS over the config-derived port", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response("ok", { status: 200 });
+      },
+    });
+    try {
+      const dir = freshDir();
+      const conf = join(dir, "community.conf");
+      // Config says a DIFFERENT (dead) port; the flag must win.
+      writeFileSync(conf, ["http_port: 9", ""].join("\n"), "utf-8");
+      const cfg: LivePortsConfig = {
+        ...cfgWithConfig(conf),
+        monitorUrl: `http://127.0.0.1:${(server.port ?? 0).toString()}`,
+      };
+      const ports = buildLivePorts(cfg);
+      const res = await ports.natsServer!.isHealthy();
+      expect(res.healthy).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("MAJOR-1: validateConfig SKIPS (ok) when nats-server is not on PATH (no block)", async () => {
+    // The live adapter shells out to `nats-server -t`; on a host without the
+    // binary it must SKIP the gate (return ok), never block the join. We can't
+    // guarantee nats-server is absent on CI, so assert the result is well-formed
+    // (ok:true when skipped/passed; ok:false only with a -t reason).
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, bareLocalConf(), "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+    const res = await ports.natsServer!.validateConfig();
+    if (!res.ok) {
+      expect(res.reason).toContain("nats-server");
+    } else {
+      expect(res.ok).toBe(true);
+    }
+  });
+
+  test("MAJOR-1: dry-run validateConfig is inert (ok, never spawns)", async () => {
+    const ports = buildDryRunPorts(cfgWithConfig("/x/local.conf"));
+    const res = await ports.natsServer!.validateConfig();
+    expect(res.ok).toBe(true);
+  });
+
+  test("NIT-1: credsExist rejects a directory, a 0-byte file, and a non-creds file", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, bareLocalConf(), "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    // A directory at the creds path → not a usable creds file.
+    const asDir = join(dir, "creds-dir");
+    mkdirSync(asDir, { recursive: true });
+    expect(ports.leafFile.credsExist(asDir)).toBe(false);
+
+    // A 0-byte file → dormant trap, rejected.
+    const empty = join(dir, "empty.creds");
+    writeFileSync(empty, "", "utf-8");
+    expect(ports.leafFile.credsExist(empty)).toBe(false);
+
+    // A non-empty file WITHOUT the NATS creds marker → rejected.
+    const notCreds = join(dir, "random.creds");
+    writeFileSync(notCreds, "just some text\n", "utf-8");
+    expect(ports.leafFile.credsExist(notCreds)).toBe(false);
+
+    // A genuine creds file (carries the marker) → accepted.
+    const good = join(dir, "andreas.creds");
+    writeFileSync(
+      good,
+      "-----BEGIN NATS USER JWT-----\neyJ0...\n------END NATS USER JWT------\n",
+      "utf-8",
+    );
+    expect(ports.leafFile.credsExist(good)).toBe(true);
   });
 });
 

@@ -21,6 +21,7 @@ import { describe, expect, test } from "bun:test";
 import type { NetworkDescriptor } from "../../registry/types";
 import {
   natsConfigHasAccountTree,
+  natsConfigMonitorUrl,
   leafIncludeFileName,
   mergeLeafRemotes,
   renderLeafIncludeFile,
@@ -310,6 +311,74 @@ describe("#799 natsConfigHasAccountTree", () => {
     const commented = "// operator: /x/operator.creds\n# accounts { }\njetstream { }\n";
     expect(natsConfigHasAccountTree(commented)).toBe(false);
   });
+
+  // #821 MAJOR-1 — non-canonical-but-valid operator-mode shapes. The detector
+  // previously checked only the canonical account-tree keys (NSC operator JWT
+  // key / accounts / resolver_preload), so these valid operator-mode configs
+  // (all in this repo's own SOP/migration docs) were misclassified as $G → a
+  // no-account remote was rendered → the #821 crash. Erring toward operator-mode
+  // only OVER-refuses (recoverable); never crashes.
+  test("MAJOR-1: true for a `resolver:`-only config (e.g. resolver: MEMORY)", () => {
+    const conf = ["resolver: MEMORY", "port: 4222", ""].join("\n");
+    expect(natsConfigHasAccountTree(conf)).toBe(true);
+  });
+
+  test("MAJOR-1: true for a `resolver { ... }` block config", () => {
+    const conf = ["resolver {", "  type: full", "  dir: /x/jwt", "}", ""].join("\n");
+    expect(natsConfigHasAccountTree(conf)).toBe(true);
+  });
+
+  test("MAJOR-1: true for a `system_account:`-only config", () => {
+    const conf = ["system_account: ADSYSACCOUNT", "port: 4224", ""].join("\n");
+    expect(natsConfigHasAccountTree(conf)).toBe(true);
+  });
+
+  test("MAJOR-1: true (fail-closed) for an `include` split config", () => {
+    // The account tree may live in the included file; the pure text scanner can't
+    // resolve it, so fail closed — assume operator-mode + require an account.
+    const conf = ['include "accounts.conf"', "port: 4224", ""].join("\n");
+    expect(natsConfigHasAccountTree(conf)).toBe(true);
+  });
+
+  test("MAJOR-1: single-quoted + extra-whitespace include still fails closed", () => {
+    const conf = ["include   'accounts.conf'", "port: 4224", ""].join("\n");
+    expect(natsConfigHasAccountTree(conf)).toBe(true);
+  });
+
+  test("MAJOR-1: a COMMENTED-OUT include/resolver/system_account does NOT count", () => {
+    const commented = [
+      "// include \"accounts.conf\"",
+      "# resolver: MEMORY",
+      "# system_account: ADSYSACCOUNT",
+      "jetstream { store_dir: /x/js }",
+      "",
+    ].join("\n");
+    expect(natsConfigHasAccountTree(commented)).toBe(false);
+  });
+
+  test("MAJOR-1: still false for a genuine $G bus (no operator-mode signal)", () => {
+    // Regression guard: the widened detector must NOT start flagging a real $G
+    // bus (the jc/default case) — that would break #803.
+    expect(natsConfigHasAccountTree(DEFAULT_G_CONF)).toBe(false);
+  });
+
+  test("MAJOR-1: a $G bus with the join's OWN leafnodes-*.conf include stays $G (re-join safe)", () => {
+    // After a $G bus joins once, `ensureLeafInclude` adds `include
+    // "leafnodes-<net>.conf"`. The fail-closed include signal must NOT count the
+    // join's own leaf fragment — else a RE-join flips the $G bus to operator-mode
+    // and over-refuses it (a #803 regression on the idempotent re-join path).
+    const reJoined = [
+      DEFAULT_G_CONF,
+      'include "leafnodes-metafactory-community.conf"',
+      "",
+    ].join("\n");
+    expect(natsConfigHasAccountTree(reJoined)).toBe(false);
+  });
+
+  test("MAJOR-1: a $G bus with a NON-leaf include DOES fail closed (account tree may be there)", () => {
+    const withRealInclude = [DEFAULT_G_CONF, 'include "accounts.conf"', ""].join("\n");
+    expect(natsConfigHasAccountTree(withRealInclude)).toBe(true);
+  });
 });
 
 describe("#799 resolveLeafBindMode", () => {
@@ -373,5 +442,56 @@ describe("#799 resolveLeafBindMode", () => {
     // An empty/whitespace account is "no account offered" — same crash path.
     const mode = resolveLeafBindMode(OPERATOR_MODE_CONF, "   ", true);
     expect(mode.mode).toBe("refuse");
+  });
+});
+
+// #821 MAJOR (code-review) — the health probe must target the bus's OWN monitor
+// port, derived from the nats config, NOT a hardcoded :8222. The community bus
+// monitors on :8224; probing :8222 false-trips rollback on a SUCCESSFUL join.
+describe("#821 natsConfigMonitorUrl", () => {
+  test("derives from `http_port: 8224`", () => {
+    const conf = ["http_port: 8224", "port: 4224", ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("derives from `monitor_port: 8224` (alias)", () => {
+    const conf = ["monitor_port: 8224", ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("derives host:port from `http: 0.0.0.0:8224` (binds 0.0.0.0 → probe 127.0.0.1)", () => {
+    const conf = ["http: 0.0.0.0:8224", ""].join("\n");
+    // We always PROBE loopback even when the server BINDS 0.0.0.0.
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("derives from `http: \"localhost:8224\"` (quoted)", () => {
+    const conf = ['http: "localhost:8224"', ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("derives from a bare `http: 8224` (port only)", () => {
+    const conf = ["http: 8224", ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBe("http://127.0.0.1:8224");
+  });
+
+  test("a COMMENTED-OUT http directive does NOT count", () => {
+    const conf = ["// http_port: 8224", "# http: 8225", "port: 4224", ""].join("\n");
+    expect(natsConfigMonitorUrl(conf)).toBeUndefined();
+  });
+
+  test("no monitor directive → undefined (caller falls back)", () => {
+    expect(natsConfigMonitorUrl(DEFAULT_G_CONF.replace(/http:.*/g, ""))).toBeUndefined();
+  });
+
+  test("the community bus shape (operator-mode + http_port 8224) resolves :8224", () => {
+    const community = [
+      "operator: /Users/andreas/.config/nats/operator.creds",
+      "system_account: ADSYSACCOUNT",
+      "port: 4224",
+      "http_port: 8224",
+      "",
+    ].join("\n");
+    expect(natsConfigMonitorUrl(community)).toBe("http://127.0.0.1:8224");
   });
 });

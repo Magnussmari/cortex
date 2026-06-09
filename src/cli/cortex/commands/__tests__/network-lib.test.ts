@@ -125,6 +125,8 @@ interface Recorder {
   restores: string[];
   /** #821 — count of nats-server health probes after restart. */
   healthProbes: number;
+  /** #821 MAJOR-1 — count of `nats-server -c <cfg> -t` validation gate runs. */
+  validateConfigs: number;
 }
 
 function makeFakes(opts: {
@@ -157,8 +159,16 @@ function makeFakes(opts: {
    * Default: healthy.
    */
   natsHealthy?: boolean;
-  /** #821 — make the rollback recovery restart ALSO fail (worst-case path). */
+  /** #821 — make the rollback recovery restart ALSO fail by EXIT CODE (worst-case). */
   recoveryRestartFails?: boolean;
+  /**
+   * #821 BLOCKER — model the recovery restart's HEALTH (post-restart probe).
+   * `false` = the recovery restart exits 0 but the server is still DOWN — must
+   * report failure, never "restored to prior state". Default: healthy.
+   */
+  recoveryHealthy?: boolean;
+  /** #821 MAJOR-1 — make the pre-restart `nats-server -t` syntax gate FAIL. */
+  validateConfigFails?: boolean;
 }): { ports: NetworkPorts; rec: Recorder; storeRef: { networks: PolicyFederatedNetwork[] } } {
   const rec: Recorder = {
     registered: 0,
@@ -180,6 +190,7 @@ function makeFakes(opts: {
     snapshots: [],
     restores: [],
     healthProbes: 0,
+    validateConfigs: 0,
   };
   const storeRef = { networks: opts.initialNetworks ?? [] };
   const leafFilesPresent = new Set<string>(
@@ -325,6 +336,14 @@ function makeFakes(opts: {
   };
 
   const natsServer: NatsServerPort = {
+    async validateConfig() {
+      rec.validateConfigs++;
+      // #821 MAJOR-1 — default: the -t syntax gate passes. A test opts into a
+      // -t failure via `validateConfigFails: true`.
+      return opts.validateConfigFails === true
+        ? { ok: false, reason: "nats-server -t: parse error near line 12" }
+        : { ok: true };
+    },
     async restart() {
       rec.natsRestarts++;
       rec.restartOrder.push("nats");
@@ -343,11 +362,23 @@ function makeFakes(opts: {
     },
     async isHealthy() {
       rec.healthProbes++;
-      // #821 — default: healthy. `natsHealthy: false` models the community case
-      // (restart exited 0 but the server then crashed on the bad leaf).
-      return opts.natsHealthy === false
-        ? { healthy: false, reason: "monitor port 8224 not listening" }
-        : { healthy: true };
+      // #821 — health is modelled PER PROBE so a test can make the FIRST restart
+      // come up down (triggering rollback) and the RECOVERY restart ALSO come up
+      // down (the BLOCKER case: a recovery that exits 0 but leaves the bus DOWN
+      // must still report failure, never "restored"). The first probe follows the
+      // first restart; the second probe follows the recovery restart.
+      const isRecoveryProbe = rec.healthProbes > 1;
+      const healthy = isRecoveryProbe
+        ? opts.recoveryHealthy ?? true
+        : opts.natsHealthy ?? true;
+      return healthy
+        ? { healthy: true }
+        : {
+            healthy: false,
+            reason: isRecoveryProbe
+              ? "recovery: monitor port 8224 not listening"
+              : "monitor port 8224 not listening",
+          };
     },
   };
 
@@ -663,8 +694,87 @@ describe("join", () => {
       expect(res.ok).toBe(false);
       expect(rec.restores).toEqual(["metafactory"]);
       expect(rec.natsRestarts).toBe(2);
-      expect(res.reason).toContain("recovery restart ALSO failed");
+      expect(res.reason).toContain("recovery restart");
       expect(res.warnings?.some((w) => w.includes("intervene manually"))).toBe(true);
+    });
+
+    // -------------------------------------------------------------------------
+    // #821 BLOCKER — the recovery restart must be HEALTH-PROBED, not trusted by
+    // exit code. A recovery that exits 0 but leaves the bus DOWN must report
+    // FAILURE + manual-intervention, NEVER "restored to prior state". This is
+    // the original sin reborn on the recovery path: the first restart is probed,
+    // but the recovery restart was decided on `recovery.ok` (exit code) alone.
+    // -------------------------------------------------------------------------
+    test("BLOCKER: recovery restart exits 0 but bus DOWN → reports failure, NOT 'restored'", async () => {
+      const { ports, rec } = makeFakes({
+        busType: "operator-mode",
+        natsHealthy: false, // first restart: exit 0 but DOWN → triggers rollback
+        recoveryHealthy: false, // recovery restart: exit 0 but STILL DOWN
+      });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+
+      expect(res.ok).toBe(false);
+      // Rollback ran and the recovery restart was issued + HEALTH-PROBED.
+      expect(rec.restores).toEqual(["metafactory"]);
+      expect(rec.natsRestarts).toBe(2);
+      expect(rec.healthProbes).toBe(2); // BOTH restarts probed (the fix)
+      // It must NOT claim the bus was restored — the recovery is down too.
+      expect(res.reason).not.toContain("restored to prior state");
+      expect(res.warnings?.some((w) => w.includes("restored to prior state"))).toBe(
+        false,
+      );
+      // It must surface the manual-intervention escalation.
+      expect(res.reason).toContain("intervene manually");
+      expect(res.warnings?.some((w) => w.includes("intervene manually"))).toBe(true);
+    });
+
+    // -------------------------------------------------------------------------
+    // #821 MAJOR-1 — the cheap pre-restart `nats-server -t` syntax gate. A `-t`
+    // FAILURE must refuse BEFORE restarting (never crash the bus on a config we
+    // already know is broken) and revert the leaf write.
+    // -------------------------------------------------------------------------
+    test("MAJOR-1: a failing `-t` gate refuses BEFORE restart + reverts the leaf write", async () => {
+      const { ports, rec } = makeFakes({
+        busType: "operator-mode",
+        validateConfigFails: true,
+      });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+
+      expect(res.ok).toBe(false);
+      expect(res.reason).toContain("config validation (-t) failed");
+      // The gate ran...
+      expect(rec.validateConfigs).toBe(1);
+      // ...and NO restart happened (refused before it).
+      expect(rec.natsRestarts).toBe(0);
+      expect(rec.restarts).toBe(0);
+      // The leaf write was reverted (snapshot restored) so the on-disk config is
+      // clean for the next attempt.
+      expect(rec.restores).toEqual(["metafactory"]);
+    });
+
+    test("MAJOR-1: the `-t` gate runs on the happy path (before the restart)", async () => {
+      const { ports, rec } = makeFakes({ busType: "operator-mode" });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+      expect(res.ok).toBe(true);
+      expect(rec.validateConfigs).toBe(1);
+      // Order: validate (1) ran before the single restart.
+      expect(rec.natsRestarts).toBe(1);
+    });
+
+    test("recovery restart exits 0 AND healthy → reports 'restored to prior state'", async () => {
+      const { ports, rec } = makeFakes({
+        busType: "operator-mode",
+        natsHealthy: false, // first restart down → rollback
+        recoveryHealthy: true, // recovery comes back UP
+      });
+      const res = await joinNetwork("metafactory", LOCAL, ports);
+
+      expect(res.ok).toBe(false); // the JOIN still failed (the leaf was bad)...
+      expect(rec.healthProbes).toBe(2);
+      // ...but the bus WAS restored — only then may we say so.
+      expect(res.warnings?.some((w) => w.includes("restored to prior state"))).toBe(
+        true,
+      );
     });
   });
 

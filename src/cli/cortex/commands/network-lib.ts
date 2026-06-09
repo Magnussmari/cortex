@@ -374,35 +374,78 @@ export async function joinNetwork(
   // the leaf); the live `join` path always supplies one.
   if (ports.natsServer !== undefined) {
     const natsServer = ports.natsServer;
-    const natsRestart = await natsServer.restart();
+
+    // (e.0) #821 MAJOR-1 — a CHEAP pre-restart config-syntax gate (`nats-server
+    // -c <cfg> -t`). This catches an obviously-broken config BEFORE the restart
+    // that would crash the bus. It is NECESSARY-NOT-SUFFICIENT (it's a syntax
+    // check — it did NOT catch the original #821 crash, which is a runtime
+    // account-resolution failure), so it sits ON TOP of the account-required +
+    // creds-exist + health-probe defenses, never replacing them. A `-t` FAILURE
+    // means the config is definitely broken → refuse BEFORE restarting (nothing
+    // to roll back: we have not restarted yet, and the leaf write is reverted by
+    // restoring the snapshot to keep the on-disk config clean for the next try).
+    const validate = await natsServer.validateConfig();
+    if (!validate.ok) {
+      try {
+        ports.leafFile.restoreLeafState(snapshot);
+      } catch (err) {
+        // Restore failed — surface it; we have NOT restarted, so the bus is still
+        // up on its prior in-memory config, but the on-disk config now carries the
+        // bad leaf. Report so the principal can clean up before the next restart.
+        process.stderr.write(
+          `network join: leaf snapshot restore after a failed -t gate also failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+      return {
+        ok: false,
+        steps,
+        reason:
+          `nats-server config validation (-t) failed before restart, refusing to restart ` +
+          `(reverted the leaf write): ${validate.reason}`,
+        network: entry,
+        usedCache,
+        resolvedPeers: peers.map((p) => p.principal_id),
+        ...(warnings.length > 0 && { warnings }),
+      };
+    }
 
     // #821 — a restart that EXITS non-zero, OR one that exits 0 but leaves the
     // server DOWN (the community crash: `launchctl kickstart` returned 0, then
-    // nats-server exited 1 on the bad leaf), must NOT be reported as success and
-    // must NOT leave the bus down. Probe health after the restart; on failure,
-    // ROLL BACK the leaf snapshot + re-restart so the bus returns to its prior
-    // working state, then report the failure.
-    let restartFailure: string | undefined;
-    if (!natsRestart.ok) {
-      restartFailure = natsRestart.reason;
-    } else {
+    // nats-server exited 1 on the bad leaf), must NOT be reported as healthy.
+    // restartAndProbe couples the restart with the post-restart health probe so
+    // BOTH the initial restart AND the rollback-recovery restart are judged by
+    // the SAME standard — exit code is necessary-not-sufficient (#821 BLOCKER:
+    // the recovery path previously trusted exit code alone and could claim the
+    // bus was "restored" while it was DOWN).
+    const restartAndProbe = async (): Promise<
+      { ok: true } | { ok: false; reason: string }
+    > => {
+      const r = await natsServer.restart();
+      if (!r.ok) return { ok: false, reason: r.reason };
       const health = await natsServer.isHealthy();
       if (!health.healthy) {
-        restartFailure = `nats-server did not come back up after restart (${health.reason})`;
+        return {
+          ok: false,
+          reason: `nats-server did not come back up after restart (${health.reason})`,
+        };
       }
-    }
+      return { ok: true };
+    };
 
-    if (restartFailure !== undefined) {
+    const initial = await restartAndProbe();
+
+    if (!initial.ok) {
       // Restore the prior leaf state + re-restart to bring the bus back. A failed
-      // join MUST NEVER leave the bus down. The rollback restart's own outcome is
-      // appended to the step log so the principal sees whether recovery succeeded.
+      // join MUST NEVER leave the bus down. The recovery restart is HEALTH-PROBED
+      // (not trusted by exit code) so we only claim "restored" when the bus is
+      // verifiably back up; otherwise we escalate to manual intervention.
       let rollbackNote: string;
       try {
         ports.leafFile.restoreLeafState(snapshot);
-        const recovery = await natsServer.restart();
+        const recovery = await restartAndProbe();
         rollbackNote = recovery.ok
-          ? "rolled back leaf config + restarted nats-server (bus restored to prior state)"
-          : `rolled back leaf config but the recovery restart ALSO failed (${recovery.reason}) — bus may be DOWN, intervene manually`;
+          ? "rolled back leaf config + restarted nats-server (bus restored to prior state, verified healthy)"
+          : `rolled back leaf config but the recovery restart did NOT bring the bus back up (${recovery.reason}) — bus may be DOWN, intervene manually`;
       } catch (err) {
         rollbackNote = `rollback FAILED (${err instanceof Error ? err.message : String(err)}) — bus may be DOWN, intervene manually`;
       }
@@ -410,7 +453,7 @@ export async function joinNetwork(
       return {
         ok: false,
         steps,
-        reason: `nats-server restart failed (${restartFailure}); ${rollbackNote}`,
+        reason: `nats-server restart failed (${initial.reason}); ${rollbackNote}`,
         network: entry,
         usedCache,
         resolvedPeers: peers.map((p) => p.principal_id),
