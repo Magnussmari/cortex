@@ -3,7 +3,7 @@
 **Date opened:** 2026-06-10
 **Driver:** Andreas
 **Author:** Luna (architect)
-**Status:** DESIGN — decisions NOT yet made. This is design-first: the §13 decisions-needed block is for the principal. **Plan means stop** — nothing is implemented until the calls are signed off.
+**Status:** DECIDED (2026-06-10) — Andreas signed off the recommended set; **D-responder = always-on between configured `peers[]`** (his explicit call). All §13 decisions resolve per the recommendations (built-in echo responder; `federated.…tasks.@{assistant}.probe.echo` / reply `…probe.reply.echo`, NOT `system.probe.*`; verdict taxonomy `reachable`/`no-responder`/`timeout`/`refused`/`not-configured`; timeout-only v1; Direct default; cortex fires + signal P-11 observes; no-amplification = SEV-1 gate). Ready to build: cortex echo-responder + `cortex network ping` first; signal P-11 observability follows.
 **Relates:** signal#113 / P-13 (the *passive* transport-observability spike — the complement to this), signal P-11 (reserved OAM / synthetic-probe phase), cortex#117 Phase E (OAM home), cortex network-join control plane (`docs/sop-network-join.md`, `docs/adr/0003`).
 **Binding sources (this spec conforms to, does not re-derive):** `compass/sops/federation-wire-protocol.md` (the 5 FG checks), `docs/adr/0001-federated-subject-grammar.md` (subject grammar), `docs/adr/0002-federated-dispatch-addressing-and-verdict-back.md` (addressing + reply-back), `CONTEXT.md` §Network/§Scope/§Domain/§Dispatch/§capability.
 
