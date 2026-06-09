@@ -109,6 +109,7 @@ import type { Surfaces } from "./common/types/surfaces";
 import type { SurfaceGateway } from "./gateway/surface-gateway";
 
 import { createDispatchListener, type DispatchListener } from "./runner/dispatch-listener";
+import { createProbeResponder, type ProbeResponder } from "./bus/probe-responder";
 import { WorklogManager } from "./runner/worklog-manager";
 
 // #752 — the `network` + `provision-stack` subcommand dispatchers. Registered
@@ -2483,6 +2484,30 @@ export async function startCortex(
   });
   await dispatchListener.start();
 
+  // signal#113 P-11 (#56) — federated echo responder. The ICMP-analog of the
+  // agent network: answers a reserved `probe.echo` capability IN THE RUNTIME
+  // (no harness, no `claude`, no Discord, no tools) on our own
+  // `federated.{us}.{stack}.tasks.*.>` subject. Always-on between configured
+  // `peers[]` (the responder only ever answers a mutually-configured, gated
+  // peer; absent/forged originator or a non-peer is dropped fail-closed; the
+  // reply is exactly-one-bounded, keyed to the originator-attributed requester
+  // scope, per-source rate-limited — no amplification). Dormant when no
+  // `policy.federated.networks[]` is declared (no peers ⇒ nothing to answer).
+  const probeResponderNetworks = new Map(
+    (options.policy?.federated?.networks ?? []).map((n) => [n.id, n] as const),
+  );
+  const probeResponder: ProbeResponder = createProbeResponder({
+    runtime,
+    source: systemEventSource,
+    stack: derivedStack.stack,
+    federatedNetworksById: probeResponderNetworks,
+  });
+  await probeResponder.start();
+  console.log(
+    `cortex: probe-responder started — subjects=[${probeResponder.subjects.join(", ")}], ` +
+      `peers-networks=${probeResponderNetworks.size}`,
+  );
+
   // cortex#491 — dispatch sink (OUTBOUND). The single delivery path for
   // dispatch lifecycle replies (CONTEXT.md §Dispatch-sink). Subscribes to
   // `local.{principal}[.{stack}].dispatch.task.>` via the runtime
@@ -2887,6 +2912,9 @@ export async function startCortex(
         }
       }
       await completeAsync("dispatch-listener stop", dispatchListener.stop());
+      // signal#113 P-11 (#56) — drain the echo responder on the same boundary
+      // as the dispatch listener. `stop()` is idempotent (no-op when dormant).
+      await completeAsync("probe-responder stop", probeResponder.stop());
       // cortex#491 — drain the dispatch sink after the runner stops
       // publishing lifecycle envelopes but before the surface-router /
       // adapters stop, so no late `postResponse` lands after the
