@@ -45,11 +45,11 @@ merge (here and on the umbrella).
 
 | Slice | PR | Depends on | Files / area | Done |
 |---|---|---|---|---|
-| **S1** | `mc:` block + embed module + retire setupDashboard | — | `config.ts`, `surface/mc/embed.ts`, `cortex.ts` | [ ] |
+| **S1** | [#854](https://github.com/the-metafactory/cortex/pull/854) — `mc:` block + embed module + retire setupDashboard | — | `config.ts`, `surface/mc/embed.ts`, `cortex.ts` | [x] |
 | **S2** | enable meta-factory + live verify + config-layout docs | S1 | `docs/config-layout`, deployment | [ ] |
-| **S3** | `cc_session_id` on `dispatch.task.started` | — | `runner/cc-session`, bus types | [ ] |
+| **S3** | [#852](https://github.com/the-metafactory/cortex/pull/852) — `cc_session_id` on `dispatch.task.started` | — | `runner/cc-session`, bus types | [x] |
 | **S4** | MC session projection from lifecycle envelopes | S1, S3 | `surface/mc` projection | [ ] |
-| **S5** | ingestor orphan auto-register (`local.observed`) | S1 | `surface/mc/hooks/ingestor` | [ ] |
+| **S5** | [#856](https://github.com/the-metafactory/cortex/pull/856) — ingestor orphan auto-register (`local.observed`) | S1 | `surface/mc/hooks/ingestor` | [x] |
 | **S6** | MC projection renderer on the surface-router | S1, S4 | `renderers`, `surface/mc` | [ ] |
 | **S7** | attention producers: `failed_dispatch` + `stale` | S6 | `surface/mc/db/attention-sources` | [ ] |
 
@@ -60,22 +60,22 @@ merge (here and on the umbrella).
 Closes [#712](https://github.com/the-metafactory/cortex/issues/712). Implements
 ADR-0005's in-process-embed + retire-the-legacy-lift decision.
 
-- [ ] `mc:` config block on `AgentConfigSchema` (`enabled` / `configPath` /
+- [x] `mc:` config block on `AgentConfigSchema` (`enabled` / `configPath` /
       `dbPath` / `port`), using the `emptyDefault()` + transform idiom so the
       all-defaults parse path stays populated.
-- [ ] `src/surface/mc/embed.ts` — `startMissionControl()` mirrors the standalone
+- [x] `src/surface/mc/embed.ts` — `startMissionControl()` mirrors the standalone
       `index.ts` composition (loadConfig → initDatabase → ProcessManager →
       startServer → HookStreamPoller); embedded mode overrides db + cursor +
       port (ADR-0005 §2), MC yaml governs hooks / ws / log only.
-- [ ] `cortex.ts` — boot the embed when `mc.enabled`; per-slug default db at
+- [x] `cortex.ts` — boot the embed when `mc.enabled`; per-slug default db at
       `~/.local/share/cortex/mc/<stack>/mission-control.db` with the hook cursor
       beside it; cockpit loop's `baseUrl` reads the embed's actual port.
-- [ ] `cortex.ts` — `api.enabled` warns once that the legacy embedded dashboard
+- [x] `cortex.ts` — `api.enabled` warns once that the legacy embedded dashboard
       is retired (it never migrated from grove-v2, #712) and directs to `mc:`;
       `setupDashboard` + `runStartupCloudSync` + the dead `as string` import
       deleted. The `api:` schema block stays (back-compat reader); `CloudPublisher`
       instantiation stays (Phase 3 / ADR-0006 re-homes its dead call site).
-- [ ] Tests: `mc` defaults parse + explicit values honored; embed boots against a
+- [x] Tests: `mc` defaults parse + explicit values honored; embed boots against a
       tmp dbPath on an OS-assigned port, serves `/health`, lands db + cursor
       beside each other, releases the port on `stop()`.
 
