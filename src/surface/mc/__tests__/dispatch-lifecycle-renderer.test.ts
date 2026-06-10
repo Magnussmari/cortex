@@ -1,0 +1,138 @@
+/**
+ * MC-I1.S4 (ADR-0005 §4) — tests for the dispatch-lifecycle projection renderer
+ * (the bus→MC surface-router seam).
+ *
+ * Verifies:
+ *   1. The adapter's subjects + id are stable + match the dispatch-lifecycle
+ *      grammar (local stack-ful/stack-less + federated).
+ *   2. render() routes a `dispatch.task.*` envelope into MC rows.
+ *   3. render() ignores non-dispatch envelopes (no rows written).
+ *   4. render() NEVER throws — a malformed envelope is swallowed + logged.
+ *   5. The renderer subjects actually match real derived subjects via the
+ *      surface-router's NATS matcher (the wire-level join).
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
+
+import { SCHEMA_SQL } from "../db/schema";
+import {
+  createDispatchProjectionRenderer,
+  DISPATCH_PROJECTION_RENDERER_ID,
+  DISPATCH_PROJECTION_SUBJECTS,
+} from "../projection/dispatch-lifecycle-renderer";
+import { subjectMatches } from "../../../bus/surface-router";
+import {
+  createDispatchTaskStartedEvent,
+  type DispatchEventSource,
+} from "../../../bus/dispatch-events";
+import type { Envelope } from "../../../bus/myelin/envelope-validator";
+
+const SOURCE: DispatchEventSource = {
+  principal: "andreas",
+  agent: "cortex",
+  instance: "local",
+};
+const TASK_ID = "33333333-3333-4333-8333-333333333333";
+
+function setupDb(): Database {
+  const db = new Database(":memory:");
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+  for (const sql of SCHEMA_SQL) db.exec(sql);
+  return db;
+}
+
+function sessionCount(db: Database): number {
+  return (
+    db.query(`SELECT COUNT(*) AS n FROM sessions`).get() as { n: number }
+  ).n;
+}
+
+describe("createDispatchProjectionRenderer", () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = setupDb();
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("exposes a stable id + the dispatch-lifecycle subjects", () => {
+    const adapter = createDispatchProjectionRenderer(db);
+    expect(adapter.id).toBe(DISPATCH_PROJECTION_RENDERER_ID);
+    expect(adapter.subjects).toEqual(DISPATCH_PROJECTION_SUBJECTS);
+  });
+
+  it("render() projects a dispatch.task.started envelope into MC rows", async () => {
+    const adapter = createDispatchProjectionRenderer(db);
+    const env = createDispatchTaskStartedEvent({
+      source: SOURCE,
+      taskId: TASK_ID,
+      agentId: "cortex",
+      startedAt: new Date("2026-06-10T12:00:00.000Z"),
+    });
+    await adapter.render(env);
+    expect(sessionCount(db)).toBe(1);
+  });
+
+  it("render() ignores a non-dispatch envelope (no rows written)", async () => {
+    const adapter = createDispatchProjectionRenderer(db);
+    const env: Envelope = {
+      ...createDispatchTaskStartedEvent({
+        source: SOURCE,
+        taskId: TASK_ID,
+        agentId: "cortex",
+        startedAt: new Date(),
+      }),
+      type: "system.heartbeat",
+    };
+    await adapter.render(env);
+    expect(sessionCount(db)).toBe(0);
+  });
+
+  it("render() never throws on a malformed envelope", async () => {
+    const adapter = createDispatchProjectionRenderer(db);
+    // A dispatch type but a garbage payload — must be swallowed, not thrown.
+    const bad = {
+      id: "x",
+      type: "dispatch.task.started",
+      payload: null,
+    } as unknown as Envelope;
+    await expect(adapter.render(bad)).resolves.toBeUndefined();
+    expect(sessionCount(db)).toBe(0);
+  });
+
+  it("subjects match real derived dispatch.task subjects via the router matcher", () => {
+    // Stack-ful, stack-less, and federated derived subjects (from
+    // @the-metafactory/myelin deriveSubject) must each be caught by at least
+    // one of the renderer's subscribe patterns.
+    const derived = [
+      "local.andreas.work.dispatch.task.started",
+      "local.andreas.dispatch.task.completed",
+      "federated.peer.work.dispatch.task.failed",
+    ];
+    for (const subject of derived) {
+      const hit = DISPATCH_PROJECTION_SUBJECTS.some((p) =>
+        subjectMatches(p, subject),
+      );
+      expect(hit).toBe(true);
+    }
+  });
+
+  it("does NOT match non-dispatch subjects", () => {
+    const nonDispatch = [
+      "local.andreas.work.system.heartbeat",
+      "local.andreas.work.review.verdict.completed",
+      "local.andreas.tasks.@did-mf-luna.chat",
+    ];
+    for (const subject of nonDispatch) {
+      const hit = DISPATCH_PROJECTION_SUBJECTS.some((p) =>
+        subjectMatches(p, subject),
+      );
+      expect(hit).toBe(false);
+    }
+  });
+});

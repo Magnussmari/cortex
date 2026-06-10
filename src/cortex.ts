@@ -99,6 +99,8 @@ import { refreshCockpit, defaultWorkItemSourceFor } from "./surface/mc/refresh";
 import { startCockpitRefreshLoop, type CockpitRefreshLoop } from "./surface/mc/refresh-loop";
 // MC-I1.S1 (ADR-0005) — in-process Mission Control embed (supersedes api.*).
 import { startMissionControl, type MissionControlHandle } from "./surface/mc/embed";
+// MC-I1.S4 (ADR-0005 §4) — bus→MC dispatch-lifecycle projection renderer.
+import { createDispatchProjectionRenderer } from "./surface/mc/projection/dispatch-lifecycle-renderer";
 import type { Database as BunDatabase } from "bun:sqlite";
 import { isGatewayEnabled } from "./gateway/gateway-bootstrap";
 import {
@@ -2683,6 +2685,17 @@ export async function startCortex(
       });
       mcDb = mcHandle.db;
       console.log(`cortex: Mission Control embed listening on http://localhost:${mcHandle.port} — db ${dbPath}`);
+
+      // MC-I1.S4 (ADR-0005 §3/§4) — register the bus→MC projection renderer so
+      // `dispatch.task.*` lifecycle envelopes land as session/assignment rows on
+      // the working grid. The seam is a surface-router renderer (§4), subscribing
+      // to the dispatch-lifecycle subjects only; its render() is non-throwing
+      // (the surface-router isolates errors too, but the renderer owns the
+      // contract). S6 (#848) extends the same renderer's project() dispatcher to
+      // verdicts / attention / heartbeats. No restart-on-config — like every
+      // renderer, the registration is static for the daemon's lifetime.
+      router.register(createDispatchProjectionRenderer(mcDb));
+      console.log("cortex: Mission Control dispatch-lifecycle projection renderer registered");
     } catch (err) {
       console.error("cortex: Mission Control embed startup error (non-fatal):", err instanceof Error ? err.message : err);
     }
