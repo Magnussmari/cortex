@@ -621,6 +621,29 @@ html, body {
 }
 .network-detail-grid-link:hover { text-decoration: underline; }
 
+/* G-1114.F.2 — cross-component capability hover highlight.
+   A capability badge is a hover target (cursor hint); a HIGHLIGHTED badge/node
+   (lit by the active hover) gets an accent border + subtle glow. The same lit
+   treatment applies in the detail panel and on the graph agent nodes so the
+   match reads identically across components. */
+.network-detail-cap { cursor: default; transition: border-color 0.1s ease, box-shadow 0.1s ease; }
+.network-node-cap { cursor: default; transition: border-color 0.1s ease, box-shadow 0.1s ease; }
+.network-detail-cap-highlighted,
+.network-node-cap-highlighted {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.network-node-highlighted {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  box-shadow: 0 0 12px -2px var(--accent);
+}
+
+/* G-1114.F.3 — dispatch-direct affordance in the detail panel. */
+.network-detail-dispatch-direct { margin-top: 2px; }
+.network-detail-dispatch-direct-foreign { font-size: 11.5px; font-style: italic; }
+
 /* G-1113.C.7 — per-repository panel */
 .repos-view .repo-card {
   border: 1px solid var(--line); border-radius: 8px;

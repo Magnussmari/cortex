@@ -28,7 +28,7 @@
  */
 
 import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
-import type { AgentsState } from "../hooks/use-agents";
+import type { AgentPresenceTile, AgentsState } from "../hooks/use-agents";
 import type { WorkingAgentTile } from "../hooks/use-working-agents";
 import { pickAgentsPanelMode } from "../lib/agents-display";
 import { buildNetworkGraph } from "../lib/network-graph-adapter";
@@ -36,6 +36,15 @@ import {
   resolveSelectedAgent,
   selectAgentDispatchActivity,
 } from "../lib/network-detail-display";
+import {
+  buildCapabilityMatchIndex,
+  type MatchTask,
+} from "../lib/capability-match";
+import {
+  computeHighlight,
+  type HoverTarget,
+} from "../lib/capability-highlight";
+import type { NetworkHoverContextValue } from "../lib/network-hover-context";
 import {
   DEFAULT_NETWORK_FILTER,
   collectCapabilityOptions,
@@ -69,12 +78,34 @@ export interface NetworkViewProps {
    * lifecycle in full.
    */
   onViewInWorkingGrid?: () => void;
+  /**
+   * G-1114.F.3 — dispatch a task DIRECTLY to a LOCAL agent. The caller wires
+   * this to the EXISTING dispatch path (`POST /api/sessions` with `agentId`) —
+   * F.3 reuses that path, it does not invent a new one. Only ever invoked for a
+   * LOCAL agent; the panel disables the affordance for a foreign peer (the
+   * dispatch path is local-only). Omitted → no dispatch-direct affordance.
+   */
+  onDispatchDirect?: (agent: AgentPresenceTile) => void;
+  /** G-1114.F.3 — agent keys with an in-flight dispatch-direct request. */
+  dispatchingAgentKeys?: ReadonlySet<string>;
+  /**
+   * G-1114.F.1/F.2 — the tasks (each with a required capability, or `null`) to
+   * feed the capability-match index. The MC task model doesn't carry a
+   * required-capability column yet, so the default is empty — the hover
+   * highlight still works fully off the agents' declared capabilities (hover a
+   * capability → matching agents glow). When tasks gain a capability field the
+   * caller projects them here and the index lights up task↔agent matches.
+   */
+  matchTasks?: readonly MatchTask[];
 }
 
 export function NetworkView({
   state,
   workingAgents = [],
   onViewInWorkingGrid,
+  onDispatchDirect,
+  dispatchingAgentKeys,
+  matchTasks = [],
 }: NetworkViewProps) {
   const mode = pickAgentsPanelMode(state);
 
@@ -96,6 +127,37 @@ export function NetworkView({
   // filter change). Tiny + engine-free, so it stays in the main bundle; the lazy
   // canvas takes the built graph and runs ELK over it.
   const graph = useMemo(() => buildNetworkGraph(filteredAgents), [filteredAgents]);
+
+  // F.1 — the capability-match index, built off the FULL snapshot (not the
+  // filtered one) so a hovered capability lights every declaring agent
+  // consistently regardless of the active filter. Origin-blind: foreign agents
+  // match purely on declared capabilities, exactly like local ones.
+  const matchIndex = useMemo(
+    () =>
+      buildCapabilityMatchIndex(
+        state.agents.map((a) => ({
+          key: a.key,
+          capabilities: a.capabilities,
+          origin: a.origin,
+        })),
+        matchTasks,
+      ),
+    [state.agents, matchTasks],
+  );
+
+  // F.2 — the cross-component hover target + the derived highlight set. The
+  // hover state lives HERE (the view owns the snapshot + index) and is broadcast
+  // into the graph node tree via `NetworkHoverContext` (through the lazy canvas)
+  // AND read by the detail panel directly.
+  const [hoverTarget, setHoverTarget] = useState<HoverTarget>(null);
+  const highlight = useMemo(
+    () => computeHighlight(hoverTarget, matchIndex),
+    [hoverTarget, matchIndex],
+  );
+  const hover = useMemo<NetworkHoverContextValue>(
+    () => ({ highlight, setHoverTarget }),
+    [highlight],
+  );
 
   // Filter callbacks.
   const onStateChange = useCallback(
@@ -237,7 +299,11 @@ export function NetworkView({
                   <div className="network-view-empty">Loading network…</div>
                 }
               >
-                <NetworkCanvas graph={graph} onSelectAgent={setSelectedKey} />
+                <NetworkCanvas
+                  graph={graph}
+                  onSelectAgent={setSelectedKey}
+                  hover={hover}
+                />
               </Suspense>
             )}
             {selectedAgent && (
@@ -246,6 +312,18 @@ export function NetworkView({
                 dispatch={dispatch}
                 onClose={closePanel}
                 onViewInWorkingGrid={onViewInWorkingGrid}
+                {...(onDispatchDirect ? { onDispatchDirect } : {})}
+                dispatchBusy={
+                  dispatchingAgentKeys?.has(selectedAgent.key) ?? false
+                }
+                highlightedCapabilities={highlight.capabilities}
+                onHoverCapability={(cap) =>
+                  setHoverTarget(
+                    cap === null
+                      ? null
+                      : { kind: "capability", capability: cap },
+                  )
+                }
               />
             )}
           </div>
