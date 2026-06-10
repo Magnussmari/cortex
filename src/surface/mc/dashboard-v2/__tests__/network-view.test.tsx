@@ -99,4 +99,32 @@ describe("NetworkView (G-1114.D.1)", () => {
     // The spotlight trigger.
     expect(html).toContain("network-filter-spotlight");
   });
+
+  it("F.1/F.2/F.3 — builds the match index + hover memos without crashing", () => {
+    // Smoke: the view body now runs `buildCapabilityMatchIndex` +
+    // `computeHighlight` `useMemo`s and accepts the F.3 dispatch-direct props.
+    // `renderToStaticMarkup` runs those memos (not effects), so this proves the
+    // new data layer doesn't throw on a populated snapshot + tasks.
+    const html = renderToStaticMarkup(
+      createElement(NetworkView, {
+        state: {
+          loaded: true,
+          error: null,
+          agents: [
+            tile({ agent_id: "luna", capabilities: ["review.code", "design"] }),
+            tile({ agent_id: "echo", capabilities: ["review.code"] }),
+          ],
+        },
+        onDispatchDirect: () => {},
+        dispatchingAgentKeys: new Set<string>(),
+        matchTasks: [
+          { id: "t1", capability: "review.code" },
+          { id: "t2", capability: null },
+        ],
+      }),
+    );
+    // Still renders the list-state chrome (canvas behind Suspense).
+    expect(html).toContain("Network");
+    expect(html).toContain("Loading network");
+  });
 });
