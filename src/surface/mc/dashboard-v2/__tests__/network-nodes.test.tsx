@@ -235,3 +235,41 @@ describe("NetworkLegend (G-1114.D.1)", () => {
     expect(html).toContain("swatch-ttl-lapse");
   });
 });
+
+describe("AgentNodeCard — F.2 hover highlight", () => {
+  it("is unlit by default (no highlighted class / data attr)", () => {
+    const html = renderAgent(agentData({ capabilities: ["review.code"] }));
+    expect(html).not.toContain("network-node-highlighted");
+    expect(html).not.toContain('data-highlighted');
+  });
+
+  it("renders the highlighted treatment when `highlighted` is set", () => {
+    const html = renderToStaticMarkup(
+      createElement(AgentNodeCard, {
+        data: agentData({ capabilities: ["review.code"] }),
+        highlighted: true,
+      }),
+    );
+    expect(html).toContain("network-node-highlighted");
+    expect(html).toContain('data-highlighted="true"');
+  });
+
+  it("marks each capability with data-capability for hover targeting", () => {
+    const html = renderAgent(
+      agentData({ capabilities: ["review.code", "design"] }),
+    );
+    expect(html).toContain('data-capability="review.code"');
+    expect(html).toContain('data-capability="design"');
+  });
+
+  it("lights only the capability in highlightedCapabilities", () => {
+    const html = renderToStaticMarkup(
+      createElement(AgentNodeCard, {
+        data: agentData({ capabilities: ["review.code", "design"] }),
+        highlightedCapabilities: new Set(["review.code"]),
+      }),
+    );
+    const lit = (html.match(/network-node-cap-highlighted/g) ?? []).length;
+    expect(lit).toBe(1);
+  });
+});

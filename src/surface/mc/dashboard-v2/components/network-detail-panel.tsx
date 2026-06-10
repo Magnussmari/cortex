@@ -39,6 +39,7 @@ import {
 } from "../lib/agents-display";
 import type { AgentPresenceTile } from "../hooks/use-agents";
 import type { AgentDispatchActivity } from "../lib/network-detail-display";
+import { DispatchButton } from "./dispatch-button";
 
 /** Match the working-grid priority label (P0–P3, P? out-of-range). */
 function priorityLabel(p: number): string {
@@ -62,6 +63,30 @@ export interface NetworkDetailPanelProps {
    * Optional — when omitted, the "view in working grid" affordance is hidden.
    */
   onViewInWorkingGrid?: () => void;
+  /**
+   * G-1114.F.3 — "dispatch direct" affordance. When provided AND the agent is
+   * LOCAL, the panel renders a confirm-gated "Dispatch to {agent}" button that
+   * calls this back; the caller wires it to the EXISTING dispatch path
+   * (`POST /api/sessions` with `agentId`) — F.3 reuses that path, it does not
+   * invent a new one. Omitted → no dispatch affordance.
+   *
+   * A FOREIGN (federated peer) agent NEVER gets the live button: the dispatch
+   * path writes to the LOCAL stack's DB + spawns a LOCAL subprocess, so it
+   * cannot target a peer principal's agent. The panel shows a disabled
+   * "federated peer — direct dispatch via its stack" future-state instead.
+   */
+  onDispatchDirect?: (agent: AgentPresenceTile) => void;
+  /** True while a dispatch-direct request is in flight (disables the button). */
+  dispatchBusy?: boolean;
+  /**
+   * G-1114.F.2 — cross-component hover. The panel reports the hovered target
+   * (a capability badge → `{kind:"capability"}`, the agent identity →
+   * `{kind:"agent"}`, mouse-leave → `null`) so the view can highlight matching
+   * agent nodes in the graph. Optional — omitted disables hover reporting.
+   */
+  onHoverCapability?: (capability: string | null) => void;
+  /** G-1114.F.2 — capabilities to render as HIGHLIGHTED (lit by the active hover). */
+  highlightedCapabilities?: ReadonlySet<string>;
   /** Injectable clock for deterministic relative-time tests. */
   now?: number;
 }
@@ -75,6 +100,10 @@ export function NetworkDetailPanel({
   dispatch,
   onClose,
   onViewInWorkingGrid,
+  onDispatchDirect,
+  dispatchBusy = false,
+  onHoverCapability,
+  highlightedCapabilities,
   now = Date.now(),
 }: NetworkDetailPanelProps) {
   const offline = agent.state === "offline";
@@ -159,9 +188,28 @@ export function NetworkDetailPanel({
                 {badge.label}
               </span>
             ) : (
+              // F.2 — each real capability badge is a hover target: entering it
+              // reports the capability up so the view lights every agent node
+              // that declares it; leaving clears. `highlightedCapabilities`
+              // marks a badge lit when a sibling hover (e.g. an agent-node
+              // hover) selected this capability.
               <span
                 key={`${badge.label}-${i}`}
-                className="network-detail-cap"
+                className={
+                  "network-detail-cap" +
+                  (highlightedCapabilities?.has(badge.label)
+                    ? " network-detail-cap-highlighted"
+                    : "")
+                }
+                data-capability={badge.label}
+                onMouseEnter={
+                  onHoverCapability
+                    ? () => onHoverCapability(badge.label)
+                    : undefined
+                }
+                onMouseLeave={
+                  onHoverCapability ? () => onHoverCapability(null) : undefined
+                }
               >
                 {badge.label}
               </span>
@@ -222,6 +270,36 @@ export function NetworkDetailPanel({
           </button>
         )}
       </section>
+
+      {/* Dispatch direct (F.3) ---------------------------------------------
+          A LOCAL agent gets a confirm-gated "Dispatch to {agent}" button that
+          REUSES the existing dispatch path (`POST /api/sessions` with
+          `agentId`) — the same confirmation popover the task-row Dispatch uses,
+          so no auth/confirm step is bypassed. A FOREIGN peer agent CANNOT be
+          dispatched to from here (the dispatch path is LOCAL-only — it writes
+          this stack's DB + spawns a local subprocess), so it shows a disabled
+          future-state rather than a half-working cross-principal dispatch. */}
+      {onDispatchDirect && (
+        <section className="network-detail-section network-detail-dispatch-direct">
+          <span className="network-detail-section-label dim">dispatch</span>
+          {foreign ? (
+            <span
+              className="network-detail-dispatch-direct-foreign dim"
+              data-dispatch-direct="foreign-disabled"
+            >
+              Federated peer — direct dispatch happens on its own stack
+              {provenance ? ` (${provenance})` : ""}.
+            </span>
+          ) : (
+            <DispatchButton
+              className="network-detail-dispatch-direct-btn"
+              agentLabel={name}
+              busy={dispatchBusy}
+              onConfirm={() => onDispatchDirect(agent)}
+            />
+          )}
+        </section>
+      )}
 
       {/*
         ADR-0007 boundary: this panel intentionally stops here. It shows
