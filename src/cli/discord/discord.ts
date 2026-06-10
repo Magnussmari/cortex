@@ -9,9 +9,8 @@
 import { Command } from "commander";
 import YAML from "yaml";
 import { loadConfig, saveConfig, getConfigPath } from "./lib/config";
-import { resolveServerContext, registerServerProfile, ServerContextError, cachedChannelId } from "./lib/server-context";
+import { resolveServerContext, registerServerProfile, ServerContextError, cachedChannelId, cacheChannelId } from "./lib/server-context";
 import type { ResolvedServerContext, ServerContextOptions } from "./lib/server-context";
-import type { DiscordCliConfig } from "./lib/config";
 import { postMessage, createThreadFromMessage, resolveChannelByName, resolveThreadByName, readMessages, listChannels, listThreads } from "./lib/discord";
 
 // Per-command option shapes. Commander's typing is permissive; pinning each
@@ -127,8 +126,7 @@ program
           console.error(`Channel "#${channelName}" not found. Run: discord channels`);
           process.exit(1);
         }
-        if (channelId) {
-          cacheChannelId(config, ctx, channelName, channelId);
+        if (channelId && cacheChannelId(config, ctx, channelName, channelId)) {
           saveConfig(config);
         }
       }
@@ -217,8 +215,9 @@ program
           console.error(`Channel "#${channelName}" not found.`);
           process.exit(1);
         }
-        cacheChannelId(config, ctx, channelName, channelId);
-        saveConfig(config);
+        if (cacheChannelId(config, ctx, channelName, channelId)) {
+          saveConfig(config);
+        }
       }
       readTargetId = channelId;
     }
@@ -349,28 +348,6 @@ configCmd
   });
 
 // ─── helpers ───────────────────────────────────────────────────────────────
-
-/**
- * Cache a freshly-resolved channel id back into config, writing to the active
- * server profile's `channels` map when a `--server` profile is in effect, else
- * to the top-level `channels`. Keeps each guild's name→id cache isolated so a
- * name that exists in two guilds never cross-contaminates.
- */
-function cacheChannelId(
-  config: DiscordCliConfig,
-  ctx: ResolvedServerContext,
-  channelName: string,
-  channelId: string
-): void {
-  const profile = ctx.serverName ? config.servers?.[ctx.serverName] : undefined;
-  if (profile) {
-    profile.channels ??= {};
-    profile.channels[channelName] = { id: channelId };
-  } else {
-    config.channels ??= {};
-    config.channels[channelName] = { id: channelId };
-  }
-}
 
 function setNestedValue(obj: ConfigObject, key: string, value: string): void {
   const parts = key.split(".");

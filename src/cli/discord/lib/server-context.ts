@@ -166,6 +166,47 @@ export function cachedChannelId(
 }
 
 /**
+ * Cache a freshly-resolved channel id back into config, writing to the active
+ * server profile's `channels` map when a `--server` profile is in effect, else
+ * to the top-level `channels`. Keeps each guild's name→id cache isolated so a
+ * name that exists in two guilds never cross-contaminates.
+ *
+ * The top-level write is GUARDED on the effective guild actually BEING the
+ * top-level guild (`!ctx.guildId || ctx.guildId === config.guildId`). A cached
+ * id is a Discord snowflake valid only in its resolving guild, so a bare
+ * `--guild <other>` (no profile) must NOT persist a foreign-guild id into the
+ * top-level map — that would make a later no-flag post read the wrong id and
+ * re-trigger #838 one invocation later. With no per-guild map to own those ids,
+ * the right move is to DROP the write (resolve-by-name stays correct anyway).
+ *
+ * Returns whether anything was written, so the caller can skip a pointless
+ * `saveConfig` when the write was dropped. Mutates `config` in place; does NOT
+ * persist.
+ */
+export function cacheChannelId(
+  config: DiscordCliConfig,
+  ctx: ResolvedServerContext,
+  channelName: string,
+  channelId: string
+): boolean {
+  const profile = ctx.serverName ? config.servers?.[ctx.serverName] : undefined;
+  if (profile) {
+    profile.channels ??= {};
+    profile.channels[channelName] = { id: channelId };
+    return true;
+  }
+  // No profile: only the top-level map is a candidate, and only when the
+  // effective guild is the top-level guild. A bare `--guild` to a different
+  // guild has no map to own its ids — drop the write rather than poison grove.
+  if (!ctx.guildId || ctx.guildId === config.guildId) {
+    config.channels ??= {};
+    config.channels[channelName] = { id: channelId };
+    return true;
+  }
+  return false;
+}
+
+/**
  * Register (or update) a named server profile in the config object, mutating
  * and returning it. Pure aside from the in-place mutation — does NOT persist;
  * the caller saves. `guildId` is required; `defaultChannel` is optional. A

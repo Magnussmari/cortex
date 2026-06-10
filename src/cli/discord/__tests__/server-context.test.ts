@@ -17,6 +17,7 @@ import {
   resolveServerContext,
   registerServerProfile,
   cachedChannelId,
+  cacheChannelId,
   ServerContextError,
 } from "../lib/server-context";
 
@@ -256,6 +257,82 @@ describe("cachedChannelId — guild-scoped cache gate (#838)", () => {
   test("unknown channel name returns undefined even when the cache is valid", () => {
     const ctx = resolveServerContext(baseConfig(), {});
     expect(cachedChannelId(ctx, "does-not-exist")).toBeUndefined();
+  });
+});
+
+describe("cacheChannelId — write-guard against foreign-guild poisoning (#838)", () => {
+  const COMMUNITY_GUILD = "1505549701674700991";
+  const COMMUNITY_CORTEX_ID = "9999999999999999999";
+
+  test("no flags: writes the resolved id into the top-level map (back-compat)", () => {
+    // Fresh config with no channels map yet (first-ever resolution of #cortex).
+    const config: DiscordCliConfig = { botToken: "grove-token", guildId: GROVE_GUILD };
+    const ctx = resolveServerContext(config, {});
+    const wrote = cacheChannelId(config, ctx, "cortex", "111");
+    expect(wrote).toBe(true);
+    expect(config.channels?.cortex?.id).toBe("111");
+  });
+
+  test("--server profile: writes into the PROFILE's channels map, not top-level", () => {
+    const config = baseConfig();
+    config.servers = { halden: { guildId: HALDEN_GUILD } }; // no channels yet
+    const ctx = resolveServerContext(config, { server: "halden" });
+    const wrote = cacheChannelId(config, ctx, "general", "777");
+    expect(wrote).toBe(true);
+    expect(config.servers?.halden?.channels?.general?.id).toBe("777");
+    // Top-level grove map is left untouched.
+    expect(config.channels).toEqual({ cortex: { id: "111" } });
+  });
+
+  test("bare --guild to a FOREIGN guild: write is DROPPED, top-level map untouched", () => {
+    const config = baseConfig();
+    const ctx = resolveServerContext(config, { guild: COMMUNITY_GUILD });
+    const wrote = cacheChannelId(config, ctx, "cortex", COMMUNITY_CORTEX_ID);
+    expect(wrote).toBe(false);
+    // The grove id must survive — the community id must NOT poison the map.
+    expect(config.channels?.cortex?.id).toBe("111");
+  });
+
+  test("--guild equal to top-level guild: write IS performed (no real override)", () => {
+    const config: DiscordCliConfig = { botToken: "grove-token", guildId: GROVE_GUILD };
+    const ctx = resolveServerContext(config, { guild: GROVE_GUILD });
+    const wrote = cacheChannelId(config, ctx, "cortex", "111");
+    expect(wrote).toBe(true);
+    expect(config.channels?.cortex?.id).toBe("111");
+  });
+
+  // The reviewer's BLOCKER sequence, end-to-end against the pure helpers:
+  // post --guild <community> -c cortex  → then a later no-flag post -c cortex.
+  test("post --guild <community> then a no-flag post resolves in GROVE, not the cached community id", () => {
+    const config = baseConfig();
+
+    // 1) `discord post --guild <community> -c cortex "..."`
+    const guildCtx = resolveServerContext(config, { guild: COMMUNITY_GUILD });
+    // Read gate already skips the cache (effective guild != channels-map guild).
+    expect(cachedChannelId(guildCtx, "cortex")).toBeUndefined();
+    // …it resolves COMMUNITY_CORTEX_ID by name and tries to cache it. The
+    // write-guard must DROP that write so the top-level map stays grove's.
+    const wrote = cacheChannelId(config, guildCtx, "cortex", COMMUNITY_CORTEX_ID);
+    expect(wrote).toBe(false);
+    expect(config.channels?.cortex?.id).toBe("111"); // grove id intact
+
+    // 2) `discord post -c cortex "..."` (next invocation, NO flags)
+    const noFlagCtx = resolveServerContext(config, {});
+    // Cache is valid here (grove==grove), and it must return the GROVE id —
+    // NOT the community id, which never made it into the map.
+    expect(cachedChannelId(noFlagCtx, "cortex")).toBe("111");
+    expect(cachedChannelId(noFlagCtx, "cortex")).not.toBe(COMMUNITY_CORTEX_ID);
+  });
+
+  test("write-guard holds even with no top-level guildId configured", () => {
+    // Defensive: a config that never set guildId. ctx.guildId is undefined →
+    // `!ctx.guildId` short-circuits true → top-level write allowed (there is no
+    // other guild to confuse it with).
+    const config: DiscordCliConfig = { botToken: "t" };
+    const ctx = resolveServerContext(config, {});
+    const wrote = cacheChannelId(config, ctx, "cortex", "111");
+    expect(wrote).toBe(true);
+    expect(config.channels?.cortex?.id).toBe("111");
   });
 });
 
