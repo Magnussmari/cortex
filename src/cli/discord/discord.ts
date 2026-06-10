@@ -9,7 +9,7 @@
 import { Command } from "commander";
 import YAML from "yaml";
 import { loadConfig, saveConfig, getConfigPath } from "./lib/config";
-import { resolveServerContext, registerServerProfile, ServerContextError } from "./lib/server-context";
+import { resolveServerContext, registerServerProfile, ServerContextError, cachedChannelId } from "./lib/server-context";
 import type { ResolvedServerContext, ServerContextOptions } from "./lib/server-context";
 import type { DiscordCliConfig } from "./lib/config";
 import { postMessage, createThreadFromMessage, resolveChannelByName, resolveThreadByName, readMessages, listChannels, listThreads } from "./lib/discord";
@@ -112,11 +112,15 @@ program
       process.exit(1);
     }
 
-    // Resolve channel name → ID (cached in context, or looked up via API).
-    // A cached id posts directly and is guild-agnostic — no resolution needed.
+    // Resolve channel name → ID. A cached id is a Discord snowflake that is
+    // ONLY valid in the guild it was resolved against, so the short-circuit is
+    // gated on the cached map belonging to the effective guild. A bare `--guild`
+    // (or a `--server` profile that inherited the top-level map) leaves the map
+    // tagged with the wrong guild — then we must resolve by NAME in the target
+    // guild instead of trusting the cached id (#838).
     let channelId: string | undefined;
     if (channelName) {
-      channelId = ctx.channels?.[channelName]?.id;
+      channelId = cachedChannelId(ctx, channelName);
       if (!channelId) {
         channelId = await resolveChannelByName(ctx.botToken, ctx.guildId, channelName) ?? undefined;
         if (!channelId && !threadId) {
@@ -203,7 +207,10 @@ program
         process.exit(1);
       }
 
-      let channelId = ctx.channels?.[channelName]?.id;
+      // Same guild-scoped cache gate as `post`: only trust a cached id when its
+      // map belongs to the effective guild, else resolve by name in the target
+      // guild (#838).
+      let channelId = cachedChannelId(ctx, channelName);
       if (!channelId) {
         channelId = await resolveChannelByName(ctx.botToken, ctx.guildId, channelName) ?? undefined;
         if (!channelId) {

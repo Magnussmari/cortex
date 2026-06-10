@@ -16,6 +16,7 @@ import type { DiscordCliConfig } from "../lib/config";
 import {
   resolveServerContext,
   registerServerProfile,
+  cachedChannelId,
   ServerContextError,
 } from "../lib/server-context";
 
@@ -50,6 +51,14 @@ describe("resolveServerContext — back-compat (no flags)", () => {
     expect(ctx.serverName).toBeUndefined();
   });
 
+  test("no flags: channels map is tagged with the effective guild (cache valid)", () => {
+    // With no override the channels map belongs to the effective guild, so the
+    // caller's cached-id short-circuit stays valid (back-compat #838).
+    const ctx = resolveServerContext(baseConfig(), {});
+    expect(ctx.channelsGuildId).toBe(GROVE_GUILD);
+    expect(ctx.channelsGuildId).toBe(ctx.guildId);
+  });
+
   test("no flags on a minimal config (no servers block) is unchanged", () => {
     const config: DiscordCliConfig = {
       botToken: "t",
@@ -75,6 +84,17 @@ describe("resolveServerContext — --guild flag (ISC-C2/C3)", () => {
     expect(ctx.channels).toEqual({ cortex: { id: "111" } });
     expect(ctx.serverName).toBeUndefined();
   });
+
+  test("--guild tags the top-level channels map with the top-level guild (#838)", () => {
+    // The cached channels map still belongs to the TOP-LEVEL guild, not the
+    // override target — channelsGuildId must reflect that so the caller's
+    // cached-id short-circuit can tell the map is for the wrong guild.
+    const ctx = resolveServerContext(baseConfig(), { guild: HALDEN_GUILD });
+    expect(ctx.guildId).toBe(HALDEN_GUILD);
+    expect(ctx.channelsGuildId).toBe(GROVE_GUILD);
+    // Effective guild != channels-map guild → the cache must NOT be trusted.
+    expect(ctx.channelsGuildId).not.toBe(ctx.guildId);
+  });
 });
 
 describe("resolveServerContext — --server profile (ISC-C7/C8)", () => {
@@ -90,6 +110,15 @@ describe("resolveServerContext — --server profile (ISC-C7/C8)", () => {
     expect(ctx.channels).toEqual({ general: { id: "1512054429480648837" } });
   });
 
+  test("--server with its own channels tags them with the profile guild (cache valid)", () => {
+    // A profile that carries its own channels map: the map belongs to the
+    // profile's guild, which IS the effective guild → cache stays trusted.
+    const ctx = resolveServerContext(baseConfig(), { server: "halden" });
+    expect(ctx.guildId).toBe(HALDEN_GUILD);
+    expect(ctx.channelsGuildId).toBe(HALDEN_GUILD);
+    expect(ctx.channelsGuildId).toBe(ctx.guildId);
+  });
+
   test("--server falls back to top-level token/channel when profile omits them", () => {
     const config = baseConfig();
     config.servers = { halden: { guildId: HALDEN_GUILD } };
@@ -98,6 +127,20 @@ describe("resolveServerContext — --server profile (ISC-C7/C8)", () => {
     expect(ctx.botToken).toBe("grove-token"); // fell back to top-level
     expect(ctx.defaultChannel).toBe("cortex"); // fell back to top-level
     expect(ctx.channels).toEqual({ cortex: { id: "111" } });
+  });
+
+  test("--server WITHOUT channels inherits top-level map tagged with the WRONG guild (#838)", () => {
+    // The subtler #838 trap: a profile that omits its channels map inherits the
+    // top-level (grove) map, but the effective guild is the profile's. The
+    // inherited map belongs to grove, NOT the target — channelsGuildId exposes
+    // the mismatch so the caller skips the cache.
+    const config = baseConfig();
+    config.servers = { halden: { guildId: HALDEN_GUILD } };
+    const ctx = resolveServerContext(config, { server: "halden" });
+    expect(ctx.guildId).toBe(HALDEN_GUILD);
+    expect(ctx.channels).toEqual({ cortex: { id: "111" } }); // inherited grove map
+    expect(ctx.channelsGuildId).toBe(GROVE_GUILD); // …but it's grove's map
+    expect(ctx.channelsGuildId).not.toBe(ctx.guildId);
   });
 
   test("--server uses the profile's own token when present", () => {
@@ -116,6 +159,14 @@ describe("resolveServerContext — precedence (ISC-C9)", () => {
     expect(ctx.guildId).toBe(HALDEN_GUILD);
     // profile's channels/defaultChannel still layered in.
     expect(ctx.defaultChannel).toBe("general");
+  });
+
+  test("--guild + matching --server keeps the profile's channels-map guild (cache valid)", () => {
+    // When the explicit --guild equals the profile guild, the profile's own
+    // channels map is still for the effective guild → cache trusted.
+    const ctx = resolveServerContext(baseConfig(), { server: "halden", guild: HALDEN_GUILD });
+    expect(ctx.channelsGuildId).toBe(HALDEN_GUILD);
+    expect(ctx.channelsGuildId).toBe(ctx.guildId);
   });
 });
 
@@ -155,6 +206,56 @@ describe("resolveServerContext — error paths (ISC-C11/C12)", () => {
     } catch (err) {
       expect((err as Error).message).not.toContain("grove-token");
     }
+  });
+});
+
+describe("cachedChannelId — guild-scoped cache gate (#838)", () => {
+  test("no override: cached id IS used (back-compat)", () => {
+    // cortex exists in the top-level grove map; no flags → effective guild ==
+    // channels-map guild → the fast path returns the cached id "111".
+    const ctx = resolveServerContext(baseConfig(), {});
+    expect(cachedChannelId(ctx, "cortex")).toBe("111");
+  });
+
+  test("bare --guild + name in top-level map: cached id is NOT used (the bug)", () => {
+    // This is the exact #838 mis-route: `discord post --guild <other> -c cortex`.
+    // "cortex" exists in grove's map, but the effective guild is HALDEN — the
+    // cached grove id must be skipped so the caller resolves by name in HALDEN.
+    const ctx = resolveServerContext(baseConfig(), { guild: HALDEN_GUILD });
+    expect(ctx.channels?.cortex?.id).toBe("111"); // the trap id is present…
+    expect(cachedChannelId(ctx, "cortex")).toBeUndefined(); // …but NOT returned
+  });
+
+  test("--server with its own channels: cached id IS used", () => {
+    // halden profile carries its own channels map for its own guild → trusted.
+    const ctx = resolveServerContext(baseConfig(), { server: "halden" });
+    expect(cachedChannelId(ctx, "general")).toBe("1512054429480648837");
+  });
+
+  test("--server WITHOUT channels (inherits top-level map): cached id is NOT used", () => {
+    // The subtler trap: profile inherits grove's map but targets HALDEN.
+    const config = baseConfig();
+    config.servers = { halden: { guildId: HALDEN_GUILD } };
+    const ctx = resolveServerContext(config, { server: "halden" });
+    expect(ctx.channels?.cortex?.id).toBe("111");
+    expect(cachedChannelId(ctx, "cortex")).toBeUndefined();
+  });
+
+  test("--guild equal to the top-level guild: cached id IS used (no real override)", () => {
+    // Passing --guild that equals config.guildId is a no-op override — the cache
+    // is still for the right guild, so the fast path stays valid.
+    const ctx = resolveServerContext(baseConfig(), { guild: GROVE_GUILD });
+    expect(cachedChannelId(ctx, "cortex")).toBe("111");
+  });
+
+  test("matching --guild + --server: profile cached id IS used", () => {
+    const ctx = resolveServerContext(baseConfig(), { server: "halden", guild: HALDEN_GUILD });
+    expect(cachedChannelId(ctx, "general")).toBe("1512054429480648837");
+  });
+
+  test("unknown channel name returns undefined even when the cache is valid", () => {
+    const ctx = resolveServerContext(baseConfig(), {});
+    expect(cachedChannelId(ctx, "does-not-exist")).toBeUndefined();
   });
 });
 

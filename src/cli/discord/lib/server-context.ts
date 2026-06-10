@@ -45,8 +45,20 @@ export interface ResolvedServerContext {
   botToken?: string;
   /** Default channel name when none passed on the command line. */
   defaultChannel?: string;
-  /** Cached channel name→id map for guild-agnostic id posting. */
+  /**
+   * Cached channel name→id map. A cached id is a Discord SNOWFLAKE that is only
+   * valid in the guild it was resolved against — see `channelsGuildId`. Callers
+   * MUST gate the cached-id short-circuit on `channelsGuildId === guildId`.
+   */
   channels?: Record<string, ChannelConfig>;
+  /**
+   * The guild the `channels` map belongs to (the guild its cached ids were
+   * resolved against). When this differs from `guildId` — e.g. a bare `--guild`
+   * override, or a `--server` profile that inherited the top-level map — the
+   * cached ids are for the WRONG guild and the caller must resolve by NAME in
+   * the target guild instead of trusting the cache (#838).
+   */
+  channelsGuildId?: string;
   /** Name of the profile applied, when `--server` was used. */
   serverName?: string;
 }
@@ -77,6 +89,12 @@ export function resolveServerContext(
   let defaultChannel = config.defaultChannel;
   let channels = config.channels;
   let serverName: string | undefined;
+  // The guild the `channels` map belongs to. It tracks the SOURCE of the map,
+  // not the effective guild: it advances to a profile's guild only when that
+  // profile supplies its OWN channels map. A bare `--guild` override (Layer 2)
+  // moves `guildId` but NOT this, exposing the cache-is-for-the-wrong-guild
+  // mismatch the caller gates on (#838).
+  let channelsGuildId = config.guildId;
 
   // ── Layer 1: named server profile ────────────────────────────────────────
   if (opts.server) {
@@ -98,7 +116,13 @@ export function resolveServerContext(
     // Optional overrides fall back to the top-level values when absent.
     if (profile.botToken) botToken = profile.botToken;
     if (profile.defaultChannel) defaultChannel = profile.defaultChannel;
-    if (profile.channels) channels = profile.channels;
+    // Only when the profile carries its OWN channels map does that map belong
+    // to the profile's guild. If it inherits the top-level map, the map (and
+    // its `channelsGuildId`) stay grove's — so the caller won't trust it here.
+    if (profile.channels) {
+      channels = profile.channels;
+      channelsGuildId = profile.guildId;
+    }
   }
 
   // ── Layer 2: explicit --guild flag (highest precedence for guildId) ───────
@@ -111,10 +135,34 @@ export function resolveServerContext(
           `resolves to guild ${guildId}. Pass only one, or make them agree.`
       );
     }
+    // Move the effective guild but NOT `channelsGuildId`: a bare `--guild`
+    // never re-tags the inherited channels map. If it equals `channelsGuildId`
+    // already (matching --server, or --guild == top-level) the cache stays
+    // valid; otherwise the caller resolves by name in the target guild.
     guildId = opts.guild;
   }
 
-  return { guildId, botToken, defaultChannel, channels, serverName };
+  return { guildId, botToken, defaultChannel, channels, channelsGuildId, serverName };
+}
+
+/**
+ * Read a cached channel id from a resolved context, honouring the guild scope
+ * of the cache. A cached id is a Discord snowflake valid ONLY in the guild it
+ * was resolved against (`channelsGuildId`); when the effective `guildId` differs
+ * — a bare `--guild` override, or a `--server` profile that inherited the
+ * top-level map — the cache is for the wrong guild and this returns undefined so
+ * the caller resolves by NAME in the target guild instead (#838). With no
+ * override the two guild ids match and the legacy cached-id fast path is kept.
+ *
+ * Pure: no I/O. The single source of truth for "is this cached id trustworthy
+ * for the guild we're about to post to?".
+ */
+export function cachedChannelId(
+  ctx: ResolvedServerContext,
+  channelName: string
+): string | undefined {
+  if (ctx.channelsGuildId !== ctx.guildId) return undefined;
+  return ctx.channels?.[channelName]?.id;
 }
 
 /**
