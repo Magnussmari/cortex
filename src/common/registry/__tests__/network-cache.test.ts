@@ -87,4 +87,43 @@ describe("NetworkCache", () => {
     );
     expect(cache.load("iaw")).toBeUndefined();
   });
+
+  // #850 — enumerate every cached descriptor (the `registered`-lifecycle source).
+  describe("list (#850)", () => {
+    test("returns [] when the cache dir does not exist", () => {
+      const absent = new NetworkCache({
+        cacheDir: join(tmp, "does-not-exist"),
+        logError: noopLog,
+      });
+      expect(absent.list()).toEqual([]);
+    });
+
+    test("returns [] when the cache dir is empty", () => {
+      expect(cache.list()).toEqual([]);
+    });
+
+    test("enumerates every valid cached record", () => {
+      cache.store("iaw", descriptor, roster);
+      const community: NetworkDescriptor = { ...descriptor, network_id: "metafactory-community" };
+      const communityRoster: NetworkRosterResult = { ...roster, network_id: "metafactory-community" };
+      cache.store("metafactory-community", community, communityRoster);
+
+      const ids = cache.list().map((r) => r.descriptor.network_id).sort();
+      expect(ids).toEqual(["iaw", "metafactory-community"]);
+    });
+
+    test("skips a corrupt file rather than throwing or surfacing it", () => {
+      cache.store("iaw", descriptor, roster);
+      writeFileSync(join(tmp, "broken.json"), "{ not json", { encoding: "utf8" });
+
+      const ids = cache.list().map((r) => r.descriptor.network_id);
+      expect(ids).toEqual(["iaw"]); // the corrupt file is dropped
+    });
+
+    test("ignores non-.json files in the cache dir", () => {
+      cache.store("iaw", descriptor, roster);
+      writeFileSync(join(tmp, "README.txt"), "not a cache file", { encoding: "utf8" });
+      expect(cache.list().length).toBe(1);
+    });
+  });
 });

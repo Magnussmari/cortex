@@ -607,13 +607,18 @@ async function runStatus(
     return ok(renderJson(envelopeOk(res.networks)));
   }
   if (res.networks.length === 0) {
-    return ok("cortex network status: no networks joined\n");
+    // #850 — the read now spans cached descriptors too, so an empty result means
+    // neither a joined network NOR a registered (cached) one was found.
+    return ok("cortex network status: no networks joined or registered\n");
   }
   const lines = ["cortex network status:", ""];
   for (const n of res.networks) {
-    lines.push(`  ${n.networkId}  [leaf:${n.leafNode}]  link:${n.link.state}`);
+    // #850 — lead each row with the lifecycle (registered/joined/live/disconnected)
+    // so a registered-but-unjoined network (e.g. metafactory-community) is visible
+    // rather than omitted.
+    lines.push(`  ${n.networkId}  [${n.status}]  [leaf:${n.leafNode}]  link:${n.link.state}`);
     lines.push(`    peers:    ${n.peers.length > 0 ? n.peers.join(", ") : "(none)"}`);
-    lines.push(`    accept:   ${n.acceptSubjects.join(", ")}`);
+    lines.push(`    accept:   ${n.acceptSubjects.length > 0 ? n.acceptSubjects.join(", ") : "(none)"}`);
     lines.push(`    max_hop:  ${n.maxHop.toString()}`);
     if (n.link.inMsgs !== undefined || n.link.outMsgs !== undefined) {
       lines.push(`    counters: in=${(n.link.inMsgs ?? 0).toString()} out=${(n.link.outMsgs ?? 0).toString()}`);

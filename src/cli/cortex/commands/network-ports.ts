@@ -342,6 +342,36 @@ export interface LeafStatePort {
   linkStates(): Promise<Record<string, LeafLinkState>>;
 }
 
+/**
+ * #850 — read-only enumeration of the on-disk network-descriptor cache
+ * (`~/.config/cortex/network-cache/*.json`), the DD-10 last-known-good store S1
+ * writes after a verified fetch. `status` reads this so a network that is
+ * **registered** (descriptor cached) but NOT in this stack's config still
+ * surfaces (lifecycle `registered`), instead of being invisible.
+ *
+ * Sibling of {@link LeafStatePort}: optional + read-only. The live adapter wraps
+ * `NetworkCache.list()`; tests inject fixtures so a unit test never reads a real
+ * `~/.config`. Absent → status reports config-joined networks only (the
+ * pre-#850 behaviour).
+ */
+export interface CachedDescriptorPort {
+  /** Every cached descriptor on disk, narrowed to what status needs. */
+  list(): CachedDescriptor[];
+}
+
+/**
+ * #850 — the slice of a cached network descriptor `status` consumes. The cache
+ * file carries the full descriptor + roster + `cached_at`; status only needs
+ * the id (to dedup against config + key the row) and the roster members (to show
+ * who is in the network for a `registered`-only row that has no config peers).
+ */
+export interface CachedDescriptor {
+  /** Network id (the cache file's `descriptor.network_id`). */
+  networkId: string;
+  /** Roster principal ids (the network's members), for a registered-only row. */
+  members: string[];
+}
+
 /** One network's leaf link state for `status`. */
 export interface LeafLinkState {
   /** ESTABLISHED / connecting / down / unknown. */
@@ -368,4 +398,10 @@ export interface NetworkPorts {
   natsServer?: NatsServerPort;
   /** Optional — status link telemetry. Absent → link state "unknown". */
   leafState?: LeafStatePort;
+  /**
+   * #850 — optional read of the on-disk descriptor cache. Absent → `status`
+   * reports config-joined networks only (no `registered` rows). Present → status
+   * merges cached-only networks in as `registered`.
+   */
+  cachedDescriptors?: CachedDescriptorPort;
 }

@@ -119,6 +119,16 @@ export interface StatusResult {
   reason?: string;
 }
 
+/**
+ * #850 — the lifecycle a network is in, from the union of {cached descriptors,
+ * config networks[], live leaf links}:
+ *   - `registered`   — descriptor cached, NOT in this stack's config.
+ *   - `joined`       — in config, leaf not currently up (connecting / unknown).
+ *   - `live`         — in config and the leaf link is `established`.
+ *   - `disconnected` — in config (or cached) but the leaf reported `down`.
+ */
+export type NetworkLifecycle = "registered" | "joined" | "live" | "disconnected";
+
 export interface StatusNetworkRow {
   networkId: string;
   leafNode: string;
@@ -126,6 +136,8 @@ export interface StatusNetworkRow {
   acceptSubjects: string[];
   maxHop: number;
   link: LeafLinkState;
+  /** #850 — the network's lifecycle (registered/joined/live/disconnected). */
+  status: NetworkLifecycle;
 }
 
 // =============================================================================
@@ -689,9 +701,36 @@ export async function leaveNetwork(
 // =============================================================================
 
 /**
- * Report joined networks: leaf link state (from the optional {@link LeafStatePort},
- * "unknown" when none wired), peers, accept-subjects, and counters. Read-only;
- * never restarts or mutates anything.
+ * Map a config-joined network's leaf link state to its lifecycle (#850):
+ *   - `established` → `live`        (in config AND the leaf is up).
+ *   - `down`        → `disconnected`(in config, leaf reported down/stale).
+ *   - else          → `joined`      (in config, leaf not up yet — connecting,
+ *                                     or unknown because the monitor has no row).
+ *
+ * A cached-only network (not in config) is never passed here — it is
+ * `registered` by definition (see {@link networkStatus}).
+ */
+export function lifecycleForJoined(link: LeafLinkState): NetworkLifecycle {
+  if (link.state === "established") return "live";
+  if (link.state === "down") return "disconnected";
+  // "connecting" / "unknown" — configured (joined) but the leaf is not up.
+  return "joined";
+}
+
+/**
+ * Report the UNION of {cached descriptors, config networks[], live leaf links}
+ * (#850), each row labelled with a lifecycle `status`:
+ *
+ *   - A config-joined network's status comes from its leaf link
+ *     ({@link lifecycleForJoined}): `live` / `disconnected` / `joined`.
+ *   - A cached-only network (descriptor on disk, NOT in this stack's config) is
+ *     `registered` — it exists in the registry but this stack has not joined it.
+ *
+ * Dedup is by network id; a CONFIG-joined network WINS over a cached-only one
+ * (the config carries the live leaf binding + peers; the cache is only the
+ * last-known-good descriptor). Read-only; never restarts or mutates anything.
+ * Degrades gracefully: no `leafState` → link "unknown"; no `cachedDescriptors`
+ * → config networks only (the pre-#850 behaviour).
  */
 export async function networkStatus(ports: NetworkPorts): Promise<StatusResult> {
   const networks = ports.configStore.readNetworks();
@@ -699,20 +738,46 @@ export async function networkStatus(ports: NetworkPorts): Promise<StatusResult> 
     ? await ports.leafState.linkStates()
     : {};
 
-  const rows: StatusNetworkRow[] = networks.map((n) => ({
-    networkId: n.id,
-    leafNode: n.leaf_node,
-    peers: n.peers.map((p) => p.principal_id),
-    acceptSubjects: n.accept_subjects,
-    maxHop: n.max_hop,
+  // Config-joined rows first — they win on a network-id conflict with the cache.
+  const configRows: StatusNetworkRow[] = networks.map((n) => {
     // C-797 — `/leafz` keys each connection by the leaf-node (remote) name, which
     // is NOT necessarily the network id (two networks may share one `leaf_node`,
     // or it may be named independently). Join on `leaf_node` first so a connected
     // leaf reports `established` (up); fall back to the network-id key for the
     // common case where they coincide, then to "unknown" when leafz has no row
     // (monitor genuinely unreachable).
-    link: linkStates[n.leaf_node] ?? linkStates[n.id] ?? { state: "unknown" },
-  }));
+    const link = linkStates[n.leaf_node] ?? linkStates[n.id] ?? { state: "unknown" };
+    return {
+      networkId: n.id,
+      leafNode: n.leaf_node,
+      peers: n.peers.map((p) => p.principal_id),
+      acceptSubjects: n.accept_subjects,
+      maxHop: n.max_hop,
+      link,
+      status: lifecycleForJoined(link),
+    };
+  });
 
-  return { ok: true, networks: rows };
+  // Cached-only rows — descriptor on disk but the network is NOT in config.
+  // These are `registered`: registered with the registry, not joined by this
+  // stack. A config-joined network of the same id already covers it, so skip it.
+  const joinedIds = new Set(networks.map((n) => n.id));
+  const cached = ports.cachedDescriptors?.list() ?? [];
+  const registeredRows: StatusNetworkRow[] = [];
+  for (const d of cached) {
+    if (joinedIds.has(d.networkId)) continue; // config wins — dedup by id.
+    registeredRows.push({
+      networkId: d.networkId,
+      // A registered-only network has no joined leaf — use the network id as the
+      // nominal leaf-node label and no live link (it is not bound to this stack).
+      leafNode: d.networkId,
+      peers: d.members,
+      acceptSubjects: [],
+      maxHop: 0,
+      link: { state: "unknown" },
+      status: "registered",
+    });
+  }
+
+  return { ok: true, networks: [...configRows, ...registeredRows] };
 }

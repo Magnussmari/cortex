@@ -52,6 +52,7 @@ import {
   type ServicePlatform,
 } from "../../../common/nats/nats-service-manager";
 import { NetworkRegistryClient } from "../../../common/registry/network-client";
+import { NetworkCache } from "../../../common/registry/network-cache";
 import {
   findCortexDaemonDescriptor,
   type DaemonLocatorIO,
@@ -73,6 +74,7 @@ import type {
 } from "../../../common/types/cortex-config";
 
 import type {
+  CachedDescriptorPort,
   ConfigStorePort,
   DaemonPort,
   LeafFilePort,
@@ -1099,6 +1101,49 @@ export function buildLeafStatePort(cfg: LivePortsConfig): LeafStatePort {
 }
 
 // =============================================================================
+// #850 — cached-descriptor port (the `registered` lifecycle source)
+// =============================================================================
+
+/**
+ * #850 — resolve the network-descriptor cache dir. The cache (DD-10) is a
+ * principal-level store (keyed by network id, NOT by stack), so it lives BESIDE
+ * the cortex config dir as `<configDir>/network-cache/`. We derive `configDir`
+ * from the threaded `--config` (layout-aware, same as {@link stackConfigPath}),
+ * falling back to `NetworkCache`'s own default (`~/.config/cortex/network-cache`)
+ * when no `--config` is set — the same dir `NetworkRegistryClient` writes to, so
+ * status reads exactly what join cached.
+ */
+function networkCacheDir(cfg: LivePortsConfig): string | undefined {
+  const cortexConfigPath = cfg.cortexConfigPath;
+  if (cortexConfigPath === undefined || cortexConfigPath === "") {
+    // Let NetworkCache apply its own `~/.config/cortex/network-cache` default.
+    return undefined;
+  }
+  const configDir = dirname(expandTilde(cortexConfigPath));
+  return join(configDir, "network-cache");
+}
+
+/**
+ * #850 — the live read of the on-disk descriptor cache. Wraps
+ * `NetworkCache.list()` and narrows each record to {@link CachedDescriptor}
+ * (network id + roster member ids). Read-only; never writes. A missing/corrupt
+ * cache degrades to `[]` inside `NetworkCache` (logged, never thrown), so status
+ * always renders.
+ */
+export function buildCachedDescriptorPort(cfg: LivePortsConfig): CachedDescriptorPort {
+  const cacheDir = networkCacheDir(cfg);
+  const cache = new NetworkCache(cacheDir !== undefined ? { cacheDir } : {});
+  return {
+    list() {
+      return cache.list().map((record) => ({
+        networkId: record.descriptor.network_id,
+        members: record.roster.members.map((m) => m.principal_id),
+      }));
+    },
+  };
+}
+
+// =============================================================================
 // Bundle builders
 // =============================================================================
 
@@ -1113,6 +1158,8 @@ function buildPorts(cfg: LivePortsConfig, mutate: boolean): NetworkPorts {
     // C-797 — always present now (defaults to the local monitor); status reads
     // the authoritative leafz view instead of falling back to link:unknown.
     leafState: buildLeafStatePort(cfg),
+    // #850 — surface `registered` networks (descriptor cached, not in config).
+    cachedDescriptors: buildCachedDescriptorPort(cfg),
   };
 }
 

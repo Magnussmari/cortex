@@ -242,27 +242,42 @@ describe("status", () => {
     expect(res.stderr).toContain("--principal is required");
   });
 
-  test("reports 'no networks joined' when the stack config is absent", async () => {
+  test("reports 'no networks joined or registered' when config + cache are absent", async () => {
     // Point at a principal whose stacks/<slug>.yaml does not exist under the
-    // home config dir. Using a unique slug guarantees absence.
+    // config dir. #850 — status now ALSO reads the descriptor cache, so isolate
+    // $HOME to an empty temp dir: with no config AND no network-cache there are
+    // neither joined nor registered networks. (Before #850 this test read the
+    // real ~/.config/cortex/network-cache, which now carries cached descriptors.)
+    const home = mkdtempSync(join(tmpdir(), "c850-empty-"));
+    tmpDirs.push(home);
+    mkdirSync(join(home, ".config", "cortex"), { recursive: true });
     const uniqueSlug = `s4test${Date.now().toString()}`;
-    const res = await dispatchNetwork([
-      "status",
-      "--principal", "andreas",
-      "--stack", `andreas/${uniqueSlug}`,
-    ]);
+    const res = await withHome(home, () =>
+      dispatchNetwork([
+        "status",
+        "--principal", "andreas",
+        "--stack", `andreas/${uniqueSlug}`,
+        "--monitor-url", "http://127.0.0.1:0",
+      ]),
+    );
     expect(res.exitCode).toBe(0);
-    expect(res.stdout).toContain("no networks joined");
+    expect(res.stdout).toContain("no networks joined or registered");
   });
 
   test("--json emits an envelope", async () => {
+    const home = mkdtempSync(join(tmpdir(), "c850-json-"));
+    tmpDirs.push(home);
+    mkdirSync(join(home, ".config", "cortex"), { recursive: true });
     const uniqueSlug = `s4test${Date.now().toString()}j`;
-    const res = await dispatchNetwork([
-      "status",
-      "--principal", "andreas",
-      "--stack", `andreas/${uniqueSlug}`,
-      "--json",
-    ]);
+    const res = await withHome(home, () =>
+      dispatchNetwork([
+        "status",
+        "--principal", "andreas",
+        "--stack", `andreas/${uniqueSlug}`,
+        "--monitor-url", "http://127.0.0.1:0",
+        "--json",
+      ]),
+    );
     expect(res.exitCode).toBe(0);
     const env = JSON.parse(res.stdout) as { status: string; items: unknown[] };
     expect(env.status).toBe("ok");
@@ -356,9 +371,10 @@ describe("#814 — status resolves the named config-split stack's config", () =>
     expect(res.stdout).toContain("metafactory-community");
   });
 
-  test("monolith on the default path is unchanged — absent config reports 'no networks joined'", async () => {
+  test("monolith on the default path is unchanged — absent config + cache reports 'no networks joined or registered'", async () => {
     // A home with NO config-split dir and no monolith for the slug: the resolver
     // returns <home>/.config/cortex/cortex.<slug>.yaml (absent) → empty read.
+    // #850 — also no network-cache under this temp home → no registered rows.
     const home = mkdtempSync(join(tmpdir(), "c814-mono-"));
     tmpDirs.push(home);
     mkdirSync(join(home, ".config", "cortex"), { recursive: true });
@@ -372,7 +388,7 @@ describe("#814 — status resolves the named config-split stack's config", () =>
     );
 
     expect(res.exitCode).toBe(0);
-    expect(res.stdout).toContain("no networks joined");
+    expect(res.stdout).toContain("no networks joined or registered");
   });
 
   test("#814 review (MAJOR) — monolith default-stack: no --stack resolves cortex.yaml (meta-factory), NOT cortex.default.yaml", async () => {

@@ -20,6 +20,8 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { mkdtempSync, mkdirSync } from "fs";
+import { tmpdir } from "os";
 import { join } from "path";
 
 // import.meta.dir = …/src/__tests__ ; the entrypoint is …/src/cortex.ts
@@ -31,12 +33,12 @@ interface RunResult {
   stderr: string;
 }
 
-async function runCortex(args: string[]): Promise<RunResult> {
+async function runCortex(args: string[], envOverride?: Record<string, string>): Promise<RunResult> {
   const proc = Bun.spawn(["bun", ENTRY, ...args], {
     stdout: "pipe",
     stderr: "pipe",
     // Clean env: no CORTEX_*/GROVE_* instrumentation leaking from the runner.
-    env: { ...process.env, CORTEX_GATEWAY: "" },
+    env: { ...process.env, CORTEX_GATEWAY: "", ...envOverride },
   });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -67,16 +69,24 @@ describe("#752 — network passthrough", () => {
   test("`cortex network status --principal …` is handled by the dispatcher (no commander flag interception)", async () => {
     // status with a unique slug → no networks joined, exit 0. Proves the
     // `--principal` / `--stack` flags reach the dispatcher untouched.
-    const r = await runCortex([
-      "network",
-      "status",
-      "--principal",
-      "andreas",
-      "--stack",
-      `andreas/dispatch${Date.now().toString()}`,
-    ]);
+    // #850 — status now also reads ~/.config/cortex/network-cache, so isolate
+    // $HOME to an empty temp dir (no config, no cache) → genuinely empty output,
+    // independent of the developer's real cached descriptors.
+    const home = mkdtempSync(join(tmpdir(), "cli-dispatch-status-"));
+    mkdirSync(join(home, ".config", "cortex"), { recursive: true });
+    const r = await runCortex(
+      [
+        "network",
+        "status",
+        "--principal",
+        "andreas",
+        "--stack",
+        `andreas/dispatch${Date.now().toString()}`,
+      ],
+      { HOME: home },
+    );
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("no networks joined");
+    expect(r.stdout).toContain("no networks joined or registered");
     expect(r.stdout + r.stderr).not.toContain("cortex: starting");
   });
 });

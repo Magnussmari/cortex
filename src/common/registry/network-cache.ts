@@ -21,9 +21,9 @@
  * return — a missing/corrupt cache file degrades to "no cache", never a throw.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { basename, join } from "path";
 
 import type { NetworkDescriptor, NetworkRosterResult } from "./types";
 
@@ -165,6 +165,51 @@ export class NetworkCache {
       return undefined;
     }
     return parsed;
+  }
+
+  /**
+   * Enumerate EVERY valid cached record under the cache dir (#850). One file
+   * per network; each `<networkId>.json` is loaded + shape-checked via the same
+   * {@link load} gate (so a corrupt/poison file is skipped, not surfaced). The
+   * network id is derived from the filename, then re-validated against the
+   * record's `descriptor.network_id` by `load`'s shape check (a swapped file is
+   * dropped). Returns the records in directory order; a missing cache dir
+   * degrades to `[]` (no cache yet), never a throw — symmetric with `load`.
+   *
+   * This is the read `cortex network status` uses to surface `registered`
+   * networks (descriptor cached but not in this stack's config). It does NOT
+   * verify signatures — a record is only ever WRITTEN after DD-9 verification
+   * (see `store`), so enumeration is a trust extension of that write-time gate.
+   */
+  list(): CachedNetwork[] {
+    let entries: string[];
+    try {
+      entries = readdirSync(this.cacheDir);
+    } catch (err) {
+      // ENOENT is the common, expected case (no cache dir yet) — degrade to no
+      // cache. Any other error (permissions, not-a-dir) is logged but still
+      // degrades to "no cache" so a status read never crashes on a bad dir.
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code !== "ENOENT") {
+        this.logError(
+          `list() readdir failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      return [];
+    }
+
+    const records: CachedNetwork[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      // The filename (minus `.json`) is the network id `pathFor` wrote it under.
+      // `load` re-reads via that same id and shape-checks the record (including
+      // the `descriptor.network_id === networkId` swap guard), so a tampered /
+      // renamed file is dropped rather than mis-attributed.
+      const networkId = basename(entry, ".json");
+      const record = this.load(networkId);
+      if (record !== undefined) records.push(record);
+    }
+    return records;
   }
 
   /** Absolute path to the cache file for `networkId`. */
