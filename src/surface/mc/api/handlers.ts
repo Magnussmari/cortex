@@ -72,6 +72,7 @@ import {
   findLatestSessionForAssignment,
   SHADOW_AGENT_ID,
 } from "../db/sessions";
+import { ensureAgentRow } from "../db/agents";
 import {
   parseGitHubRef,
   canonicalRef,
@@ -539,12 +540,14 @@ function ensureNamedAgent(
   agentName: string | undefined
 ): string {
   const displayName = agentName && agentName.length > 0 ? agentName : agentId;
-  db.query(
-    `INSERT INTO agents (id, name, type, persistent)
-     VALUES (?, ?, 'head', 1)
-     ON CONFLICT(id) DO NOTHING`
-  ).run(agentId, displayName);
-  return agentId;
+  // head / persistent. Insert-only name via the shared ensureAgentRow helper
+  // (S6 DRY pickup, #861 finding 3).
+  return ensureAgentRow(db, {
+    id: agentId,
+    name: displayName,
+    type: "head",
+    persistent: true,
+  });
 }
 
 // F-19 Decision 5 — server-side dispatch debounce.

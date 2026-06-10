@@ -189,6 +189,44 @@ export function broadcastTaskUpdated(
 }
 
 /**
+ * MC-I1.S6 (#848) — projection family the broadcast describes. Mirrors the
+ * `mc.projection` WS message's `family` union (ws/types.ts).
+ */
+export type ProjectionFamily =
+  | "dispatch.lifecycle"
+  | "review.verdict"
+  | "agent.heartbeat"
+  | "attention"
+  | "adapter.health";
+
+/**
+ * MC-I1.S6 (#848) — broadcast an `mc.projection` refresh signal to all connected
+ * dashboard clients after the projection renderer mutated MC state from a bus
+ * envelope. Closes the S4 "projection writes bypass WS fan-out" gap: the
+ * projection's writes (verdicts, heartbeats, federated attention, adapter
+ * health, AND S4's dispatch-lifecycle transitions) now push to live clients the
+ * same way API mutations do, instead of waiting for the next poll/refetch.
+ *
+ * Like `broadcastTransition`, this is a fan-out of an already-committed write —
+ * a REFRESH SIGNAL, not authoritative-by-payload — so clients react with the
+ * existing debounced refetch. `wsRegistry` may be undefined when MC runs without
+ * a live server (tests, headless), in which case this is a no-op.
+ */
+export function broadcastProjection(
+  wsRegistry: WsClientRegistry | undefined,
+  family: ProjectionFamily,
+  refs?: { sessionId?: string; assignmentId?: string }
+): void {
+  if (!wsRegistry) return;
+  wsRegistry.broadcast({
+    type: "mc.projection",
+    family,
+    ...(refs?.sessionId !== undefined && { sessionId: refs.sessionId }),
+    ...(refs?.assignmentId !== undefined && { assignmentId: refs.assignmentId }),
+  });
+}
+
+/**
  * F-12 Decision 11 — process-kill observer.
  *
  * Decisions 5/6/7 all assume a side effect that the existing process-manager
