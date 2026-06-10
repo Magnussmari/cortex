@@ -42,6 +42,7 @@ import {
   filterAgents,
   type NetworkFilterState,
   type NetworkStateFilter,
+  type NetworkScopeFilter,
 } from "../lib/network-graph-filter";
 import { isSpotlightOpenChord } from "../lib/network-spotlight";
 import { NetworkDetailPanel } from "./network-detail-panel";
@@ -105,6 +106,13 @@ export function NetworkView({
     (cap: string | null) => setFilter((f) => ({ ...f, capability: cap })),
     [],
   );
+  // E.4 — scope toggle: include-federated (show local + foreign) vs local-only
+  // (hide every foreign peer agent). Threads onto the SAME filter the adapter +
+  // spotlight read, so flipping it cleanly removes/restores foreign agents.
+  const onScopeChange = useCallback(
+    (scope: NetworkScopeFilter) => setFilter((f) => ({ ...f, scope })),
+    [],
+  );
   const onClearFilters = useCallback(() => setFilter(DEFAULT_NETWORK_FILTER), []);
 
   // D.4 — node-click selection. The canvas lifts the clicked agent's key here;
@@ -125,9 +133,14 @@ export function NetworkView({
     }
   }, [selectedKey, selectedAgent]);
 
+  // D.4 + #909: join the LOCAL working-agents projection ONLY for a LOCAL agent.
+  // A foreign peer agent's dispatch activity lives on ITS stack, not ours — the
+  // working-agents projection is this stack's, so joining it for a foreign agent
+  // would be wrong (and could false-match a same-named local agent_id). Foreign →
+  // null; the detail panel renders "federated peer — activity not local".
   const dispatch = useMemo(
     () =>
-      selectedAgent
+      selectedAgent && selectedAgent.origin === "local"
         ? selectAgentDispatchActivity(workingAgents, selectedAgent.agent_id)
         : null,
     [workingAgents, selectedAgent],
@@ -185,9 +198,9 @@ export function NetworkView({
     <section className="scaffold-section network-view" aria-label="Network (agent topology)">
       <h2>Network</h2>
       <p className="dim network-view-subtitle">
-        Stack-local agent <strong>topology</strong> — the agents on this stack,
-        their declared capabilities, and their liveness, laid out around the
-        stack hub. Cross-stack federated peers arrive in G-1114.E.
+        Agent <strong>topology</strong> — the agents on this stack and any
+        federated peers, their declared capabilities, and their liveness, laid
+        out around each stack&rsquo;s hub. Filter by scope to focus on this stack.
       </p>
 
       {mode === "error" && (
@@ -206,6 +219,7 @@ export function NetworkView({
             capabilityOptions={capabilityOptions}
             onStateChange={onStateChange}
             onCapabilityChange={onCapabilityChange}
+            onScopeChange={onScopeChange}
             onClear={onClearFilters}
             onOpenSpotlight={openSpotlight}
           />
