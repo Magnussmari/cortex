@@ -208,12 +208,38 @@ describe("projectHeartbeat", () => {
     expect(eventsOfType(db, "system.agent.heartbeat").length).toBe(0);
   });
 
-  it("collapses a redelivered tick (same iteration) to one row, appends new ticks", () => {
+  it("keeps EXACTLY ONE heartbeat row per session — N ticks collapse, latest iteration wins", () => {
     seedDispatchAnchor(db);
-    projectHeartbeat(db, makeHeartbeat(1));
-    projectHeartbeat(db, makeHeartbeat(1)); // redelivery
-    projectHeartbeat(db, makeHeartbeat(2)); // new tick
-    expect(eventsOfType(db, "system.agent.heartbeat").length).toBe(2);
+    // A burst of distinct 30s ticks (the unbounded-growth case the #862 review
+    // flagged) MUST stay at one row, carrying the latest iteration's liveness.
+    for (const it of [1, 2, 3, 4, 5]) {
+      projectHeartbeat(db, makeHeartbeat(it));
+    }
+    const evs = eventsOfType(db, "system.agent.heartbeat");
+    expect(evs.length).toBe(1);
+    const payload = JSON.parse(evs[0]!.payload) as { iteration: number };
+    expect(payload.iteration).toBe(5);
+  });
+
+  it("an exact redelivery of the latest tick is idempotent (still one row, same iteration)", () => {
+    seedDispatchAnchor(db);
+    projectHeartbeat(db, makeHeartbeat(3));
+    projectHeartbeat(db, makeHeartbeat(3)); // redelivery of the latest tick
+    const evs = eventsOfType(db, "system.agent.heartbeat");
+    expect(evs.length).toBe(1);
+    expect((JSON.parse(evs[0]!.payload) as { iteration: number }).iteration).toBe(3);
+  });
+
+  it("an out-of-order OLDER tick does NOT regress the recorded liveness", () => {
+    seedDispatchAnchor(db);
+    projectHeartbeat(db, makeHeartbeat(5)); // latest seen
+    const res = projectHeartbeat(db, makeHeartbeat(2)); // reordered older tick
+    // One row, still the newer iteration — the older tick must not overwrite it.
+    const evs = eventsOfType(db, "system.agent.heartbeat");
+    expect(evs.length).toBe(1);
+    expect((JSON.parse(evs[0]!.payload) as { iteration: number }).iteration).toBe(5);
+    // The result reflects the row's retained (newer) iteration, not the stale one.
+    expect(res?.iteration).toBe(5);
   });
 
   it("ignores a non-heartbeat type", () => {

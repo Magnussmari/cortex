@@ -13,12 +13,23 @@
  * when the data can ride an existing surface. A heartbeat lands as an `events`
  * row (type `system.agent.heartbeat`) on the joined session — the working grid's
  * recent-events feed already carries the session's last activity, so "Echo last
- * seen 4s ago" derives from the newest heartbeat event's timestamp + the
- * payload's `last_activity_ms_ago`. No new column, no migration.
+ * seen 4s ago" derives from the heartbeat event's timestamp + the payload's
+ * `last_activity_ms_ago`.
  *
- * Idempotency: each heartbeat is a distinct tick (the `iteration` counter), so
- * we DON'T dedupe on envelope id — a redelivered heartbeat with the same
- * `(correlation_id, iteration)` is collapsed to one row (latest wins per tick).
+ * **One latest-heartbeat row per session (#862 review — bounded growth).**
+ * Liveness only needs "last seen", and `system.agent.heartbeat` is the busiest
+ * event source in the system (a 30 s tick → ~120 rows/hr/session), with NO
+ * server-side `events` retention. Appending a fresh row per tick would silently
+ * make heartbeats the dominant table writer and grow linearly with session
+ * duration (events#864). So we keep EXACTLY ONE heartbeat event per session:
+ *   - INSERT when the session has no heartbeat row yet;
+ *   - UPDATE that single row in place on every later tick (payload + timestamp
+ *     refreshed) — O(1) per session, not O(ticks).
+ * The update is GUARDED on `iteration`: an out-of-order OLDER tick (a redelivered
+ * or reordered earlier heartbeat) MUST NOT regress the row to stale liveness, so
+ * we only overwrite when the incoming `iteration` is `>=` the stored one. (`>=`
+ * not `>`: an exact redelivery of the latest tick is idempotently re-applied,
+ * which is harmless and keeps the timestamp fresh.)
  *
  * No-op when no dispatch anchor exists for the correlation_id: a heartbeat for a
  * task MC never saw projected (e.g. the `started` was lost AND no terminal has
@@ -31,9 +42,9 @@
 import type { Database } from "bun:sqlite";
 
 import { insertEvent } from "../db/events";
+import { findAnchorSession } from "./anchor";
 
 const HEARTBEAT_TYPE = "system.agent.heartbeat";
-const ANCHOR_TASK_PREFIX = "mc-dispatch-task-";
 
 export interface ProjectableHeartbeatEnvelope {
   id?: string;
@@ -45,22 +56,19 @@ export interface ProjectableHeartbeatEnvelope {
 export interface HeartbeatProjectionResult {
   /** MC session the liveness touch landed on. */
   sessionId: string;
-  /** The heartbeat tick iteration. */
+  /** The heartbeat tick iteration now recorded on the session's liveness row. */
   iteration: number;
   /** ms since last activity, echoed from the payload. */
   lastActivityMsAgo: number;
-  /** The MC event id created (or updated). */
+  /** The MC event id created (or updated in place). */
   eventId: string;
-}
-
-function anchorTaskId(correlationId: string): string {
-  return `${ANCHOR_TASK_PREFIX}${correlationId}`;
 }
 
 /**
  * Project one `system.agent.heartbeat` envelope into a liveness touch. Returns
- * null for a non-heartbeat type, a malformed payload, or an unjoinable
- * heartbeat (no projected dispatch anchor).
+ * null for a non-heartbeat type, a malformed payload, an unjoinable heartbeat
+ * (no projected dispatch anchor), or an out-of-order OLDER tick that would
+ * regress the session's recorded liveness.
  */
 export function projectHeartbeat(
   db: Database,
@@ -101,20 +109,27 @@ export function projectHeartbeat(
       correlation_id: correlationId,
     };
 
-    // Collapse to one row per (session, iteration): a redelivered tick updates
-    // the existing row's payload rather than appending a duplicate. Distinct
-    // ticks (new iteration) append fresh, giving the grid a monotonic liveness
-    // trail without unbounded growth on redelivery.
+    // ONE latest-heartbeat row per session. Find the session's existing
+    // heartbeat row (there is at most one — this invariant is maintained here).
     const existing = db
       .query(
-        `SELECT id FROM events
+        `SELECT id, json_extract(payload, '$.iteration') AS iteration
+         FROM events
          WHERE session_id = ? AND type = ?
-           AND json_extract(payload, '$.iteration') = ?
          LIMIT 1`,
       )
-      .get(sessionId, HEARTBEAT_TYPE, iteration) as { id: string } | null;
+      .get(sessionId, HEARTBEAT_TYPE) as
+      | { id: string; iteration: number | null }
+      | null;
 
     if (existing !== null) {
+      const storedIteration =
+        typeof existing.iteration === "number" ? existing.iteration : -1;
+      // Out-of-order OLDER tick → do NOT regress the recorded liveness. `>=`
+      // tolerates an exact redelivery of the latest tick (idempotent refresh).
+      if (iteration < storedIteration) {
+        return { sessionId, iteration: storedIteration, lastActivityMsAgo, eventId: existing.id };
+      }
       db.query(
         `UPDATE events SET payload = ?, timestamp = ? WHERE id = ?`,
       ).run(
@@ -134,20 +149,6 @@ export function projectHeartbeat(
   });
 
   return txn();
-}
-
-function findAnchorSession(db: Database, correlationId: string): string | null {
-  const row = db
-    .query(
-      `SELECT s.id AS session_id
-       FROM agent_task_assignment a
-       JOIN sessions s ON s.assignment_id = a.id
-       WHERE a.task_id = ?
-       ORDER BY s.started_at DESC, s.id DESC
-       LIMIT 1`,
-    )
-    .get(anchorTaskId(correlationId)) as { session_id: string } | null;
-  return row ? row.session_id : null;
 }
 
 function asString(value: unknown): string | null {

@@ -5,6 +5,14 @@
  * shapes. Clients check `protocolVersion` on the `connected` handshake to
  * detect incompatibility.
  *
+ * ADDITIVE frame types are BACK-COMPAT — NOT a version bump. The client
+ * dispatcher (dashboard-v2 `use-websocket.ts`) is a type-keyed subscription map
+ * (`subs.get(parsed.type)?.forEach(...)`), so a frame `type` an older client
+ * doesn't know finds no handler and no-ops (falling through only to an opt-in
+ * `"*"` wildcard). Only a BREAKING change to an EXISTING frame's shape bumps
+ * `WS_PROTOCOL_VERSION`. (E.g. MC-I1.S6's `mc.projection` frame is additive and
+ * intentionally ships without a bump.)
+ *
  * v2 (cortex#436): the input/curation event kinds were renamed to
  * `principal.input` / `principal.curation`; the identity field was renamed
  * to `principalId`. Clients must read the principal.* kinds.

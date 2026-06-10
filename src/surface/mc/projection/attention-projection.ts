@@ -89,6 +89,22 @@ export function projectAttention(
   // Gate: federated only. A missing subject (direct test call without the
   // router) is treated as non-federated — the renderer always passes one in
   // production, and a subject-less call has no provenance to trust as federated.
+  //
+  // PROVENANCE (#862 review): this projection trusts the post-gate `federated.`
+  // subject and does NOT re-verify signatures — that is the correct layering.
+  // The surface-router's `evaluateFederationGate` is the SINGLE ingress trust
+  // boundary for `federated.*` envelopes: it resolves the source principal →
+  // `peers[]` membership, cross-checks the delivering leaf link for anti-spoof,
+  // and applies the network's accept/deny patterns + hop budget BEFORE any
+  // `render()` fires. Re-verifying the signed_by chain in every consumer would
+  // be wrong duplication (mirrors how every other renderer consumes the bus).
+  // CAVEAT: that gate is OPT-IN — it engages only when `policy.federated.networks[]`
+  // is configured (`federatedNetworksById.size > 0`). On a network-joined stack
+  // with no `federated:` policy block, a `federated.*` subject passes ungated
+  // and this projection ingests it on subject-prefix alone. That is the
+  // ecosystem-wide renderer posture (not a regression here), but flagged because
+  // this is the first projection to write federated peer data into a
+  // principal-visible queue.
   if (!subject?.startsWith("federated.")) return null;
 
   const action = attentionAction(envelope.type);

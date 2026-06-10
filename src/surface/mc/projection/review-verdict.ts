@@ -35,6 +35,7 @@ import type { Database } from "bun:sqlite";
 import { insertEvent } from "../db/events";
 import { ensureAgentRow } from "../db/agents";
 import { registerOrphanSession } from "../db/sessions";
+import { findAnchorSession } from "./anchor";
 
 /** The three verdict kinds (mirror `bus/review-events.ts:ReviewVerdictKind`). */
 const VERDICT_KINDS = new Set(["approved", "changes-requested", "commented"]);
@@ -58,13 +59,7 @@ export interface VerdictProjectionResult {
   eventId: string;
 }
 
-const ANCHOR_TASK_PREFIX = "mc-dispatch-task-";
 const VERDICT_EVENT_TYPE = "review.verdict";
-
-/** Deterministic dispatch anchor task id (must match dispatch-lifecycle.ts). */
-function anchorTaskId(correlationId: string): string {
-  return `${ANCHOR_TASK_PREFIX}${correlationId}`;
-}
 
 /**
  * Project one `review.verdict.*` envelope into MC. Returns null for any
@@ -164,21 +159,6 @@ export function projectReviewVerdict(
 // ---------------------------------------------------------------------------
 // Joins
 // ---------------------------------------------------------------------------
-
-/** Find the dispatch anchor's session for a correlation_id (via the anchor task). */
-function findAnchorSession(db: Database, correlationId: string): string | null {
-  const row = db
-    .query(
-      `SELECT s.id AS session_id
-       FROM agent_task_assignment a
-       JOIN sessions s ON s.assignment_id = a.id
-       WHERE a.task_id = ?
-       ORDER BY s.started_at DESC, s.id DESC
-       LIMIT 1`,
-    )
-    .get(anchorTaskId(correlationId)) as { session_id: string } | null;
-  return row ? row.session_id : null;
-}
 
 function findSessionByCcId(db: Database, ccSessionId: string): string | null {
   const row = db
