@@ -63,7 +63,11 @@
  * `events.session_id → sessions.id` FK, no event re-write), drop the now-empty
  * projected placeholder session, transition the projected assignment, and
  * delete the orphan's emptied assignment. This is cheaper than re-pointing N
- * events and preserves every hook event + its CASCADE. The orphan's shared
+ * events and preserves every HOOK event (they ride the orphan session's FK).
+ * What is NOT preserved verbatim: the placeholder's own `state.transition`
+ * events CASCADE away with its DELETE, and `driveToTerminal` re-synthesizes
+ * the start→terminal pair on the adopted row at TERMINAL-time timestamps —
+ * transition history is reconstructed, not carried over. The orphan's shared
  * catch-all task/agent are bookkeeping and left in place (idempotent, shared).
  */
 
@@ -427,6 +431,12 @@ function backfillCcSessionId(db: Database, params: BackfillParams): string {
   // 2. Re-point the orphan session onto the projected assignment and stamp the
   //    authoritative cc_session_id (idempotent — it already equals ccSessionId,
   //    but the SET keeps the write explicit and survives a provisional mismatch).
+  //    INTENTIONAL INVARIANT: the adopted session stays OPEN (`ended_at` NULL)
+  //    after the terminal transition — sessions are closed by the ingestor's
+  //    convention (hook Stop), not by lifecycle projection, so late-arriving
+  //    hook events still ingest. The open row keeps occupying the
+  //    `idx_sessions_active_cc_session_id` partial index by design: it IS the
+  //    one active row for that cc_session_id.
   db.query(
     `UPDATE sessions SET assignment_id = ?, cc_session_id = ? WHERE id = ?`,
   ).run(params.projectedAssignmentId, params.ccSessionId, orphan.sessionId);

@@ -65,6 +65,9 @@ export const DISPATCH_PROJECTION_RENDERER_ID = "mc-dispatch-projection";
 export const DISPATCH_PROJECTION_SUBJECTS: string[] = [
   "local.*.dispatch.task.*",
   "local.*.*.dispatch.task.*",
+  // Deliberately NO stack-less federated twin: the federated grammar is always
+  // `federated.{principal}.{stack}.…` (ADR-0001 / CONTEXT.md §Subject) — the
+  // stack-less variant exists only as the legacy LOCAL shape.
   "federated.*.*.dispatch.task.*",
 ];
 
