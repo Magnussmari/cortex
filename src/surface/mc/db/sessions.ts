@@ -5,6 +5,7 @@
 import type { Database } from "bun:sqlite";
 import type { EndpointKind, Session } from "../types";
 import { generateId } from "./events";
+import { ensureAgentRow } from "./agents";
 
 export function createSession(
   db: Database,
@@ -278,12 +279,9 @@ function ensureOrphanAgent(
   // empty agent_name values): this fallback must hold for ANY caller, not
   // just the ingestor path.
   const name = displayName && displayName.length > 0 ? displayName : ccSessionId;
-  db.query(
-    `INSERT INTO agents (id, name, type, persistent)
-     VALUES (?, ?, 'head', 0)
-     ON CONFLICT(id) DO NOTHING`
-  ).run(id, name);
-  return id;
+  // head / non-persistent (per-orphan ephemeral agent). Insert-only name via
+  // the shared ensureAgentRow helper (S6 DRY pickup, #861 finding 3).
+  return ensureAgentRow(db, { id, name, type: "head", persistent: false });
 }
 
 export interface OrphanSession {

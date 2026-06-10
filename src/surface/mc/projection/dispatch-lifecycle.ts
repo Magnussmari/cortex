@@ -74,6 +74,7 @@
 import type { Database } from "bun:sqlite";
 
 import { generateId } from "../db/events";
+import { ensureAgentRow } from "../db/agents";
 import { applyTransition } from "../db/transitions";
 import type { AssignmentState } from "../types";
 
@@ -303,13 +304,15 @@ function ensureAnchor(
     ANCHOR_TASK_SOURCE_SYSTEM,
   );
 
-  // The dispatched agent. `head` type (it runs a task) — insert-only name so a
-  // principal-edited display name is never overwritten, matching ensureNamedAgent.
-  db.query(
-    `INSERT INTO agents (id, name, type, persistent)
-     VALUES (?, ?, 'head', 1)
-     ON CONFLICT(id) DO NOTHING`,
-  ).run(params.agentId, params.agentId);
+  // The dispatched agent. `head` type (it runs a task), persistent — insert-only
+  // name via the shared ensureAgentRow helper (S6 DRY pickup, #861 finding 3) so
+  // a principal-edited display name is never overwritten, matching ensureNamedAgent.
+  ensureAgentRow(db, {
+    id: params.agentId,
+    name: params.agentId,
+    type: "head",
+    persistent: true,
+  });
 
   const assignmentId = generateId();
   const sessionId = generateId();

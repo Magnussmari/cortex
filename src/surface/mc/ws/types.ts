@@ -79,6 +79,26 @@ export type WsServerMessage =
   // Backend now broadcasts a fresh `TaskListItem` (re-read with the
   // updated denorm) so subscribers replace the row in place.
   | { type: "task.updated"; task: TaskListItem }
+  // MC-I1.S6 (#848) — bus→MC projection signal. Emitted when the projection
+  // renderer mutates MC state from a bus envelope (verdict, heartbeat,
+  // federated attention, adapter health, or a dispatch-lifecycle transition).
+  // Carries the projected `family` + the optional joined session/assignment so
+  // a client can scope its refetch. Like `state.transition`, it's a REFRESH
+  // SIGNAL — the authoritative rows come from the REST API on refetch, not from
+  // this frame's fields — so it reuses the existing debounced-refetch pattern
+  // rather than inventing an authoritative-by-payload protocol. Closes the S4
+  // "projection writes bypass WS fan-out" gap.
+  | {
+      type: "mc.projection";
+      family:
+        | "dispatch.lifecycle"
+        | "review.verdict"
+        | "agent.heartbeat"
+        | "attention"
+        | "adapter.health";
+      sessionId?: string;
+      assignmentId?: string;
+    }
   | { type: "pong" }
   | { type: "ping" }
   | {

@@ -21,10 +21,19 @@ import { startServer } from "./server";
 import { ProcessManager } from "./session/process-manager";
 import { HookStreamPoller } from "./hooks/poller";
 import type { Config } from "./types";
+import type { WsClientRegistry } from "./ws/client-registry";
 
 export interface MissionControlHandle {
   db: Database;
   port: number;
+  /**
+   * The live WebSocket client registry (MC-I1.S6, #848). Exposed so the bus→MC
+   * projection renderer can broadcast `mc.projection` refresh signals to live
+   * dashboard clients on a projected mutation — closing the S4 "projection
+   * writes bypass WS fan-out" gap. The cockpit/API mutation paths reach the
+   * SAME registry; the projection reuses the existing broadcast helpers.
+   */
+  wsRegistry: WsClientRegistry;
   stop(): Promise<void>;
 }
 
@@ -97,7 +106,7 @@ export async function startMissionControl(
     // callers (the cockpit refresh loop's baseUrl) need the real listen port.
     // Bun.serve guarantees a numeric `port` once started; the `?? config.port`
     // coalesce only satisfies the optional type on `Server.port`.
-    return { db, port: server.port ?? config.port, stop };
+    return { db, port: server.port ?? config.port, wsRegistry, stop };
   } catch (err) {
     // Reverse-order teardown of whatever was constructed before the throw.
     hookPoller?.stop();

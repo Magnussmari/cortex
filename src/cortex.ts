@@ -2686,16 +2686,19 @@ export async function startCortex(
       mcDb = mcHandle.db;
       console.log(`cortex: Mission Control embed listening on http://localhost:${mcHandle.port} — db ${dbPath}`);
 
-      // MC-I1.S4 (ADR-0005 §3/§4) — register the bus→MC projection renderer so
-      // `dispatch.task.*` lifecycle envelopes land as session/assignment rows on
-      // the working grid. The seam is a surface-router renderer (§4), subscribing
-      // to the dispatch-lifecycle subjects only; its render() is non-throwing
-      // (the surface-router isolates errors too, but the renderer owns the
-      // contract). S6 (#848) extends the same renderer's project() dispatcher to
-      // verdicts / attention / heartbeats. No restart-on-config — like every
-      // renderer, the registration is static for the daemon's lifetime.
-      router.register(createDispatchProjectionRenderer(mcDb));
-      console.log("cortex: Mission Control dispatch-lifecycle projection renderer registered");
+      // MC-I1.S4/S6 (ADR-0005 §3/§4) — register the bus→MC projection renderer.
+      // The seam is a surface-router renderer (§4) with a single project()
+      // dispatcher: S4 lands `dispatch.task.*` lifecycle envelopes as
+      // session/assignment rows; S6 (#848) generalises it to review verdicts,
+      // agent heartbeats, federated attention, and adapter health. Its render()
+      // is non-throwing (the surface-router isolates errors too, but the
+      // renderer owns the contract). The embed's `wsRegistry` is threaded in so
+      // projected mutations broadcast `mc.projection` refresh signals to live
+      // dashboard clients (S6 — closes the S4 WS fan-out gap). No
+      // restart-on-config — like every renderer, the registration is static for
+      // the daemon's lifetime.
+      router.register(createDispatchProjectionRenderer(mcDb, mcHandle.wsRegistry));
+      console.log("cortex: Mission Control bus→MC projection renderer registered (dispatch + verdicts + heartbeats + attention + adapter health)");
     } catch (err) {
       console.error("cortex: Mission Control embed startup error (non-fatal):", err instanceof Error ? err.message : err);
     }

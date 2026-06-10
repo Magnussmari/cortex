@@ -66,6 +66,14 @@ describe("startMissionControl (embed)", () => {
     // The handle exposes the live db handle (the cockpit loop consumes it).
     expect(handle.db).toBeDefined();
     expect(() => handle!.db.query("SELECT 1").get()).not.toThrow();
+
+    // MC-I1.S6 (#848) — the handle exposes the live WebSocket registry so the
+    // bus→MC projection renderer can broadcast `mc.projection` refresh signals
+    // to live dashboard clients. It must be the SAME registry the server's
+    // hooks/API use (broadcast() callable, starts with zero clients).
+    expect(handle.wsRegistry).toBeDefined();
+    expect(typeof handle.wsRegistry.broadcast).toBe("function");
+    expect(handle.wsRegistry.size).toBe(0);
   });
 
   it("releases the port on stop()", async () => {

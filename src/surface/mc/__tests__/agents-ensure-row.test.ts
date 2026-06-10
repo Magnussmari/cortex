@@ -1,0 +1,141 @@
+/**
+ * MC-I1.S6 (#848) — tests for the `ensureAgentRow` DRY helper (the deferred
+ * #861-review finding-3 pickup) AND the three call sites it now backs.
+ *
+ * The helper itself: insert-only-name idempotency + the type/persistent
+ * parameterisation. The call sites: behaviour-unchanged proof that
+ * `ensureNamedAgent` / `ensureOrphanAgent` / the dispatch anchor still land
+ * the SAME rows they did before the extraction.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
+
+import { SCHEMA_SQL } from "../db/schema";
+import { ensureAgentRow } from "../db/agents";
+import { registerOrphanSession, orphanAgentId } from "../db/sessions";
+import { projectDispatchLifecycle } from "../projection/dispatch-lifecycle";
+import {
+  createDispatchTaskStartedEvent,
+  type DispatchEventSource,
+} from "../../../bus/dispatch-events";
+
+const SOURCE: DispatchEventSource = {
+  principal: "andreas",
+  agent: "cortex",
+  instance: "local",
+};
+const TASK_ID = "44444444-4444-4444-8444-444444444444";
+
+function setupDb(): Database {
+  const db = new Database(":memory:");
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+  for (const sql of SCHEMA_SQL) db.exec(sql);
+  return db;
+}
+
+interface AgentRow {
+  id: string;
+  name: string;
+  type: string;
+  persistent: number;
+}
+
+function agent(db: Database, id: string): AgentRow | null {
+  return db
+    .query(`SELECT id, name, type, persistent FROM agents WHERE id = ?`)
+    .get(id) as AgentRow | null;
+}
+
+describe("ensureAgentRow", () => {
+  let db: Database;
+  beforeEach(() => {
+    db = setupDb();
+  });
+  afterEach(() => {
+    db.close();
+  });
+
+  it("inserts a head/persistent agent", () => {
+    ensureAgentRow(db, { id: "echo", name: "Echo", type: "head", persistent: true });
+    expect(agent(db, "echo")).toEqual({
+      id: "echo",
+      name: "Echo",
+      type: "head",
+      persistent: 1,
+    });
+  });
+
+  it("inserts a hands/non-persistent agent", () => {
+    ensureAgentRow(db, { id: "worker", name: "Worker", type: "hands", persistent: false });
+    expect(agent(db, "worker")).toEqual({
+      id: "worker",
+      name: "Worker",
+      type: "hands",
+      persistent: 0,
+    });
+  });
+
+  it("is insert-only on the name — a second call never clobbers a principal-edited name", () => {
+    ensureAgentRow(db, { id: "luna", name: "Luna", type: "head", persistent: true });
+    // Principal renames the agent out-of-band.
+    db.query(`UPDATE agents SET name = ? WHERE id = ?`).run("Luna (renamed)", "luna");
+    // A re-dispatch calls ensureAgentRow again with the ORIGINAL name.
+    ensureAgentRow(db, { id: "luna", name: "Luna", type: "head", persistent: true });
+    expect(agent(db, "luna")?.name).toBe("Luna (renamed)");
+  });
+
+  it("is idempotent — repeated calls do not create duplicate rows", () => {
+    ensureAgentRow(db, { id: "echo", name: "Echo", type: "head", persistent: true });
+    ensureAgentRow(db, { id: "echo", name: "Echo", type: "head", persistent: true });
+    const n = (
+      db.query(`SELECT COUNT(*) AS n FROM agents WHERE id = 'echo'`).get() as {
+        n: number;
+      }
+    ).n;
+    expect(n).toBe(1);
+  });
+});
+
+describe("ensureAgentRow — call sites behaviour unchanged", () => {
+  let db: Database;
+  beforeEach(() => {
+    db = setupDb();
+  });
+  afterEach(() => {
+    db.close();
+  });
+
+  it("registerOrphanSession still lands a head/non-persistent agent (ensureOrphanAgent path)", () => {
+    const cc = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    registerOrphanSession(db, cc, "Andreas");
+    const row = agent(db, orphanAgentId(cc));
+    expect(row).not.toBeNull();
+    expect(row?.type).toBe("head");
+    expect(row?.persistent).toBe(0);
+    expect(row?.name).toBe("Andreas");
+  });
+
+  it("registerOrphanSession falls back to the cc_session_id when no name (ensureOrphanAgent path)", () => {
+    const cc = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    registerOrphanSession(db, cc);
+    expect(agent(db, orphanAgentId(cc))?.name).toBe(cc);
+  });
+
+  it("the dispatch anchor still lands a head/persistent agent (S4 copy path)", () => {
+    projectDispatchLifecycle(
+      db,
+      createDispatchTaskStartedEvent({
+        source: SOURCE,
+        taskId: TASK_ID,
+        agentId: "echo",
+        startedAt: new Date("2026-06-10T12:00:00.000Z"),
+      }),
+    );
+    const row = agent(db, "echo");
+    expect(row).not.toBeNull();
+    expect(row?.type).toBe("head");
+    expect(row?.persistent).toBe(1);
+  });
+});
