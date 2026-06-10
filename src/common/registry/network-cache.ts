@@ -132,17 +132,41 @@ export class NetworkCache {
    * than crashing on a poison file.
    */
   load(networkId: string): CachedNetwork | undefined {
+    return this.readRecordAt(this.pathFor(networkId), networkId, `load(${networkId})`);
+  }
+
+  /**
+   * Read + parse + shape-validate the cache file at an EXPLICIT `path`, checking
+   * its `network_id` against `expectedNetworkId`. NEVER throws — every failure
+   * (missing file, unreadable, bad JSON, failed shape/version/swap guard) logs
+   * and returns `undefined` (fail-closed). `label` prefixes the log line.
+   *
+   * Reading by explicit path (rather than re-deriving via {@link pathFor}) is
+   * what lets {@link list} enumerate every on-disk file faithfully: `pathFor`
+   * SANITIZES its argument (`[^a-z0-9-] → _`), so round-tripping a non-canonical
+   * filename (`Foo.json`, `a.b.json`) through it would resolve to a DIFFERENT
+   * path and silently miss the real file. `list` reads the actual entry directly
+   * and passes the basename as the expected id so the swap guard still fires.
+   */
+  private readRecordAt(
+    path: string,
+    expectedNetworkId: string,
+    label: string,
+  ): CachedNetwork | undefined {
     let text: string;
     try {
-      text = readFileSync(this.pathFor(networkId), { encoding: "utf8" });
+      text = readFileSync(path, { encoding: "utf8" });
     } catch (err) {
       // ENOENT is the common, expected case (no cache yet) — log at the same
       // fidelity as other misses so a silent "why is there no cache" is still
-      // observable, but it is not an error condition for the caller.
+      // observable, but it is not an error condition for the caller. Any other
+      // read failure (permissions, a dangling/broken symlink → ENOENT/ELOOP, a
+      // directory in the entry slot → EISDIR) also degrades to a drop, never a
+      // throw.
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (code !== "ENOENT") {
         this.logError(
-          `load(${networkId}) read failed: ${err instanceof Error ? err.message : String(err)}`,
+          `${label} read failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
       return undefined;
@@ -153,14 +177,14 @@ export class NetworkCache {
       parsed = JSON.parse(text);
     } catch (err) {
       this.logError(
-        `load(${networkId}) JSON parse failed: ${err instanceof Error ? err.message : String(err)}`,
+        `${label} JSON parse failed: ${err instanceof Error ? err.message : String(err)}`,
       );
       return undefined;
     }
 
-    if (!isCachedNetwork(parsed, networkId)) {
+    if (!isCachedNetwork(parsed, expectedNetworkId)) {
       this.logError(
-        `load(${networkId}) cache file failed shape/version check; ignoring`,
+        `${label} cache file failed shape/version check; ignoring`,
       );
       return undefined;
     }
@@ -169,12 +193,17 @@ export class NetworkCache {
 
   /**
    * Enumerate EVERY valid cached record under the cache dir (#850). One file
-   * per network; each `<networkId>.json` is loaded + shape-checked via the same
-   * {@link load} gate (so a corrupt/poison file is skipped, not surfaced). The
-   * network id is derived from the filename, then re-validated against the
-   * record's `descriptor.network_id` by `load`'s shape check (a swapped file is
-   * dropped). Returns the records in directory order; a missing cache dir
-   * degrades to `[]` (no cache yet), never a throw — symmetric with `load`.
+   * per network; each `*.json` entry is read DIRECTLY at its actual path and
+   * shape-checked the same way {@link load} validates a single record (so a
+   * corrupt/poison file is dropped, not surfaced). The expected `network_id`
+   * for the swap guard is the file's basename — but we read the file at its real
+   * `join(cacheDir, entry)` path rather than re-deriving it via {@link pathFor}.
+   * `pathFor` SANITIZES its argument, so round-tripping a non-canonical filename
+   * (`Foo.json`, `a.b.json`) through `load` would resolve to a DIFFERENT path
+   * and silently miss the file; reading the entry directly enumerates it
+   * faithfully, and the swap guard then drops it if its `network_id` does not
+   * match the basename (fail-closed). A missing cache dir degrades to `[]` (no
+   * cache yet), never a throw — symmetric with `load`.
    *
    * This is the read `cortex network status` uses to surface `registered`
    * networks (descriptor cached but not in this stack's config). It does NOT
@@ -201,12 +230,15 @@ export class NetworkCache {
     const records: CachedNetwork[] = [];
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
-      // The filename (minus `.json`) is the network id `pathFor` wrote it under.
-      // `load` re-reads via that same id and shape-checks the record (including
-      // the `descriptor.network_id === networkId` swap guard), so a tampered /
-      // renamed file is dropped rather than mis-attributed.
-      const networkId = basename(entry, ".json");
-      const record = this.load(networkId);
+      // Read the ACTUAL file (no pathFor round-trip — see jsdoc). The basename is
+      // the expected `network_id` for the swap guard; a file whose record names a
+      // different network (or fails shape/version) is dropped fail-closed.
+      const expectedNetworkId = basename(entry, ".json");
+      const record = this.readRecordAt(
+        join(this.cacheDir, entry),
+        expectedNetworkId,
+        `list(${entry})`,
+      );
       if (record !== undefined) records.push(record);
     }
     return records;

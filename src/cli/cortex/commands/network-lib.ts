@@ -779,5 +779,11 @@ export async function networkStatus(ports: NetworkPorts): Promise<StatusResult> 
     });
   }
 
+  // Sort the registered (cached-only) rows by network id so human + JSON output
+  // is STABLE across machines — `readdirSync` (the cache enumeration source) is
+  // not order-guaranteed. The config-joined rows are NOT reordered: they keep
+  // the principal's authored `policy.federated.networks[]` order.
+  registeredRows.sort((a, b) => a.networkId.localeCompare(b.networkId));
+
   return { ok: true, networks: [...configRows, ...registeredRows] };
 }

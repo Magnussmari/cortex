@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -124,6 +124,64 @@ describe("NetworkCache", () => {
       cache.store("iaw", descriptor, roster);
       writeFileSync(join(tmp, "README.txt"), "not a cache file", { encoding: "utf8" });
       expect(cache.list().length).toBe(1);
+    });
+
+    // Review #1 — a non-canonical filename must be ENUMERATED + validated by
+    // reading the entry directly, NOT silently missed via a pathFor round-trip
+    // (pathFor sanitizes `[^a-z0-9-] → _`, so `load("Foo")` would look at
+    // `Foo.json` → `_oo`? no — `F`→`_`, i.e. `_oo.json`, a different path).
+    test("enumerates a non-canonical filename whose record matches its basename", () => {
+      // `Foo.json` — uppercase basename. Its record's network_id MUST equal the
+      // basename "Foo" for the swap guard to admit it. (A real cache never writes
+      // such a name; this proves list() reads the actual file, not a sanitized one.)
+      const fooDescriptor: NetworkDescriptor = { ...descriptor, network_id: "Foo" };
+      const fooRoster: NetworkRosterResult = { ...roster, network_id: "Foo" };
+      writeFileSync(
+        join(tmp, "Foo.json"),
+        JSON.stringify({
+          schema_version: 1,
+          cached_at: new Date().toISOString(),
+          descriptor: fooDescriptor,
+          roster: fooRoster,
+        }),
+        { encoding: "utf8" },
+      );
+      const ids = cache.list().map((r) => r.descriptor.network_id);
+      // BEFORE review #1's fix this was [] — load("Foo") → pathFor sanitized
+      // "Foo" to "_oo" and read the wrong (absent) path, silently missing it.
+      expect(ids).toEqual(["Foo"]);
+    });
+
+    test("drops a file with valid JSON whose network_id mismatches its basename (swap guard)", () => {
+      // Valid JSON, valid shape, but the record names a DIFFERENT network than the
+      // filename → the swap guard drops it (a swapped/renamed file is not trusted).
+      writeFileSync(
+        join(tmp, "iaw.json"),
+        JSON.stringify({
+          schema_version: 1,
+          cached_at: new Date().toISOString(),
+          descriptor: { ...descriptor, network_id: "someone-else" },
+          roster: { ...roster, network_id: "someone-else" },
+        }),
+        { encoding: "utf8" },
+      );
+      expect(cache.list()).toEqual([]); // dropped, not mis-attributed
+    });
+
+    test("degrades to a drop (not a throw) on an unreadable / dangling-symlink entry", () => {
+      cache.store("iaw", descriptor, roster);
+      // A dangling symlink ending in `.json` — readFileSync throws ENOENT/ELOOP.
+      // list() must drop it and still return the valid record, never throw.
+      symlinkSync(join(tmp, "nonexistent-target"), join(tmp, "dangling.json"));
+      // A directory occupying a `.json` entry slot — readFileSync throws EISDIR.
+      mkdirSync(join(tmp, "adir.json"));
+
+      let result: ReturnType<typeof cache.list>;
+      expect(() => {
+        result = cache.list();
+      }).not.toThrow();
+      const ids = result!.map((r) => r.descriptor.network_id);
+      expect(ids).toEqual(["iaw"]); // only the valid record survives
     });
   });
 });

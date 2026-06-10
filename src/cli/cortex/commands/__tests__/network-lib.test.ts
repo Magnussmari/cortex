@@ -1596,6 +1596,39 @@ describe("status — #850 lifecycle (registered/joined/live/disconnected)", () =
     expect(findRow(res, "metafactory-community")!.status).toBe("registered");
   });
 
+  // Review #2 — registered (cached-only) rows are sorted by network id for stable
+  // output across machines (readdirSync is not order-guaranteed); config-joined
+  // rows keep their authored order and are NOT reordered.
+  test("ordering — registered rows are sorted by id; config rows keep config order", async () => {
+    const leafState: LeafStatePort = {
+      async linkStates() {
+        return { zeta: { state: "established" }, alpha: { state: "established" } };
+      },
+    };
+    const { ports } = makeFakes({
+      // Config order: zeta THEN alpha (deliberately NOT alphabetical).
+      initialNetworks: [joinedNetwork("zeta"), joinedNetwork("alpha")],
+      // Cached-only, supplied in reverse-alpha order to prove the sort.
+      cachedDescriptors: [
+        { networkId: "delta", members: [] },
+        { networkId: "beta", members: [] },
+        { networkId: "charlie", members: [] },
+      ],
+      leafState,
+    });
+    const res = await networkStatus(ports);
+
+    const ids = res.networks.map((r) => r.networkId);
+    // Config rows first, in CONFIG order (zeta, alpha — not sorted), then the
+    // registered rows in SORTED order (beta, charlie, delta).
+    expect(ids).toEqual(["zeta", "alpha", "beta", "charlie", "delta"]);
+    expect(res.networks.filter((r) => r.status === "registered").map((r) => r.networkId)).toEqual([
+      "beta",
+      "charlie",
+      "delta",
+    ]);
+  });
+
   test("no cachedDescriptors port → config networks only (pre-#850 graceful degradation)", async () => {
     const { ports } = makeFakes({ initialNetworks: [joinedNetwork("metafactory")] });
     // The bundle omits `cachedDescriptors` entirely (opt not supplied).
