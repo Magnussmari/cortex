@@ -28,7 +28,16 @@
  */
 
 import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, chmodSync } from "fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  chmodSync,
+  statSync,
+} from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import YAML from "yaml";
@@ -135,6 +144,19 @@ describe("CapabilityMergeFragmentSchema", () => {
 
   test("rejects empty fragment (no capabilities, no policy)", () => {
     const f = CapabilityMergeFragmentSchema.safeParse({});
+    expect(f.success).toBe(false);
+  });
+
+  test("rejects all-empty-arrays fragment (capabilities: [])", () => {
+    // review NIT-3: an empty capabilities array merges nothing.
+    const f = CapabilityMergeFragmentSchema.safeParse({ capabilities: [] });
+    expect(f.success).toBe(false);
+  });
+
+  test("rejects empty policy block (policy: {} → no principals/roles)", () => {
+    // review NIT-3: `policy: {}` would otherwise materialise as
+    // `policy: {principals: [], roles: []}`. Reject it.
+    const f = CapabilityMergeFragmentSchema.safeParse({ policy: {} });
     expect(f.success).toBe(false);
   });
 
@@ -339,6 +361,12 @@ describe("runConfigMerge — CLI", () => {
 
     const backups = readdirSync(join(dir, "stacks")).filter((f) => f.includes(".pre-config-merge-"));
     expect(backups.length).toBe(1);
+
+    // review NIT-1: the backup is chmod 600 (secret-at-rest perm).
+    const backupName = backups[0];
+    expect(backupName).toBeDefined();
+    const backupPath = join(dir, "stacks", backupName ?? "");
+    expect(statSync(backupPath).mode & 0o777).toBe(0o600);
   });
 
   test("idempotent — second run writes nothing (no second backup)", async () => {
@@ -364,6 +392,24 @@ describe("runConfigMerge — CLI", () => {
     expect(after).toBe(before);
     const backups = readdirSync(join(dir, "stacks")).filter((f) => f.includes(".pre-config-merge-"));
     expect(backups.length).toBe(0);
+  });
+
+  test("--dry-run (split form) leaves the target byte-identical AND mtime-unchanged", async () => {
+    // review MAJOR-1: validateComposed must NOT writeFileSync the real target
+    // (even transiently) for the split form — content AND mtime must be
+    // untouched after a dry-run that exercises the compose-validation path.
+    const dir = makeSplitDir({ research: stackLayer() });
+    const targetPath = join(dir, "stacks", "research.yaml");
+    const frag = writeFragment("frag.yaml", { capabilities: [CAP_DEV] });
+
+    const before = readFileSync(targetPath, "utf-8");
+    const beforeMtime = statSync(targetPath).mtimeMs;
+
+    const code = await runConfigMerge(["--config", dir, "--fragment", frag, "--dry-run"]);
+    expect(code).toBe(0);
+
+    expect(readFileSync(targetPath, "utf-8")).toBe(before);
+    expect(statSync(targetPath).mtimeMs).toBe(beforeMtime); // never written, not even transiently
   });
 
   test("--stack required when >1 stack file; selects the right one", async () => {
@@ -395,6 +441,34 @@ describe("runConfigMerge — CLI", () => {
 
     const written = YAML.parse(readFileSync(join(dir, "stacks", "research.yaml"), "utf-8")) as Rec;
     expect((written.capabilities as Rec[])).toHaveLength(0);
+  });
+
+  test("--rollback that would orphan a role reference → exit 1, file unchanged", async () => {
+    // review MAJOR-2: rollback routes through validateComposed. A principal
+    // still references role `develop` (role[]); rolling back the role that
+    // declares it would leave a dangling principal.role[] ref → the composed
+    // config fails PolicySchema's cross-ref guard. The rollback must be REFUSED
+    // (exit 1) so the stack never goes unloadable, and the file stays put.
+    const dir = makeSplitDir({
+      research: stackLayer({
+        policy: {
+          principals: [PRINCIPAL_DEV], // PRINCIPAL_DEV.role = ["develop"]
+          roles: [ROLE_DEVELOP], // declares "develop"
+        },
+      }),
+    });
+    const targetPath = join(dir, "stacks", "research.yaml");
+    const before = readFileSync(targetPath, "utf-8");
+
+    // Roll back ONLY the role — the principal that references it survives.
+    const frag = writeFragment("frag.yaml", { policy: { roles: [ROLE_DEVELOP] } });
+    const code = await runConfigMerge(["--config", dir, "--fragment", frag, "--rollback"]);
+    expect(code).toBe(1);
+
+    // File untouched — rollback refused, stack stays valid.
+    expect(readFileSync(targetPath, "utf-8")).toBe(before);
+    const backups = readdirSync(join(dir, "stacks")).filter((f) => f.includes(".pre-config-merge-"));
+    expect(backups.length).toBe(0);
   });
 
   test("merge that breaks CortexConfigSchema → exit 1, no write", async () => {

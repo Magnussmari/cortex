@@ -76,8 +76,19 @@
  *   2  — usage error (bad flags, missing required arg).
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
-import { dirname, join, resolve } from "path";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "fs";
+import { tmpdir } from "os";
+import { dirname, join, relative, resolve } from "path";
 import YAML from "yaml";
 import { z } from "zod/v4";
 
@@ -109,14 +120,23 @@ const FragmentPolicySchema = z
     principals: z.array(PolicyPrincipalSchema).default([]),
     roles: z.array(PolicyRoleSchema).default([]),
   })
-  .strict();
+  .strict()
+  // review NIT-3 (cortex#876): a `policy:` block with both arrays empty
+  // contributes nothing — same as omitting `policy:` — but would otherwise
+  // materialise as `policy: {principals: [], roles: []}` in the written file.
+  // Reject it so the only way to write a policy block is to actually populate
+  // it. (An empty fragment is a caller error, not a silent no-op.)
+  .refine((p) => p.principals.length > 0 || p.roles.length > 0, {
+    message:
+      "fragment `policy:` block declares no principals or roles — populate it or omit the `policy:` key entirely",
+  });
 
 /**
  * A merge fragment: capabilities + policy ONLY. `.strict()` rejects any other
  * top-level key (`agents`, `principal`, `nats`, …) so a caller can't sneak a
  * transport/identity change in through the merge path — those are NOT a
- * package's to declare. At least one of the two blocks must be present (an
- * empty fragment is a caller error, not a silent no-op).
+ * package's to declare. At least one NON-EMPTY block must be present (an empty
+ * — or all-empty-arrays — fragment is a caller error, not a silent no-op).
  */
 export const CapabilityMergeFragmentSchema = z
   .object({
@@ -125,10 +145,10 @@ export const CapabilityMergeFragmentSchema = z
   })
   .strict()
   .refine(
-    (f) => f.capabilities !== undefined || f.policy !== undefined,
+    (f) => (f.capabilities !== undefined && f.capabilities.length > 0) || f.policy !== undefined,
     {
       message:
-        "fragment must declare at least one of `capabilities:` or `policy:` — an empty fragment merges nothing",
+        "fragment must declare at least one capability or a non-empty `policy:` block — an empty fragment merges nothing",
     },
   );
 
@@ -241,8 +261,9 @@ function removeIdKeyed(
 
 /**
  * Merge `fragment` into `layer` (the target stack-layer object), id-keyed
- * append fragment-wins. PURE — `layer` is not mutated. Empty result arrays are
- * pruned so an unchanged block doesn't materialise as `capabilities: []`.
+ * append fragment-wins. PURE — `layer` is not mutated. A `policy:` block is
+ * materialised only when the fragment carries policy (the schema rejects an
+ * all-empty policy fragment, so this never writes an empty `policy: {}`).
  */
 export function mergeFragmentIntoLayer(
   layer: Record<string, unknown>,
@@ -688,15 +709,12 @@ export async function runConfigMerge(argv: string[]): Promise<number> {
 
   const newText = YAML.stringify(mergedLayer, { indent: 2, lineWidth: 0 });
 
-  // 5. Validate the COMPOSED WHOLE against CortexConfigSchema BEFORE write.
-  //    We compose by writing the candidate to a temp copy of the layer? No —
-  //    re-compose deterministically by substituting our merged layer for the
-  //    on-disk one in-memory: easiest correct path is to write, re-compose,
-  //    validate, and roll back on failure. To avoid a write-then-revert dance
-  //    we compose against the merged layer directly for the single-file form,
-  //    and for the split form we stage the write under a backup so a failed
-  //    validation restores the original.
-  const composedValidation = validateComposed(target, newText, originalText);
+  // 5. Validate the COMPOSED WHOLE against CortexConfigSchema BEFORE any write.
+  //    `validateComposed` substitutes the merged layer in WITHOUT touching the
+  //    real file — single-file form validates in-memory; split form composes a
+  //    temp mirror of the config dir (review MAJOR-1, cortex#876). This makes
+  //    the pre-check — and therefore `--dry-run` — provably side-effect-free.
+  const composedValidation = validateComposed(target, newText);
   if (!composedValidation.ok) {
     process.stderr.write(
       `config ${verb}: composed config failed CortexConfigSchema — NOT writing.\n` +
@@ -725,6 +743,12 @@ export async function runConfigMerge(argv: string[]): Promise<number> {
   const backupPath = buildBackupPath(target.filePath);
   try {
     writeFileSync(backupPath, originalText, "utf-8");
+    // Secret-at-rest perm (review NIT-1, cortex#876): a single-file cortex.yaml
+    // carries inline platform tokens, so its backup must match the chmod-600
+    // gate the live loader enforces on the original — don't leave a 0644 copy
+    // of secrets on disk. Cheap + harmless for the split form (stack layers
+    // hold no tokens), so we apply it unconditionally.
+    chmodSync(backupPath, 0o600);
     process.stderr.write(`config ${verb}: backup saved to ${backupPath}\n`);
   } catch (err) {
     process.stderr.write(
@@ -771,19 +795,26 @@ export async function runConfigMerge(argv: string[]): Promise<number> {
 }
 
 /**
- * Validate the composed whole with the merged layer substituted in. For the
- * single-file form the merged layer IS the whole config. For the split form we
- * compose with the on-disk layers but swap our merged candidate in for the
- * target layer by writing it, composing, then restoring — done here behind a
- * try/finally so a validation failure never leaves the disk dirty.
+ * Validate the composed whole with the merged layer substituted in, WITHOUT
+ * ever writing to the real target file (review MAJOR-1, cortex#876). This is a
+ * pure pre-check: under `--dry-run` the help text promises "no write", and even
+ * a write-then-restore dance has a 2-syscall window where a SIGKILL would leave
+ * the real file in the candidate state. So:
+ *
+ *   - Single-file form: the merged layer IS the whole config → parse + validate
+ *     the in-memory candidate text. No disk write at all.
+ *   - Split form: mirror the config dir into an OS temp dir (`cpSync`),
+ *     overwrite ONLY the target layer's copy with the candidate, compose the
+ *     mirror, and validate. The real config dir is read-only throughout; the
+ *     temp mirror is removed in `finally`.
  */
 function validateComposed(
   target: ResolvedTarget,
   newLayerText: string,
-  originalLayerText: string,
 ): { ok: true } | { ok: false; error: string } {
   if (target.singleFile) {
-    // The whole config is the single file — validate the merged candidate.
+    // The whole config is the single file — validate the merged candidate text
+    // in-memory; nothing is written.
     let parsed: unknown;
     try {
       parsed = YAML.parse(newLayerText);
@@ -794,35 +825,67 @@ function validateComposed(
     return res.success ? { ok: true } : { ok: false, error: res.error.message };
   }
 
-  // Split form: temporarily stage the candidate layer on disk, compose, then
-  // ALWAYS restore the original (try/finally) so this validation is pure from
-  // the disk's point of view.
-  let composed: Record<string, unknown>;
+  // Split form: compose a TEMP MIRROR of the config dir with the candidate
+  // layer swapped in. The real dir is never written.
+  let mirrorRoot: string | undefined;
   try {
-    writeFileSync(target.filePath, newLayerText, "utf-8");
-    composed = composeRawConfig(target.composePath);
+    mirrorRoot = mkdtempSync(join(tmpdir(), "cortex-config-merge-check-"));
+    // Mirror the whole config dir (system/, network/, surfaces/, stacks/, …).
+    cpSync(target.configDir, mirrorRoot, { recursive: true });
+    // Overwrite the target layer's mirrored copy with the candidate. The
+    // target's path relative to configDir locates it inside the mirror.
+    const rel = relative(target.configDir, target.filePath);
+    writeFileSync(join(mirrorRoot, rel), newLayerText, "utf-8");
+    // Compose the mirror via a pointer whose dirname is the mirror root.
+    const composed = composeRawConfig(join(mirrorRoot, "config-merge-pointer.yaml"));
+    const res = CortexConfigSchema.safeParse(composed);
+    return res.success ? { ok: true } : { ok: false, error: res.error.message };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
-    writeFileSync(target.filePath, originalLayerText, "utf-8");
+    if (mirrorRoot !== undefined) {
+      try {
+        rmSync(mirrorRoot, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        // Best-effort cleanup of an OS temp dir; a leaked temp dir is harmless
+        // (the OS reaps tmpdir) and must not mask the validation result.
+        process.stderr.write(
+          `config merge: warning — could not remove temp validation dir ${mirrorRoot}: ` +
+            `${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}\n`,
+        );
+      }
+    }
   }
-  const res = CortexConfigSchema.safeParse(composed);
-  return res.success ? { ok: true } : { ok: false, error: res.error.message };
 }
 
-/** A minimal line-oriented diff for --dry-run output (added/removed prefixes). */
+/**
+ * A minimal line-oriented diff for --dry-run output. Positional with shared
+ * common-prefix/suffix trimming so DUPLICATE lines are NOT swallowed (review
+ * NIT-2, cortex#876 — the previous Set-based compare filtered any line present
+ * in both arrays, making repeated lines invisible). This is a presentation aid,
+ * not a minimal-edit (Myers) diff — the changed middle block is shown verbatim
+ * as removed-then-added, which is correct (never hides a real change) if not
+ * always the tightest rendering.
+ */
 function renderDiff(label: string, before: string, after: string): string {
   const b = before.split("\n");
   const a = after.split("\n");
-  const bSet = new Set(b);
-  const aSet = new Set(a);
+
+  // Trim the shared common prefix.
+  let start = 0;
+  while (start < b.length && start < a.length && b[start] === a[start]) start++;
+
+  // Trim the shared common suffix (not overlapping the prefix).
+  let bEnd = b.length;
+  let aEnd = a.length;
+  while (bEnd > start && aEnd > start && b[bEnd - 1] === a[aEnd - 1]) {
+    bEnd--;
+    aEnd--;
+  }
+
   const lines: string[] = [`--- ${label} (current)`, `+++ ${label} (merged)`];
-  for (const line of a) {
-    if (!bSet.has(line)) lines.push(`+ ${line}`);
-  }
-  for (const line of b) {
-    if (!aSet.has(line)) lines.push(`- ${line}`);
-  }
+  for (let i = start; i < bEnd; i++) lines.push(`- ${b[i]}`);
+  for (let i = start; i < aEnd; i++) lines.push(`+ ${a[i]}`);
   return lines.join("\n") + "\n";
 }
 
