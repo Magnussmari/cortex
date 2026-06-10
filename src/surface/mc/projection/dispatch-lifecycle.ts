@@ -74,7 +74,9 @@
 import type { Database } from "bun:sqlite";
 
 import { generateId } from "../db/events";
+import { ensureAgentRow } from "../db/agents";
 import { applyTransition } from "../db/transitions";
+import { anchorTaskId } from "./anchor";
 import type { AssignmentState } from "../types";
 
 /**
@@ -239,15 +241,13 @@ export function projectDispatchLifecycle(
 // Anchor
 // ---------------------------------------------------------------------------
 
-const ANCHOR_TASK_PREFIX = "mc-dispatch-task-";
+// The deterministic anchor-task id (`ANCHOR_TASK_PREFIX` + `anchorTaskId`) is
+// shared via `./anchor` so the verdict + heartbeat projections join the SAME
+// anchor (#862 review cheap-fold 1). The constants below are dispatch-lifecycle-
+// local bookkeeping for the anchor task ROW the projection writes.
 const ANCHOR_TASK_PRINCIPAL = "mc-dispatch";
 const ANCHOR_TASK_SOURCE_SYSTEM = "internal";
 const CONTROLLED_ENDPOINT = "local.process.controlled";
-
-/** Deterministic MC task id for a dispatch correlation_id. One task per dispatch. */
-function anchorTaskId(correlationId: string): string {
-  return `${ANCHOR_TASK_PREFIX}${correlationId}`;
-}
 
 interface AnchorParams {
   correlationId: string;
@@ -303,13 +303,15 @@ function ensureAnchor(
     ANCHOR_TASK_SOURCE_SYSTEM,
   );
 
-  // The dispatched agent. `head` type (it runs a task) — insert-only name so a
-  // principal-edited display name is never overwritten, matching ensureNamedAgent.
-  db.query(
-    `INSERT INTO agents (id, name, type, persistent)
-     VALUES (?, ?, 'head', 1)
-     ON CONFLICT(id) DO NOTHING`,
-  ).run(params.agentId, params.agentId);
+  // The dispatched agent. `head` type (it runs a task), persistent — insert-only
+  // name via the shared ensureAgentRow helper (S6 DRY pickup, #861 finding 3) so
+  // a principal-edited display name is never overwritten, matching ensureNamedAgent.
+  ensureAgentRow(db, {
+    id: params.agentId,
+    name: params.agentId,
+    type: "head",
+    persistent: true,
+  });
 
   const assignmentId = generateId();
   const sessionId = generateId();

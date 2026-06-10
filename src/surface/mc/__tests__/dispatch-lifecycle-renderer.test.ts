@@ -122,13 +122,44 @@ describe("createDispatchProjectionRenderer", () => {
     }
   });
 
-  it("does NOT match non-dispatch subjects", () => {
-    const nonDispatch = [
-      "local.andreas.work.system.heartbeat",
-      "local.andreas.work.review.verdict.completed",
-      "local.andreas.tasks.@did-mf-luna.chat",
+  it("subjects match the S6-generalized families (verdict / heartbeat / attention / adapter)", () => {
+    // S6 (#848) extends the seam beyond dispatch.task.*: the renderer now
+    // subscribes to the four additional projection families on the local
+    // (stack-ful + stack-less) and federated grammars.
+    const derived = [
+      // review verdicts
+      "local.andreas.work.review.verdict.changes-requested",
+      "local.andreas.review.verdict.approved",
+      "federated.peer.work.review.verdict.commented",
+      // agent heartbeat
+      "local.andreas.work.system.agent.heartbeat",
+      "local.andreas.system.agent.heartbeat",
+      "federated.peer.work.system.agent.heartbeat",
+      // attention
+      "local.andreas.work.system.attention.opened",
+      "federated.peer.work.system.attention.resolved",
+      // adapter health
+      "local.andreas.work.system.adapter.degraded",
+      "federated.peer.work.system.adapter.recovered",
     ];
-    for (const subject of nonDispatch) {
+    for (const subject of derived) {
+      const hit = DISPATCH_PROJECTION_SUBJECTS.some((p) =>
+        subjectMatches(p, subject),
+      );
+      expect(hit).toBe(true);
+    }
+  });
+
+  it("does NOT match subjects outside any projection family", () => {
+    const nonProjection = [
+      // a chat dispatch (handled elsewhere), not a projection family
+      "local.andreas.tasks.@did-mf-luna.chat",
+      // a different system.* subdomain the projection doesn't own
+      "local.andreas.work.system.inbound.aborted",
+      // github webhook events
+      "local.andreas.work.github.push.created",
+    ];
+    for (const subject of nonProjection) {
       const hit = DISPATCH_PROJECTION_SUBJECTS.some((p) =>
         subjectMatches(p, subject),
       );

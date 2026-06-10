@@ -1,29 +1,35 @@
 /**
  * MIG-7.2d — Dashboard renderer (in-memory buffer stub).
  *
- * Architecture §9.2 makes the dashboard activity-centric, not agent-centric.
- * The eventual Mission Control v3 surface (under `src/surface/mc/`) reads
- * from a stream of recent bus envelopes and projects them into
- * Kanban/inbox/status-banner views. Full Mission Control integration
- * lands at MIG-7.13 (integration test) when cortex.ts wires MC into the
- * top-level startup.
+ * ## SUPERSEDED as the MC feed (ADR-0005 §4, MC-I1.S6 #848)
  *
- * For this slice the dashboard renderer is the *sink* that satisfies the
- * G-1111 §4.6 fail-safe rule's pairing requirement alongside
- * `PagerDutyRenderer` — operationally distinct platform classes both
- * subscribed to `local.{principal}.system.>` so a degraded NATS subscription
- * for one doesn't blind the principal on the other.
+ * This ring buffer was the MIG-7.13 plan's anticipated bus→MC IPC mechanism:
+ * MC was to POLL `getRecent()` and project the recent-envelope window onto the
+ * glass. **ADR-0005 §4 demotes that plan.** The bus→MC seam is now a registered
+ * surface-router renderer (`src/surface/mc/projection/dispatch-lifecycle-renderer.ts`)
+ * doing push-based `project(envelope)` straight into MC rows — no polling, no
+ * 1000-envelope bound that drops bursts, no dedup bookkeeping. The ADR records
+ * this buffer "survives, if at all, only as the drill-down's recent-raw-envelopes
+ * feed."
  *
- * Implementation: a bounded ring buffer over the last N envelopes the
- * router delivered. Tests probe `getRecent()` to assert the renderer is
- * actually receiving; Mission Control's projection pipeline will graduate
- * the buffer to a richer data structure at MIG-7.13.
+ * **S6 disposition: RETAINED, not retired.** Verified at S6 time that NOTHING in
+ * production reads `getRecent()` (only this file's own tests do) — so the buffer
+ * is functionally inert as an MC feed. It is kept rather than removed because:
+ *   - it is still a user-facing `renderers:` config `kind: dashboard` in the
+ *     `RendererSchema` discriminated union; removing it is a config-breaking
+ *     change (a principal carrying `kind: dashboard` would fail to boot), wider
+ *     blast radius than the faithful demotion this slice owns; and
+ *   - it still satisfies the G-1111 §4.6 fail-safe-pairing rule alongside
+ *     `PagerDutyRenderer` (two operationally-distinct sinks on
+ *     `local.{principal}.system.>` so a degraded subscription for one doesn't
+ *     blind the principal on the other) — retiring it would also need that rule
+ *     re-homed.
+ * If/when the ADR's "drill-down recent-raw feed" consumer is built it reads off
+ * `getRecent()`; until then this is a no-op sink, intentionally.
  *
- * The renderer DOES NOT serve HTTP itself — Mission Control's existing
- * Bun server keeps that concern. Wiring is one direction only: cortex.ts
- * registers the renderer with the surface-router; MC's server (a separate
- * Bun process today, an in-process module post-MIG-7.13) reads the buffer
- * out of process when it lands.
+ * The renderer DOES NOT serve HTTP itself — Mission Control's existing Bun
+ * server keeps that concern. Architecture §9.2 makes the dashboard
+ * activity-centric, not agent-centric.
  */
 
 import type { Envelope } from "../bus/myelin/envelope-validator";
