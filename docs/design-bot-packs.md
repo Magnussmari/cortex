@@ -21,7 +21,7 @@ engine: "sage" | "assistant"
 
 Every behavior cortex can host is compiled into cortex: the review pipeline
 (CC session), the sage subprocess runner, the chat dispatch handler. Adding
-Yarrow — whose loop is *scenario → compose → validate → operator-ack →
+Yarrow — whose loop is *scenario → compose → validate → principal-ack →
 execute pulse pipeline → per-step thread replies* — means writing a new
 runner inside cortex, a new engine enum value, a release of cortex. The next
 bot means doing it again.
@@ -70,8 +70,10 @@ bridges presence surfaces ↔ envelopes. Already half-exists:
 **Decision: B and C are one contract at two lifecycles.** The brain speaks
 **envelopes in, effects out**; whether cortex spawns it per task (B) or
 supervises it as a daemon (C) is a manifest field, not a different
-interface. (A) is rejected permanently — process isolation *is* the
-sovereignty story.
+interface. (A) is rejected for third-party packs — process isolation *is*
+the sovereignty story. Builtin engines (`brain.kind: builtin` — assistant,
+sage) remain in-process by definition; that is a trust statement about
+first-party code, not a loophole.
 
 ## 4. The Bot Pack
 
@@ -106,7 +108,7 @@ runtime:
     run: "bun {pack}/brain/main.ts"       # {pack} expands to the arc install dir
     protocol: cortex-brain/v1
     lifecycle: daemon                     # per-task | daemon
-    secrets: [VT_API_KEY]                 # operator approves at install; injected as env
+    secrets: [VT_API_KEY]                 # principal approves at install; injected as env
     maxRestarts: 3
 ```
 
@@ -127,10 +129,12 @@ socket (stdio kept for logs).
   "payload": { /* envelope payload */ },
   "source": { "surface": "mattermost", "channel": "…", "thread": "…", "user": "…" } }
 { "v": 1, "type": "message", "task_id": "…", "text": "…", "user": "…" }   // follow-up in an open task's thread
-{ "v": 1, "type": "gate_verdict", "task_id": "…", "gate": "operator-ack",
-  "verdict": "pass", "notes": "run it" }                                   // answer to ask_operator
+{ "v": 1, "type": "gate_verdict", "task_id": "…", "gate": "principal-ack",
+  "verdict": "pass", "notes": "run it" }                                   // answer to ask_principal
 { "v": 1, "type": "cancel",  "task_id": "…" }
 { "v": 1, "type": "shutdown", "deadline_ms": 5000 }                        // drain signal (hot-swap)
+{ "v": 1, "type": "effect_rejected", "task_id": "…", "effect": "dispatch",
+  "reason": { "kind": "wont_do", "detail": "capability outside manifest" } } // cortex refused a brain effect — the brain decides how to degrade
 ```
 
 **Brain → cortex (effects):**
@@ -138,12 +142,14 @@ socket (stdio kept for logs).
 ```jsonc
 { "v": 1, "type": "post",         "task_id": "…", "text": "…",
   "attachment": { "filename": "flow.png", "b64": "…" } }                   // cortex posts to the task's surface/thread
-{ "v": 1, "type": "ask_operator", "task_id": "…", "gate": "operator-ack",
+{ "v": 1, "type": "ask_principal", "task_id": "…", "gate": "principal-ack",
   "prompt": "Run this flow?" }                                             // cortex renders the gate, enforces the PRINCIPAL
 { "v": 1, "type": "dispatch",     "task_id": "…", "capability": "soc.triage.email",
   "payload": { … }, "sovereignty": { "model_class": "local-only" } }       // fleet work — cortex publishes the myelin envelope
 { "v": 1, "type": "result",       "task_id": "…", "status": "complete",
   "summary": "…" }                                                         // closes the task; cortex publishes lifecycle envelope
+{ "v": 1, "type": "result",       "task_id": "…", "status": "failed",
+  "reason": { "kind": "cant_do" | "not_now" | "wont_do", "detail": "…" } } // typed refusal — maps 1:1 onto the dispatch failure taxonomy
 { "v": 1, "type": "log",          "level": "info", "text": "…" }
 ```
 
@@ -156,7 +162,7 @@ Properties that make this the right shape:
    policy. A brain cannot post to a channel it wasn't addressed from,
    cannot dispatch a capability its manifest doesn't allow, cannot answer
    its own gate.
-2. **Gates are host-enforced.** `ask_operator` routes through cortex's gate
+2. **Gates are host-enforced.** `ask_principal` routes through cortex's gate
    rendering with the principal check cortex already knows how to do — the
    Yarrow lesson (sage blocker, pulse#47: any channel member could say "run
    it") is solved once, in the host, for every future bot.
@@ -165,6 +171,44 @@ Properties that make this the right shape:
    cortex's adapters own the mapping both ways.
 4. **Language-agnostic.** `run` is any argv. Bun/TS is the house style;
    nothing in the protocol requires it.
+5. **Refusals are typed, not flattened.** `result.status: failed` carries
+   `reason.kind: cant_do | not_now | wont_do` — the same taxonomy the
+   dispatch layer already speaks — and cortex refusing a brain's effect
+   comes back as `effect_rejected` with the same kinds. B-1 must not
+   re-flatten the distinction sage-runner Phase 1 flattened.
+6. **Sovereignty in `dispatch` is downgrade-only.** The manifest is the
+   ceiling cortex enforces; a brain's `sovereignty` field may only TIGHTEN
+   it (e.g. request `local-only` although `any` is allowed), never loosen.
+   Policy is never the bot's own claim (§2).
+
+Protocol contract details (the part implementations will cite):
+
+- **`gate_verdict` carries the HOST-RESOLVED principal**, not whatever was
+  typed in a chat thread. The brain must never infer a verdict from
+  `message` text — the host performs the principal check (the pulse#47
+  lesson) and only then forwards `gate_verdict`.
+- **`task_id` correlation is enforced host-side.** Every effect's
+  `task_id` must belong to the set of tasks currently owned by THIS brain
+  instance; unknown or foreign ids are refused with `effect_rejected`
+  (`wont_do`). A brain cannot post into a sibling's thread by guessing.
+- **Persona delivery:** per-task brains receive `persona` on the `task`
+  event; daemons receive it once in a `hello` handshake event at start.
+- **`lifecycle: per-task` means alive until `result`,** not
+  spawn-read-exit — long tasks emit many `post`s before closing.
+- **Backpressure is host-side** for both lifecycles: cortex stops
+  delivering past `maxConcurrent` (the BrainConsumer mirrors
+  ReviewConsumer's pull semantics); brains never need to self-throttle.
+- **Version tolerance:** cortex drops-and-logs unknown brain→cortex event
+  types; brains MUST ignore unknown cortex→brain event types. That is the
+  v1 forward-compat rule that lets B-2 add events without a protocol bump.
+- **Attachments are capped at 256 KiB** inline (`b64`); anything larger is
+  written by the brain to its scratch dir and referenced by path
+  (`attachment: { filename, path }`), which cortex reads and uploads.
+- **Vocabulary note:** effect/gate names use *principal* (`ask_principal`,
+  `principal-ack`) per vocabulary migration 0002 R1/R2 — settled here so
+  B-1 doesn't re-litigate it. `gate_verdict.verdict` reuses the existing
+  gate vocabulary (`pass | fail`); aligning with the governance verdict
+  enum is a B-1 audit item.
 
 ## 6. Routing: how a message reaches a brain
 
@@ -201,6 +245,13 @@ The process boundary makes this almost boring — no module-cache exorcism:
 4. **Supervision (daemon):** cortex restarts crashed brains up to
    `maxRestarts`, then marks the agent degraded and surfaces it
    (`agent.online` presence envelope already exists for exactly this).
+5. **Open gates across a swap:** drain waits for open `ask_principal`
+   gates up to the drain deadline; past it the gate is CANCELLED — cortex
+   posts a visible notice in the task's thread ("brain was upgraded;
+   re-trigger the request") and closes the task `failed/not_now`. No
+   verdict is ever forwarded to a generation that didn't open the gate.
+6. **`shutdown` escalation:** deadline passes → SIGTERM; +5 s grace →
+   SIGKILL. Mirrors the existing daemon supervision shape.
 
 Identity, presence connections, and tokens stay up across a brain swap —
 the MM websocket/poller never blinks; only the brain process is replaced.
@@ -209,8 +260,8 @@ That is the practical meaning of "hot".
 ## 8. Security model
 
 - **Brains are untrusted by default.** They run as separate OS processes
-  with: the task payload, the persona text, a scoped scratch dir, and ONLY
-  the env vars named in `brain.secrets` (shown to the operator at install
+  with: the task payload, the persona text, a scoped scratch dir, a minimal exec environment (PATH, HOME, LANG, scoped
+  TMP/scratch), and ONLY the secret env vars named in `brain.secrets` (shown to the principal at install
   time — same consent shape as arc hook installation).
 - **No ambient fleet credentials.** Per-task brains get none. Daemon brains
   get their own scoped NATS creds (A.2) — addressable, revocable
@@ -231,10 +282,10 @@ should be the proving migration:
 | Yarrow needs | Protocol element |
 |---|---|
 | Reply in-thread with YAML + PNG | `post` with attachment |
-| Operator "run it" with principal check | `ask_operator` / `gate_verdict` |
+| Operator "run it" with principal check | `ask_principal` / `gate_verdict` |
 | Long-running execution with progress | multiple `post`s per task (maps from pulse `onActionStepEvent`) |
 | Frontier-A self-disclosure before composing | first `post` of every task |
-| Sub-tasks to the fleet (future: agent: steps) | `dispatch` with sovereignty |
+| Fleet sub-tasks — pulse pipelines containing `agent:` steps route their dispatch through the hosting brain | `dispatch` with downgrade-only sovereignty |
 
 Migration: `pulse/examples/soc-demo/run-demo.ts` splits — the
 `MattermostThread` poller and `MMAckGateProvider` are **deleted** (cortex
@@ -259,11 +310,11 @@ offline rehearsal (`bun run-demo.ts` keeps working without a cortex).
 
 | Phase | Scope | Depends on |
 |---|---|---|
-| **B-0** | Ship cortex#60 **A.1** (agents.d watcher + `cortex agents reload`); derive `capabilities[].provided_by` from agent fragments (removes the manual catalog cross-edit) | — |
-| **B-1** | `brain:` schema block + `cortex-brain/v1` per-task exec: generalize `sage-runner.ts` into `exec-brain-runner.ts`; `BrainConsumer` from the `ReviewConsumer` skeleton | B-0 |
-| **B-2** | Daemon lifecycle: socket transport, supervision, drain-on-reload, `ask_operator`/gate bridge, attachments | B-1 |
+| **B-0** | Finish/verify cortex#60 **A.1** (`src/common/config/watcher.ts` + fragment-watcher tests already exist in-tree — audit what remains vs. wire-up) + `cortex agents reload`; derive `capabilities[].provided_by` from agent fragments (removes the manual catalog cross-edit) | — |
+| **B-1** | `brain:` schema block + `cortex-brain/v1` per-task exec: NEW sibling `exec-brain-runner.ts` modeled on `sage-runner.ts` (sage-runner itself untouched — it carries cortex#888/917/920 history; migrating sage onto the generic runner is a later option, not a B-1 goal); `BrainConsumer` from the `ReviewConsumer` skeleton | B-0 |
+| **B-2** | Daemon lifecycle: socket transport, supervision, drain-on-reload, `ask_principal`/gate bridge, attachments | B-1 |
 | **B-3** | `arc install <pack>` end-to-end (cortex#60 A.2/A.3, arc#117) | arc#117 |
-| **B-4** | Yarrow pack migration — acceptance test for the whole seam | B-2 (B-3 optional) |
+| **B-4** | Yarrow pack migration — acceptance test for the whole seam | B-2 (B-3 optional — the hand-drop install path is the `cortex install-bot <path>` wrapper from design-arc-agent-bots.md §11) |
 
 B-0..B-2 are cortex-internal and unblock everything; the SOC demo itself
 does NOT wait for any of this (standalone wiring shipped in pulse v0.14.0
@@ -280,3 +331,5 @@ carries the talk; Yarrow-as-pack is the post-talk consolidation).
    chat-feel, or are whole-message `post`s enough? v1: whole messages.
 4. Capability *versioning* (pack v2 changes a capability's contract) —
    unsolved in cortex#60 too; punt to the offering work (cortex#939)?
+5. Attachments >256 KiB use the scratch-path route (§5) — is a host-side
+   total-size budget per task also needed? Decide in B-2.
