@@ -39,16 +39,26 @@ The named being cortex runs — Luna, Echo, Forge, Pilot. Has a persona, a voice
 _Avoid_: persona, bot, DA, character
 
 **Agent**:
-The stack-local, long-lived runtime identity (daemon) that hosts an **assistant** on the bus — its own NKey signing identity and a JetStream consumer. An agent has **no independent name**: it is reached via the **assistant** it hosts plus the **stack** it runs on. The same assistant may be hosted by different agents on different stacks ("same assistant, different agent surfaces").
-_Avoid_: bot, persona, daemon (as the domain term)
+The stack-local, long-lived runtime identity (daemon) that hosts an **assistant** on the bus — its own NKey signing identity and a JetStream consumer. An agent has **no independent name**: it is reached via the **assistant** it hosts plus the **stack** it runs on. The same assistant may be hosted by different agents on different stacks ("same assistant, different agent surfaces"). An agent **runs sessions** (it is not itself a session); distinct from the **substrate's** own word "agent" — a Claude Code `Agent`-tool spawn is a **child session**, not a cortex agent (that is a substrate label).
+_Avoid_: bot, persona, daemon (as the domain term); a **session** or **child session** (Claude Code's bare "agent"/"sub-agent" are substrate labels, not the bus-identity agent)
 
-**Sub-agent**:
-A short-lived task spawned via Claude Code's `Agent` tool — e.g. the Engineer or Explore sub-agents the pilot loop uses. Not an **agent**: no bus identity, no persistence. Always carries the `sub-` qualifier; never bare `agent`.
-_Avoid_: agent (bare), worker, helper
+**Sub-agent** (substrate-projection term):
+What the **Claude Code** substrate calls a **child session** spawned via its `Agent`/`Task` tool — e.g. the Engineer or Explore sub-agents the pilot loop uses. **A substrate label, not a domain entity:** the substrate-agnostic term is **child session** (a **session** with a `parent_session_id`); Codex projects a different word for the same row. Mission Control's model + schema speak **session** / **child session**; "sub-agent" survives only as the display label rendered through the Claude-Code lens. Not an **agent**: no bus identity, no persistence. Always carries the `sub-` qualifier; never bare `agent`.
+_Avoid_: agent (bare), worker, helper; "sub-agent" in the MC domain model or schema (say **child session**)
 
 **Agent presence**:
 Whether an **agent** process is up and consuming the bus — *independent of any dispatch*. Carried on the **`agent` domain** (`agent.{online|heartbeat|offline|capabilities-changed}`, G-1114), with a liveness FSM (online while heartbeats arrive within TTL → offline on graceful `offline` or TTL lapse). An idle agent has presence; it is not running a dispatch. Presence is what the Mission Control **Network view** renders across stacks. **Cross-principal, only presence + dispatch *lifecycle* metadata is visible** — never the **session interior** (ADR-0005): clicking a peer's agent shows identity, online state, capabilities, and any federated `dispatch.task.*` lifecycle, but never their tool calls/prompts/diffs (those never leave the peer's stack). Supersedes the observability-only `agents.capabilities.registered` envelope (folded into `agent.online` + `agent.capabilities-changed`; dual-emit then retire — routing is unaffected, it is subject/consumer-filter based, not registry-lookup based). (Resolved 2026-06-10, G-1114 grilling.)
 _Avoid_: liveness (that is the FSM, not the concept), availability; conflating presence with dispatch progress (`system.agent.heartbeat`)
+
+### Sessions
+
+**Session**:
+One run of a **substrate** — a single `claude-code`/`codex`/… execution with its own id (`cc_session_id`), lifecycle, and **session interior**. A session belongs to one **agent** and runs on one **substrate** (an attribute, not a separate hierarchy level). It is the unit Mission Control's working view renders. A session is either **agent-rooted** (started directly by its agent — no parent session) or a **child session** initiated by another session (see **Session tree**). The substrate-neutral term — soma's framing: *"Soma's living existence inside a session of a substrate."* (Resolved 2026-06-11, MC session-tree grilling.)
+_Avoid_: agent (a session is **not** an agent — that conflation is the bug the MC session-tree refactor fixes), run, instance (bare), thread (a platform word)
+
+**Session tree** (parent / child session):
+The recursive structure of an **agent**'s work: a **session** may spawn **child sessions**, each of which may spawn its own — a tree rooted at the agent. The edge is **initiated-by**: a child session carries a `parent_session_id` naming the session that spawned it; an agent-rooted session has none. A child session is structurally *agent-like* — it runs its own session and can spawn further children — but is **not an agent**: no bus identity, no persistence; it is identified with its session. What **Claude Code** calls a **sub-agent** is exactly a child session on the `claude-code` substrate (a substrate-projection label — see **Sub-agent**). (Resolved 2026-06-11.)
+_Avoid_: sub-agent tree (substrate term — say child session), delegation tree (the bus-layer concern an agent owns locally), modelling a child session as its own **agent** row
 
 ### The bus
 
@@ -155,7 +165,8 @@ _Avoid_: reading dashboard `role: operator` as the **principal**; conflating the
 - A **principal**'s **stacks** run in a single **cortex runtime** (one OS process); each stack stays its own isolated M1–M7 slice (identity, subjects, policy) and opens one NatsLink per **network** it joins.
 - A **stack** hosts one or more **agents**.
 - An **agent** hosts exactly one **assistant**; the same assistant may be hosted by different agents on different stacks.
-- An **agent** may spawn zero or more **sub-agents**.
+- An **agent** runs zero or more **sessions** (each one run of a **substrate**); a session belongs to exactly one agent.
+- A **session** may spawn **child sessions** — a **session tree** keyed by `parent_session_id` (the *initiated-by* edge); an agent-rooted session has no parent. Claude Code projects a child session as a **sub-agent**.
 - An **assistant** declares one or more **capabilities**.
 - Work is **dispatched** to an **assistant** as an **envelope** published on a **subject**.
 - A **subject** = `{scope}.{principal}.{stack}.{domain}.…`; its **scope** sets how far it travels.
@@ -180,6 +191,7 @@ _Avoid_: reading dashboard `role: operator` as the **principal**; conflating the
 
 - **`operator` → `principal`.** cortex historically said `operator` (`operator.id`, "operator cockpit", the `{org}` segment). Resolved: **`principal`** ecosystem-wide, matching `soma:principal`. Carries into `cortex.yaml` schema, subject derivation, Mission Control copy. **Carve-outs (two distinct concepts keep the word):** (1) the NATS **NSC operator** (account-tree root, `OP_ANDREAS`) — a NATS-infra identity (see §Identity & trust → NSC operator), always qualified ("NSC operator"), never bare; (2) the **Mission Control authorization role** `operator` (the `viewer | operator | admin` AAA tier) — a surface-only dashboard privilege level, *not* the identity (see §Identity & trust → Mission Control authorization role).
 - **`agent` was overloaded** — the named being, the runtime identity, *and* a Claude Code spawned task. Resolved into **assistant** / **agent** / **sub-agent**.
+- **`agent`/`sub-agent` are substrate-projection labels, not the MC domain model.** Resolved 2026-06-11: cortex's **agent** is the bus runtime identity; a Claude Code `Agent`-tool spawn is a **child session**. Mission Control carries the substrate-agnostic spine — **agent → session → child session** (`parent_session_id` tree), with **substrate** an attribute — and "sub-agent"/CC-"agent" survive only as labels *projected per substrate* (soma already qualifies them "Cortex agent" / "Claude Code sub-agent"). The current `agents`-row-per-session orphan model (`db/sessions.ts` `registerOrphanSession`) is the violation; refactor map in `docs/refactor-mc-session-tree.md`.
 - **`persona` → `assistant`.** `persona` is not a domain entity. `personas/luna.md` stays a valid filename ("the assistant's persona file").
 - **The `@`-segment names an `assistant`** — `@{assistant}`. myelin's `namespace.md` calls it a "principal address"; its examples ("Forge", "Pilot") are assistants. The hosting **agent** is resolved from `(stack, assistant)`; it carries no wire name.
 - **`stack` meant two things** — the M1–M7 layering *and* a deployment unit. Resolved: `stack` is the **deployment unit**; the M1–M7 layering is the **Myelin layer model**.
@@ -202,7 +214,8 @@ Reconciled in full in `compass/ecosystem/CONTEXT-MAP.md`:
 - `cortex:principal` **≡** `soma:principal` — identical concept, identical term (Q2).
 - `cortex:assistant` **≡** `soma:assistant` — the named being.
 - `cortex:agent` **≡** `soma:"Cortex agent"` — SOMA always qualifies `agent`; within cortex's own bounded context bare `agent` is canonical.
-- `cortex:sub-agent` **≡** `soma:"Claude Code sub-agent"`.
+- `cortex:sub-agent` **≡** `soma:"Claude Code sub-agent"` — both **substrate-projection** labels for a **child session**; the domain term is **child session**.
+- `cortex:session` **≡** the substrate-neutral **session** (one run of a **substrate**), seeded by soma's *presence-inside-a-session* framing and promoted to a CONTEXT-MAP boundary term (2026-06-11). A **child session** carries `parent_session_id`; each **substrate** projects its own label onto it (Claude Code → *sub-agent*). The substrate vocabulary is a projection layer; the spine is substrate-agnostic.
 - `cortex:capability` is **distinct from** `soma:skill` — a capability is the bus-routable ability tag; a skill is the packaged implementation that may fulfil it.
 - **myelin** owns the **subject** grammar (a published language cortex consumes). Pending myelin alignment, filed as a namespace.md issue: `{org}` → `{principal}`, the `@`-segment relabelled an *assistant address*, "Reach" → "Scope".
 - **signal** owns **network-wide observability** — the live, cross-peer view of the substrate (which principals'/stacks' leaves are actually connected to a network, leaf RTT/up-since, roster-as-liveness), per `docs/architecture.md` §3.6 (Tier 3). cortex owns only a **stack's own** control-plane federation state — its joined networks, its own leaf link, its accept-subjects (`cortex network status`). A cortex stack cannot observe another peer's leaf; that is a `signal` collection concern (the-metafactory/signal#113). Split: cortex = *what a stack knows about itself*; signal = *what is happening across the federation* — the metafactory analog of TCP/IP's layered diagnostics (ping/traceroute/tcpdump at the right layer).
