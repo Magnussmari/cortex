@@ -98,12 +98,17 @@ export type WsServerMessage =
   // "projection writes bypass WS fan-out" gap.
   | {
       type: "mc.projection";
+      // MUST stay in sync with `ProjectionFamily` (notifications.ts). When that
+      // type gains a member and this union doesn't, `broadcastProjection` fails
+      // tsc (TS2322) — which is how main went red after `governance.verdict`
+      // landed. Drift-dedup follow-up: reference ProjectionFamily directly.
       family:
         | "dispatch.lifecycle"
         | "review.verdict"
         | "agent.heartbeat"
         | "attention"
-        | "adapter.health";
+        | "adapter.health"
+        | "governance.verdict";
       sessionId?: string;
       assignmentId?: string;
     }
