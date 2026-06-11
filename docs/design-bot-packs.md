@@ -320,16 +320,22 @@ B-0..B-2 are cortex-internal and unblock everything; the SOC demo itself
 does NOT wait for any of this (standalone wiring shipped in pulse v0.14.0
 carries the talk; Yarrow-as-pack is the post-talk consolidation).
 
-## 12. Open questions
+## 12. Decisions on the open questions (JC, 2026-06-11)
 
-1. Socket vs stdio for daemon mode — stdio is simpler but conflates logs
-   and protocol; proposal says socket, logs on stdio. Confirm.
-2. Should `brain.secrets` values come from a cortex secret store rather
-   than the daemon's env at all (brains request decryption per use)? v2
-   candidate; v1 = env injection with install-time consent.
-3. Does the protocol need streaming partials (token-by-token posts) for
-   chat-feel, or are whole-message `post`s enough? v1: whole messages.
-4. Capability *versioning* (pack v2 changes a capability's contract) —
-   unsolved in cortex#60 too; punt to the offering work (cortex#939)?
-5. Attachments >256 KiB use the scratch-path route (§5) — is a host-side
-   total-size budget per task also needed? Decide in B-2.
+1. **Daemon transport: socket for protocol, stdio for logs.** Confirmed.
+2. **Secrets v1: env injection with install-time consent.** Confirmed.
+   Secret-store indirection (brains request decryption per use) stays a
+   v2 candidate.
+3. **Whole-message `post`s.** Confirmed for v1; streaming partials are a
+   protocol-tolerant addition later (new event type — covered by the
+   forward-compat rule in §5).
+4. **Capability versioning: punt to the offering work (cortex#939),**
+   with one v1 bridge rule: a pack release that CHANGES a capability's
+   contract MUST publish it under a new capability id
+   (`soc.compose.flow.v2`), never mutate the meaning of an existing id.
+   Deterministic, zero schema work, and consumers never get silently
+   re-contracted.
+5. **Per-task attachment budget: 4 MiB total** (inline + scratch-path
+   uploads combined), host-enforced. Over budget → `effect_rejected`
+   with `wont_do` (permanent for that task — the brain must summarize or
+   link instead of re-trying the same payload).
