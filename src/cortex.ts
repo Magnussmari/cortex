@@ -77,6 +77,17 @@ import { CCSession, type CCSessionOpts } from "./runner/cc-session";
 import { makeSageReviewRunner } from "./runner/sage-runner";
 import { resolveReviewEngine } from "./runner/review-engine";
 import { buildReviewPrompt } from "./runner/review-prompt";
+import {
+  resolveOffering,
+  offeringSubjectPatterns,
+  type OfferScope,
+} from "./common/types/offering";
+import { admitOfferedDispatch } from "./bus/admit-offered-dispatch";
+import type { GateFloorContext, GateFloorDecision } from "./bus/gate-floor";
+import {
+  getSignedByChain,
+  type Envelope,
+} from "./bus/myelin/envelope-validator";
 
 import { DiscordAdapter } from "./adapters/discord";
 import { createRenderer, type Renderer } from "./renderers";
@@ -1086,6 +1097,97 @@ export async function startCortex(
   // consumer wiring readable alongside the dashboard's `operatorId`
   // column name (still on the MC surface — PR-R2b).
   const reviewPrincipalId = principalId;
+
+  // CO-2/CO-4 (epic cortex#939) — the per-capability OFFER-SCOPE ADMISSION GATE
+  // factory. Returns the closure each consumer calls (after signature
+  // verification, before the capability gate) to evaluate whether an
+  // offered-wider dispatch clears its scope's floor. The closure:
+  //
+  //   1. derives `arrivedScope` from the subject prefix (`local.`/`federated.`/
+  //      `public.`); a malformed/unknown prefix is treated as `local` (the
+  //      narrowest, fail-safe scope — never silently a wider tier);
+  //   2. calls `admitOfferedDispatch` (CO-4), which resolves the capability's
+  //      offering and evaluates `gateFloorForScope` for the arrived scope.
+  //
+  // BYTE-IDENTICAL: with no `policy.offerings` every capability resolves
+  // `local`-only and `gateFloorForScope('local', …)` admits UNCONDITIONALLY
+  // (reading none of the context), so the closure is a provingly-inert
+  // `{admit:true}` on the `local.` subjects that are the ONLY scope bound today.
+  // It bites only on the `federated.`/`public.` subjects CO-2 newly binds once a
+  // capability is offered wider (CO-3).
+  //
+  // CONTEXT WIRING (what is live now vs. the CO-5/CO-7 seams):
+  //   - `signed`           — LIVE: read from the envelope's `signed_by[]` chain.
+  //   - `peerPrincipal`    — LIVE: first signed stamp's principal (federated
+  //                          {kind:'principals'} roster check).
+  //   - `peerInNetwork`    — defense-in-depth ONLY here: the federated `peers[]`
+  //                          roster is ALSO (and authoritatively) enforced by the
+  //                          existing cortex#686 federated consumer gate. Passed
+  //                          `false` so the FLOOR never *widens* admission beyond
+  //                          what that gate already allows (the floor can only
+  //                          refuse; a federated {kind:'network'} request still
+  //                          has to clear the existing peers gate regardless).
+  //   - `surfaceVerified` / `surfacePredicatePassed` — CO-5 seam (gh-webhook
+  //                          Stage-1 tap). NOT yet computed ⇒ passed `false` ⇒
+  //                          the public floor REFUSES (`policy_denied`). This is
+  //                          the SECURE default: a public offering cannot admit
+  //                          until CO-5 wires the surface trust anchor — which is
+  //                          correct, since the public marketplace (CO-5) is
+  //                          itself gated on CO-7 hardening.
+  //   - `complianceOk`     — CO-7 seam. Passed `false` ⇒ public refuses
+  //                          `compliance_block` until CO-7 wires the hook.
+  //   - `rateOk`           — passed `true` (no limiter wired yet; the §5
+  //                          rate/cost cap is a CO-4-follow / CO-7 knob). The
+  //                          structural floors above gate public long before
+  //                          rate matters.
+  //
+  // Net: federated admits a signed peer at `signing ≥ permissive` (then the
+  // existing peers gate enforces the roster); public is refused until CO-5/CO-7
+  // land. Both are correct-and-secure given what is built today. A follow-up
+  // (filed as part of CO-5/CO-7) threads the live surface/compliance/rate
+  // signals into this context.
+  const makeOfferAdmission = (
+    capability: string,
+  ): ((envelope: Envelope, subject: string) => GateFloorDecision) => {
+    return (envelope, subject) => {
+      const arrivedScope: OfferScope = subject.startsWith("federated.")
+        ? "federated"
+        : subject.startsWith("public.")
+          ? "public"
+          : "local";
+      const chain = getSignedByChain(envelope);
+      const signed = chain.length > 0;
+      const ctx: GateFloorContext = {
+        signed,
+        // `peerPrincipal` is intentionally left undefined here: the signed
+        // stamp carries a `did:mf:` identity, not a bare principal, and the
+        // AUTHORITATIVE federated roster check (both `{kind:'network'}` and
+        // `{kind:'principals'}`) is the existing cortex#686 `peers[]` gate that
+        // decodes the requester from `originator.identity`. The CO-4 floor here
+        // contributes the signing-posture + signed-peer + scope-admission gates;
+        // it does not re-derive the roster (see block comment).
+        // Defense-in-depth only — the authoritative federated roster check is
+        // the existing cortex#686 peers gate (see block comment). `false` keeps
+        // the floor refuse-only; it never widens admission.
+        peerInNetwork: false,
+        // CO-5 seam — not yet computed ⇒ secure default (public refuses).
+        surfaceVerified: false,
+        surfacePredicatePassed: false,
+        // CO-7 seam — not yet computed ⇒ secure default (public refuses).
+        complianceOk: false,
+        // No limiter wired yet; structural floors gate public before rate.
+        rateOk: true,
+      };
+      return admitOfferedDispatch({
+        capability,
+        offerings: resolvedPolicy?.offerings,
+        arrivedScope,
+        signing: config.security.signing,
+        ctx,
+      });
+    };
+  };
+
   // cortex#318 — include the stack segment to match the 6-segment grammar
   // `deriveSubject` produces for stack-scoped publishes (cortex#262 / IAW
   // Phase A.5 + canonical helper at `@the-metafactory/myelin/subjects`).
@@ -1095,6 +1197,27 @@ export async function startCortex(
   // Reuses `derivedStack.stack` resolved at boot (line 308) — same source
   // sage's bridge subscription already uses for `local.{principal}.{stack}.>`.
   const reviewSubjectPattern = `local.${reviewPrincipalId}.${derivedStack.stack}.tasks.code-review.>`;
+  // CO-2 (cortex#941) — the offering-derived consumer binding for the
+  // `code-review` capability. `resolveOffering` reads the per-stack offering
+  // policy (default-deny ⇒ `local`-only when `policy.offerings` is absent);
+  // `offeringSubjectPatterns` projects the admitted offer-scopes onto the
+  // scope-prefixed subject patterns the Offer consumer binds on. The
+  // `tasks.code-review.>` task-suffix is the SAME wildcard family the local
+  // pattern uses, so a `local`-only resolution returns EXACTLY
+  // `[reviewSubjectPattern]` — byte-identical to today's single binding. When
+  // (CO-3) `code-review` is offered `federated`/`public`, this also yields the
+  // `federated.…`/`public.….tasks.code-review.>` patterns and the consumer
+  // binds them too. This is ORTHOGONAL to the cortex#686/#725 `federated:`
+  // policy-block federation wiring below (which routes verdicts back to a
+  // cross-principal requester and stays gated on `federationConfigured`); the
+  // offering layer decides reachability, the existing federation block decides
+  // verdict-routing. They compose; CO-2 touches only the Offer binding.
+  const reviewOfferingPatterns = offeringSubjectPatterns(
+    "tasks.code-review.>",
+    reviewPrincipalId,
+    derivedStack.stack,
+    resolveOffering("code-review", resolvedPolicy?.offerings),
+  );
   // cortex#686 (ADR 0001) — the FEDERATED review pattern: this RECEIVING stack's
   // OWN identity (`federated.{my-principal}.{my-stack}.tasks.code-review.>`),
   // the same `{principal}.{stack}` segments as the local pattern, only the
@@ -1188,13 +1311,28 @@ export async function startCortex(
   // an inbound `federated.{me}.{stack}.tasks.@{did}.code-review.…` Direct
   // request is captured by the same CODE_REVIEW stream the Offer + local
   // consumers bind. A parallel Direct DURABLE (per agent) binds below.
-  const reviewStreamSubjects = federationConfigured
-    ? [
-        reviewSubjectPattern,
-        reviewFederatedSubjectPattern,
-        reviewFederatedDirectSubjectPattern,
-      ]
-    : [reviewSubjectPattern];
+  // CO-2 (cortex#941) — the CODE_REVIEW stream filter must also CAPTURE the
+  // wider scope prefixes the `code-review` offering admits, or the Offer
+  // consumer's `federated.…`/`public.….tasks.code-review.>` binding would hit
+  // "subject not in stream". The offering's non-local patterns are unioned in
+  // with DEDUP so a `federated` offering and the pre-existing cortex#686
+  // `reviewFederatedSubjectPattern` (byte-identical string) coalesce to ONE
+  // subject — JetStream rejects overlapping/duplicate subjects, so the set is
+  // dedup'd. For the CO-1 default (`local`-only) `reviewOfferingPatterns` is
+  // `[reviewSubjectPattern]`, which is already in the base set, so this adds
+  // NOTHING — the stream filter is byte-identical to today.
+  const reviewStreamSubjects = Array.from(
+    new Set([
+      ...(federationConfigured
+        ? [
+            reviewSubjectPattern,
+            reviewFederatedSubjectPattern,
+            reviewFederatedDirectSubjectPattern,
+          ]
+        : [reviewSubjectPattern]),
+      ...reviewOfferingPatterns,
+    ]),
+  );
 
   // cortex#835 / pilot#154 — REVIEW_LIFECYCLE subject set. Covers the THREE
   // local lifecycle families a downstream verdict-reactor races for (the
@@ -1247,9 +1385,20 @@ export async function startCortex(
   // principal-local (F-5 federation is a later slice); a federated-history
   // follow-up can extend this set under `federationConfigured` the same way
   // `reviewStreamSubjects` does, when a cross-principal dev consumer needs it.
-  const devImplementStreamSubjects = [
-    `local.${reviewPrincipalId}.${derivedStack.stack}.tasks.dev.>`,
-  ];
+  // CO-2 (cortex#941) — the DEV_IMPLEMENT stream filter carries the scope
+  // prefixes the `dev.implement` offering admits, using the `tasks.dev.>`
+  // wildcard family (so the stream still covers any future `tasks.dev.*`
+  // capability under each admitted scope). `local`-only (the CO-1 default) ⇒
+  // `devStreamOfferingPatterns` is exactly `[local.…tasks.dev.>]` — byte-
+  // identical to today's single-subject filter. The per-consumer binding uses
+  // the narrower exact `tasks.dev.implement` suffix (see the dev boot loop).
+  const devStreamOfferingPatterns = offeringSubjectPatterns(
+    "tasks.dev.>",
+    reviewPrincipalId,
+    derivedStack.stack,
+    resolveOffering("dev.implement", resolvedPolicy?.offerings),
+  );
+  const devImplementStreamSubjects = devStreamOfferingPatterns;
   // ── /F-2.2 DEV_IMPLEMENT subject set ──────────────────────────────────────
 
   if (reviewJsm !== null) {
@@ -1509,6 +1658,10 @@ export async function startCortex(
           sessionOpts: reviewSessionOpts,
           ...(pipelineRunner !== undefined && { pipelineRunner }),
           ...(signatureVerifier !== undefined && { signatureVerifier }),
+          // CO-2/CO-4 — the per-offer-scope admission gate. Inert on `local.`
+          // (byte-identical); gates the `federated.`/`public.` subjects this
+          // PR newly binds at their scope's floor before reviewer work.
+          offerAdmission: makeOfferAdmission("code-review"),
           // cortex#686 — federated consumers route the verdict back to the
           // requester's identity on the conformant `federated.{requester}.…`
           // grammar (the cortex receiver that closes the cross-principal loop).
@@ -1566,8 +1719,19 @@ export async function startCortex(
         }
       }
 
+      // CO-2 (cortex#941) — bind the Offer consumer on the scope prefixes the
+      // `code-review` offering admits. `reviewOfferingPatterns[0]` is the
+      // first admitted scope in canonical order (local → federated → public);
+      // for a `local`-only resolution (the CO-1 default) it is byte-identical
+      // to `reviewSubjectPattern`, so the primary `start()` below is unchanged.
+      // Any FURTHER patterns (federated/public, once CO-3 offers them wider)
+      // bind on a per-scope durable so each scope's traffic acks independently,
+      // mirroring the cortex#686/#725 federated-consumer idiom. With no
+      // offerings, `reviewOfferingPatterns` is exactly `[reviewSubjectPattern]`
+      // and this slice-loop is empty — zero added boot behaviour.
+      const primaryReviewPattern = reviewOfferingPatterns[0] ?? reviewSubjectPattern;
       const started = await consumer.start({
-        pattern: reviewSubjectPattern,
+        pattern: primaryReviewPattern,
         stream: reviewStream,
         durable,
       });
@@ -1595,6 +1759,69 @@ export async function startCortex(
         console.log(
           `cortex: review consumer DORMANT for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} engine=${engine} model=${model ?? "default"} — cortex MyelinRuntime subscriptions disabled (G-1111 pending; tasks.code-review.* envelopes will not be claimed by this consumer)`,
         );
+      }
+
+      // CO-2 (cortex#941) — bind the FURTHER offering scopes (federated/public)
+      // beyond the primary local one. Empty for the CO-1 default (`local`-only
+      // ⇒ `reviewOfferingPatterns` has length 1, so `.slice(1)` is empty ⇒ this
+      // loop never runs ⇒ byte-identical boot). Each extra scope binds on its
+      // OWN durable (scope token in the durable name) so the scopes ack
+      // independently, the same idiom as the cortex#686/#725 federated durables.
+      for (const extraPattern of reviewOfferingPatterns.slice(1)) {
+        const scopeToken = extraPattern.split(".", 1)[0] ?? "scope";
+        // MAJOR-1 fix (cortex#715 re-introduction): a `federated.`/`public.`
+        // offer-scope consumer MUST be constructed with `federated: true` so
+        // `ReviewConsumer.processEnvelope` decodes the REQUESTER from
+        // `originator.identity` and routes the verdict back cross-principal —
+        // `makeConsumer(false)` left `this.federated` unset, routing every
+        // verdict to SELF (the exact cortex#715 BLOCKER). `makeConsumer(true)`
+        // also wires `federatedNetworks` so the defense-in-depth `peers[]` gate
+        // runs. (`public` shares the federated verdict-routing path: a public
+        // requester reaches us through a surface but the verdict still routes to
+        // the relaying identity in `originator`, not self.)
+        const offerConsumer = makeConsumer(
+          scopeToken === "federated" || scopeToken === "public",
+        );
+        reviewConsumers.push(offerConsumer);
+        const offerDurable = `cortex-review-consumer-offer-${scopeToken}-${reviewPrincipalId}-${agent.id}`;
+        if (reviewJsm !== null) {
+          try {
+            const outcome = await provisionReviewConsumer({
+              jsm: reviewJsm,
+              stream: reviewStream,
+              durable: offerDurable,
+              maxDeliver: reviewConsumerMaxDeliver,
+            });
+            if (outcome === "created") {
+              console.log(
+                `cortex: provisioned JetStream durable "${offerDurable}" on stream "${reviewStream}"`,
+              );
+            } else if (outcome === "updated") {
+              console.log(
+                `cortex: reconciled JetStream durable "${offerDurable}" ack_wait (cortex#422) on stream "${reviewStream}"`,
+              );
+            }
+          } catch (provisionErr) {
+            process.stderr.write(
+              `cortex: provisionReviewConsumer failed for "${offerDurable}": ` +
+                `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+            );
+          }
+        }
+        const offerStarted = await offerConsumer.start({
+          pattern: extraPattern,
+          stream: reviewStream,
+          durable: offerDurable,
+        });
+        if (offerStarted.subscribed) {
+          console.log(
+            `cortex: review consumer (offer:${scopeToken}) ready for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} engine=${engine} model=${model ?? "default"} pattern=${extraPattern}`,
+          );
+        } else {
+          console.log(
+            `cortex: review consumer (offer:${scopeToken}) DORMANT for agent=${agent.id} flavors=[${flavorSummary}] signed=${signedTag} engine=${engine} model=${model ?? "default"} — cortex MyelinRuntime subscriptions disabled (${extraPattern} envelopes will not be claimed by this consumer)`,
+          );
+        }
       }
 
       // cortex#686 (ADR 0001) — the FEDERATED review consumer. Subscribes this
@@ -1742,6 +1969,20 @@ export async function startCortex(
     // agent) so dev + prod instances on the same principal share competing-
     // consumer semantics and a restart resumes from the same offset.
     const releaseSubjectPattern = `local.${principalId}.${derivedStack.stack}.tasks.release.cut`;
+    // CO-2 (cortex#941) — the offering-derived binding for the `release.cut`
+    // capability. The task-suffix `tasks.release.cut` is an EXACT subject (no
+    // wildcard); `offeringSubjectPatterns` only varies the scope prefix, so a
+    // `local`-only resolution (the CO-1 default) returns EXACTLY
+    // `[releaseSubjectPattern]` — byte-identical to today's single binding.
+    // Resolved against `release.cut` (the canonical capability the subject
+    // routes on, regardless of whether the agent declared `release` or
+    // `release.cut`).
+    const releaseOfferingPatterns = offeringSubjectPatterns(
+      "tasks.release.cut",
+      principalId,
+      derivedStack.stack,
+      resolveOffering("release.cut", resolvedPolicy?.offerings),
+    );
     const releaseStream = "RELEASE";
     // Reuse the review-lane stream defaults: a release-cut request is small +
     // infrequent; 24h retention + 512MiB is ample and matches the operational
@@ -1760,16 +2001,20 @@ export async function startCortex(
 
     if (releaseJsm !== null) {
       try {
+        // CO-2 (cortex#941) — the RELEASE stream filter carries the scope
+        // prefixes the `release.cut` offering admits. `local`-only (the CO-1
+        // default) ⇒ `releaseOfferingPatterns` is `[releaseSubjectPattern]`, so
+        // this is byte-identical to today's single-subject filter.
         const outcome = await provisionReviewStream({
           jsm: releaseJsm,
           name: releaseStream,
-          subjects: [releaseSubjectPattern],
+          subjects: releaseOfferingPatterns,
           maxAgeNs: releaseStreamMaxAgeNs,
           maxBytes: releaseStreamMaxBytes,
         });
         if (outcome === "created") {
           console.log(
-            `cortex: provisioned JetStream stream "${releaseStream}" (subjects=[${releaseSubjectPattern}])`,
+            `cortex: provisioned JetStream stream "${releaseStream}" (subjects=[${releaseOfferingPatterns.join(", ")}])`,
           );
         } else if (outcome === "exists") {
           console.log(
@@ -1800,6 +2045,8 @@ export async function startCortex(
           agent: consumerAgent,
           source: systemEventSource,
           runtime,
+          // CO-2/CO-4 — per-offer-scope admission gate (inert on `local.`).
+          offerAdmission: makeOfferAdmission("release.cut"),
         });
         releaseConsumers.push(consumer);
 
@@ -1829,8 +2076,14 @@ export async function startCortex(
           }
         }
 
+        // CO-2 (cortex#941) — bind on the offering-admitted scope prefixes.
+        // `releaseOfferingPatterns[0]` is byte-identical to
+        // `releaseSubjectPattern` for the CO-1 default (`local`-only); the
+        // `.slice(1)` loop is empty unless `release.cut` is offered wider.
+        const primaryReleasePattern =
+          releaseOfferingPatterns[0] ?? releaseSubjectPattern;
         const started = await consumer.start({
-          pattern: releaseSubjectPattern,
+          pattern: primaryReleasePattern,
           stream: releaseStream,
           durable,
         });
@@ -1844,6 +2097,62 @@ export async function startCortex(
           console.log(
             `cortex: release consumer DORMANT for agent=${agent.id} capability=release.cut executor=none — cortex MyelinRuntime subscriptions disabled (G-1111 pending; tasks.release.cut envelopes will not be claimed by this consumer)`,
           );
+        }
+        // CO-2 — extra offering scopes (federated/public) beyond the primary
+        // local one, each on its own scope-named durable. Empty for the CO-1
+        // default ⇒ byte-identical boot.
+        for (const extraPattern of releaseOfferingPatterns.slice(1)) {
+          const scopeToken = extraPattern.split(".", 1)[0] ?? "scope";
+          // A NEW consumer instance per extra scope (one filter per JetStream
+          // pull consumer) — same idiom as the review lane + the NIT-fix on the
+          // dev lane. The CO-2/CO-4 admission gate is wired here too so the
+          // wider-scope release dispatch clears its floor.
+          const extraConsumer = new ReleaseConsumer({
+            agent: consumerAgent,
+            source: systemEventSource,
+            runtime,
+            offerAdmission: makeOfferAdmission("release.cut"),
+          });
+          releaseConsumers.push(extraConsumer);
+          const extraDurable = `cortex-release-consumer-offer-${scopeToken}-${principalId}-${agent.id}`;
+          if (releaseJsm !== null) {
+            try {
+              const outcome = await provisionReviewConsumer({
+                jsm: releaseJsm,
+                stream: releaseStream,
+                durable: extraDurable,
+                maxDeliver: releaseConsumerMaxDeliver,
+              });
+              if (outcome === "created") {
+                console.log(
+                  `cortex: provisioned JetStream durable "${extraDurable}" on stream "${releaseStream}"`,
+                );
+              } else if (outcome === "updated") {
+                console.log(
+                  `cortex: reconciled JetStream durable "${extraDurable}" on stream "${releaseStream}"`,
+                );
+              }
+            } catch (provisionErr) {
+              process.stderr.write(
+                `cortex: provisionReviewConsumer failed for "${extraDurable}": ` +
+                  `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+              );
+            }
+          }
+          const extraStarted = await extraConsumer.start({
+            pattern: extraPattern,
+            stream: releaseStream,
+            durable: extraDurable,
+          });
+          if (extraStarted.subscribed) {
+            console.log(
+              `cortex: release consumer (offer:${scopeToken}) ready for agent=${agent.id} capability=release.cut executor=none pattern=${extraPattern}`,
+            );
+          } else {
+            console.log(
+              `cortex: release consumer (offer:${scopeToken}) DORMANT for agent=${agent.id} capability=release.cut executor=none — cortex MyelinRuntime subscriptions disabled (${extraPattern} envelopes will not be claimed by this consumer)`,
+            );
+          }
         }
       } catch (err) {
         // Per CLAUDE.md "no empty catch blocks": a single agent's release
@@ -1867,7 +2176,23 @@ export async function startCortex(
   // block is inert: byte-identical boot. Mirrors the review-consumer
   // dormancy contract above; runs AFTER it so a principal scanning boot logs
   // sees the review path first.
-  const devConsumers = wireDevConsumers({
+  // CO-2 (cortex#941) — the dev consumer binds on the scope prefixes the
+  // `dev.implement` offering admits, using the EXACT `tasks.dev.implement`
+  // subject (narrower than the `tasks.dev.>` stream filter). `local`-only (the
+  // CO-1 default) ⇒ `devOfferingPatterns` is exactly
+  // `[local.…tasks.dev.implement]` — byte-identical to today's single binding.
+  const devOfferingPatterns = offeringSubjectPatterns(
+    "tasks.dev.implement",
+    principalId,
+    derivedStack.stack,
+    resolveOffering("dev.implement", resolvedPolicy?.offerings),
+  );
+  // CO-2 NIT-fix: `wireDevConsumers` now returns one {consumer, pattern} per
+  // (agent × admitted scope) — a SEPARATE DevConsumer instance per scope, never
+  // one `.start()`-ed twice (the second `.start()` would silently drop the
+  // extra filter). With no offerings, `devOfferingPatterns` is the single local
+  // pattern ⇒ one entry per agent ⇒ byte-identical boot.
+  const wiredDevConsumers = wireDevConsumers({
     agents: mergedAgents,
     runtime,
     source: systemEventSource,
@@ -1879,25 +2204,41 @@ export async function startCortex(
     // review session. `buildDevSessionOpts` also sets the bash-guard Gate-1
     // channel + a conservative allowlist default when the config declares none.
     guardrails: config.claude,
+    offeringPatterns: devOfferingPatterns,
+    // CO-2/CO-4 — per-offer-scope admission gate (inert on `local.`).
+    offerAdmission: makeOfferAdmission("dev.implement"),
   });
-  for (const consumer of devConsumers) {
+  // Flat consumer list for the shutdown drain (one entry per wired scope).
+  const devConsumers = wiredDevConsumers.map((w) => w.consumer);
+  for (const { consumer, pattern } of wiredDevConsumers) {
     try {
       // Stream provisioning for `tasks.dev.implement` is deliberately a
       // sibling slice (see dev-consumer-boot.ts header FLAG) — until a
       // dev-capable agent exists this loop never runs, so the deferral
       // changes no live behaviour. `start()` stays dormant-safe: a disabled
       // runtime returns `subscribed: false` and the consumer never binds.
+      // The durable carries the scope token so a multi-scope offering's
+      // consumers don't collide; for `local.` it is byte-identical to today's
+      // `cortex-dev-consumer-{principal}-{agent}`.
+      const scopeToken = pattern.split(".", 1)[0] ?? "local";
+      const durable =
+        scopeToken === "local"
+          ? `cortex-dev-consumer-${principalId}-${consumer.agent.id}`
+          : `cortex-dev-consumer-offer-${scopeToken}-${principalId}-${consumer.agent.id}`;
       const started = await consumer.start({
-        pattern: `local.${principalId}.${derivedStack.stack}.tasks.dev.implement`,
+        pattern,
         stream: "DEV_IMPLEMENT",
-        durable: `cortex-dev-consumer-${principalId}-${consumer.agent.id}`,
+        durable,
       });
+      const scopeTag = scopeToken === "local" ? "" : ` (offer:${scopeToken})`;
       if (started.subscribed) {
-        console.log(`cortex: dev.implement consumer ready for agent=${consumer.agent.id}`);
+        console.log(
+          `cortex: dev.implement consumer${scopeTag} ready for agent=${consumer.agent.id} pattern=${pattern}`,
+        );
       } else {
         console.log(
-          `cortex: dev.implement consumer DORMANT for agent=${consumer.agent.id} — ` +
-            `cortex MyelinRuntime subscriptions disabled (G-1111 pending; tasks.dev.implement ` +
+          `cortex: dev.implement consumer${scopeTag} DORMANT for agent=${consumer.agent.id} — ` +
+            `cortex MyelinRuntime subscriptions disabled (G-1111 pending; ${pattern} ` +
             `envelopes will not be claimed by this consumer)`,
         );
       }
