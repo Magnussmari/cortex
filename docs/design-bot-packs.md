@@ -125,12 +125,14 @@ socket (stdio kept for logs).
 **Cortex → brain (events):**
 
 ```jsonc
+{ "v": 1, "type": "hello",   "agent": "yarrow", "persona": "…",
+  "protocol": "cortex-brain/v1" }                                          // daemon handshake — host-authoritative identity; per-task brains get persona on task instead
 { "v": 1, "type": "task",    "task_id": "…", "capability": "soc.compose.flow",
   "payload": { /* envelope payload */ },
   "source": { "surface": "mattermost", "channel": "…", "thread": "…", "user": "…" } }
 { "v": 1, "type": "message", "task_id": "…", "text": "…", "user": "…" }   // follow-up in an open task's thread
 { "v": 1, "type": "gate_verdict", "task_id": "…", "gate": "principal-ack",
-  "verdict": "pass", "notes": "run it" }                                   // answer to ask_principal
+  "verdict": "pass", "principal": "…", "notes": "run it" }                                   // answer to ask_principal
 { "v": 1, "type": "cancel",  "task_id": "…" }
 { "v": 1, "type": "shutdown", "deadline_ms": 5000 }                        // drain signal (hot-swap)
 { "v": 1, "type": "effect_rejected", "task_id": "…", "effect": "dispatch",
@@ -172,7 +174,9 @@ Properties that make this the right shape:
 4. **Language-agnostic.** `run` is any argv. Bun/TS is the house style;
    nothing in the protocol requires it.
 5. **Refusals are typed, not flattened.** `result.status: failed` carries
-   `reason.kind: cant_do | not_now | wont_do` — the same taxonomy the
+   `reason.kind: cant_do | not_now | wont_do` (brain side; host-emitted
+   refusals may additionally carry `policy_denied | compliance_block`,
+   and `not_now` may carry `retry_after_ms`) — the same taxonomy the
    dispatch layer already speaks — and cortex refusing a brain's effect
    comes back as `effect_rejected` with the same kinds. B-1 must not
    re-flatten the distinction sage-runner Phase 1 flattened.
