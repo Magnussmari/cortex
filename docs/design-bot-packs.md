@@ -282,7 +282,7 @@ should be the proving migration:
 | Yarrow needs | Protocol element |
 |---|---|
 | Reply in-thread with YAML + PNG | `post` with attachment |
-| Operator "run it" with principal check | `ask_principal` / `gate_verdict` |
+| Principal "run it" with host-side check | `ask_principal` / `gate_verdict` |
 | Long-running execution with progress | multiple `post`s per task (maps from pulse `onActionStepEvent`) |
 | Frontier-A self-disclosure before composing | first `post` of every task |
 | Fleet sub-tasks — pulse pipelines containing `agent:` steps route their dispatch through the hosting brain | `dispatch` with downgrade-only sovereignty |
