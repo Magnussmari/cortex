@@ -469,7 +469,7 @@ features:
 
   G-1115:
     name: Governance verdict observability (governance upgrade Stage 5)
-    status: in-progress
+    status: done
     description: >
       Read-only MC Governance tab over the governed-action stack's bus
       verdicts (pulse P-702 publishes governance.verdict.{l0,tribunal,gate,
