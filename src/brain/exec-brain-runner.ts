@@ -155,18 +155,16 @@ export interface BrainTaskHooks {
    * event so it can degrade. Resolving with `{ rejected: false }` (or void)
    * accepts the dispatch.
    */
-  onDispatch(
-    dispatch: DispatchEffect,
-  ):
-    | void
-    | Promise<void>
-    | { rejected: false }
-    | { rejected: true; reason: BrainReason }
-    | Promise<{ rejected: false } | { rejected: true; reason: BrainReason }>;
+  onDispatch(dispatch: DispatchEffect): BrainDispatchOutcome | Promise<BrainDispatchOutcome>;
 
   /** A `log` effect — diagnostic; not surfaced to the principal. */
   onLog(log: LogEffect): void | Promise<void>;
 }
+
+export type BrainDispatchOutcome =
+  | undefined
+  | { rejected: false }
+  | { rejected: true; reason: BrainReason };
 
 // ---------------------------------------------------------------------------
 // Factory options + result
@@ -311,13 +309,8 @@ export function makeExecBrainRunner(
     }
 
     // --- timeout → SIGTERM → (grace) → SIGKILL ----------------------------
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
-    const clearTimers = (): void => {
-      if (killTimer !== undefined) clearTimeout(killTimer);
-      if (graceTimer !== undefined) clearTimeout(graceTimer);
-    };
 
     /**
      * Fire-and-forget kill escalation: SIGTERM now, SIGKILL after the grace.
@@ -345,10 +338,14 @@ export function makeExecBrainRunner(
       }, killGraceMs);
     };
 
-    killTimer = setTimeout(() => {
+    const killTimer = setTimeout(() => {
       timedOut = true;
       escalateKill();
     }, timeoutMs);
+    const clearTimers = (): void => {
+      clearTimeout(killTimer);
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+    };
 
     /**
      * Resolve the run with the brain's terminal `result`, THEN run cleanup
@@ -397,7 +394,7 @@ export function makeExecBrainRunner(
       const exitedOnOwn = await Promise.race([
         proc.exited.then(() => true).catch(() => true),
         new Promise<boolean>((res) =>
-          setTimeout(() => res(false), resultGraceMs),
+          setTimeout(() => { res(false); }, resultGraceMs),
         ),
       ]);
       if (!exitedOnOwn) {
@@ -415,7 +412,7 @@ export function makeExecBrainRunner(
 
     // --- write the task event to stdin ------------------------------------
     try {
-      proc.stdin.write(encodeBrainEvent(task) + "\n");
+      await proc.stdin.write(encodeBrainEvent(task) + "\n");
       await proc.stdin.flush?.();
     } catch (err) {
       // stdin closed before we could write — treat as a brain that refused
@@ -439,7 +436,7 @@ export function makeExecBrainRunner(
      */
     const sendEvent = async (line: string): Promise<void> => {
       try {
-        proc.stdin.write(line + "\n");
+        await proc.stdin.write(line + "\n");
         await proc.stdin.flush?.();
       } catch (err) {
         console.warn(
@@ -496,7 +493,7 @@ export function makeExecBrainRunner(
       if (e.task_id !== task.task_id) {
         await rejectEffect(
           e.type,
-          `foreign task_id ${String(e.task_id)} (this brain owns ${task.task_id})`,
+          `foreign task_id ${e.task_id} (this brain owns ${task.task_id})`,
         );
         return;
       }
@@ -542,13 +539,7 @@ export function makeExecBrainRunner(
         }
         case "dispatch": {
           const outcome = await hooks.onDispatch(e);
-          if (
-            outcome !== undefined &&
-            outcome !== null &&
-            typeof outcome === "object" &&
-            "rejected" in outcome &&
-            outcome.rejected === true
-          ) {
+          if (outcome?.rejected) {
             await sendEvent(
               encodeBrainEvent({
                 v: 1,
@@ -587,10 +578,8 @@ export function makeExecBrainRunner(
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (value !== undefined) {
-            for (const line of decoder.push(value)) {
-              await routeEffect(parseBrainEffect(line));
-            }
+          for (const line of decoder.push(value)) {
+            await routeEffect(parseBrainEffect(line));
           }
         }
         // Flush any final newline-less line.
@@ -615,9 +604,7 @@ export function makeExecBrainRunner(
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
-            if (value !== undefined) {
-              stderrRing.append(dec.decode(value, { stream: true }));
-            }
+            stderrRing.append(dec.decode(value, { stream: true }));
           }
           const trailing = dec.decode();
           if (trailing.length > 0) stderrRing.append(trailing);
@@ -644,7 +631,7 @@ export function makeExecBrainRunner(
     // the routeEffect loop; whichever settles the run first wins (settleWith*
     // is idempotent via runSettled).
     void (async (): Promise<void> => {
-      let exitCode: number | null = null;
+      let exitCode: number | null;
       try {
         exitCode = await proc.exited;
       } catch (err) {
@@ -657,9 +644,11 @@ export function makeExecBrainRunner(
       // Drain the remaining stdout/stderr — a late `result` on the final chunk
       // can still settle the run inside routeEffect.
       await Promise.allSettled([stdoutDone, stderrDone]);
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- routeEffect can settle the run while this exit watcher awaits process/pump completion.
       if (runSettled) return;
       clearTimers();
       const stderrTail = stderrRing.value();
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- the timeout callback can flip timedOut before proc.exited resolves.
       const reasonDetail = timedOut
         ? `brain timed out after ${timeoutMs}ms${
             stderrTail.trim() ? `; stderr: ${tail(stderrTail)}` : ""
@@ -752,7 +741,7 @@ function defaultSpawn(
     stdout: proc.stdout,
     stderr: proc.stderr,
     exited: proc.exited,
-    kill: (signal) => proc.kill(signal as number | NodeJS.Signals | undefined),
+    kill: (signal) => { proc.kill(signal); },
   };
 }
 
@@ -799,7 +788,7 @@ function isOkEffect(
   if (parsed.kind === "unknown") {
     // Forward-compat: unknown effect type — drop and log (§5).
     logs.push(
-      `[runner] dropped unknown effect type: ${String(parsed.raw["type"])}`,
+      `[runner] dropped unknown effect type: ${String(parsed.raw.type)}`,
     );
     return false;
   }

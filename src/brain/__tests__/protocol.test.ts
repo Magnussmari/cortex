@@ -183,7 +183,7 @@ describe("unknown-type tolerance (forward-compat §5)", () => {
     const parsed = parseBrainEffect(line);
     expect(parsed.kind).toBe("unknown");
     if (parsed.kind === "unknown") {
-      expect(parsed.raw["type"]).toBe("stream_partial");
+      expect(parsed.raw.type).toBe("stream_partial");
     }
   });
 

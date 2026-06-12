@@ -95,6 +95,7 @@ function makeHooks(over: Partial<BrainTaskHooks> = {}): BrainTaskHooks & {
       over.onDispatch ??
       ((d) => {
         dispatches.push(d);
+        return undefined;
       }),
     onLog: over.onLog ?? ((l) => void brainLogs.push(l)),
   };

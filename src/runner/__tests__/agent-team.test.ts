@@ -20,14 +20,14 @@ import { testClaude } from "../../common/test-utils";
  * hook so tests can inject the peer's terminal envelope synchronously.
  */
 function fakeBusPeerDeps(): NonNullable<AgentTeamOpts["busPeer"]> {
-  /* eslint-disable @typescript-eslint/no-empty-function, @typescript-eslint/require-await */
+
   const runtime: MyelinRuntime = {
     enabled: true,
     onEnvelope: () => ({ unregister: () => {} }),
     publish: async () => {},
     stop: async () => {},
   };
-  /* eslint-enable @typescript-eslint/no-empty-function, @typescript-eslint/require-await */
+
   // The bus-peer factory in tests doesn't actually consume the
   // resolver (it's just threaded into BusPeerHarness). An empty
   // object satisfies the structural shape via cast — declared
