@@ -2335,37 +2335,62 @@ export async function startCortex(
   // with no platform id there is nothing to verify a reply against, so the
   // consumer keeps its DenyAll default (fail-closed, B-1 behaviour).
   const gateReplyRouter = new GateReplyRouter();
-  const liveSurfaces = new Set<string>();
-  if (config.discord.length > 0) liveSurfaces.add("discord");
-  if (config.mattermost.length > 0) liveSurfaces.add("mattermost");
-  if (config.slack.length > 0) liveSurfaces.add("slack");
+
+  // One metadata row per surface family (sage #1037 round 2: liveSurfaces,
+  // principalIdentity and the has-identity check previously repeated the
+  // platform list in three independent shapes — adding a surface meant
+  // touching all of them).
+  const surfaceGateMeta = [
+    {
+      surface: "discord",
+      configured: config.discord.length > 0,
+      identityKey: "discordId" as const,
+      principalId: options.principal?.discordId,
+    },
+    {
+      surface: "mattermost",
+      configured: config.mattermost.length > 0,
+      identityKey: "mattermostId" as const,
+      principalId: options.principal?.mattermostId,
+    },
+    {
+      surface: "slack",
+      configured: config.slack.length > 0,
+      identityKey: "slackId" as const,
+      principalId: options.principal?.slackId,
+    },
+  ];
+  const liveSurfaces = new Set<string>(
+    surfaceGateMeta.filter((m) => m.configured).map((m) => m.surface),
+  );
+  const principalIdentity: PrincipalIdentity = {};
+  for (const m of surfaceGateMeta) {
+    if (m.principalId !== undefined) principalIdentity[m.identityKey] = m.principalId;
+  }
+  const principalHasSurfaceIdentity = surfaceGateMeta.some(
+    (m) => m.principalId !== undefined,
+  );
 
   // sage #1037 round 1 (maintainability): ONE inbound handler shape for all
   // three adapter families — gate reply-bridge first, chat dispatch second.
   // B-3 (cortex#1021 W-1): a message landing in a thread with an open
   // principal gate is that gate's reply (identity checked by the GATE, never
-  // here), not a chat dispatch.
+  // here), not a chat dispatch. The InboundMessage → GateReplyOffer mapping
+  // lives HERE (surface layer) so the bus-side router stays blind to adapter
+  // DTOs (sage round 2, architecture).
   const inboundWithGateBridge =
     (adapter: PlatformAdapter, agent: Agent) =>
     (msg: InboundMessage): Promise<void> => {
-      if (gateReplyRouter.offerInbound(msg)) return Promise.resolve();
+      const consumed = gateReplyRouter.offer({
+        surface: msg.platform,
+        channel: msg.channelId,
+        ...(msg.threadId !== undefined && { thread: msg.threadId }),
+        authorId: msg.authorId,
+        text: msg.content,
+      });
+      if (consumed) return Promise.resolve();
       return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
     };
-  const principalIdentity: PrincipalIdentity = {
-    ...(options.principal?.mattermostId !== undefined && {
-      mattermostId: options.principal.mattermostId,
-    }),
-    ...(options.principal?.discordId !== undefined && {
-      discordId: options.principal.discordId,
-    }),
-    ...(options.principal?.slackId !== undefined && {
-      slackId: options.principal.slackId,
-    }),
-  };
-  const principalHasSurfaceIdentity =
-    principalIdentity.mattermostId !== undefined ||
-    principalIdentity.discordId !== undefined ||
-    principalIdentity.slackId !== undefined;
   const surfacePrincipalGate = principalHasSurfaceIdentity
     ? new SurfacePrincipalGate({
         principalIdentity,

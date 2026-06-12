@@ -3,10 +3,12 @@
  * inbound reply-bridge).
  *
  * Covered (plan W-1 probes):
- *   - matching inbound reply resolves the waiting gate (consumed)
- *   - non-matching inbound (other thread/channel/surface, or no thread) is
+ *   - matching offer resolves the waiting gate (consumed)
+ *   - non-matching offer (other thread/channel/surface, or no thread) is
  *     NOT consumed — chat dispatch unaffected
  *   - timeout resolves null and deregisters the waiter
+ *   - the re-await grace window: a reply in the gap is buffered (consumed)
+ *     and delivered to the next awaitReply; expired buffers pass through
  *   - stop() resolves all pending null (drain cannot be held hostage)
  *   - FIFO across multiple gates on one key
  *   - END-TO-END with the real SurfacePrincipalGate: principal reply passes,
@@ -15,26 +17,21 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { GateReplyRouter } from "../gate-reply-router";
+import { GateReplyRouter, type GateReplyOffer } from "../gate-reply-router";
 import {
   SurfacePrincipalGate,
   type GatePromptRenderer,
 } from "../surface-principal-gate";
-import type { InboundMessage } from "../../adapters/types";
 
 const PRINCIPAL_MM = "mm-principal-123";
 
-function inbound(over: Partial<InboundMessage> = {}): InboundMessage {
+function offerOf(over: Partial<GateReplyOffer> = {}): GateReplyOffer {
   return {
-    platform: "mattermost",
-    instanceId: "mm-1",
+    surface: "mattermost",
+    channel: "c1",
+    thread: "th1",
     authorId: PRINCIPAL_MM,
-    authorName: "JC",
-    content: "run it",
-    channelId: "c1",
-    threadId: "th1",
-    attachments: [],
-    timestamp: new Date(),
+    text: "run it",
     ...over,
   };
 }
@@ -44,7 +41,7 @@ function nullRenderer(): GatePromptRenderer {
 }
 
 describe("GateReplyRouter", () => {
-  test("matching inbound resolves the waiting gate and is consumed", async () => {
+  test("matching offer resolves the waiting gate and is consumed", async () => {
     const router = new GateReplyRouter();
     const pending = router.awaitReply({
       surface: "mattermost",
@@ -53,13 +50,13 @@ describe("GateReplyRouter", () => {
       timeoutMs: 5_000,
     });
     expect(router.pendingCount).toBe(1);
-    expect(router.offerInbound(inbound())).toBe(true); // consumed
+    expect(router.offer(offerOf())).toBe(true); // consumed
     const reply = await pending;
     expect(reply).toEqual({ authorId: PRINCIPAL_MM, text: "run it" });
     expect(router.pendingCount).toBe(0);
   });
 
-  test("non-matching inbound is NOT consumed — chat dispatch unaffected", async () => {
+  test("non-matching offer is NOT consumed — chat dispatch unaffected", async () => {
     const router = new GateReplyRouter();
     const pending = router.awaitReply({
       surface: "mattermost",
@@ -69,19 +66,19 @@ describe("GateReplyRouter", () => {
     });
     // Different thread, different channel, different surface, and no thread
     // at all — none of these belong to the open gate.
-    expect(router.offerInbound(inbound({ threadId: "other" }))).toBe(false);
-    expect(router.offerInbound(inbound({ channelId: "other" }))).toBe(false);
-    expect(router.offerInbound(inbound({ platform: "discord" }))).toBe(false);
-    const noThread = inbound();
-    delete noThread.threadId;
-    expect(router.offerInbound(noThread)).toBe(false);
+    expect(router.offer(offerOf({ thread: "other" }))).toBe(false);
+    expect(router.offer(offerOf({ channel: "other" }))).toBe(false);
+    expect(router.offer(offerOf({ surface: "discord" }))).toBe(false);
+    const noThread = offerOf();
+    delete noThread.thread;
+    expect(router.offer(noThread)).toBe(false);
     // The gate is still waiting; it times out to null.
     expect(await pending).toBeNull();
   });
 
-  test("with NO open gate, every offer is a pass-through", () => {
+  test("with NO open gate (and no grace window), every offer passes through", () => {
     const router = new GateReplyRouter();
-    expect(router.offerInbound(inbound())).toBe(false);
+    expect(router.offer(offerOf())).toBe(false);
   });
 
   test("timeout resolves null and deregisters", async () => {
@@ -94,8 +91,8 @@ describe("GateReplyRouter", () => {
     });
     expect(reply).toBeNull();
     expect(router.pendingCount).toBe(0);
-    // After the timeout the late reply is a pass-through, not a consume.
-    expect(router.offerInbound(inbound())).toBe(false);
+    // A waiter TIMEOUT opens no grace window — the late reply passes through.
+    expect(router.offer(offerOf())).toBe(false);
   });
 
   test("non-positive timeout resolves null immediately", async () => {
@@ -130,6 +127,44 @@ describe("GateReplyRouter", () => {
     ).toBeNull();
   });
 
+  test("re-await gap: a reply after a delivery is buffered (consumed) and handed to the next awaitReply", async () => {
+    const router = new GateReplyRouter();
+    const first = router.awaitReply({
+      surface: "mattermost",
+      channel: "c1",
+      thread: "th1",
+      timeoutMs: 5_000,
+    });
+    // Delivery #1 (e.g. an impostor reply) — opens the grace window.
+    expect(router.offer(offerOf({ authorId: "impostor", text: "run it" }))).toBe(true);
+    expect((await first)?.authorId).toBe("impostor");
+    // The gap: no waiter registered yet, but the key is hot — the principal's
+    // reply must be CONSUMED (buffered), never become a chat dispatch.
+    expect(router.offer(offerOf({ text: "yes" }))).toBe(true);
+    // The gate's re-await drains the buffer immediately.
+    const second = await router.awaitReply({
+      surface: "mattermost",
+      channel: "c1",
+      thread: "th1",
+      timeoutMs: 5_000,
+    });
+    expect(second).toEqual({ authorId: PRINCIPAL_MM, text: "yes" });
+  });
+
+  test("grace window is bounded: an unrelated key never buffers", () => {
+    const router = new GateReplyRouter();
+    const pending = router.awaitReply({
+      surface: "mattermost",
+      channel: "c1",
+      thread: "th1",
+      timeoutMs: 1_000,
+    });
+    expect(router.offer(offerOf())).toBe(true); // delivery — c1/th1 hot
+    // A different thread is NOT hot — passes through.
+    expect(router.offer(offerOf({ thread: "th2" }))).toBe(false);
+    return pending;
+  });
+
   test("stop() resolves all pending null and rejects later traffic", async () => {
     const router = new GateReplyRouter();
     const a = router.awaitReply({
@@ -148,7 +183,7 @@ describe("GateReplyRouter", () => {
     expect(await a).toBeNull();
     expect(await b).toBeNull();
     expect(router.pendingCount).toBe(0);
-    expect(router.offerInbound(inbound())).toBe(false);
+    expect(router.offer(offerOf())).toBe(false);
     expect(
       await router.awaitReply({
         surface: "mattermost",
@@ -174,7 +209,7 @@ describe("GateReplyRouter", () => {
       timeoutMs: 50,
     });
     expect(router.pendingCount).toBe(2);
-    expect(router.offerInbound(inbound({ content: "yes" }))).toBe(true);
+    expect(router.offer(offerOf({ text: "yes" }))).toBe(true);
     expect((await first)?.text).toBe("yes");
     // The second waiter is untouched and times out on its own.
     expect(await second).toBeNull();
@@ -219,7 +254,7 @@ describe("SurfacePrincipalGate over GateReplyRouter", () => {
     const gate = liveGate(router);
     const verdictP = resolveGate(gate);
     await untilPending(router);
-    expect(router.offerInbound(inbound({ content: "run it" }))).toBe(true);
+    expect(router.offer(offerOf({ text: "run it" }))).toBe(true);
     const verdict = await verdictP;
     expect(verdict.verdict).toBe("pass");
     expect(verdict.principal).toBe(PRINCIPAL_MM);
@@ -232,14 +267,13 @@ describe("SurfacePrincipalGate over GateReplyRouter", () => {
     await untilPending(router);
     // The impostor's reply IS a gate-thread reply — consumed — but the gate
     // ignores the non-principal author and re-awaits.
-    expect(
-      router.offerInbound(inbound({ authorId: "impostor", content: "run it" })),
-    ).toBe(true);
-    await untilPending(router); // gate re-registered
-    // Then the principal denies.
-    expect(router.offerInbound(inbound({ content: "no" }))).toBe(true);
+    expect(router.offer(offerOf({ authorId: "impostor", text: "run it" }))).toBe(true);
+    // The principal's denial can land in the re-await gap — the grace buffer
+    // consumes it and the gate's next awaitReply receives it.
+    expect(router.offer(offerOf({ text: "no" }))).toBe(true);
     const verdict = await verdictP;
     expect(verdict.verdict).toBe("fail");
+    expect(verdict.principal).toBe(PRINCIPAL_MM);
   });
 
   test("router.stop() with an open gate fails it closed (drain path)", async () => {
