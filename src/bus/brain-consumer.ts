@@ -97,6 +97,7 @@ import type {
   RunBrainTask,
   BrainTaskHooks,
 } from "../brain/exec-brain-runner";
+import type { DaemonBrainHost } from "../brain/daemon-brain-host";
 import type {
   TaskEvent,
   TaskSource,
@@ -198,11 +199,14 @@ export interface BrainConsumerAgent {
 }
 
 /**
- * Construction options. Every dependency is injected — no module-scope
- * singletons. Production wires the real `runtime` + `runBrainTask`; tests
- * inject doubles.
+ * Construction options shared by both lifecycles. The lifecycle-specific
+ * `runBrainTask` (per-task / B-1) vs `daemonHost` (daemon / B-2) split is
+ * layered on as a discriminated union below ({@link BrainConsumerOpts}) so the
+ * two are MUTUALLY EXCLUSIVE at the type level — a caller cannot construct an
+ * inert runner alongside a daemon host (sage cortex#1035: one lifecycle path
+ * should be impossible, not merely "daemonHost wins").
  */
-export interface BrainConsumerOpts {
+export interface BrainConsumerBaseOpts {
   /** The agent this consumer serves. */
   agent: BrainConsumerAgent;
   /** Envelope source `{principal}.{agent}.{instance}` for emitted lifecycle envelopes. */
@@ -210,11 +214,12 @@ export interface BrainConsumerOpts {
   /** The myelin runtime — used for `publish` + `subscribePull`. */
   runtime: MyelinRuntime;
   /**
-   * The configured per-task brain runner (from `makeExecBrainRunner` over the
-   * manifest's `brain` block). Injected so the consumer never owns spawn
-   * policy; tests pass a stub that resolves a deterministic result.
+   * Hot-swap drain deadline (ms) handed to {@link DaemonBrainHost.drain} on
+   * `stop()`. Past it, open `ask_principal` gates are cancelled with a
+   * re-trigger notice (§7.5). Ignored for the per-task lifecycle. Defaults to
+   * 5_000.
    */
-  runBrainTask: RunBrainTask;
+  drainDeadlineMs?: number;
   /**
    * Optional persona text delivered to the brain on each `task` event (per-task
    * brains receive persona on the task; §5 "Persona delivery"). Omitted → no
@@ -237,6 +242,47 @@ export interface BrainConsumerOpts {
   /** Test seam — clock. Defaults to `() => new Date()`. */
   clock?: () => Date;
 }
+
+/**
+ * Per-task lifecycle (B-1): the consumer owns an injected per-task runner and
+ * NO daemon host. `daemonHost` is statically forbidden here.
+ */
+export interface BrainConsumerPerTaskOpts extends BrainConsumerBaseOpts {
+  /**
+   * The configured per-task brain runner (from `makeExecBrainRunner` over the
+   * manifest's `brain` block). Injected so the consumer never owns spawn
+   * policy; tests pass a stub that resolves a deterministic result.
+   */
+  runBrainTask: RunBrainTask;
+  /** Forbidden on the per-task path — use {@link BrainConsumerDaemonOpts}. */
+  daemonHost?: never;
+}
+
+/**
+ * Daemon lifecycle (B-2): the consumer multiplexes tasks over a long-lived
+ * {@link DaemonBrainHost} (its `runTask` IS the runner) and `stop()` DRAINS the
+ * host (hot-swap or shutdown). A degraded host (restart budget exhausted) is
+ * surfaced through the host's own `onDegraded` callback the boot wiring
+ * supplies. `runBrainTask` is statically forbidden here — there is no inert
+ * per-task runner to construct alongside the host.
+ */
+export interface BrainConsumerDaemonOpts extends BrainConsumerBaseOpts {
+  /** The daemon brain host (`lifecycle: daemon`). */
+  daemonHost: DaemonBrainHost;
+  /** Forbidden on the daemon path — the host's `runTask` is the runner. */
+  runBrainTask?: never;
+}
+
+/**
+ * Construction options. A discriminated union over the two lifecycles so
+ * exactly ONE of `runBrainTask` (per-task / B-1) and `daemonHost` (daemon /
+ * B-2) is constructible — never both, never neither. Every dependency is
+ * injected — no module-scope singletons. Production wires the real `runtime`
+ * plus the lifecycle's runner; tests inject doubles.
+ */
+export type BrainConsumerOpts =
+  | BrainConsumerPerTaskOpts
+  | BrainConsumerDaemonOpts;
 
 /**
  * Options for {@link BrainConsumer.start} when binding real JetStream pull
@@ -283,6 +329,9 @@ export class BrainConsumer {
   private readonly source: SystemEventSource;
   private readonly runtime: MyelinRuntime;
   private readonly runBrainTask: RunBrainTask;
+  /** B-2 — the daemon host (when `lifecycle: daemon`), else undefined. */
+  private readonly daemonHost: DaemonBrainHost | undefined;
+  private readonly drainDeadlineMs: number;
   private readonly persona: string | undefined;
   private readonly principalGate: PrincipalGate;
   private readonly sovereigntyEnforce: boolean;
@@ -303,7 +352,18 @@ export class BrainConsumer {
     this.agent = opts.agent;
     this.source = opts.source;
     this.runtime = opts.runtime;
-    this.runBrainTask = opts.runBrainTask;
+    this.daemonHost = opts.daemonHost;
+    this.drainDeadlineMs = opts.drainDeadlineMs ?? 5_000;
+    // B-2: when a daemon host is provided, the runner IS the host's multiplexed
+    // `runTask` (one long-lived process). Otherwise the injected per-task runner
+    // (B-1). Binding here keeps `runOne` lifecycle-agnostic — it just calls
+    // `this.runBrainTask(task, hooks)` either way.
+    if (opts.daemonHost !== undefined) {
+      const host = opts.daemonHost;
+      this.runBrainTask = (task, hooks) => host.runTask(task, hooks);
+    } else {
+      this.runBrainTask = opts.runBrainTask;
+    }
     this.persona = opts.persona;
     this.principalGate = opts.principalGate ?? new DenyAllPrincipalGate();
     this.sovereigntyEnforce = opts.sovereigntyEnforce ?? false;
@@ -505,6 +565,21 @@ export class BrainConsumer {
       });
       if (this.inFlight.size > 0) {
         await Promise.allSettled(Array.from(this.inFlight));
+      }
+      // B-2 — drain the daemon host on the SAME stop path (hot-swap or shutdown).
+      // `drain(deadline)` sends `shutdown`, waits for in-flight tasks + open
+      // gates up to the deadline, cancels stragglers with the re-trigger notice
+      // (§7.5), then SIGTERM/SIGKILL. The per-task lifecycle has no host to
+      // drain — its in-flight runs already settled in the `inFlight` await above.
+      if (this.daemonHost !== undefined) {
+        try {
+          await this.daemonHost.drain(this.drainDeadlineMs);
+        } catch (err) {
+          process.stderr.write(
+            `brain-consumer: daemon host drain failed for agent=${this.agent.id}: ` +
+              `${err instanceof Error ? err.message : String(err)}\n`,
+          );
+        }
       }
     })();
     return this.stopPromise;

@@ -69,6 +69,7 @@ import {
   type BrainConsumerAgent,
 } from "./bus/brain-consumer";
 import { makeExecBrainRunner } from "./brain/exec-brain-runner";
+import { DaemonBrainHost } from "./brain/daemon-brain-host";
 import { wireDevConsumers } from "./runner/dev-consumer-boot";
 import {
   ReleaseConsumer,
@@ -1354,6 +1355,20 @@ export async function startCortex(
     return runtime?.brain?.kind === "exec" && runtime.capabilities.length > 0;
   };
   const brainConsumers: BrainConsumer[] = [];
+  // Bot Packs B-2 — the long-lived daemon brain hosts (one per `lifecycle:
+  // daemon` agent). Tracked so the shutdown drain + reconcile teardown can stop
+  // them; the BrainConsumer already routes per-task drain through `stop()`, but
+  // a host also needs an unconditional teardown on process shutdown.
+  const daemonBrainHosts: DaemonBrainHost[] = [];
+  // Bot Packs B-2 — a mutable holder for the presence producer so the daemon
+  // host's `onDegraded` callback (which fires at RUNTIME, long after boot) can
+  // surface a degraded agent via `publishCapabilitiesChanged(agentId, [])` —
+  // the same capability-change presence signal the reconcile path uses. The
+  // producer is constructed later (the MC-registry block); this holder is
+  // assigned there and read lazily inside the callback.
+  const brainPresenceHolder: { producer: AgentPresenceProducer | null } = {
+    producer: null,
+  };
   const reviewCapableAgents = mergedAgents.filter((a) => {
     // An exec-brain agent is hosted by the brain path even if it happens to
     // declare a code-review capability — the two consumers are mutually
@@ -2326,29 +2341,82 @@ export async function startCortex(
       const packDir = join(brainPackBaseDir, agent.id);
       const secrets = collectBrainSecrets(agent.id, brain.secrets);
 
-      const runBrainTask = makeExecBrainRunner({
-        run: brain.run,
-        packDir,
-        secrets,
-      });
-
-      // Persona delivered to the brain on each task event (§5 "Persona
-      // delivery"). A missing/unreadable persona is non-fatal — the brain simply
-      // receives no persona (logged once inside the helper).
+      // Persona delivered to the brain — per-task brains receive it on each task
+      // event; daemon brains receive it ONCE in the `hello` handshake (§5
+      // "Persona delivery"). A missing/unreadable persona is non-fatal.
       const personaText = loadBrainPersona(agent.id, agent.persona);
 
-      const consumer = new BrainConsumer({
+      // Bot Packs B-2 — `lifecycle: daemon` is hosted by a long-lived
+      // DaemonBrainHost (spawn once, socket-multiplex tasks, supervise + drain);
+      // `per-task` (default) keeps the B-1 per-spawn runner. Both feed the SAME
+      // BrainConsumer policy seam (the consumer is lifecycle-agnostic — it routes
+      // brain effects through the host hooks identically). The lifecycle-specific
+      // runner is mutually exclusive: a daemon agent passes `daemonHost` (no
+      // per-task runner constructed), a per-task agent passes `runBrainTask`.
+      // The `principalGate` is left to the consumer default on BOTH paths:
+      // DenyAllPrincipalGate (B-1 fail-closed — every `ask_principal` denied).
+      // SurfacePrincipalGate (B-2) is IMPLEMENTED + unit-tested but NOT booted
+      // here yet: it needs an adapter inbound reply-bridge (a
+      // PrincipalReplySource fed by a live surface adapter) to observe the
+      // principal's reply, which lands in B-3. Until that bridge exists there is
+      // nothing to construct the gate from, so the boot path leaves the
+      // fail-closed default in place — identity-based approval is NOT live.
+      // Sovereignty audit-parity by default, mirroring ReviewConsumer (a
+      // self-declared modelClass is spoofable until bound to the signing
+      // identity, cortex#327).
+      const baseConsumerOpts = {
         agent: consumerAgent,
         source: systemEventSource,
         runtime,
-        runBrainTask,
         ...(personaText !== undefined && { persona: personaText }),
-        // onAskPrincipal defaults to DenyAllPrincipalGate (B-1 fail-closed —
-        // the surface gate lands in B-2).
-        // Sovereignty audit-parity by default, mirroring ReviewConsumer (a
-        // self-declared modelClass is spoofable until bound to the signing
-        // identity, cortex#327).
-      });
+      };
+      let daemonHost: DaemonBrainHost | undefined;
+      let consumer: BrainConsumer;
+      if (brain.lifecycle === "daemon") {
+        daemonHost = new DaemonBrainHost({
+          agentId: agent.id,
+          run: brain.run,
+          packDir,
+          secrets,
+          maxRestarts: brain.maxRestarts,
+          ...(personaText !== undefined && { persona: personaText }),
+          // On degradation (restart budget exhausted) surface the agent via the
+          // presence producer's capability-change signal (drop to empty caps),
+          // the same path the reconcile uses (§7.4). Read the holder lazily —
+          // the producer is constructed after this boot closure runs.
+          onDegraded: (degradedId: string): void => {
+            const producer = brainPresenceHolder.producer;
+            if (producer !== null) {
+              producer.publishCapabilitiesChanged(degradedId, []);
+            }
+            process.stderr.write(
+              `cortex: daemon brain agent=${degradedId} marked DEGRADED — ` +
+                `restart budget exhausted; presence signalled\n`,
+            );
+          },
+        });
+        // Spawn + connect + hello. A spawn/connect failure is logged; the
+        // consumer still registers so a later reload can replace it. The
+        // consumer's runner (the host's runTask) fast-fails not_now until the
+        // host connects, so no task is silently lost.
+        // Non-blocking start (sage cortex#1035 round 3): start() resolves on
+        // the socket handshake, so awaiting here would make cortex boot
+        // latency the SUM of every daemon's spawn+auth. The consumer's
+        // runner fast-fails not_now until the host connects (documented
+        // above), so registering the consumer before the handshake settles
+        // loses nothing — failures land in the same stderr path.
+        void daemonHost.start().catch((startErr: unknown) => {
+          process.stderr.write(
+            `cortex: daemon brain host start failed for agent=${agent.id}: ` +
+              `${startErr instanceof Error ? startErr.message : String(startErr)}\n`,
+          );
+        });
+        daemonBrainHosts.push(daemonHost);
+        consumer = new BrainConsumer({ ...baseConsumerOpts, daemonHost });
+      } else {
+        const runBrainTask = makeExecBrainRunner({ run: brain.run, packDir, secrets });
+        consumer = new BrainConsumer({ ...baseConsumerOpts, runBrainTask });
+      }
       brainConsumers.push(consumer);
 
       // Provision + bind one durable pull consumer per declared capability.
@@ -4081,6 +4149,16 @@ export async function startCortex(
         brainConsumers.splice(i, 1);
       }
     }
+    // Bot Packs B-2 — the removed/changed agent's daemon brain host (if any) was
+    // already drained by its BrainConsumer.stop() above (which calls
+    // host.drain()); compact it out of the tracking array so a subsequent
+    // shutdown doesn't re-stop a host whose generation is gone. stop() is
+    // idempotent regardless, so this is bookkeeping, not correctness.
+    for (let i = daemonBrainHosts.length - 1; i >= 0; i--) {
+      if (daemonBrainHosts[i]?.agentId === agentId) {
+        daemonBrainHosts.splice(i, 1);
+      }
+    }
   };
 
   // The single reconcile path. Both the fs.watch callback and the handle's
@@ -4684,6 +4762,10 @@ export async function startCortex(
       // defensive emit side). Wired regardless of `mc.enabled` so capability
       // hot-reload tracks presence even on a non-dashboard stack.
       presenceProducerForReload = presenceProducer;
+      // Bot Packs B-2 — publish the producer to the daemon-brain degrade holder
+      // so a `DaemonBrainHost.onDegraded` (restart budget exhausted, at runtime)
+      // can surface the agent via `publishCapabilitiesChanged(agentId, [])`.
+      brainPresenceHolder.producer = presenceProducer;
       console.log(
         `cortex: agent-presence producer started — ${presenceAgents.length} agent(s) announced ` +
           `(stack-local${config.mc.enabled ? " + local registry" : ", mc disabled"}; ` +
@@ -5093,6 +5175,9 @@ export async function startCortex(
       ...adapterCleanup.map((_, i) => `outbound poller stop[${i}]`),
       ...reviewConsumers.map((c, i) => `review-consumer stop[${i}] (agent=${c.agent.id})`),
       ...brainConsumers.map((c, i) => `brain-consumer stop[${i}] (agent=${c.agent.id})`),
+      // Bot Packs B-2 — daemon brain host teardown slots (belt-and-braces; the
+      // consumer drain already drains the host, these are idempotent).
+      ...daemonBrainHosts.map((h, i) => `daemon-brain-host stop[${i}] (agent=${h.agentId})`),
       ...releaseConsumers.map((c, i) => `release-consumer stop[${i}] (agent=${c.agent.id})`),
       ...devConsumers.map((c, i) => `dev-consumer stop[${i}] (agent=${c.agent.id})`),
       "dispatch-listener stop",
@@ -5222,6 +5307,19 @@ export async function startCortex(
           await completeAsync(
             `brain-consumer stop[${i}] (agent=${consumer.agent.id})`,
             consumer.stop(),
+          );
+        }
+      }
+      // Bot Packs B-2 — belt-and-braces: ensure every daemon brain host is torn
+      // down even if its consumer's stop() did not reach the drain (e.g. a host
+      // whose consumer init threw after the host spawned). `stop()` is idempotent
+      // — a host already drained by its consumer above is a no-op.
+      for (let i = 0; i < daemonBrainHosts.length; i++) {
+        const host = daemonBrainHosts[i];
+        if (host) {
+          await completeAsync(
+            `daemon-brain-host stop[${i}] (agent=${host.agentId})`,
+            host.stop(),
           );
         }
       }
