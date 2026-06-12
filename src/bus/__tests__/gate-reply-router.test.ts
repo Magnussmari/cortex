@@ -127,6 +127,26 @@ describe("GateReplyRouter", () => {
     ).toBeNull();
   });
 
+  test("separator-bearing ids never form a key — gate fails closed, offer passes through", async () => {
+    const router = new GateReplyRouter();
+    expect(
+      await router.awaitReply({
+        surface: "mattermost",
+        channel: "c1\u001fx",
+        thread: "th1",
+        timeoutMs: 1_000,
+      }),
+    ).toBeNull();
+    const pending = router.awaitReply({
+      surface: "mattermost",
+      channel: "c1",
+      thread: "th1",
+      timeoutMs: 50,
+    });
+    expect(router.offer(offerOf({ thread: "th1\u001fmattermost" }))).toBe(false);
+    expect(await pending).toBeNull();
+  });
+
   test("re-await gap: a reply after a delivery is buffered (consumed) and handed to the next awaitReply", async () => {
     const router = new GateReplyRouter();
     const first = router.awaitReply({
@@ -217,10 +237,12 @@ describe("GateReplyRouter", () => {
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end: real gate + real router (the W-1 bridge, no stubs)
+// Real gate + real router. The renderer is a stub: prompt RENDERING rides the
+// dispatch.task.post path (dispatch sink), which is outside the W-1 bridge —
+// what this section proves is the await/identity/verdict path over the router.
 // ---------------------------------------------------------------------------
 
-describe("SurfacePrincipalGate over GateReplyRouter", () => {
+describe("SurfacePrincipalGate over GateReplyRouter (renderer stubbed — prompt delivery belongs to the dispatch sink, not this bridge)", () => {
   function liveGate(router: GateReplyRouter): SurfacePrincipalGate {
     return new SurfacePrincipalGate({
       principalIdentity: { mattermostId: PRINCIPAL_MM },

@@ -82,6 +82,9 @@ interface PendingWaiter {
 interface GraceBuffer {
   expiresAt: number;
   replies: PrincipalReply[];
+  /** Self-eviction timer — a long-lived process gating across many unique
+   *  threads must not retain expired entries (sage #1037 round 3). */
+  evictTimer: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -90,19 +93,26 @@ interface GraceBuffer {
  * 500 ms is comfortably past any event-loop scheduling jitter while keeping
  * the post-verdict suppression window (see module doc) tightly bounded.
  */
-export const REAWAIT_GRACE_MS = 500;
+const REAWAIT_GRACE_MS = 500;
 
 /**
- * Joined with U+001F (the ASCII unit separator). This is NOT claimed
- * collision-proof against arbitrary ids — it relies on platform channel and
- * thread ids being control-character-free (Discord snowflakes, Mattermost
- * and Slack alphanumeric ids), which this module cannot enforce. The failure
- * mode of a crafted collision is bounded either way: a misrouted reply only
- * reaches the GATE's identity check, which still ignores any author that is
- * not the configured principal (pulse#47).
+ * Composite keys are joined with U+001F (the ASCII unit separator). A
+ * crafted id CONTAINING U+001F could otherwise collide two distinct route
+ * triples — and a collision is NOT bounded by the gate's identity check
+ * (a principal-authored reply in thread A would pass the identity check of
+ * a colliding gate in thread B). So the invariant is ENFORCED, not assumed:
+ * {@link hasSeparator} callers refuse any surface/channel/thread containing
+ * the separator — the gate side fails closed (null → timeout-fail), the
+ * offer side passes the message through to ordinary chat dispatch.
  */
+const KEY_SEPARATOR = "\u001f";
+
+function hasSeparator(...parts: (string | undefined)[]): boolean {
+  return parts.some((part) => part !== undefined && part.includes(KEY_SEPARATOR));
+}
+
 function routeKey(surface: string, channel: string, thread: string): string {
-  return `${surface}\u001f${channel}\u001f${thread}`;
+  return `${surface}${KEY_SEPARATOR}${channel}${KEY_SEPARATOR}${thread}`;
 }
 
 /**
@@ -136,7 +146,8 @@ export class GateReplyRouter implements PrincipalReplySource {
       this.stopped ||
       opts.channel.length === 0 ||
       opts.thread.length === 0 ||
-      opts.timeoutMs <= 0
+      opts.timeoutMs <= 0 ||
+      hasSeparator(opts.surface, opts.channel, opts.thread)
     ) {
       return Promise.resolve(null);
     }
@@ -179,6 +190,9 @@ export class GateReplyRouter implements PrincipalReplySource {
     // empty thread before awaiting), so an unthreaded message can never be
     // a gate reply.
     if (reply.thread === undefined || reply.thread.length === 0) return false;
+    // Separator-bearing ids cannot form an unambiguous key — never a gate
+    // reply (see KEY_SEPARATOR doc); ordinary chat dispatch handles it.
+    if (hasSeparator(reply.surface, reply.channel, reply.thread)) return false;
     const key = routeKey(reply.surface, reply.channel, reply.thread);
     const principalReply: PrincipalReply = {
       authorId: reply.authorId,
@@ -220,9 +234,25 @@ export class GateReplyRouter implements PrincipalReplySource {
     const existing = this.grace.get(key);
     if (existing !== undefined) {
       existing.expiresAt = expiresAt;
+      clearTimeout(existing.evictTimer);
+      existing.evictTimer = this.scheduleEvict(key);
     } else {
-      this.grace.set(key, { expiresAt, replies: [] });
+      this.grace.set(key, {
+        expiresAt,
+        replies: [],
+        evictTimer: this.scheduleEvict(key),
+      });
     }
+  }
+
+  /** Drop the key's grace entry at expiry — no unbounded retention. */
+  private scheduleEvict(key: string): ReturnType<typeof setTimeout> {
+    return setTimeout(() => {
+      const buffer = this.grace.get(key);
+      if (buffer !== undefined && buffer.expiresAt <= Date.now()) {
+        this.grace.delete(key);
+      }
+    }, REAWAIT_GRACE_MS + 50);
   }
 
   /** Shift the oldest in-grace buffered reply for the key, if any. */
@@ -230,6 +260,7 @@ export class GateReplyRouter implements PrincipalReplySource {
     const buffer = this.grace.get(key);
     if (buffer === undefined) return undefined;
     if (buffer.expiresAt <= Date.now()) {
+      clearTimeout(buffer.evictTimer);
       this.grace.delete(key);
       return undefined;
     }
@@ -251,6 +282,7 @@ export class GateReplyRouter implements PrincipalReplySource {
       }
     }
     this.waiters.clear();
+    for (const buffer of this.grace.values()) clearTimeout(buffer.evictTimer);
     this.grace.clear();
   }
 
