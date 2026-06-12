@@ -148,13 +148,20 @@ function completeResult(taskId: string, summary?: string): ResultEffect {
 }
 
 function baseOpts(over: Partial<BrainConsumerOpts> = {}): BrainConsumerOpts {
-  return {
+  const { runBrainTask, daemonHost, ...rest } = over;
+  const base = {
     agent: buildAgent(),
     source: SOURCE,
     runtime: over.runtime ?? createRecordingRuntime(),
-    runBrainTask: over.runBrainTask ?? stubRunner(completeResult("x")),
-    ...over,
+    ...rest,
   };
+  // The opts type is a discriminated union: a daemon agent passes `daemonHost`
+  // (no per-task runner), a per-task agent passes `runBrainTask`. Build the
+  // correct variant so neither field leaks onto the other path.
+  if (daemonHost !== undefined) {
+    return { ...base, daemonHost };
+  }
+  return { ...base, runBrainTask: runBrainTask ?? stubRunner(completeResult("x")) };
 }
 
 function published(runtime: RecordingRuntime, type: string): Envelope[] {
@@ -788,4 +795,106 @@ process.exit(0);
     },
     15_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// B-2 — daemon host integration
+// ---------------------------------------------------------------------------
+//
+// The consumer is lifecycle-agnostic: given a DaemonBrainHost, it multiplexes
+// tasks through the host's `runTask` and DRAINS the host on `stop()`. These
+// tests use a minimal in-memory transport double so no real socket/subprocess
+// is needed — the consumer↔host↔(fake brain) round-trip is fully driven.
+
+import { DaemonBrainHost } from "../../brain/daemon-brain-host";
+import {
+  FakeDaemonBrain,
+  singleFakeDaemonTransport,
+} from "../../brain/__tests__/fake-daemon-brain";
+
+// The daemon-brain double + single-brain transport are shared with the host's
+// own unit tests; see `src/brain/__tests__/fake-daemon-brain.ts`.
+const DaemonFakeBrain = FakeDaemonBrain;
+const daemonTransport = singleFakeDaemonTransport;
+
+async function tick(): Promise<void> {
+  for (let i = 0; i < 50; i++) await new Promise((r) => setTimeout(r, 2));
+}
+
+describe("brain-consumer — daemon host (B-2)", () => {
+  test("routes a task through the daemon host to a completed envelope", async () => {
+    const runtime = createRecordingRuntime();
+    const brain = new DaemonFakeBrain();
+    const host = new DaemonBrainHost({
+      agentId: "yarrow",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport: daemonTransport(brain),
+    });
+    await host.start();
+    const consumer = new BrainConsumer(baseOpts({ runtime, daemonHost: host }));
+
+    const env = makeTaskEnvelope();
+    const decisionP = consumer.processEnvelope(env, "subj", null, "soc.compose.flow");
+
+    // Wait for the task to reach the fake brain, then complete it.
+    await tick();
+    expect(brain.hasTask()).toBe(true);
+    const tid = brain.taskId();
+    brain.emit(JSON.stringify({ v: 1, type: "post", task_id: tid, text: "hi" }));
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: tid, status: "complete" }));
+
+    const decision = await decisionP;
+    expect(decision).toEqual({ kind: "ack" });
+    expect(published(runtime, "dispatch.task.post").length).toBe(1);
+    expect(published(runtime, "dispatch.task.completed").length).toBe(1);
+    await consumer.stop();
+  });
+
+  test("stop() drains the daemon host (sends shutdown)", async () => {
+    const runtime = createRecordingRuntime();
+    const brain = new DaemonFakeBrain();
+    const host = new DaemonBrainHost({
+      agentId: "yarrow",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport: daemonTransport(brain),
+      killGraceMs: 20,
+    });
+    await host.start();
+    const consumer = new BrainConsumer(
+      baseOpts({ runtime, daemonHost: host, drainDeadlineMs: 20 }),
+    );
+    await consumer.stop();
+    expect(brain.received.some((e) => e.type === "shutdown")).toBe(true);
+  });
+
+  test("a crashed daemon's in-flight task fails → dispatch.task.failed + nak", async () => {
+    const runtime = createRecordingRuntime();
+    const brain = new DaemonFakeBrain();
+    const host = new DaemonBrainHost({
+      agentId: "yarrow",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport: daemonTransport(brain),
+      maxRestarts: 0, // crash → straight to degraded; task fails cant_do
+    });
+    await host.start();
+    const consumer = new BrainConsumer(baseOpts({ runtime, daemonHost: host }));
+
+    const env = makeTaskEnvelope();
+    const decisionP = consumer.processEnvelope(env, "subj", null, "soc.compose.flow");
+    await tick();
+    expect(brain.hasTask()).toBe(true);
+    brain.crash();
+
+    const decision = await decisionP;
+    // cant_do maps to a terminal failure; the consumer publishes failed + maps
+    // the ack per failedReasonToAckDecision.
+    expect(published(runtime, "dispatch.task.failed").length).toBeGreaterThanOrEqual(1);
+    const failed = published(runtime, "dispatch.task.failed")[0];
+    expect(JSON.stringify(failed?.payload)).toMatch(/brain crashed/);
+    void decision;
+    await consumer.stop();
+  });
 });
