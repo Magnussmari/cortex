@@ -162,7 +162,7 @@ function capRegAgentIds(published: Envelope[]): string[] {
 // tell a real registration (caps > 0) apart from a TOMBSTONE (caps === 0).
 function capRegEvents(
   published: Envelope[],
-): Array<{ agentId: string; capCount: number }> {
+): { agentId: string; capCount: number }[] {
   return published
     .filter((e) => e.type === "agents.capabilities.registered")
     .map((e) => {
@@ -386,13 +386,13 @@ runtime:
   test("onAgentsReloaded hook reports add/remove/change sets + generation", async () => {
     const runtime = createRecordingRuntime();
     writeFragment("echo", ["code-review.typescript"]);
-    const events: Array<{
+    const events: {
       generation: number;
       added: string[];
       removed: string[];
       changed: string[];
       failed: boolean;
-    }> = [];
+    }[] = [];
     const handle = await startCortex(minimalConfig(), {
       disableConfigWatcher: true,
       disableDashboard: true,

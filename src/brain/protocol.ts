@@ -542,7 +542,7 @@ export function parseBrainEffect(line: string): ParseBrainEffectResult {
   }
 
   const obj = raw as Record<string, unknown>;
-  const type = obj["type"];
+  const type = obj.type;
   if (typeof type !== "string") {
     return {
       kind: "invalid",
@@ -615,7 +615,7 @@ export function parseBrainEvent(line: string): ParseBrainEventResult {
   }
 
   const obj = raw as Record<string, unknown>;
-  const type = obj["type"];
+  const type = obj.type;
   if (typeof type !== "string") {
     return {
       kind: "invalid",
