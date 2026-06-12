@@ -38,7 +38,7 @@ function agentFixture(
         capabilities,
       },
     }),
-  } as Agent;
+  };
 }
 
 function cap(

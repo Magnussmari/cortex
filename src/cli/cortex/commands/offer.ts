@@ -870,7 +870,7 @@ export function reconcileLayer(
   const federated = isPlainObject(policy.federated) ? structuredClone(policy.federated) : undefined;
   let dangling: string[];
   if (federated !== undefined && Array.isArray(federated.networks)) {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+
     const networks = federated.networks as Record<string, unknown>[];
     const networkIds = networks
       .map((n) => (typeof n.id === "string" ? n.id : undefined))
@@ -1342,7 +1342,7 @@ function runList(
   // (cortex#1021 B-0 — kills the manual capabilities[] cross-edit).
   const effectiveCatalog = deriveEffectiveCapabilityCatalog(
     cfg.capabilities,
-    cfg.agents ?? [],
+    cfg.agents,
   );
   const rows = buildListRows(
     effectiveCatalog.map((c) => ({ id: c.id, provided_by: c.provided_by })),

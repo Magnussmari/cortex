@@ -19,7 +19,7 @@ import "./bootstrap/ws-transport";
 
 import { Command } from "commander";
 import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, readdirSync } from "fs";
-import { basename, join, dirname, isAbsolute } from "path";
+import { join, dirname, isAbsolute } from "path";
 import { homedir } from "os";
 import { parse as parseYaml } from "yaml";
 import type { TextChannel } from "discord.js";
@@ -237,7 +237,7 @@ import {
 // the lightweight `cortex agents reload` CLI can resolve the running daemon's
 // PID (to signal a reload) without importing this whole module graph. Re-import
 // here so cortex.ts's lifecycle paths stay on the single source of truth.
-import { STATE_DIR, PID_FILE, DEFAULT_CONFIG, pidFileFor } from "./common/pidfile";
+import { STATE_DIR, DEFAULT_CONFIG, pidFileFor } from "./common/pidfile";
 
 /**
  * Resolve the PID file path for a given `--config` value.
@@ -1244,6 +1244,7 @@ export async function startCortex(
     let tombstoned = 0;
     for (const agentId of removedAgentIds) {
       try {
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- intentional dual-emit tombstone during the agent.online migration window.
         const envelope = buildCapabilityRegisteredEnvelope({
           source: systemEventSource,
           agentId,
@@ -4059,7 +4060,7 @@ export async function startCortex(
     ]);
     outcomes.forEach((outcome, i) => {
       if (outcome.status === "rejected") {
-        const err = outcome.reason;
+        const err: unknown = outcome.reason;
         process.stderr.write(
           `cortex: agents-reload — consumer drain failed for agent=${agentId} ` +
             `(consumer ${i}): ${err instanceof Error ? err.message : String(err)}\n`,
@@ -4205,7 +4206,9 @@ export async function startCortex(
     // agent would keep its stale prior registration).
     const changedToEmpty = changed.filter((id) => {
       const a = freshById.get(id);
-      return (a?.runtime?.capabilities?.length ?? 0) === 0;
+      if (a === undefined) return true;
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- tolerate partially-loaded runtime fragments during reload; missing capabilities means empty.
+      return (a.runtime?.capabilities?.length ?? 0) === 0;
     });
     await publishCapabilityTombstones([...removed, ...changedToEmpty]);
 
@@ -4274,7 +4277,7 @@ export async function startCortex(
     // Swallow the rejection on the CHAIN (not on `next`) so one failed
     // reconcile doesn't poison every subsequent trigger; the per-reconcile
     // body already logs its own errors.
-    reloadInFlight = next.catch((err) => {
+    reloadInFlight = next.catch((err: unknown) => {
       process.stderr.write(
         `cortex: agents-reload reconcile error (non-fatal): ` +
           `${err instanceof Error ? err.message : String(err)}\n`,
