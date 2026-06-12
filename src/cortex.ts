@@ -135,7 +135,7 @@ import {
 } from "./common/policy";
 import { MattermostAdapter } from "./adapters/mattermost";
 import { SlackAdapter } from "./adapters/slack";
-import type { PlatformAdapter } from "./adapters/types";
+import type { InboundMessage, PlatformAdapter } from "./adapters/types";
 import { createDispatchSink, type DispatchSink } from "./adapters/dispatch-sink";
 import { createReviewSink, type ReviewSink } from "./adapters/review-sink";
 import { startGatewayIfEnabled } from "./gateway/start-gateway";
@@ -2322,15 +2322,35 @@ export async function startCortex(
   //   - `gateReplyRouter` is a passive registry; each adapter's inbound
   //     handler (below, at adapter start) offers every normalized message to
   //     it before chat dispatch;
-  //   - `liveSurfaces` is a mutable set each adapter joins as it starts; the
-  //     gate consults it at `ask_principal` time (resolve-time check), so a
-  //     surface that never came up stays fail-closed.
+  //   - `liveSurfaces` is seeded from the CONFIGURED surface instances (sage
+  //     #1037 round 1: brain consumers boot BEFORE adapters, so seeding only
+  //     at adapter start would fail-close every gate in the boot window even
+  //     though the adapter is seconds from being available). A configured
+  //     surface whose adapter then fails to start still fails closed: the
+  //     gate's rendered prompt has no adapter to deliver it and no reply can
+  //     arrive, so the gate times out to `fail`. Adapters still `add()` on
+  //     start (idempotent) so a surface added by hot-reload joins late.
   // The gate itself only boots when the principal has at least one configured
   // surface identity (`principal.mattermostId` / `discordId` / `slackId`) —
   // with no platform id there is nothing to verify a reply against, so the
   // consumer keeps its DenyAll default (fail-closed, B-1 behaviour).
   const gateReplyRouter = new GateReplyRouter();
   const liveSurfaces = new Set<string>();
+  if (config.discord.length > 0) liveSurfaces.add("discord");
+  if (config.mattermost.length > 0) liveSurfaces.add("mattermost");
+  if (config.slack.length > 0) liveSurfaces.add("slack");
+
+  // sage #1037 round 1 (maintainability): ONE inbound handler shape for all
+  // three adapter families — gate reply-bridge first, chat dispatch second.
+  // B-3 (cortex#1021 W-1): a message landing in a thread with an open
+  // principal gate is that gate's reply (identity checked by the GATE, never
+  // here), not a chat dispatch.
+  const inboundWithGateBridge =
+    (adapter: PlatformAdapter, agent: Agent) =>
+    (msg: InboundMessage): Promise<void> => {
+      if (gateReplyRouter.offerInbound(msg)) return Promise.resolve();
+      return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
+    };
   const principalIdentity: PrincipalIdentity = {
     ...(options.principal?.mattermostId !== undefined && {
       mattermostId: options.principal.mattermostId,
@@ -3372,15 +3392,9 @@ export async function startCortex(
       // Register the adapter's surface-router face. Empty `surfaceSubjects`
       // makes this a no-op match; harmless to register either way.
       router.register(adapter.surfaceConfig);
-      await adapter.start((msg) => {
-        // B-3 (cortex#1021 W-1): offer every inbound message to the gate
-        // reply-bridge FIRST — a message landing in a thread with an open
-        // principal gate is that gate's reply (identity checked by the gate,
-        // never here), not a chat dispatch.
-        if (gateReplyRouter.offerInbound(msg)) return Promise.resolve();
-        return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
-      });
-      // B-3: this surface is now live — principal gates may render to it.
+      await adapter.start(inboundWithGateBridge(adapter, agent));
+      // B-3: confirm this surface live (idempotent — seeded from config; a
+      // hot-reloaded surface joins here).
       liveSurfaces.add(adapter.platform);
       adapters.push(adapter);
 
@@ -3548,15 +3562,9 @@ export async function startCortex(
         },
       );
       router.register(adapter.surfaceConfig);
-      await adapter.start((msg) => {
-        // B-3 (cortex#1021 W-1): offer every inbound message to the gate
-        // reply-bridge FIRST — a message landing in a thread with an open
-        // principal gate is that gate's reply (identity checked by the gate,
-        // never here), not a chat dispatch.
-        if (gateReplyRouter.offerInbound(msg)) return Promise.resolve();
-        return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
-      });
-      // B-3: this surface is now live — principal gates may render to it.
+      await adapter.start(inboundWithGateBridge(adapter, agent));
+      // B-3: confirm this surface live (idempotent — seeded from config; a
+      // hot-reloaded surface joins here).
       liveSurfaces.add(adapter.platform);
       adapters.push(adapter);
       console.log(`cortex: mattermost adapter started (instance: ${instanceId}, ${instance.channels.length} channel(s))`);
@@ -3665,15 +3673,9 @@ export async function startCortex(
       // `attachInboundDispatch()`. This is the Slack equivalent of
       // discord.js's buffered-events-before-listener pattern.
       const explicitTrustedBotIds: ReadonlySet<string> = new Set(instance.trustedBotIds);
-      await adapter.start((msg) => {
-        // B-3 (cortex#1021 W-1): offer every inbound message to the gate
-        // reply-bridge FIRST — a message landing in a thread with an open
-        // principal gate is that gate's reply (identity checked by the gate,
-        // never here), not a chat dispatch.
-        if (gateReplyRouter.offerInbound(msg)) return Promise.resolve();
-        return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
-      });
-      // B-3: this surface is now live — principal gates may render to it.
+      await adapter.start(inboundWithGateBridge(adapter, agent));
+      // B-3: confirm this surface live (idempotent — seeded from config; a
+      // hot-reloaded surface joins here).
       liveSurfaces.add(adapter.platform);
       adapters.push(adapter);
       // Best-effort trust-resolver registration matches the Discord pattern.
