@@ -17,6 +17,7 @@ import { describe, test, expect } from "bun:test";
 import { AgentConfigSchema } from "../config";
 import {
   AgentDetectionSchema,
+  AgentRuntimeSchema,
   AgentSchema,
   AttachmentsConfigSchema,
   BusConfigSchema,
@@ -344,6 +345,115 @@ describe("AgentSchema", () => {
       presence: { discord: { ...minDiscordPresence(), guildId: 1487 } },
     }));
     expect(parsed.presence.discord?.guildId).toBe("1487");
+  });
+});
+
+// =============================================================================
+// Bot Packs B-1 — AgentRuntime.brain block (docs/design-bot-packs.md §4)
+// =============================================================================
+
+describe("AgentRuntimeSchema.brain (Bot Packs B-1)", () => {
+  function minRuntime(brain?: Record<string, unknown>) {
+    return {
+      mode: "in-process" as const,
+      capabilities: ["soc.compose.flow"],
+      ...(brain !== undefined && { brain }),
+    };
+  }
+
+  test("brain absent ⇒ builtin ⇒ existing runtime parses with no brain key", () => {
+    // The zero-migration contract: a runtime that omits `brain` parses with an
+    // UNDEFINED `brain` field — no synthetic default object, so downstream
+    // engine resolution stays untouched.
+    const parsed = AgentRuntimeSchema.parse(minRuntime());
+    expect(parsed.brain).toBeUndefined();
+  });
+
+  test("representative existing config shapes parse identically (builtin-absent equivalence spread) (no brain drift)", () => {
+    // Prove the schema addition is purely additive: a representative spread of
+    // pre-B-1 runtime shapes round-trips byte-identical, with `brain` absent.
+    const fixtures: Record<string, unknown>[] = [
+      { mode: "in-process", capabilities: [] },
+      { mode: "in-process", capabilities: ["code-review.typescript"], engine: "assistant" },
+      { mode: "standalone", capabilities: ["research"], substrate: "claude-code" },
+      { mode: "in-process", capabilities: ["code-review"], engine: "sage", model: "pi" },
+      { mode: "in-process", capabilities: ["x"], maxConcurrent: 3, modelClass: "frontier", sovereignty: "selective" },
+    ];
+    for (const fx of fixtures) {
+      const parsed = AgentRuntimeSchema.parse(fx);
+      expect(parsed.brain).toBeUndefined();
+      // The non-brain fields survive verbatim (a sample of each).
+      expect(parsed.mode).toBe(fx.mode as "in-process" | "standalone");
+      expect(parsed.capabilities).toEqual(fx.capabilities as string[]);
+    }
+  });
+
+  test("brain defaults: kind=builtin, protocol=cortex-brain/v1, lifecycle=per-task, secrets=[], dispatch_capabilities=[], maxRestarts=3", () => {
+    const parsed = AgentRuntimeSchema.parse(minRuntime({}));
+    expect(parsed.brain).toEqual({
+      kind: "builtin",
+      protocol: "cortex-brain/v1",
+      lifecycle: "per-task",
+      secrets: [],
+      dispatch_capabilities: [],
+      maxRestarts: 3,
+    });
+  });
+
+  test("kind=exec requires run", () => {
+    expect(() => AgentRuntimeSchema.parse(minRuntime({ kind: "exec" }))).toThrow(
+      /brain\.run is required when brain\.kind is 'exec'/,
+    );
+  });
+
+  test("kind=exec with run parses + carries the run/secrets/dispatch allow-list", () => {
+    const parsed = AgentRuntimeSchema.parse(
+      minRuntime({
+        kind: "exec",
+        run: "bun {pack}/brain/main.ts",
+        secrets: ["VT_API_KEY"],
+        dispatch_capabilities: ["soc.triage.email"],
+      }),
+    );
+    expect(parsed.brain?.kind).toBe("exec");
+    expect(parsed.brain?.run).toBe("bun {pack}/brain/main.ts");
+    expect(parsed.brain?.secrets).toEqual(["VT_API_KEY"]);
+    expect(parsed.brain?.dispatch_capabilities).toEqual(["soc.triage.email"]);
+  });
+
+  test("lifecycle=daemon is REJECTED at load (lands in B-2)", () => {
+    expect(() =>
+      AgentRuntimeSchema.parse(
+        minRuntime({ kind: "exec", run: "bun x.ts", lifecycle: "daemon" }),
+      ),
+    ).toThrow(/daemon[\s\S]*B-2/);
+  });
+
+  test("protocol pinned to cortex-brain/v1 — a wrong protocol fails", () => {
+    expect(() =>
+      AgentRuntimeSchema.parse(
+        minRuntime({ kind: "exec", run: "bun x.ts", protocol: "cortex-brain/v2" }),
+      ),
+    ).toThrow();
+  });
+
+  test("maxRestarts must be a non-negative integer", () => {
+    expect(() =>
+      AgentRuntimeSchema.parse(minRuntime({ maxRestarts: -1 })),
+    ).toThrow(/maxRestarts must be >= 0/);
+    expect(() =>
+      AgentRuntimeSchema.parse(minRuntime({ maxRestarts: 1.5 })),
+    ).toThrow(/maxRestarts must be an integer/);
+    // 0 is valid (no restarts).
+    expect(
+      AgentRuntimeSchema.parse(minRuntime({ maxRestarts: 0 })).brain?.maxRestarts,
+    ).toBe(0);
+  });
+
+  test("builtin brain accepts an explicit kind without requiring run", () => {
+    const parsed = AgentRuntimeSchema.parse(minRuntime({ kind: "builtin" }));
+    expect(parsed.brain?.kind).toBe("builtin");
+    expect(parsed.brain?.run).toBeUndefined();
   });
 });
 
@@ -1633,5 +1743,40 @@ describe("CortexConfigSchema — federated accept/deny subject scope (ADR 0001)"
       },
     });
     expect(parsed.policy?.federated?.networks[0]?.accept_subjects).toHaveLength(1);
+  });
+});
+
+// sage cortex#1033 round 2 (blocker) — exec-brain capability ids are exact
+// NATS subject segments; wildcards must fail at LOAD.
+describe("round-2: exec-brain capability wildcard rejection", () => {
+  const base = {
+    mode: "in-process",
+    capabilities: ["soc.compose.flow"],
+    brain: { kind: "exec", run: "bun {pack}/brain/main.ts" },
+  };
+
+  test("wildcard '>' in capabilities rejected for exec brains", () => {
+    const r = AgentRuntimeSchema.safeParse({ ...base, capabilities: [">"] });
+    expect(r.success).toBe(false);
+  });
+
+  test("'soc.>' rejected; '*' rejected", () => {
+    expect(AgentRuntimeSchema.safeParse({ ...base, capabilities: ["soc.>"] }).success).toBe(false);
+    expect(AgentRuntimeSchema.safeParse({ ...base, capabilities: ["*"] }).success).toBe(false);
+  });
+
+  test("wildcard in dispatch_capabilities rejected", () => {
+    const r = AgentRuntimeSchema.safeParse({
+      ...base,
+      brain: { ...base.brain, dispatch_capabilities: ["soc.>"] },
+    });
+    expect(r.success).toBe(false);
+  });
+
+  test("valid ids still pass; builtin agents unaffected by the grammar gate", () => {
+    expect(AgentRuntimeSchema.safeParse(base).success).toBe(true);
+    expect(
+      AgentRuntimeSchema.safeParse({ mode: "in-process", capabilities: ["WEIRD CAPS"] }).success,
+    ).toBe(true); // builtin: legacy looseness preserved
   });
 });
