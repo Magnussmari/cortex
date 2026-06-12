@@ -141,7 +141,7 @@ A/B.
   smoke hook with phantom tsc errors).
 - **Gates before every push:** `bun test` (full), `bunx tsc --noEmit`,
   `bash scripts/check-carveouts.sh` (cortex vocab ratchet — say "principal",
-  never "operator"; it scans docs too).
+  never the deprecated term it ratchets; it scans docs too).
 - **Known flake:** cortex#1028-class — one rotating full-suite failure
   (CO-2 boot / api.test sqlite / fs.watch debounce). Re-run once; verify
   isolation; do not chase.
