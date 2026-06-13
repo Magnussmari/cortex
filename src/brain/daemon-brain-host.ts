@@ -183,8 +183,9 @@ export interface DaemonBrainHostOpts {
    * (`cant_do`, timeout) — but does NOT kill the shared process (other tasks
    * keep running). Defaults to 300_000 (5 min): a frontier-model brain
    * (e.g. Yarrow's compose) can make SEVERAL sequential LLM calls in one task
-   * — the soc-demo no-match path is initial + 2 validator retries +
-   * closest-match = up to 4 frontier calls, which blew past the old 2-min
+   * — the soc-demo no-match path is initial + `MAX_RETRIES` (2) validator
+   * retries + a closest-match call = up to 4 frontier calls (the loop in
+   * pulse `examples/soc-demo/composer/compose.ts`), which blew past the old 2-min
    * default and stranded the brain's real answer (cortex#1040 follow-up: the
    * task failed mid-compose, so every post after the disclosure was rejected
    * as a closed task_id). 5 min is a heuristic headroom bump (~2.5x the old
