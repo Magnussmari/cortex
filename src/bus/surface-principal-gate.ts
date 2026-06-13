@@ -358,6 +358,12 @@ export function makeDispatchPostRenderer(opts: {
             channel: r.source.channel,
             thread: r.source.thread,
             user: r.source.user,
+            // cortex#1038 — carry the adapter instance so the gate PROMPT
+            // (ask_principal) reaches the originating adapter via the chat
+            // dispatch-sink, same as the brain's own posts.
+            ...(r.source.adapter_instance !== undefined && {
+              adapter_instance: r.source.adapter_instance,
+            }),
           },
         }),
       );

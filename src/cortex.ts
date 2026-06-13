@@ -2518,6 +2518,10 @@ export async function startCortex(
         surface: msg.platform,
         channel: msg.channelId,
         thread,
+        // cortex#1038 — the adapter instance the @-mention arrived on, so the
+        // brain's posts + the gate prompt route back to THIS adapter via the
+        // chat dispatch-sink (which filters on adapter_instance).
+        adapterInstance: msg.instanceId,
       }),
       ...(agent.runtime?.modelClass !== undefined && { modelClass: agent.runtime.modelClass }),
     });

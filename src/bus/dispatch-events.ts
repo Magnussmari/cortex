@@ -576,6 +576,15 @@ export interface BrainPostSource {
   thread: string;
   /** The user who triggered the task. */
   user: string;
+  /**
+   * cortex#1038 — the adapter instance id, when the task arrived on a LIVE
+   * surface. Present ⇒ the post emits the WIRE `response_routing`
+   * (`{ adapter_instance, channel_id, thread_id }`) the chat dispatch-sink
+   * routes on, so a brain reply reaches the originating adapter directly.
+   * Absent (bus-originated) ⇒ the logical `{ surface, channel, thread }`
+   * shape (review-sink path) — back-compat unchanged.
+   */
+  adapter_instance?: string;
 }
 
 export interface BrainPostOpts extends DispatchTaskCommonOpts {
@@ -623,13 +632,27 @@ export function createDispatchTaskPostEvent(
   // so the B-2 dispatch sink reads one vocabulary — never a parallel
   // `task_source` (sage cortex#1033 round 3). The triggering user is not part
   // of routing; it rides as its own field.
+  // cortex#1038 — when the task came from a LIVE surface (adapter_instance
+  // present), emit the WIRE routing shape the chat dispatch-sink consumes
+  // (`readResponseRouting` requires `adapter_instance` + `channel_id`); a
+  // brain `post` then reaches the originating adapter directly. Without it
+  // (bus-originated), keep the logical `{ surface, channel, thread }` shape
+  // the review-sink resolves — back-compat unchanged.
+  const responseRouting =
+    opts.taskSource.adapter_instance !== undefined
+      ? {
+          adapter_instance: opts.taskSource.adapter_instance,
+          channel_id: opts.taskSource.channel,
+          ...(opts.taskSource.thread !== "" && { thread_id: opts.taskSource.thread }),
+        }
+      : {
+          surface: opts.taskSource.surface,
+          channel: opts.taskSource.channel,
+          ...(opts.taskSource.thread !== "" && { thread: opts.taskSource.thread }),
+        };
   return buildBaseEnvelope("dispatch.task.post", opts, {
     text: opts.text,
-    response_routing: {
-      surface: opts.taskSource.surface,
-      channel: opts.taskSource.channel,
-      ...(opts.taskSource.thread !== "" && { thread: opts.taskSource.thread }),
-    },
+    response_routing: responseRouting,
     triggered_by: opts.taskSource.user,
     ...(opts.attachment !== undefined && { attachment: opts.attachment }),
   });
