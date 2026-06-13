@@ -181,7 +181,13 @@ export interface DaemonBrainHostOpts {
   /**
    * Per-task timeout (ms). A task with no `result` by this point fails
    * (`cant_do`, timeout) — but does NOT kill the shared process (other tasks
-   * keep running). Defaults to 120_000 (2 min).
+   * keep running). Defaults to 300_000 (5 min): a frontier-model brain
+   * (e.g. Yarrow's compose) can make SEVERAL sequential LLM calls in one task
+   * — the soc-demo no-match path is initial + 2 validator retries +
+   * closest-match = up to 4 frontier calls, which blew past the old 2-min
+   * default and stranded the brain's real answer (cortex#1040 follow-up: the
+   * task failed mid-compose, so every post after the disclosure was rejected
+   * as a closed task_id). 5 min comfortably covers the worst-case chain.
    */
   taskTimeoutMs?: number;
   /** SIGTERM → SIGKILL grace on drain/shutdown. Defaults to 5_000 (§7.6). */
@@ -284,7 +290,7 @@ export class DaemonBrainHost {
     this.secrets = opts.secrets ?? {};
     this.maxRestarts = opts.maxRestarts ?? 3;
     this.healthyResetMs = opts.healthyResetMs ?? 600_000;
-    this.taskTimeoutMs = opts.taskTimeoutMs ?? 120_000;
+    this.taskTimeoutMs = opts.taskTimeoutMs ?? 300_000;
     this.killGraceMs = opts.killGraceMs ?? 5_000;
     this.transport = opts.transport ?? makeBunUnixTransport;
     this.makeScratchDir =
