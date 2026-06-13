@@ -21,7 +21,7 @@
  * files (the loader stats them).
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -136,7 +136,10 @@ function removeFragment(id: string): void {
 
 async function bootWatcherless(
   runtime: RecordingRuntime,
-  opts: { brainPackBaseDir?: string } = {},
+  opts: {
+    brainPackBaseDir?: string;
+    principal?: { id: string; mattermostId?: string; discordId?: string; slackId?: string };
+  } = {},
 ): Promise<CortexHandle> {
   const handle = await startCortex(minimalConfig(), {
     disableConfigWatcher: true,
@@ -146,7 +149,7 @@ async function bootWatcherless(
     agentsDir: tmpAgentsDir,
     configPath: join(tmpAgentsDir, "cortex.yaml"), // so agentsDir resolution + pid path are coherent
     injectRuntime: runtime,
-    principal: { id: "test-op" },
+    principal: opts.principal ?? { id: "test-op" },
     ...(opts.brainPackBaseDir !== undefined && {
       brainPackBaseDir: opts.brainPackBaseDir,
     }),
@@ -608,5 +611,79 @@ process.exit(0);
     expect(
       brainDurables(runtime).some((d) => d.includes("soc-triage-email")),
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-3 (cortex#1021 W-2) — surface principal gate boot probes
+// ---------------------------------------------------------------------------
+
+describe("startCortex — surface principal gate boot (B-3, cortex#1021 W-2)", () => {
+  let packBase: string;
+  let logSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    packBase = mkdtempSync(join(tmpdir(), "cortex-gateboot-packs-"));
+    logSpy = spyOn(console, "log");
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+    rmSync(packBase, { recursive: true, force: true });
+  });
+
+  function writeBrainPack(id: string): void {
+    const dir = join(packBase, id, "brain");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "main.ts"), `process.exit(0);\n`, "utf8");
+  }
+
+  /** The brain-consumer boot line for `id` (ready or DORMANT — both carry `gate=`). */
+  function bootLineFor(id: string): string | undefined {
+    return logSpy.mock.calls
+      .map((args: unknown[]) => args.map(String).join(" "))
+      .find(
+        (line: string) =>
+          line.includes(`brain consumer`) && line.includes(`agent=${id}`),
+      );
+  }
+
+  test("principal WITH a surface identity → consumers boot with the surface gate", async () => {
+    writeBrainPack("yarrow");
+    writeBrainFragment("yarrow", ["soc.compose.flow"]);
+    const runtime = createRecordingRuntime();
+    await bootWatcherless(runtime, {
+      brainPackBaseDir: packBase,
+      principal: { id: "test-op", mattermostId: "mm-jc" },
+    });
+    const line = bootLineFor("yarrow");
+    expect(line).toBeDefined();
+    expect(line).toContain("gate=surface");
+  });
+
+  test("principal WITHOUT any surface identity → DenyAll default retained", async () => {
+    writeBrainPack("yarrow");
+    writeBrainFragment("yarrow", ["soc.compose.flow"]);
+    const runtime = createRecordingRuntime();
+    await bootWatcherless(runtime, {
+      brainPackBaseDir: packBase,
+      principal: { id: "test-op" }, // no mattermostId/discordId/slackId
+    });
+    const line = bootLineFor("yarrow");
+    expect(line).toBeDefined();
+    expect(line).toContain("gate=deny-all");
+  });
+
+  test("hot-ADDED agent inherits the same gate decision (reload path)", async () => {
+    const runtime = createRecordingRuntime();
+    const handle = await bootWatcherless(runtime, {
+      brainPackBaseDir: packBase,
+      principal: { id: "test-op", mattermostId: "mm-jc" },
+    });
+    writeBrainPack("late");
+    writeBrainFragment("late", ["soc.compose.flow"]);
+    await handle.reloadAgents("cli");
+    const line = bootLineFor("late");
+    expect(line).toBeDefined();
+    expect(line).toContain("gate=surface");
   });
 });

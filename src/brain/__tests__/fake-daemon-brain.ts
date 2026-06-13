@@ -57,7 +57,7 @@ export class FakeDaemonBrain {
         }
       },
       onData: (handler) => {
-        this.dataHandler = handler as (c: string) => void;
+        this.dataHandler = handler;
       },
       onClose: (handler) => {
         this.closeHandler = handler;
