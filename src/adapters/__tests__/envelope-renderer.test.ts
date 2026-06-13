@@ -142,14 +142,14 @@ describe("formatEnvelopeAsMarkdown — dispatch lifecycle", () => {
     // flow, the ask_principal prompt, per-step replies. Without rendering it
     // the sink dropped every brain post on null text, so a bot pack stayed
     // silent. Empty text → null (nothing to deliver).
+    // Verbatim — intentional leading/trailing whitespace + final newline are
+    // preserved (sage #1040: trim only gates emptiness, never the output).
+    const body = "  ⚖️ Yarrow is frontier-A\n```yaml\nname: F_X\n```\n";
     expect(
       formatDispatchLifecycle(
-        makeEnvelope({
-          type: "dispatch.task.post",
-          payload: { agent_id: "yarrow", text: "⚖️ Yarrow is frontier-A\n```yaml\nname: F_X\n```" },
-        }),
+        makeEnvelope({ type: "dispatch.task.post", payload: { agent_id: "yarrow", text: body } }),
       ),
-    ).toBe("⚖️ Yarrow is frontier-A\n```yaml\nname: F_X\n```");
+    ).toBe(body);
     expect(
       formatDispatchLifecycle(
         makeEnvelope({ type: "dispatch.task.post", payload: { agent_id: "yarrow", text: "  " } }),

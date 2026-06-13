@@ -75,8 +75,10 @@ export function formatDispatchLifecycle(envelope: Envelope): string | null {
     // Empty text → null (nothing to post). Attachment delivery (the diagram
     // PNG) is a separate sink concern — the flow falls back to fenced mermaid
     // source in `text` when no PNG, so text alone is a complete message.
-    const text = typeof payload.text === "string" ? payload.text.trim() : "";
-    return text.length > 0 ? text : null;
+    // Verbatim: post the brain's text exactly (intentional leading/trailing
+    // whitespace + final newlines preserved); trim ONLY for the empty check.
+    const text = typeof payload.text === "string" ? payload.text : "";
+    return text.trim().length > 0 ? text : null;
   }
 
   if (envelope.type === "dispatch.task.completed") {
