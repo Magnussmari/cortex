@@ -2463,8 +2463,12 @@ export async function startCortex(
       // brain consumer pulls — the documented "bus is the medium" contract
       // (sage #1038 round 1). Fleet `dispatch` effects ride the bus too.
       if (agent.runtime?.brain?.kind === "exec") {
-        void dispatchInboundToBrain(agent, msg, thread);
-        return Promise.resolve();
+        // Return (not void) so the platform handler applies natural
+        // back-pressure on the publish (sage #1038 r2). The publish is cheap
+        // — a JetStream write; the long compose is decoupled on the consumer
+        // side (the brain pulls the task), so awaiting here bounds inbound
+        // publish concurrency without serialising composition.
+        return dispatchInboundToBrain(agent, msg, thread);
       }
       return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
     };
