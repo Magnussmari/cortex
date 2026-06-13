@@ -68,6 +68,12 @@ import {
   BrainConsumer,
   type BrainConsumerAgent,
 } from "./bus/brain-consumer";
+import {
+  SurfacePrincipalGate,
+  makeDispatchPostRenderer,
+  type PrincipalIdentity,
+} from "./bus/surface-principal-gate";
+import { GateReplyRouter } from "./bus/gate-reply-router";
 import { makeExecBrainRunner } from "./brain/exec-brain-runner";
 import { DaemonBrainHost } from "./brain/daemon-brain-host";
 import { wireDevConsumers } from "./runner/dev-consumer-boot";
@@ -129,7 +135,7 @@ import {
 } from "./common/policy";
 import { MattermostAdapter } from "./adapters/mattermost";
 import { SlackAdapter } from "./adapters/slack";
-import type { PlatformAdapter } from "./adapters/types";
+import type { InboundMessage, PlatformAdapter } from "./adapters/types";
 import { createDispatchSink, type DispatchSink } from "./adapters/dispatch-sink";
 import { createReviewSink, type ReviewSink } from "./adapters/review-sink";
 import { startGatewayIfEnabled } from "./gateway/start-gateway";
@@ -2308,6 +2314,92 @@ export async function startCortex(
   // one brain's wiring failure does not abort boot.
   const brainPackBaseDir =
     options.brainPackBaseDir ?? expandTilde("~/.config/metafactory/pkg/repos/");
+
+  // Bot Packs B-3 (cortex#1021 W-1/W-2) — the adapter inbound reply-bridge +
+  // the booted surface gate. Constructed ONCE here (before the per-agent brain
+  // consumers, which capture the gate) even though the surface adapters boot
+  // LATER: the bridge is late-wired —
+  //   - `gateReplyRouter` is a passive registry; each adapter's inbound
+  //     handler (below, at adapter start) offers every normalized message to
+  //     it before chat dispatch;
+  //   - `liveSurfaces` is seeded from the CONFIGURED surface instances (sage
+  //     #1037 round 1: brain consumers boot BEFORE adapters, so seeding only
+  //     at adapter start would fail-close every gate in the boot window even
+  //     though the adapter is seconds from being available). A configured
+  //     surface whose adapter then fails to start still fails closed: the
+  //     gate's rendered prompt has no adapter to deliver it and no reply can
+  //     arrive, so the gate times out to `fail`. Adapters still `add()` on
+  //     start (idempotent) so a surface added by hot-reload joins late.
+  // The gate itself only boots when the principal has at least one configured
+  // surface identity (`principal.mattermostId` / `discordId` / `slackId`) —
+  // with no platform id there is nothing to verify a reply against, so the
+  // consumer keeps its DenyAll default (fail-closed, B-1 behaviour).
+  const gateReplyRouter = new GateReplyRouter();
+
+  // One metadata row per surface family (sage #1037 round 2: liveSurfaces,
+  // principalIdentity and the has-identity check previously repeated the
+  // platform list in three independent shapes — adding a surface meant
+  // touching all of them).
+  const surfaceGateMeta = [
+    {
+      surface: "discord",
+      configured: config.discord.length > 0,
+      identityKey: "discordId" as const,
+      principalId: options.principal?.discordId,
+    },
+    {
+      surface: "mattermost",
+      configured: config.mattermost.length > 0,
+      identityKey: "mattermostId" as const,
+      principalId: options.principal?.mattermostId,
+    },
+    {
+      surface: "slack",
+      configured: config.slack.length > 0,
+      identityKey: "slackId" as const,
+      principalId: options.principal?.slackId,
+    },
+  ];
+  const liveSurfaces = new Set<string>(
+    surfaceGateMeta.filter((m) => m.configured).map((m) => m.surface),
+  );
+  const principalIdentity: PrincipalIdentity = {};
+  for (const m of surfaceGateMeta) {
+    if (m.principalId !== undefined) principalIdentity[m.identityKey] = m.principalId;
+  }
+  const principalHasSurfaceIdentity = surfaceGateMeta.some(
+    (m) => m.principalId !== undefined,
+  );
+
+  // sage #1037 round 1 (maintainability): ONE inbound handler shape for all
+  // three adapter families — gate reply-bridge first, chat dispatch second.
+  // B-3 (cortex#1021 W-1): a message landing in a thread with an open
+  // principal gate is that gate's reply (identity checked by the GATE, never
+  // here), not a chat dispatch. The InboundMessage → GateReplyOffer mapping
+  // lives HERE (surface layer) so the bus-side router stays blind to adapter
+  // DTOs (sage round 2, architecture).
+  const inboundWithGateBridge =
+    (adapter: PlatformAdapter, agent: Agent) =>
+    (msg: InboundMessage): Promise<void> => {
+      const consumed = gateReplyRouter.offer({
+        surface: msg.platform,
+        channel: msg.channelId,
+        ...(msg.threadId !== undefined && { thread: msg.threadId }),
+        authorId: msg.authorId,
+        text: msg.content,
+      });
+      if (consumed) return Promise.resolve();
+      return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
+    };
+  const surfacePrincipalGate = principalHasSurfaceIdentity
+    ? new SurfacePrincipalGate({
+        principalIdentity,
+        liveSurfaces,
+        renderer: makeDispatchPostRenderer({ runtime, source: systemEventSource }),
+        replySource: gateReplyRouter,
+      })
+    : undefined;
+
   const startBrainConsumersForAgent = async (agent: Agent): Promise<void> => {
     try {
       const brain = agent.runtime?.brain;
@@ -2353,14 +2445,16 @@ export async function startCortex(
       // brain effects through the host hooks identically). The lifecycle-specific
       // runner is mutually exclusive: a daemon agent passes `daemonHost` (no
       // per-task runner constructed), a per-task agent passes `runBrainTask`.
-      // The `principalGate` is left to the consumer default on BOTH paths:
-      // DenyAllPrincipalGate (B-1 fail-closed — every `ask_principal` denied).
-      // SurfacePrincipalGate (B-2) is IMPLEMENTED + unit-tested but NOT booted
-      // here yet: it needs an adapter inbound reply-bridge (a
-      // PrincipalReplySource fed by a live surface adapter) to observe the
-      // principal's reply, which lands in B-3. Until that bridge exists there is
-      // nothing to construct the gate from, so the boot path leaves the
-      // fail-closed default in place — identity-based approval is NOT live.
+      // The `principalGate` (B-3, cortex#1021 W-2): when the principal has a
+      // configured surface identity, every brain consumer gets the SHARED
+      // `surfacePrincipalGate` — `ask_principal` renders to the task's
+      // surface/thread and awaits the principal's identity-checked reply via
+      // the `gateReplyRouter` bridge (wired into each adapter's inbound flow
+      // at adapter start). Tasks that are bus-only, on a surface this
+      // instance doesn't host, or on a surface with no configured principal
+      // id STILL fail closed inside the gate (resolve-time checks). With no
+      // principal surface identity at all the consumer keeps its
+      // DenyAllPrincipalGate default (B-1 fail-closed).
       // Sovereignty audit-parity by default, mirroring ReviewConsumer (a
       // self-declared modelClass is spoofable until bound to the signing
       // identity, cortex#327).
@@ -2369,6 +2463,9 @@ export async function startCortex(
         source: systemEventSource,
         runtime,
         ...(personaText !== undefined && { persona: personaText }),
+        ...(surfacePrincipalGate !== undefined && {
+          principalGate: surfacePrincipalGate,
+        }),
       };
       let daemonHost: DaemonBrainHost | undefined;
       let consumer: BrainConsumer;
@@ -2480,12 +2577,15 @@ export async function startCortex(
       if (started.subscribedCapabilities.length > 0) {
         console.log(
           `cortex: brain consumer ready for agent=${agent.id} kind=exec ` +
-            `capabilities=[${capSummary}] subscribed=[${started.subscribedCapabilities.join(",")}]`,
+            `capabilities=[${capSummary}] subscribed=[${started.subscribedCapabilities.join(",")}] ` +
+            `gate=${surfacePrincipalGate !== undefined ? "surface" : "deny-all"}`,
         );
       } else {
         console.log(
           `cortex: brain consumer DORMANT for agent=${agent.id} kind=exec ` +
-            `capabilities=[${capSummary}] — cortex MyelinRuntime subscriptions disabled ` +
+            `capabilities=[${capSummary}] ` +
+            `gate=${surfacePrincipalGate !== undefined ? "surface" : "deny-all"} ` +
+            `— cortex MyelinRuntime subscriptions disabled ` +
             `(G-1111 pending; tasks.{capability} envelopes will not be claimed by this brain)`,
         );
       }
@@ -3317,7 +3417,10 @@ export async function startCortex(
       // Register the adapter's surface-router face. Empty `surfaceSubjects`
       // makes this a no-op match; harmless to register either way.
       router.register(adapter.surfaceConfig);
-      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir)));
+      await adapter.start(inboundWithGateBridge(adapter, agent));
+      // B-3: confirm this surface live (idempotent — seeded from config; a
+      // hot-reloaded surface joins here).
+      liveSurfaces.add(adapter.platform);
       adapters.push(adapter);
 
       // cortex#98 (part B) — Pass 1 step c: register this adapter's bot
@@ -3484,7 +3587,10 @@ export async function startCortex(
         },
       );
       router.register(adapter.surfaceConfig);
-      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir)));
+      await adapter.start(inboundWithGateBridge(adapter, agent));
+      // B-3: confirm this surface live (idempotent — seeded from config; a
+      // hot-reloaded surface joins here).
+      liveSurfaces.add(adapter.platform);
       adapters.push(adapter);
       console.log(`cortex: mattermost adapter started (instance: ${instanceId}, ${instance.channels.length} channel(s))`);
     } catch (err) {
@@ -3592,7 +3698,10 @@ export async function startCortex(
       // `attachInboundDispatch()`. This is the Slack equivalent of
       // discord.js's buffered-events-before-listener pattern.
       const explicitTrustedBotIds: ReadonlySet<string> = new Set(instance.trustedBotIds);
-      await adapter.start((msg) => dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir)));
+      await adapter.start(inboundWithGateBridge(adapter, agent));
+      // B-3: confirm this surface live (idempotent — seeded from config; a
+      // hot-reloaded surface joins here).
+      liveSurfaces.add(adapter.platform);
       adapters.push(adapter);
       // Best-effort trust-resolver registration matches the Discord pattern.
       if (agentRegistry.tryGetById(agent.id)) {
@@ -5296,6 +5405,12 @@ export async function startCortex(
           );
         }
       }
+      // Bot Packs B-3 — stop the gate reply-bridge FIRST: every open
+      // principal gate resolves `null` (its fail-closed timeout branch)
+      // immediately, so the brain-consumer drain below is never held hostage
+      // by a gate awaiting a reply that can no longer arrive (the adapters
+      // are going down on this same boundary).
+      gateReplyRouter.stop();
       // Bot Packs B-1 — drain brain consumers on the SAME boundary as the
       // review consumers so an in-flight brain task publishes its terminal
       // envelope before the runtime closes. `BrainConsumer.stop()` is

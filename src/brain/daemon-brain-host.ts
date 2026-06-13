@@ -57,7 +57,7 @@
  */
 
 import { timingSafeEqual } from "crypto";
-import { chmodSync, mkdtempSync, realpathSync } from "fs";
+import { chmodSync, mkdtempSync } from "fs";
 import { realpath } from "fs/promises";
 import { rm } from "fs/promises";
 import { tmpdir } from "os";
@@ -706,7 +706,7 @@ export class DaemonBrainHost {
     }, this.killGraceMs);
     void proc.exited
       .catch(() => undefined)
-      .finally(() => clearTimeout(killTimer));
+      .finally(() => { clearTimeout(killTimer); });
   }
 
   /**
@@ -1217,7 +1217,7 @@ export const makeBunUnixTransport: DaemonTransport = (opts) => {
   let closeHandler: (() => void) | null = null;
   // The bound socket the brain connects on. Bun's socket data callback is
   // (socket, data); we expose a write/onData/onClose facade.
-  type BunServerSocket = { write(data: string | Uint8Array): number; end(): void };
+  interface BunServerSocket { write(data: string | Uint8Array): number; end(): void }
   let liveSocket: BunServerSocket | null = null;
   // Auth state: until the first line proves the token, the connection is NOT
   // resolved and inbound bytes are buffered by the auth pre-reader, never the
@@ -1278,7 +1278,7 @@ export const makeBunUnixTransport: DaemonTransport = (opts) => {
         liveSocket = socket;
         // Start the auth deadline: no valid proof within the window → reject.
         authTimer = setTimeout(
-          () => failAuth(`no auth line within ${SOCKET_AUTH_TIMEOUT_MS}ms`),
+          () => { failAuth(`no auth line within ${SOCKET_AUTH_TIMEOUT_MS}ms`); },
           SOCKET_AUTH_TIMEOUT_MS,
         );
         (authTimer as { unref?: () => void }).unref?.();

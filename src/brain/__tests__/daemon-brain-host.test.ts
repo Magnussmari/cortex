@@ -378,7 +378,7 @@ describe("DaemonBrainHost — drain (hot-swap §7)", () => {
     const posts: { text: string }[] = [];
     let gateResolve: (() => void) | null = null;
     const hooks = makeHooks({
-      onPost: (p) => void posts.push(p as { text: string }),
+      onPost: (p) => void posts.push(p),
       onAskPrincipal: () =>
         new Promise(() => {
           gateResolve = () => {};
