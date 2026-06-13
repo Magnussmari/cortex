@@ -23,6 +23,7 @@ import {
   checkDowngradeOnly,
   deriveTaskSource,
   brainReasonToDispatchReason,
+  buildBrainTaskPayload,
   buildDispatchTaskEnvelope,
   type BrainConsumerAgent,
   type BrainConsumerOpts,
@@ -217,6 +218,35 @@ describe("brain-consumer helpers", () => {
       channel: "c1",
       thread: "t1",
       user: "u1",
+    });
+  });
+
+  test("buildBrainTaskPayload round-trips through deriveTaskSource (B-3 inbound routing)", () => {
+    // The inbound surface→brain contract: the payload a surface @-mention
+    // builds must yield the originating source back to the brain, so its
+    // `post`/`ask_principal` lands in the same thread (cortex#1021 W-3
+    // triggering). text + scenario both carry the message so either brain
+    // reader works.
+    const payload = buildBrainTaskPayload({
+      text: "credential leak at a member university",
+      user: "mm-jc",
+      surface: "discord",
+      channel: "chan-1",
+      thread: "thread-1",
+    });
+    expect(payload.text).toBe("credential leak at a member university");
+    expect(payload.scenario).toBe("credential leak at a member university");
+    const env = buildDispatchTaskEnvelope({
+      source: SOURCE,
+      capability: "soc.compose.flow",
+      payload,
+    });
+    expect(env.type).toBe("tasks.soc.compose.flow");
+    expect(deriveTaskSource(env)).toEqual({
+      surface: "discord",
+      channel: "chan-1",
+      thread: "thread-1",
+      user: "mm-jc",
     });
   });
 

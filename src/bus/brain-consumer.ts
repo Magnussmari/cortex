@@ -930,6 +930,35 @@ export function checkDowngradeOnly(
 }
 
 /**
+ * Build a brain task payload from an inbound SURFACE message (cortex#1021
+ * B-3 inbound routing). Carries the message text (both `text` and `scenario`
+ * — the brain reads either) + the surface `response_routing` triple, which
+ * {@link deriveTaskSource} reads back so the brain can `post` to the
+ * originating thread and `ask_principal` renders there. Plain-string params
+ * (no adapter DTO) keep the bus layer blind to platform message shapes — the
+ * surface layer maps `InboundMessage → these fields` (mirrors the
+ * `GateReplyOffer` boundary).
+ */
+export function buildBrainTaskPayload(opts: {
+  text: string;
+  user: string;
+  surface: string;
+  channel: string;
+  thread: string;
+}): Record<string, unknown> {
+  return {
+    text: opts.text,
+    scenario: opts.text,
+    user: opts.user,
+    response_routing: {
+      surface: opts.surface,
+      channel: opts.channel,
+      thread: opts.thread,
+    },
+  };
+}
+
+/**
  * Build a fleet `dispatch` task envelope for an ALLOWED brain dispatch. The
  * envelope type is `tasks.{capability}` and carries the brain's payload under
  * the agent's own source identity. The optional `modelClass` (the brain's

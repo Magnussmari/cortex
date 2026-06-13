@@ -66,6 +66,8 @@ import {
 } from "./bus/review-consumer";
 import {
   BrainConsumer,
+  buildBrainTaskPayload,
+  buildDispatchTaskEnvelope,
   type BrainConsumerAgent,
 } from "./bus/brain-consumer";
 import {
@@ -2381,16 +2383,91 @@ export async function startCortex(
   const inboundWithGateBridge =
     (adapter: PlatformAdapter, agent: Agent) =>
     (msg: InboundMessage): Promise<void> => {
+      // The routing key for both the gate reply-bridge and a brain task's
+      // response_routing. A top-level (non-threaded) surface message has no
+      // native thread, so the channel id is the key — used IDENTICALLY on the
+      // gate-await side and the offer side, so a gate prompt + the principal's
+      // reply correlate whether the conversation is threaded or not.
+      const thread = msg.threadId !== undefined && msg.threadId.length > 0
+        ? msg.threadId
+        : msg.channelId;
       const consumed = gateReplyRouter.offer({
         surface: msg.platform,
         channel: msg.channelId,
-        ...(msg.threadId !== undefined && { thread: msg.threadId }),
+        thread,
         authorId: msg.authorId,
         text: msg.content,
       });
       if (consumed) return Promise.resolve();
+      // B-3 routing (design-bot-packs.md §6, cortex#1021): an exec-brain agent
+      // does NOT run the builtin claude-code chat pipeline. Its inbound
+      // @-mention becomes a capability task the brain composes against. The
+      // brain consumer's `tasks.{capability}` durable lives on a stream that
+      // does not carry non-code-review subjects today (B-1 binds every brain
+      // capability on CODE_REVIEW), so we drive the consumer's documented
+      // `processEnvelope` seam DIRECTLY rather than round-trip a broker that
+      // would never store the subject. Live @-mention compose is a synchronous
+      // interaction, not a durable queued job, so the direct path is the right
+      // semantics — fleet `dispatch` effects still ride the bus.
+      if (agent.runtime?.brain?.kind === "exec") {
+        void dispatchInboundToBrain(agent, msg, thread);
+        return Promise.resolve();
+      }
       return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
     };
+
+  /**
+   * Drive an exec-brain agent's consumer with an inbound surface message as a
+   * capability task. Finds the agent's {@link BrainConsumer}, builds a
+   * `tasks.{capability}` envelope carrying the message text + the surface
+   * `response_routing` (so the brain can `post` back and `ask_principal`
+   * renders to the originating thread), and calls `processEnvelope` (the
+   * broker-free seam). Non-blocking: composition + gate + run are long, so the
+   * inbound handler never awaits.
+   *
+   * Capability selection: the brain's FIRST declared capability. A
+   * multi-capability brain needs a keyword/prefix selector (follow-up); v1
+   * brains (Yarrow → `soc.compose.flow`) declare exactly one.
+   */
+  const dispatchInboundToBrain = async (
+    agent: Agent,
+    msg: InboundMessage,
+    thread: string,
+  ): Promise<void> => {
+    const capability = agent.runtime?.capabilities[0];
+    if (capability === undefined) {
+      process.stderr.write(
+        `cortex: exec-brain agent=${agent.id} has no declared capability — dropping inbound message\n`,
+      );
+      return;
+    }
+    const consumer = brainConsumers.find((c) => c.agent.id === agent.id);
+    if (consumer === undefined) {
+      process.stderr.write(
+        `cortex: exec-brain agent=${agent.id} has no brain consumer (not yet started?) — dropping inbound message\n`,
+      );
+      return;
+    }
+    const envelope = buildDispatchTaskEnvelope({
+      source: systemEventSource,
+      capability,
+      payload: buildBrainTaskPayload({
+        text: msg.content,
+        user: msg.authorId,
+        surface: msg.platform,
+        channel: msg.channelId,
+        thread,
+      }),
+      ...(agent.runtime?.modelClass !== undefined && { modelClass: agent.runtime.modelClass }),
+    });
+    try {
+      await consumer.processEnvelope(envelope, envelope.type, null, capability);
+    } catch (err) {
+      process.stderr.write(
+        `cortex: exec-brain agent=${agent.id} task failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  };
   const surfacePrincipalGate = principalHasSurfaceIdentity
     ? new SurfacePrincipalGate({
         principalIdentity,
