@@ -66,6 +66,19 @@ export function formatDispatchLifecycle(envelope: Envelope): string | null {
     return `${label} is working...`;
   }
 
+  if (envelope.type === "dispatch.task.post") {
+    // cortex#1039 follow-up — a brain `post` carries its OWN content (the
+    // composed flow, the ask_principal prompt, per-step replies) under
+    // `payload.text`. Render that verbatim; without this the sink dropped
+    // every brain post on `text === null` (started/completed/failed were the
+    // only rendered lifecycle types), so a bot pack could never speak.
+    // Empty text → null (nothing to post). Attachment delivery (the diagram
+    // PNG) is a separate sink concern — the flow falls back to fenced mermaid
+    // source in `text` when no PNG, so text alone is a complete message.
+    const text = typeof payload.text === "string" ? payload.text.trim() : "";
+    return text.length > 0 ? text : null;
+  }
+
   if (envelope.type === "dispatch.task.completed") {
     // cortex#491 — full reply when present (chat round-trip), else the
     // dashboard summary label, else a terse default.
