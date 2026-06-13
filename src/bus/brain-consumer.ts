@@ -931,10 +931,12 @@ export function checkDowngradeOnly(
 
 /**
  * Build a brain task payload from an inbound SURFACE message (cortex#1021
- * B-3 inbound routing). Carries the message text (both `text` and `scenario`
- * — the brain reads either) + the surface `response_routing` triple, which
- * {@link deriveTaskSource} reads back so the brain can `post` to the
- * originating thread and `ask_principal` renders there. Plain-string params
+ * B-3 inbound routing). Carries the message text under BOTH `text` and
+ * `scenario` (the two keys brains have used for the message body; a brain
+ * picks whichever it reads — the host does not assume which) + the surface
+ * `response_routing` triple, which {@link deriveTaskSource} reads back so the
+ * brain can `post` to the originating thread and `ask_principal` renders
+ * there. Plain-string params
  * (no adapter DTO) keep the bus layer blind to platform message shapes — the
  * surface layer maps `InboundMessage → these fields` (mirrors the
  * `GateReplyOffer` boundary).
@@ -959,24 +961,38 @@ export function buildBrainTaskPayload(opts: {
 }
 
 /**
- * Build a fleet `dispatch` task envelope for an ALLOWED brain dispatch. The
- * envelope type is `tasks.{capability}` and carries the brain's payload under
- * the agent's own source identity. The optional `modelClass` (the brain's
- * downgrade request) stamps the envelope sovereignty so the downstream consumer
- * honours the tightened class.
+/**
+ * The subject family for INBOUND surface tasks addressed TO a brain
+ * (cortex#1021 B-3). Distinct from `tasks.` (which targets the review/dev
+ * fleet consumers) so brain-inbound traffic lands on its OWN stream
+ * (`BRAIN_TASKS`, owning `…brain.>`) with no subject overlap against
+ * CODE_REVIEW (`tasks.code-review.>`) / DEV_IMPLEMENT (`tasks.dev.>`) /
+ * REVIEW_LIFECYCLE. The brain consumer subscribes `…brain.{capability}`.
+ */
+export const BRAIN_TASK_SUBJECT_FAMILY = "brain" as const;
+
+/**
+ * Build a task envelope. `family` selects the subject family / stream:
+ *   - `"tasks"` (default) — a fleet `dispatch` task targeting review/dev
+ *     consumers (the brain's own `dispatch` effect).
+ *   - `"brain"` — an inbound surface task addressed to a brain, landing on
+ *     `…brain.{capability}` (the `BRAIN_TASKS` stream; B-3 inbound routing).
+ * Carries the payload under the source identity; the optional `modelClass`
+ * (a brain's downgrade request) stamps the envelope sovereignty.
  */
 export function buildDispatchTaskEnvelope(opts: {
   source: SystemEventSource;
   capability: string;
   payload: Record<string, unknown>;
   modelClass?: string;
+  family?: "tasks" | typeof BRAIN_TASK_SUBJECT_FAMILY;
 }): Envelope {
   const now = new Date().toISOString();
   const modelClass = isModelClass(opts.modelClass) ? opts.modelClass : "any";
   return {
     id: crypto.randomUUID(),
     source: buildSource(opts.source),
-    type: `tasks.${opts.capability}`,
+    type: `${opts.family ?? "tasks"}.${opts.capability}`,
     timestamp: now,
     sovereignty: {
       classification: "local",

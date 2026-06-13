@@ -236,18 +236,24 @@ describe("brain-consumer helpers", () => {
     });
     expect(payload.text).toBe("credential leak at a member university");
     expect(payload.scenario).toBe("credential leak at a member university");
+    // The inbound path uses family="brain" → BRAIN_TASKS stream subject.
     const env = buildDispatchTaskEnvelope({
       source: SOURCE,
       capability: "soc.compose.flow",
+      family: "brain",
       payload,
     });
-    expect(env.type).toBe("tasks.soc.compose.flow");
+    expect(env.type).toBe("brain.soc.compose.flow");
     expect(deriveTaskSource(env)).toEqual({
       surface: "discord",
       channel: "chan-1",
       thread: "thread-1",
       user: "mm-jc",
     });
+    // Default family stays `tasks.` (fleet dispatch to review/dev consumers).
+    expect(
+      buildDispatchTaskEnvelope({ source: SOURCE, capability: "x.y", payload }).type,
+    ).toBe("tasks.x.y");
   });
 
   test("brainReasonToDispatchReason: not_now carries retry_after_ms", () => {
