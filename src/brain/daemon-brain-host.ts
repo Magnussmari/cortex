@@ -187,7 +187,10 @@ export interface DaemonBrainHostOpts {
    * closest-match = up to 4 frontier calls, which blew past the old 2-min
    * default and stranded the brain's real answer (cortex#1040 follow-up: the
    * task failed mid-compose, so every post after the disclosure was rejected
-   * as a closed task_id). 5 min comfortably covers the worst-case chain.
+   * as a closed task_id). 5 min is a heuristic headroom bump (~2.5x the old
+   * ceiling), NOT a measured bound — per-call frontier latency varies; if a
+   * brain's chain still exceeds it, lengthen this rather than treating 5 min
+   * as validated. The host caller may also override per-brain.
    */
   taskTimeoutMs?: number;
   /** SIGTERM → SIGKILL grace on drain/shutdown. Defaults to 5_000 (§7.6). */
