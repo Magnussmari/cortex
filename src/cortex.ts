@@ -2524,9 +2524,14 @@ export async function startCortex(
     try {
       await runtime.publish(envelope);
     } catch (err) {
+      // Log AND rethrow (sage #1038 r3): swallowing here would let the
+      // platform handler treat the mention as successfully handled while no
+      // brain task was actually delivered — a silent drop on a transient bus
+      // error. Rejecting lets the adapter surface/retry per its own policy.
       process.stderr.write(
         `cortex: exec-brain agent=${agent.id} inbound publish failed: ${err instanceof Error ? err.message : String(err)}\n`,
       );
+      throw err;
     }
   };
   const surfacePrincipalGate = principalHasSurfaceIdentity
