@@ -66,6 +66,9 @@ import {
 } from "./bus/review-consumer";
 import {
   BrainConsumer,
+  buildBrainTaskPayload,
+  buildDispatchTaskEnvelope,
+  BRAIN_TASK_SUBJECT_FAMILY,
   type BrainConsumerAgent,
 } from "./bus/brain-consumer";
 import {
@@ -1727,6 +1730,29 @@ export async function startCortex(
   const devImplementStreamSubjects = devStreamOfferingPatterns;
   // ── /F-2.2 DEV_IMPLEMENT subject set ──────────────────────────────────────
 
+  // ── B-3 (cortex#1021) BRAIN_TASKS subject set ─────────────────────────────
+  // Inbound surface tasks addressed TO an exec-brain agent land on
+  // `…brain.{capability}` (the `BRAIN_TASK_SUBJECT_FAMILY`), captured by the
+  // BRAIN_TASKS stream. The B-1 runtime bound every brain capability on
+  // CODE_REVIEW, whose filter is `tasks.code-review.>` — so a non-code-review
+  // capability (e.g. `soc.compose.flow`) had NO stream to receive a task from.
+  // This stream closes that gap: a brain consumer binds its durable here, and
+  // the inbound dispatch publishes to the bus on `…brain.{capability}`.
+  //
+  // OVERLAP ANALYSIS (JetStream rejects overlapping subjects across streams):
+  //   CODE_REVIEW       owns `…tasks.code-review.>`
+  //   DEV_IMPLEMENT     owns `…tasks.dev.>`
+  //   REVIEW_LIFECYCLE  owns `…review.verdict.>` / `…code.pr.review.>` / `…dispatch.task.>`
+  //   BRAIN_TASKS       owns `…brain.>`            (THIS stream)
+  // `brain.` is a distinct segment-4 token from `tasks.` / `review.` / `code.`
+  // / `dispatch.`: no subject here is a prefix of (or prefixed by) any other
+  // stream's subjects. The four streams partition the subject space cleanly.
+  const brainTasksStream = "BRAIN_TASKS";
+  const brainTasksStreamSubjects = [
+    `local.${reviewPrincipalId}.${derivedStack.stack}.${BRAIN_TASK_SUBJECT_FAMILY}.>`,
+  ];
+  // ── /B-3 BRAIN_TASKS subject set ──────────────────────────────────────────
+
   if (reviewJsm !== null) {
     try {
       const outcome = await provisionReviewStream({
@@ -1838,6 +1864,39 @@ export async function startCortex(
       );
     }
     // ── /F-2.2 provision DEV_IMPLEMENT ──────────────────────────────────────
+
+    // ── B-3 (cortex#1021) provision BRAIN_TASKS ─────────────────────────────
+    // Same `reviewJsm !== null` gate + posture as CODE_REVIEW / DEV_IMPLEMENT
+    // (Interest retention, File storage, idempotent ensure). The exec-brain
+    // consumer binds its durable here; the inbound dispatch publishes onto
+    // `…brain.{capability}`. A failure does NOT abort boot. Same KNOWN COUPLING
+    // as DEV_IMPLEMENT: the gate is review-capability presence, so a
+    // brain-ONLY stack would skip provisioning — not reachable today (the
+    // switch stack runs sage); the independent-gate fix is the same follow-up.
+    try {
+      const brainOutcome = await provisionReviewStream({
+        jsm: reviewJsm,
+        name: brainTasksStream,
+        subjects: brainTasksStreamSubjects,
+        maxAgeNs: reviewStreamMaxAgeNs,
+        maxBytes: reviewStreamMaxBytes,
+      });
+      if (brainOutcome === "created") {
+        console.log(
+          `cortex: provisioned JetStream stream "${brainTasksStream}" (subjects=[${brainTasksStreamSubjects.join(", ")}])`,
+        );
+      } else if (brainOutcome === "exists") {
+        console.log(
+          `cortex: JetStream stream "${brainTasksStream}" already present — binding existing config`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `cortex: provisionReviewStream failed for "${brainTasksStream}": ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+    // ── /B-3 provision BRAIN_TASKS ──────────────────────────────────────────
   }
 
   // B-0 (cortex#1021) — the per-agent review-consumer construction, lifted out
@@ -2381,16 +2440,100 @@ export async function startCortex(
   const inboundWithGateBridge =
     (adapter: PlatformAdapter, agent: Agent) =>
     (msg: InboundMessage): Promise<void> => {
+      // The routing key for both the gate reply-bridge and a brain task's
+      // response_routing. A top-level (non-threaded) surface message has no
+      // native thread, so the channel id is the key — used IDENTICALLY on the
+      // gate-await side and the offer side, so a gate prompt + the principal's
+      // reply correlate whether the conversation is threaded or not.
+      const thread = msg.threadId !== undefined && msg.threadId.length > 0
+        ? msg.threadId
+        : msg.channelId;
       const consumed = gateReplyRouter.offer({
         surface: msg.platform,
         channel: msg.channelId,
-        ...(msg.threadId !== undefined && { thread: msg.threadId }),
+        thread,
         authorId: msg.authorId,
         text: msg.content,
       });
       if (consumed) return Promise.resolve();
+      // B-3 routing (design-bot-packs.md §6, cortex#1021): an exec-brain agent
+      // does NOT run the builtin claude-code chat pipeline (it has no CC
+      // substrate). Its inbound @-mention becomes a capability task PUBLISHED
+      // TO THE BUS on `…brain.{capability}` (the BRAIN_TASKS stream), which the
+      // brain consumer pulls — the documented "bus is the medium" contract
+      // (sage #1038 round 1). Fleet `dispatch` effects ride the bus too.
+      if (agent.runtime?.brain?.kind === "exec") {
+        // Return (not void) so the platform handler applies natural
+        // back-pressure on the publish (sage #1038 r2). The publish is cheap
+        // — a JetStream write; the long compose is decoupled on the consumer
+        // side (the brain pulls the task), so awaiting here bounds inbound
+        // publish concurrency without serialising composition.
+        return dispatchInboundToBrain(agent, msg, thread);
+      }
       return dispatchHandler.handleMessage(adapter, msg, targetAgentForDispatch(agent, configDir));
     };
+
+  /**
+   * Publish an inbound surface message to an exec-brain agent as a capability
+   * task on the bus. Builds a `brain.{capability}` envelope (BRAIN_TASKS
+   * stream) carrying the message text + the surface `response_routing` (so the
+   * brain can `post` back and `ask_principal` renders to the originating
+   * thread), and `runtime.publish`es it — the brain consumer's durable pulls
+   * it through the normal `processEnvelope` path. Non-blocking: the inbound
+   * handler never awaits compose/gate/run.
+   *
+   * Note on the gate thread key (sage #1038 round 1): `thread` is
+   * `threadId ?? channelId`, computed once in the caller and used IDENTICALLY
+   * for the gate reply-bridge offer (above) AND this task's `response_routing`.
+   * A top-level (non-threaded) message would otherwise have no thread for the
+   * gate to await on / correlate a reply against; keying both sides on the
+   * channel id when there is no native thread makes the gate prompt and the
+   * principal's reply correlate either way. The SurfacePrincipalGate is the
+   * only PrincipalReplySource consumer, and it awaits on exactly this source —
+   * so the normalization is self-consistent, not a generic-router assumption.
+   *
+   * Capability selection: the brain's FIRST declared capability. A
+   * multi-capability brain needs a keyword/prefix selector (follow-up); v1
+   * brains (Yarrow → `soc.compose.flow`) declare exactly one.
+   */
+  const dispatchInboundToBrain = async (
+    agent: Agent,
+    msg: InboundMessage,
+    thread: string,
+  ): Promise<void> => {
+    const capability = agent.runtime?.capabilities[0];
+    if (capability === undefined) {
+      process.stderr.write(
+        `cortex: exec-brain agent=${agent.id} has no declared capability — dropping inbound message\n`,
+      );
+      return;
+    }
+    const envelope = buildDispatchTaskEnvelope({
+      source: systemEventSource,
+      capability,
+      family: BRAIN_TASK_SUBJECT_FAMILY,
+      payload: buildBrainTaskPayload({
+        text: msg.content,
+        user: msg.authorId,
+        surface: msg.platform,
+        channel: msg.channelId,
+        thread,
+      }),
+      ...(agent.runtime?.modelClass !== undefined && { modelClass: agent.runtime.modelClass }),
+    });
+    try {
+      await runtime.publish(envelope);
+    } catch (err) {
+      // Log AND rethrow (sage #1038 r3): swallowing here would let the
+      // platform handler treat the mention as successfully handled while no
+      // brain task was actually delivered — a silent drop on a transient bus
+      // error. Rejecting lets the adapter surface/retry per its own policy.
+      process.stderr.write(
+        `cortex: exec-brain agent=${agent.id} inbound publish failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      throw err;
+    }
+  };
   const surfacePrincipalGate = principalHasSurfaceIdentity
     ? new SurfacePrincipalGate({
         principalIdentity,
@@ -2532,11 +2675,15 @@ export async function startCortex(
       // synchronous `resolve` callback, which returned the subscription params
       // immediately while provisioning was still in flight. `resolve` is now a
       // pure subject/durable resolver with no side effect.
+      // B-3 (cortex#1021): brain task subjects live on the `brain.` family /
+      // BRAIN_TASKS stream — NOT `tasks.`/CODE_REVIEW (where B-1 bound them,
+      // a stream that never carried non-code-review capabilities). The inbound
+      // dispatch publishes onto exactly this subject.
       const brainCapabilities = consumerAgent.capabilities;
       const brainDurableFor = (capability: string): string =>
         `cortex-brain-consumer-${reviewPrincipalId}-${agent.id}-${capability.replaceAll(".", "-")}`;
       const brainPatternFor = (capability: string): string =>
-        `local.${reviewPrincipalId}.${derivedStack.stack}.tasks.${capability}`;
+        `local.${reviewPrincipalId}.${derivedStack.stack}.${BRAIN_TASK_SUBJECT_FAMILY}.${capability}`;
 
       if (reviewJsm !== null) {
         // Independent durables — provision in one parallel wave (sage
@@ -2547,7 +2694,7 @@ export async function startCortex(
             try {
               await provisionReviewConsumer({
                 jsm: reviewJsm,
-                stream: reviewStream,
+                stream: brainTasksStream,
                 durable,
                 filterSubject: brainPatternFor(capability),
                 maxDeliver: reviewConsumerMaxDeliver,
@@ -2567,7 +2714,7 @@ export async function startCortex(
       const started = await consumer.start({
         resolve: (capability) => ({
           pattern: brainPatternFor(capability),
-          stream: reviewStream,
+          stream: brainTasksStream,
           durable: brainDurableFor(capability),
         }),
       });
