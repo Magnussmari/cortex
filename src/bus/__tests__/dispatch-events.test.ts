@@ -16,6 +16,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { validateEnvelope } from "../myelin/envelope-validator";
+import { readResponseRouting } from "../../adapters/response-routing-delivery";
 import {
   createDispatchTaskAbortedEvent,
   createDispatchTaskCompletedEvent,
@@ -365,6 +366,54 @@ describe("createDispatchTaskPostEvent", () => {
       expect(validateEnvelope(env).ok).toBe(true);
     },
   );
+
+  test("cortex#1038 — adapter_instance source ⇒ WIRE routing the chat sink delivers; absent ⇒ logical shape", () => {
+    // The bug: a brain post's logical {surface,channel,thread} routing is
+    // null to `readResponseRouting` (the chat dispatch-sink's gate), so every
+    // post was dropped. With adapter_instance the post must carry the wire
+    // shape the sink accepts.
+    const live = createDispatchTaskPostEvent({
+      source: SOURCE,
+      taskId: TASK_ID,
+      agentId: "yarrow",
+      text: "Composed the flow.",
+      taskSource: {
+        surface: "discord",
+        channel: "chan-snowflake",
+        thread: "thread-snowflake",
+        user: "u1",
+        adapter_instance: "discord-yarrow",
+      },
+    });
+    expect(live.payload).toMatchObject({
+      response_routing: {
+        adapter_instance: "discord-yarrow",
+        channel_id: "chan-snowflake",
+        thread_id: "thread-snowflake",
+      },
+    });
+    // The sink's gate now ACCEPTS it (was null before this fix).
+    expect(readResponseRouting(live)).toEqual({
+      adapter_instance: "discord-yarrow",
+      channel_id: "chan-snowflake",
+      thread_id: "thread-snowflake",
+    });
+    expect(validateEnvelope(live).ok).toBe(true);
+
+    // Bus-originated (no adapter_instance) keeps the logical shape — the
+    // review-sink path — back-compat unchanged.
+    const bus = createDispatchTaskPostEvent({
+      source: SOURCE,
+      taskId: TASK_ID,
+      agentId: "yarrow",
+      text: "x",
+      taskSource: { surface: "bus", channel: "c1", thread: "t1", user: "u1" },
+    });
+    expect(bus.payload).toMatchObject({
+      response_routing: { surface: "bus", channel: "c1", thread: "t1" },
+    });
+    expect(readResponseRouting(bus)).toBeNull();
+  });
 
   test("attachment reference is carried when present, omitted otherwise", () => {
     const withAtt = createDispatchTaskPostEvent({

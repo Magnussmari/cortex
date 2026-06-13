@@ -166,6 +166,15 @@ export const TaskSourceSchema = z.object({
   channel: z.string(),
   thread: z.string(),
   user: z.string(),
+  /**
+   * Host-routing metadata (cortex#1038): the adapter instance id the task
+   * arrived on, when the source is a live surface. The brain treats it as
+   * opaque (it never chooses a channel — §5 property 1); cortex uses it to
+   * route a brain `post` back to the originating adapter via the chat
+   * dispatch-sink's `adapter_instance` filter (a bus-originated task has no
+   * adapter, so it is absent then). Optional + ignored by the brain.
+   */
+  adapter_instance: z.string().optional(),
 });
 export type TaskSource = z.infer<typeof TaskSourceSchema>;
 

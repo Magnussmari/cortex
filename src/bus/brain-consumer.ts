@@ -695,6 +695,9 @@ export class BrainConsumer {
       channel: source.channel,
       thread: source.thread,
       user: source.user,
+      ...(source.adapter_instance !== undefined && {
+        adapter_instance: source.adapter_instance,
+      }),
     };
     return {
       // `post` — B-1 publishes a `dispatch.task.post` lifecycle envelope (no
@@ -874,11 +877,19 @@ export function deriveTaskSource(envelope: Envelope): TaskSource {
       ? (p.response_routing as Record<string, unknown>)
       : undefined;
   const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  // cortex#1038: a live-surface inbound task carries the adapter instance id
+  // so a brain `post` can route back through the chat dispatch-sink's
+  // `adapter_instance` filter. Absent for bus-originated tasks.
+  const adapterInstance =
+    routing && typeof routing.adapter_instance === "string"
+      ? routing.adapter_instance
+      : undefined;
   return {
     surface: routing && typeof routing.surface === "string" ? routing.surface : "bus",
     channel: routing ? str(routing.channel) : "",
     thread: routing ? str(routing.thread) : "",
     user: p ? str(p.user) : "",
+    ...(adapterInstance !== undefined && { adapter_instance: adapterInstance }),
   };
 }
 
@@ -947,6 +958,12 @@ export function buildBrainTaskPayload(opts: {
   surface: string;
   channel: string;
   thread: string;
+  /**
+   * cortex#1038 — the live-surface adapter instance id. Rides in
+   * `response_routing` so it survives `deriveTaskSource` → the brain `post`,
+   * letting the post reach the originating adapter via the chat dispatch-sink.
+   */
+  adapterInstance?: string;
 }): Record<string, unknown> {
   return {
     text: opts.text,
@@ -956,6 +973,9 @@ export function buildBrainTaskPayload(opts: {
       surface: opts.surface,
       channel: opts.channel,
       thread: opts.thread,
+      ...(opts.adapterInstance !== undefined && {
+        adapter_instance: opts.adapterInstance,
+      }),
     },
   };
 }
