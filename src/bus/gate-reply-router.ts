@@ -108,7 +108,7 @@ const REAWAIT_GRACE_MS = 500;
 const KEY_SEPARATOR = "\u001f";
 
 function hasSeparator(...parts: (string | undefined)[]): boolean {
-  return parts.some((part) => part !== undefined && part.includes(KEY_SEPARATOR));
+  return parts.some((part) => part?.includes(KEY_SEPARATOR));
 }
 
 function routeKey(surface: string, channel: string, thread: string): string {
@@ -202,7 +202,7 @@ export class GateReplyRouter implements PrincipalReplySource {
     const queue = this.waiters.get(key);
     const waiter = queue?.shift();
     if (waiter !== undefined) {
-      if (queue !== undefined && queue.length === 0) this.waiters.delete(key);
+      if (queue?.length === 0) this.waiters.delete(key);
       clearTimeout(waiter.timer);
       this.markHot(key);
       waiter.resolve(principalReply);
