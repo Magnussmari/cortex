@@ -99,8 +99,55 @@ describe("replyToVerdict", () => {
       expect(replyToVerdict(t)).toBe("pass");
     }
   });
+  test("natural-language affirmatives map to pass (per-word match)", () => {
+    for (const t of [
+      "yes, run the flow",
+      "yes, run it",
+      "approve this reset",
+      "ok go ahead",
+      "Yep — proceed",
+      "confirmed, run it now",
+    ]) {
+      expect(replyToVerdict(t)).toBe("pass");
+    }
+  });
   test("negatives and unrecognised map to fail (fail-closed)", () => {
     for (const t of ["no", "deny", "stop", "maybe", "", "what?"]) {
+      expect(replyToVerdict(t)).toBe("fail");
+    }
+  });
+  test("a negative word anywhere wins, even alongside an affirmative", () => {
+    for (const t of [
+      "no, don't run it", // contains "run"
+      "do not run the flow",
+      "cancel the run",
+      "hold off, don't approve",
+      "yes but not now", // ambiguous → fail-closed
+    ]) {
+      expect(replyToVerdict(t)).toBe("fail");
+    }
+  });
+  test("contracted negatives fail-closed (apostrophe stripped, not split to a bare 't')", () => {
+    // Each contains an affirmative word ("run"/"approve"/"go") — the contraction
+    // MUST still deny, or an explicit refusal would fail-OPEN (sage blocker).
+    for (const t of [
+      "don't run it",
+      "don’t approve", // curly apostrophe
+      "won't run",
+      "can't approve this",
+      "cannot run the flow",
+      "shouldn't go ahead",
+    ]) {
+      expect(replyToVerdict(t)).toBe("fail");
+    }
+  });
+  test("refusal verbs deny even with an affirmative word present", () => {
+    for (const t of [
+      "refuse to run",
+      "I decline to approve",
+      "veto this run",
+      "dismiss — do not run",
+    ]) {
       expect(replyToVerdict(t)).toBe("fail");
     }
   });

@@ -143,37 +143,63 @@ export interface GatePromptRenderer {
 // ---------------------------------------------------------------------------
 
 /**
- * Default affirmative replies. Deliberately a small, explicit allow-list rather
- * than fuzzy NLP — a gate verdict is a security decision; an unrecognised reply
- * is NOT a pass. The text is matched ONLY after the identity check passes, so it
- * never carries identity weight (pulse#47).
+ * Affirmative / negative TOKEN allow-lists. Deliberately explicit word lists,
+ * not fuzzy NLP — a gate verdict is a security decision. The text is matched
+ * ONLY after the identity check passes, so it never carries identity weight
+ * (pulse#47).
+ *
+ * Matched per-WORD (not whole-string) so a natural reply like
+ * "yes, run the flow" or "approve this reset" passes, while staying fail-closed:
+ * a negative word ANYWHERE wins, so "no, don't run it" — which contains the
+ * affirmative "run" — still fails.
  */
 const AFFIRMATIVE = new Set([
-  "yes",
-  "y",
-  "approve",
-  "approved",
-  "run it",
-  "run",
-  "go",
-  "ok",
-  "okay",
-  "pass",
-  "confirm",
-  "confirmed",
+  "yes", "y", "yeah", "yep", "yup",
+  "approve", "approved", "approving",
+  "run", "go", "ok", "okay",
+  "pass", "confirm", "confirmed", "ack", "proceed", "affirmative",
+]);
+const NEGATIVE = new Set([
+  "no", "n", "nope", "nah", "not", "never",
+  "deny", "denied", "reject", "rejected", "cancel", "cancelled", "canceled",
+  "stop", "abort", "aborted", "halt", "hold", "wait",
+  // Refusal verbs — a reply can negate WITHOUT "no"/"not" ("refuse to run").
+  "refuse", "refused", "refusing", "decline", "declined", "declining",
+  "veto", "vetoed", "nay", "negative", "against", "dismiss", "dismissed",
+  // Contraction stems — apostrophes are stripped WITHIN words before tokenizing
+  // (don't → dont), so the negation isn't lost as a bare "t".
+  "dont", "doesnt", "didnt", "wont", "cant", "cannot",
+  "shouldnt", "wouldnt", "couldnt", "isnt", "arent", "wasnt", "werent", "aint",
 ]);
 
 /**
- * Map a principal's reply text to a gate verdict. Affirmative → `pass`; anything
- * else → `fail`. FAIL-CLOSED on ambiguity: an explicit negative ("no", "deny")
- * and an unrecognised reply both fail the same way — a verdict must be an
- * explicit affirmative. There is therefore no separate negative allow-list to
- * maintain (the absence of a `pass` IS the deny). Normalises case + surrounding
- * whitespace; never parses identity.
+ * Map a principal's reply text to a gate verdict. FAIL-CLOSED: `pass` requires a
+ * recognised AFFIRMATIVE word and NO recognised NEGATIVE word. NEGATIVE is
+ * checked first, so a recognised negative in the SAME reply wins over a
+ * co-occurring affirmative ("no, run it" / "refuse to run" → fail). An
+ * unrecognised reply ("maybe", a question) also fails — absence of a clear
+ * affirmative IS the deny. Never parses identity.
+ *
+ * Apostrophes are stripped WITHIN words FIRST ("don't" → "dont", not "don"+"t")
+ * before non-alphanumerics become separators, so a contracted negative keeps
+ * its negation (else "don't run it" would fail-OPEN on the affirmative "run").
+ *
+ * LIMITATION (not exhaustive NLP): both lists are explicit, so an UNLISTED
+ * refusal phrasing that also contains an affirmative word would pass. The
+ * principal is already IDENTITY-verified before this runs (pulse#47), so this
+ * mapping only guards against misreading the PRINCIPAL'S OWN wording, not an
+ * adversary — keep the deny-list current; a bare "yes"/"no" is unambiguous.
  */
 export function replyToVerdict(text: string): GateVerdictValue {
-  const normalized = text.trim().toLowerCase();
-  if (AFFIRMATIVE.has(normalized)) return "pass";
+  const words = text
+    .toLowerCase()
+    .replace(/['‘’ʼ`´]/g, "") // strip apostrophes within words: don't → dont
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.some((w) => NEGATIVE.has(w))) return "fail"; // recognised negative wins
+  if (words.some((w) => AFFIRMATIVE.has(w))) return "pass";
   return "fail";
 }
 
