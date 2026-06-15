@@ -287,6 +287,7 @@ describe("brain-consumer helpers", () => {
       { filename: "ssrf.txt", url: "http://169.254.169.254/latest/meta-data" }, // not https + off-allowlist
       { filename: "ssrf2.txt", url: "https://attacker.example/evil" }, // off-allowlist host
       { filename: "ssrf3.txt", url: "https://cdn.discordapp.com.evil.com/x" }, // lookalike host
+      { filename: "ssrf4.txt", url: "https://cdn.discordapp.com:22/x" }, // allowlisted host, nonstandard port
       { filename: "bad.txt", url: "not a url" },
     ]);
     expect(refs).toEqual([
