@@ -160,8 +160,13 @@ const AFFIRMATIVE = new Set([
   "pass", "confirm", "confirmed", "ack", "proceed", "affirmative",
 ]);
 const NEGATIVE = new Set([
-  "no", "n", "nope", "nah", "not", "dont", "deny", "denied", "reject", "rejected",
-  "cancel", "cancelled", "canceled", "stop", "abort", "aborted", "halt", "hold", "wait", "never",
+  "no", "n", "nope", "nah", "not", "never",
+  "deny", "denied", "reject", "rejected", "cancel", "cancelled", "canceled",
+  "stop", "abort", "aborted", "halt", "hold", "wait",
+  // Contraction stems — apostrophes are stripped WITHIN words before tokenizing
+  // (don't → dont), so the negation isn't lost as a bare "t".
+  "dont", "doesnt", "didnt", "wont", "cant", "cannot",
+  "shouldnt", "wouldnt", "couldnt", "isnt", "arent", "wasnt", "werent", "aint",
 ]);
 
 /**
@@ -169,11 +174,21 @@ const NEGATIVE = new Set([
  * an affirmative word AND no negative word. An explicit negative ("no", "deny",
  * "don't") fails even alongside an affirmative (ambiguity → deny); an
  * unrecognised reply ("maybe", a question) also fails — the absence of a clear
- * affirmative IS the deny. Normalises case, strips punctuation, matches per
- * word; never parses identity.
+ * affirmative IS the deny. Never parses identity.
+ *
+ * Apostrophes are stripped WITHIN words FIRST (so "don't" → "dont", not "don"
+ * + "t") before non-alphanumerics become word separators — otherwise a
+ * contracted negative would lose its negation and a phrase like "don't run it"
+ * would fail-OPEN on the affirmative "run". This was a real fail-open (sage).
  */
 export function replyToVerdict(text: string): GateVerdictValue {
-  const words = text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/).filter(Boolean);
+  const words = text
+    .toLowerCase()
+    .replace(/['‘’ʼ`´]/g, "") // strip apostrophes within words: don't → dont
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
   if (words.some((w) => NEGATIVE.has(w))) return "fail"; // a negative anywhere wins
   if (words.some((w) => AFFIRMATIVE.has(w))) return "pass";
   return "fail";

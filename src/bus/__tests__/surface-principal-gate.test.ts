@@ -127,6 +127,20 @@ describe("replyToVerdict", () => {
       expect(replyToVerdict(t)).toBe("fail");
     }
   });
+  test("contracted negatives fail-closed (apostrophe stripped, not split to a bare 't')", () => {
+    // Each contains an affirmative word ("run"/"approve"/"go") — the contraction
+    // MUST still deny, or an explicit refusal would fail-OPEN (sage blocker).
+    for (const t of [
+      "don't run it",
+      "don’t approve", // curly apostrophe
+      "won't run",
+      "can't approve this",
+      "cannot run the flow",
+      "shouldn't go ahead",
+    ]) {
+      expect(replyToVerdict(t)).toBe("fail");
+    }
+  });
 });
 
 describe("principalIdForSurface", () => {
