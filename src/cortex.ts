@@ -2522,6 +2522,15 @@ export async function startCortex(
         // brain's posts + the gate prompt route back to THIS adapter via the
         // chat dispatch-sink (which filters on adapter_instance).
         adapterInstance: msg.instanceId,
+        // Pass attachment REFERENCES (url, not bytes) so a brain can fetch a
+        // dropped file (e.g. Yarrow's A_INGEST_ATTACHMENT). filename → name.
+        ...(msg.attachments.length > 0 && {
+          attachments: msg.attachments.map((a) => ({
+            name: a.filename,
+            ...(a.contentType !== undefined && { contentType: a.contentType }),
+            url: a.url,
+          })),
+        }),
       }),
       ...(agent.runtime?.modelClass !== undefined && { modelClass: agent.runtime.modelClass }),
     });

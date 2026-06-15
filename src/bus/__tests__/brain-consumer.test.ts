@@ -256,6 +256,29 @@ describe("brain-consumer helpers", () => {
     ).toBe("tasks.x.y");
   });
 
+  test("buildBrainTaskPayload carries attachment references when present, omits when not", () => {
+    const withAtt = buildBrainTaskPayload({
+      text: "triage this mail",
+      user: "u",
+      surface: "discord",
+      channel: "c",
+      thread: "t",
+      attachments: [
+        { name: "phish.eml", contentType: "message/rfc822", url: "https://cdn/phish.eml" },
+      ],
+    });
+    expect(withAtt.attachments).toEqual([
+      { name: "phish.eml", contentType: "message/rfc822", url: "https://cdn/phish.eml" },
+    ]);
+
+    // No attachments → the key is absent (not an empty array), keeping the
+    // payload shape stable for flows that never use files.
+    const without = buildBrainTaskPayload({ text: "t", user: "u", surface: "discord", channel: "c", thread: "t" });
+    expect("attachments" in without).toBe(false);
+    const empty = buildBrainTaskPayload({ text: "t", user: "u", surface: "discord", channel: "c", thread: "t", attachments: [] });
+    expect("attachments" in empty).toBe(false);
+  });
+
   test("brainReasonToDispatchReason: not_now carries retry_after_ms", () => {
     expect(
       brainReasonToDispatchReason({ kind: "not_now", detail: "busy", retry_after_ms: 500 }),

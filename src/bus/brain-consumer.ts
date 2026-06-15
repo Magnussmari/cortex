@@ -964,11 +964,19 @@ export function buildBrainTaskPayload(opts: {
    * letting the post reach the originating adapter via the chat dispatch-sink.
    */
   adapterInstance?: string;
+  /**
+   * Inbound file attachment REFERENCES ({ name, contentType, url }) — the URL,
+   * not the bytes. A brain (e.g. Yarrow's A_INGEST_ATTACHMENT) fetches the URL
+   * itself. Omitted from the payload when there are none.
+   */
+  attachments?: { name: string; contentType?: string; url: string }[];
 }): Record<string, unknown> {
   return {
     text: opts.text,
     scenario: opts.text,
     user: opts.user,
+    ...(opts.attachments !== undefined &&
+      opts.attachments.length > 0 && { attachments: opts.attachments }),
     response_routing: {
       surface: opts.surface,
       channel: opts.channel,
