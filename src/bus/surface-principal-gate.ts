@@ -163,6 +163,9 @@ const NEGATIVE = new Set([
   "no", "n", "nope", "nah", "not", "never",
   "deny", "denied", "reject", "rejected", "cancel", "cancelled", "canceled",
   "stop", "abort", "aborted", "halt", "hold", "wait",
+  // Refusal verbs — a reply can negate WITHOUT "no"/"not" ("refuse to run").
+  "refuse", "refused", "refusing", "decline", "declined", "declining",
+  "veto", "vetoed", "nay", "negative", "against", "dismiss", "dismissed",
   // Contraction stems — apostrophes are stripped WITHIN words before tokenizing
   // (don't → dont), so the negation isn't lost as a bare "t".
   "dont", "doesnt", "didnt", "wont", "cant", "cannot",
@@ -170,16 +173,22 @@ const NEGATIVE = new Set([
 ]);
 
 /**
- * Map a principal's reply text to a gate verdict. FAIL-CLOSED: a `pass` requires
- * an affirmative word AND no negative word. An explicit negative ("no", "deny",
- * "don't") fails even alongside an affirmative (ambiguity → deny); an
- * unrecognised reply ("maybe", a question) also fails — the absence of a clear
+ * Map a principal's reply text to a gate verdict. FAIL-CLOSED: `pass` requires a
+ * recognised AFFIRMATIVE word and NO recognised NEGATIVE word. NEGATIVE is
+ * checked first, so a recognised negative in the SAME reply wins over a
+ * co-occurring affirmative ("no, run it" / "refuse to run" → fail). An
+ * unrecognised reply ("maybe", a question) also fails — absence of a clear
  * affirmative IS the deny. Never parses identity.
  *
- * Apostrophes are stripped WITHIN words FIRST (so "don't" → "dont", not "don"
- * + "t") before non-alphanumerics become word separators — otherwise a
- * contracted negative would lose its negation and a phrase like "don't run it"
- * would fail-OPEN on the affirmative "run". This was a real fail-open (sage).
+ * Apostrophes are stripped WITHIN words FIRST ("don't" → "dont", not "don"+"t")
+ * before non-alphanumerics become separators, so a contracted negative keeps
+ * its negation (else "don't run it" would fail-OPEN on the affirmative "run").
+ *
+ * LIMITATION (not exhaustive NLP): both lists are explicit, so an UNLISTED
+ * refusal phrasing that also contains an affirmative word would pass. The
+ * principal is already IDENTITY-verified before this runs (pulse#47), so this
+ * mapping only guards against misreading the PRINCIPAL'S OWN wording, not an
+ * adversary — keep the deny-list current; a bare "yes"/"no" is unambiguous.
  */
 export function replyToVerdict(text: string): GateVerdictValue {
   const words = text
@@ -189,7 +198,7 @@ export function replyToVerdict(text: string): GateVerdictValue {
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-  if (words.some((w) => NEGATIVE.has(w))) return "fail"; // a negative anywhere wins
+  if (words.some((w) => NEGATIVE.has(w))) return "fail"; // recognised negative wins
   if (words.some((w) => AFFIRMATIVE.has(w))) return "pass";
   return "fail";
 }

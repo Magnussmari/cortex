@@ -141,6 +141,16 @@ describe("replyToVerdict", () => {
       expect(replyToVerdict(t)).toBe("fail");
     }
   });
+  test("refusal verbs deny even with an affirmative word present", () => {
+    for (const t of [
+      "refuse to run",
+      "I decline to approve",
+      "veto this run",
+      "dismiss — do not run",
+    ]) {
+      expect(replyToVerdict(t)).toBe("fail");
+    }
+  });
 });
 
 describe("principalIdForSurface", () => {
