@@ -999,6 +999,47 @@ export function buildBrainTaskPayload(opts: {
 export const BRAIN_TASK_SUBJECT_FAMILY = "brain" as const;
 
 /**
+ * Per-surface allowlist of attachment hosts whose URLs may be forwarded to a
+ * brain as fetchable references. The brain fetches the URL, so an unvalidated
+ * ref is an SSRF vector — a compromised/odd inbound adapter could supply an
+ * internal URL. Only these origins (the platform's own CDN) are forwarded.
+ */
+const ATTACHMENT_HOST_ALLOWLIST: Record<string, readonly string[]> = {
+  discord: ["cdn.discordapp.com", "media.discordapp.net"],
+};
+
+/**
+ * Filter inbound attachments to SAFE, fetchable references for a brain:
+ * `https:` only, host on the surface's allowlist. Fail-closed — an unknown
+ * surface (no allowlist entry) forwards NONE, and a malformed/non-https/
+ * off-allowlist URL is dropped. Normalises `filename` → `name`.
+ */
+export function safeAttachmentRefs(
+  platform: string,
+  attachments: { filename: string; contentType?: string; url: string }[],
+): { name: string; contentType?: string; url: string }[] {
+  const allowed = ATTACHMENT_HOST_ALLOWLIST[platform] ?? [];
+  const refs: { name: string; contentType?: string; url: string }[] = [];
+  for (const a of attachments) {
+    let host: string;
+    try {
+      const u = new URL(a.url);
+      if (u.protocol !== "https:") continue;
+      host = u.hostname.toLowerCase();
+    } catch {
+      continue; // unparseable URL — drop (fail-closed)
+    }
+    if (!allowed.includes(host)) continue;
+    refs.push({
+      name: a.filename,
+      ...(a.contentType !== undefined && { contentType: a.contentType }),
+      url: a.url,
+    });
+  }
+  return refs;
+}
+
+/**
  * Build a task envelope. `family` selects the subject family / stream:
  *   - `"tasks"` (default) — a fleet `dispatch` task targeting review/dev
  *     consumers (the brain's own `dispatch` effect).

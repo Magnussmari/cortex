@@ -24,6 +24,7 @@ import {
   deriveTaskSource,
   brainReasonToDispatchReason,
   buildBrainTaskPayload,
+  safeAttachmentRefs,
   buildDispatchTaskEnvelope,
   type BrainConsumerAgent,
   type BrainConsumerOpts,
@@ -277,6 +278,23 @@ describe("brain-consumer helpers", () => {
     expect("attachments" in without).toBe(false);
     const empty = buildBrainTaskPayload({ text: "t", user: "u", surface: "discord", channel: "c", thread: "t", attachments: [] });
     expect("attachments" in empty).toBe(false);
+  });
+
+  test("safeAttachmentRefs: SSRF guard — https + surface host allowlist, fail-closed", () => {
+    const refs = safeAttachmentRefs("discord", [
+      { filename: "ok.eml", contentType: "message/rfc822", url: "https://cdn.discordapp.com/x/ok.eml" },
+      { filename: "ok2.txt", url: "https://media.discordapp.net/y/ok2.txt" },
+      { filename: "ssrf.txt", url: "http://169.254.169.254/latest/meta-data" }, // not https + off-allowlist
+      { filename: "ssrf2.txt", url: "https://attacker.example/evil" }, // off-allowlist host
+      { filename: "ssrf3.txt", url: "https://cdn.discordapp.com.evil.com/x" }, // lookalike host
+      { filename: "bad.txt", url: "not a url" },
+    ]);
+    expect(refs).toEqual([
+      { name: "ok.eml", contentType: "message/rfc822", url: "https://cdn.discordapp.com/x/ok.eml" },
+      { name: "ok2.txt", url: "https://media.discordapp.net/y/ok2.txt" },
+    ]);
+    // Unknown surface (no allowlist) → forward NONE (fail-closed).
+    expect(safeAttachmentRefs("mattermost", [{ filename: "x", url: "https://files.mm/x" }])).toEqual([]);
   });
 
   test("brainReasonToDispatchReason: not_now carries retry_after_ms", () => {
