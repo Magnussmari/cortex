@@ -964,11 +964,19 @@ export function buildBrainTaskPayload(opts: {
    * letting the post reach the originating adapter via the chat dispatch-sink.
    */
   adapterInstance?: string;
+  /**
+   * Inbound file attachment REFERENCES ({ name, contentType, url }) — the URL,
+   * not the bytes. A brain (e.g. Yarrow's A_INGEST_ATTACHMENT) fetches the URL
+   * itself. Omitted from the payload when there are none.
+   */
+  attachments?: BrainAttachmentRef[];
 }): Record<string, unknown> {
   return {
     text: opts.text,
     scenario: opts.text,
     user: opts.user,
+    ...(opts.attachments !== undefined &&
+      opts.attachments.length > 0 && { attachments: opts.attachments }),
     response_routing: {
       surface: opts.surface,
       channel: opts.channel,
@@ -989,6 +997,59 @@ export function buildBrainTaskPayload(opts: {
  * REVIEW_LIFECYCLE. The brain consumer subscribes `…brain.{capability}`.
  */
 export const BRAIN_TASK_SUBJECT_FAMILY = "brain" as const;
+
+/** A fetchable attachment reference carried in a brain task payload. */
+export interface BrainAttachmentRef {
+  name: string;
+  contentType?: string;
+  url: string;
+}
+
+/**
+ * Per-surface allowlist of attachment hosts whose URLs may be forwarded to a
+ * brain as fetchable references. The brain fetches the URL, so an unvalidated
+ * ref is an SSRF vector — a compromised/odd inbound adapter could supply an
+ * internal URL. Only the platform's own CDN hosts are forwarded.
+ */
+const ATTACHMENT_HOST_ALLOWLIST: Record<string, readonly string[]> = {
+  discord: ["cdn.discordapp.com", "media.discordapp.net"],
+};
+
+/**
+ * Filter inbound attachments to SAFE, fetchable references for a brain. Checks
+ * the full ORIGIN: `https:` scheme + host on the surface's allowlist + the
+ * default port (443) — a non-default port (e.g. `cdn.discordapp.com:22`) is
+ * rejected. Fail-closed: an unknown surface (no allowlist entry) forwards NONE,
+ * and a malformed / non-https / off-allowlist / non-default-port URL is dropped.
+ * Normalises `filename` → `name`.
+ */
+export function safeAttachmentRefs(
+  platform: string,
+  attachments: { filename: string; contentType?: string; url: string }[],
+): BrainAttachmentRef[] {
+  const allowed = ATTACHMENT_HOST_ALLOWLIST[platform] ?? [];
+  const refs: BrainAttachmentRef[] = [];
+  for (const a of attachments) {
+    let host: string;
+    try {
+      const u = new URL(a.url);
+      if (u.protocol !== "https:") continue;
+      // Constrain the full origin: default https port only (u.port is "" when
+      // default). A nonstandard port on an allowlisted host is still SSRF.
+      if (u.port !== "" && u.port !== "443") continue;
+      host = u.hostname.toLowerCase();
+    } catch {
+      continue; // unparseable URL — drop (fail-closed)
+    }
+    if (!allowed.includes(host)) continue;
+    refs.push({
+      name: a.filename,
+      ...(a.contentType !== undefined && { contentType: a.contentType }),
+      url: a.url,
+    });
+  }
+  return refs;
+}
 
 /**
  * Build a task envelope. `family` selects the subject family / stream:

@@ -67,6 +67,8 @@ import {
 import {
   BrainConsumer,
   buildBrainTaskPayload,
+  safeAttachmentRefs,
+  type BrainAttachmentRef,
   buildDispatchTaskEnvelope,
   BRAIN_TASK_SUBJECT_FAMILY,
   type BrainConsumerAgent,
@@ -2522,6 +2524,13 @@ export async function startCortex(
         // brain's posts + the gate prompt route back to THIS adapter via the
         // chat dispatch-sink (which filters on adapter_instance).
         adapterInstance: msg.instanceId,
+        // Pass attachment REFERENCES (url, not bytes) so a brain can fetch a
+        // dropped file (e.g. Yarrow's A_INGEST_ATTACHMENT). safeAttachmentRefs
+        // is the SSRF guard: https + surface host-allowlist, fail-closed.
+        ...((): { attachments?: BrainAttachmentRef[] } => {
+          const refs = safeAttachmentRefs(msg.platform, msg.attachments);
+          return refs.length > 0 ? { attachments: refs } : {};
+        })(),
       }),
       ...(agent.runtime?.modelClass !== undefined && { modelClass: agent.runtime.modelClass }),
     });
