@@ -4729,12 +4729,13 @@ export async function startCortex(
   // registry boots AFTER this embed (below), so the getter returns `null` until
   // we assign it post-registry-start. The MC server resolves it per request.
   let presenceViewForApi: AgentPresenceView | null = null;
-  // #1008 — discovered LOCAL sibling stacks, computed ONCE here and shared by
-  // BOTH the DB-read pane-of-glass aggregation (the embed's `localAggregation`
-  // getter, below) AND the #989 bus sibling-presence aggregator (later) — so the
-  // two paths agree on the same roster and the dbRead-supersedes-bus gate is
-  // coherent. Empty until the aggregation block computes it; the getter reads
-  // this holder lazily (the embed starts before discovery runs).
+  // #1008/#989 — discovered LOCAL sibling stacks, used by BOTH the DB-read
+  // pane-of-glass aggregation (the embed's `localAggregation` getter, below, for
+  // session trees) AND the #989 bus sibling-presence aggregator (later, for
+  // idle-or-active liveness). The two paths COMPOSE (presence via bus, sessions
+  // via db) — they are no longer mutually exclusive; `aggregateAgentTiles` dedups
+  // the overlap by key. Empty until the aggregation block computes it; the getter
+  // reads this holder lazily (the embed starts before discovery runs).
   const aggCfg = config.mc.aggregateLocalStacks;
   let discoveredSiblings: readonly SiblingStackDescriptor[] = [];
   let siblingResolveOpts: SiblingDbResolveOptions | null = null;

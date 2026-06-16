@@ -396,20 +396,41 @@ export function aggregateAgentTiles(
   const out: AgentPresenceTile[] = localRecords.map(recordToTile);
   // #989/#1008 — the registry (`localRecords`) now folds local siblings' LIVE
   // bus presence (idle-or-active) via the bus aggregator. The db-derived sibling
-  // tiles below are a live-SESSION fallback for the same agents, so dedup by key
-  // (`{principal}/{stack}/{agent_id}` — identical on both paths): the bus-folded
-  // record WINS (it carries real liveness/capabilities), and a sibling the bus
-  // couldn't reach still surfaces from its db. Without this, an active sibling
-  // present on BOTH paths would double-count (two tiles, same key → dup React key).
-  const seen = new Set(out.map((t) => t.key));
+  // tiles below are a live-SESSION fallback for the same agents, deduped by key
+  // (`{principal}/{stack}/{agent_id}` — identical on both paths) so an active
+  // sibling on BOTH paths is ONE tile (no dup React key).
+  //
+  // The registry record wins on its RICHER fields (capabilities/nkey, which the
+  // db projection leaves empty) — BUT liveness is state-aware: the TTL reaper
+  // keeps a record as `state:offline` after a heartbeat lapse (it never deletes),
+  // so a sibling whose bus went quiet WHILE a session is still live would read
+  // `offline` from the registry yet `online` from its db. That is the exact
+  // degraded-bus case the db fallback exists for, so an `online` db tile upgrades
+  // an `offline` registry tile's liveness (keeping the registry's richer fields).
+  const idxByKey = new Map<string, number>();
+  out.forEach((t, i) => idxByKey.set(t.key, i));
 
   const { handles } = openReadableSiblingDbs(siblings, opts);
   try {
     for (const h of handles) {
       for (const tile of siblingAgentTiles(h.db, h.origin)) {
-        if (seen.has(tile.key)) continue;
-        seen.add(tile.key);
-        out.push(tile);
+        const existingIdx = idxByKey.get(tile.key);
+        if (existingIdx === undefined) {
+          idxByKey.set(tile.key, out.length);
+          out.push(tile);
+          continue;
+        }
+        // Collision with a bus-folded registry tile: keep it, but let a live db
+        // session revive an offline-by-TTL liveness (bus quiet, work ongoing).
+        const existing = out[existingIdx];
+        if (existing?.state === "offline" && tile.state === "online") {
+          out[existingIdx] = {
+            ...existing,
+            state: "online",
+            offline_reason: null,
+            last_seen_at: Math.max(existing.last_seen_at, tile.last_seen_at),
+          };
+        }
       }
     }
   } finally {
