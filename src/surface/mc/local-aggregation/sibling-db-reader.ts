@@ -394,11 +394,23 @@ export function aggregateAgentTiles(
   opts: SiblingDbResolveOptions,
 ): AgentPresenceTile[] {
   const out: AgentPresenceTile[] = localRecords.map(recordToTile);
+  // #989/#1008 — the registry (`localRecords`) now folds local siblings' LIVE
+  // bus presence (idle-or-active) via the bus aggregator. The db-derived sibling
+  // tiles below are a live-SESSION fallback for the same agents, so dedup by key
+  // (`{principal}/{stack}/{agent_id}` — identical on both paths): the bus-folded
+  // record WINS (it carries real liveness/capabilities), and a sibling the bus
+  // couldn't reach still surfaces from its db. Without this, an active sibling
+  // present on BOTH paths would double-count (two tiles, same key → dup React key).
+  const seen = new Set(out.map((t) => t.key));
 
   const { handles } = openReadableSiblingDbs(siblings, opts);
   try {
     for (const h of handles) {
-      out.push(...siblingAgentTiles(h.db, h.origin));
+      for (const tile of siblingAgentTiles(h.db, h.origin)) {
+        if (seen.has(tile.key)) continue;
+        seen.add(tile.key);
+        out.push(tile);
+      }
     }
   } finally {
     for (const h of handles) h.db.close();

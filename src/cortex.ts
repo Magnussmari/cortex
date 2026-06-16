@@ -5186,19 +5186,29 @@ export async function startCortex(
       // sibling that can't be reached / authed degrades to absent — it never
       // blocks this boot or perturbs the serving stack's own presence.
       //
-      // #1008 RECONCILIATION (DB-read OWNS local siblings): when `dbRead` is on
-      // (default), the DB-read pane-of-glass aggregation already merges every
-      // LOCAL sibling's agents (+ session trees) straight off its db into the
-      // /api/agents + /api/working-agents feeds. Running this BUS sibling-presence
-      // aggregator too would DOUBLE-COUNT the same local agents (db + bus). So the
-      // bus path is gated OFF for local siblings whenever DB-read aggregation is
-      // on. The bus sibling path remains the mechanism for FEDERATED / cross-
-      // principal peers (whose dbs live on another machine/principal and cannot be
-      // read here) — that is the separate `startFederatedAgentPresenceSubscriber`
-      // above, NOT this local-sibling aggregator. Clean reach/depth split: DB-read
-      // = my own local stacks; bus = remote peers. Set `dbRead: false` to restore
-      // the bus path for local siblings (agents only, no session trees).
-      const runBusSiblingPresence = aggCfg.enabled && !aggCfg.dbRead;
+      // #1008/#989 RECONCILIATION — PRESENCE via bus, SESSIONS via db (they
+      // COMPOSE, they are not mutually exclusive). Agent PRESENCE (the liveness
+      // a hub renders: "this agent is up, idle or not") lives ONLY in the
+      // in-memory registry, fed by the `agent.{online,heartbeat,offline}` bus
+      // stream — it is NEVER persisted to a sibling's db. So the DB-read path can
+      // only project a sibling agent that "owns a LIVE SESSION" (sibling-db-reader
+      // `siblingAgentTiles`); an IDLE local sibling has no live session and thus
+      // vanished from the Network view whenever the bus path was gated off (the
+      // "only one stack" regression). The earlier "DB-read OWNS local siblings,
+      // gate the bus path off to avoid double-count" framing was wrong: db-read
+      // owns SESSION TREES (/api/working-agents), not idle PRESENCE.
+      //
+      // Corrected split: the BUS sibling-presence aggregator owns local-sibling
+      // PRESENCE (folds idle-or-active `agent.*` into the registry, origin-tagged)
+      // and runs whenever aggregation is enabled — NOT gated by dbRead. The
+      // DB-read path keeps the session trees (working-agents) AND a deduped
+      // live-session fallback into /api/agents: `aggregateAgentTiles` skips any
+      // sibling tile whose key is already live in the registry (the bus fold), so
+      // an active sibling present on BOTH paths is counted ONCE (registry wins),
+      // and a sibling the bus couldn't reach still surfaces from its db. The
+      // separate `startFederatedAgentPresenceSubscriber` above stays the path for
+      // FEDERATED / cross-principal peers (remote dbs, unreadable here).
+      const runBusSiblingPresence = aggCfg.enabled;
       if (runBusSiblingPresence) {
         try {
           // Precedence: explicit `stacks[]` overrides discovery. Empty ⇒ scan

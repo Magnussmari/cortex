@@ -257,6 +257,51 @@ describe("aggregateAgentTiles (/api/agents union)", () => {
     expect(luna).toBeDefined();
     expect(luna!.origin).toEqual({ principal: "andreas", stack: "work" });
   });
+
+  test("#989 dedup — a sibling already live in the registry (bus fold) is NOT double-counted from its db", () => {
+    // The reconciliation: the bus aggregator folds a local sibling's LIVE
+    // presence into the registry (`localRecords`), AND the same sibling has a
+    // live session in its db. Both paths produce the SAME key
+    // (`andreas/work/luna`) — `aggregateAgentTiles` must emit ONE tile (the
+    // bus-folded record wins, carrying real liveness), never two (which would be
+    // a duplicate React key in the Network view).
+    const root = freshTmp();
+    const share = freshTmp();
+    seedDb(join(share, "work", "mission-control.db"), {
+      agentId: "luna",
+      agentName: "Luna",
+      taskTitle: "work task",
+    });
+
+    const localRecords: AgentPresenceSnapshotRecord[] = [
+      {
+        // The SAME sibling agent, already folded into the registry via the bus.
+        key: "andreas/work/luna",
+        origin: { kind: "foreign", principal: "andreas", stack: "work" },
+        agentId: "luna",
+        nkeyPublicKey: "NKEYLUNA",
+        assistantName: "Luna",
+        principal: "andreas",
+        stack: "work",
+        capabilities: ["chat"],
+        state: "online",
+        lastSeenAt: 42,
+      },
+    ];
+
+    const tiles = aggregateAgentTiles(
+      localRecords,
+      [sibling("work")],
+      { configRoot: root, homeShareDir: share },
+    );
+
+    const lunas = tiles.filter((t) => t.key === "andreas/work/luna");
+    expect(lunas).toHaveLength(1); // deduped — not two
+    // The registry (bus-folded) record wins: it carries the real capabilities +
+    // nkey, which the db live-session projection leaves empty.
+    expect(lunas[0]!.capabilities).toEqual(["chat"]);
+    expect(lunas[0]!.nkey_public_key).toBe("NKEYLUNA");
+  });
 });
 
 // ---------------------------------------------------------------------------
