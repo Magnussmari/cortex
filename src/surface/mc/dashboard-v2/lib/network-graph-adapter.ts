@@ -43,6 +43,7 @@ import type {
   TransportVerdict,
 } from "./network-transport-overlay";
 import { overlayForStack } from "./network-transport-overlay";
+import { stackColor } from "./stack-color";
 
 /** Reserved id for the synthetic LOCAL stack-root hub node (never a valid agent key). */
 export const STACK_HUB_NODE_ID = "__stack__";
@@ -87,6 +88,14 @@ export interface StackHubNodeData {
   /** Count of agents attached to this hub. */
   agentCount: number;
   /**
+   * #1068 — the deterministic per-stack color for this hub, derived from
+   * `origin` via `stackColor` (the LOCAL stack gets the reserved signature hue,
+   * each peer a stable palette color). Used as the hub's accent/border. ADDITIVE:
+   * the local/sibling/foreign shape treatments (solid/dashed border, eyebrow)
+   * stay — color is a legibility aid, never the only signal.
+   */
+  stackColor: string;
+  /**
    * P-14 U2.3 (#935) — signal's intent⋈reality VERDICT for this stack, when the
    * transport overlay is on AND signal observed this `{principal}/{stack}`.
    * Undefined → no overlay / no observation (the hub renders no verdict badge).
@@ -126,6 +135,14 @@ export interface AgentNodeData {
   offlineReason: string | null;
   /** Epoch-ms of the last `agent.heartbeat` observed, or `null`. */
   lastHeartbeatAt: number | null;
+  /**
+   * #1068 — the deterministic per-stack color for THIS agent's stack (the same
+   * `stackColor(origin)` its hub carries — a local agent shares the local
+   * signature hue, a foreign peer shares its stack's color). Drives the agent
+   * card's accent/left-border. ADDITIVE — the foreign dashed-border + provenance
+   * badge stay; color groups the card visually with its hub.
+   */
+  stackColor: string;
   /**
    * P-14 U2.3 (#935) — leaf LIVENESS for this agent's stack, when the transport
    * overlay is on AND signal observed the stack. `present` is the live-link flag,
@@ -175,8 +192,14 @@ export interface NetworkGraphEdge {
   id: string;
   source: string;
   target: string;
-  /** U2.3 — optional transport overlay payload (health/lag), sourced from signal. */
-  data?: { transport?: NetworkEdgeTransportData };
+  /**
+   * Edge `data` payload.
+   *   - `stackColor` (#1068) — the hub's stack color, so the hub→agent connector
+   *     strokes in the stack's hue (set at build time for every edge).
+   *   - `transport` (U2.3) — optional health/lag overlay payload, sourced from
+   *     signal (present only when the transport overlay is on).
+   */
+  data?: { stackColor?: string; transport?: NetworkEdgeTransportData };
 }
 
 /** The adapter's output: nodes + edges, pre-layout. */
@@ -292,6 +315,11 @@ export function buildNetworkGraph(
   const edges: NetworkGraphEdge[] = [];
 
   for (const bucket of orderedBuckets) {
+    // #1068 — the stack's deterministic color, derived from the bucket's verified
+    // origin. The hub, every agent in the bucket, and every hub→agent edge share
+    // it, so a stack reads as one colored cluster. ADDITIVE over the shape/label
+    // treatments — never the only signal.
+    const color = stackColor(bucket.origin);
     nodes.push({
       id: bucket.hubId,
       type: "stackHub",
@@ -303,6 +331,7 @@ export function buildNetworkGraph(
         principal: bucket.principal ?? null,
         stack: bucket.stack ?? null,
         agentCount: bucket.agents.length,
+        stackColor: color,
       },
     });
     for (const a of bucket.agents) {
@@ -321,17 +350,55 @@ export function buildNetworkGraph(
           state: a.state,
           offlineReason: a.offline_reason,
           lastHeartbeatAt: a.last_heartbeat_at,
+          stackColor: color,
         },
       });
       edges.push({
         id: `hub-${a.key}`,
         source: bucket.hubId,
         target: a.key,
+        data: { stackColor: color },
       });
     }
   }
 
   return { nodes, edges };
+}
+
+/** #1068 — one legend entry: a stack's hub id, display label, and color. */
+export interface LegendStack {
+  /** The hub node id (stable React key + identity). */
+  id: string;
+  /** Display label — `{principal}/{stack}`, or `local` for the self stack. */
+  label: string;
+  /** The stack's deterministic color (the hub's `stackColor`). */
+  color: string;
+}
+
+/**
+ * #1068 — collect the per-stack legend entries from a built graph: one row per
+ * stack-hub node, carrying its `{principal}/{stack}` label (or `local` for the
+ * self stack) and its deterministic color. Hub emission order is preserved
+ * (local first, then peers in first-seen order — see {@link buildNetworkGraph}),
+ * so the legend reads in the same order the hubs lay out.
+ *
+ * Pure + DOM-free so it's unit-tested without a browser; the legend component
+ * takes the result and renders swatches.
+ */
+export function collectLegendStacks(graph: NetworkGraph): LegendStack[] {
+  const out: LegendStack[] = [];
+  for (const node of graph.nodes) {
+    if (node.data.kind !== "stack-hub") continue;
+    const d = node.data;
+    const label =
+      d.origin === "local"
+        ? "local"
+        : d.principal && d.stack
+          ? `${d.principal}/${d.stack}`
+          : (d.stack ?? d.principal ?? node.id);
+    out.push({ id: node.id, label, color: d.stackColor });
+  }
+  return out;
 }
 
 /**
@@ -394,6 +461,9 @@ export function applyTransportOverlay(
     return {
       ...edge,
       data: {
+        // Preserve the #1068 per-stack color the base build set; the overlay
+        // only ADDS the transport payload.
+        ...edge.data,
         transport: {
           verdict: peer.verdict,
           present: peer.present,

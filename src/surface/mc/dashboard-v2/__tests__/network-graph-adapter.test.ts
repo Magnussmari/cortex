@@ -10,6 +10,7 @@
 import { describe, it, expect } from "bun:test";
 import {
   buildNetworkGraph,
+  collectLegendStacks,
   deriveServingPrincipal,
   STACK_HUB_NODE_ID,
   FOREIGN_HUB_ID_PREFIX,
@@ -17,6 +18,7 @@ import {
   type StackHubNodeData,
 } from "../lib/network-graph-adapter";
 import { classifyOrigin } from "../lib/agents-display";
+import { LOCAL_STACK_COLOR } from "../lib/stack-color";
 import type { AgentPresenceTile } from "../hooks/use-agents";
 
 function tile(
@@ -95,6 +97,10 @@ describe("buildNetworkGraph (G-1114.D.2)", () => {
     expect(data.principal).toBe("andreas");
     expect(data.stack).toBe("research");
     expect(data.agentCount).toBe(1);
+    // #1068 — the local hub carries the reserved signature color, and its edge
+    // strokes in the same hue.
+    expect(data.stackColor).toBe(LOCAL_STACK_COLOR);
+    expect(g.edges[0]!.data?.stackColor).toBe(LOCAL_STACK_COLOR);
   });
 
   it("emits one agent node + one hub→agent edge per agent", () => {
@@ -154,7 +160,9 @@ describe("buildNetworkGraph (G-1114.D.2)", () => {
     expect(d.offlineReason).toBeNull();
     expect(d.lastHeartbeatAt).toBe(beat);
     // No session-interior fields leak onto the node (ADR-0007). The data shape
-    // is a fixed allowlist — assert the key set is exactly the presence fields.
+    // is a fixed allowlist — assert the key set is exactly the presence fields
+    // (+ #1068 `stackColor`, a deterministic presentation field derived from the
+    // origin, NOT a session interior).
     expect(Object.keys(d).sort()).toEqual(
       [
         "agentId",
@@ -166,9 +174,13 @@ describe("buildNetworkGraph (G-1114.D.2)", () => {
         "offlineReason",
         "origin",
         "servingPrincipal",
+        "stackColor",
         "state",
       ].sort(),
     );
+    // #1068 — the agent carries its stack's deterministic color (a member of the
+    // palette), shared with its hub. Local agent → the reserved signature hue.
+    expect(d.stackColor).toBe(LOCAL_STACK_COLOR);
     // The local agent carries the bare "local" origin.
     expect(d.origin).toBe("local");
   });
@@ -357,6 +369,18 @@ describe("buildNetworkGraph — local-sibling vs federated classification (#1008
     expect(classifyOrigin(foreignHub.origin, foreignHub.servingPrincipal)).toBe(
       "foreign",
     );
+
+    // #1068 — each stack gets a DISTINCT color: self → signature, the two peers
+    // → their own (different) hues, and each hub's agents + edge share the hub's.
+    expect(selfHub.stackColor).toBe(LOCAL_STACK_COLOR);
+    const hubColors = [selfHub, siblingHub, foreignHub].map((h) => h.stackColor);
+    expect(new Set(hubColors).size).toBe(3);
+    // The sibling agent + its edge carry the SIBLING hub's color, not the local's.
+    const siblingAgent = g.nodes.find((n) => n.id === "andreas/work/echo")!
+      .data as AgentNodeData;
+    expect(siblingAgent.stackColor).toBe(siblingHub.stackColor);
+    const siblingEdge = g.edges.find((e) => e.target === "andreas/work/echo")!;
+    expect(siblingEdge.data?.stackColor).toBe(siblingHub.stackColor);
   });
 
   it("still gives each distinct stack its OWN hub (sibling gets its own, not the local one)", () => {
@@ -505,5 +529,39 @@ describe("buildNetworkGraph — agent node ids namespaced by stack (#1065)", () 
     expect(agentNode.id).toBe("andreas/research/luna");
     expect(g.edges).toHaveLength(1);
     expect(g.edges[0]!.target).toBe("andreas/research/luna");
+  });
+});
+
+describe("collectLegendStacks (#1068)", () => {
+  it("returns no rows for an empty graph", () => {
+    expect(collectLegendStacks({ nodes: [], edges: [] })).toEqual([]);
+  });
+
+  it("one row per stack-hub, local first, with label + matching hub color", () => {
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna" }), // local self
+      siblingTile({ agent_id: "echo", stack: "work" }), // andreas/work
+      foreignTile({ agent_id: "sage", principal: "jc", stack: "research" }),
+    ]);
+    const rows = collectLegendStacks(g);
+    expect(rows).toHaveLength(3);
+
+    // Local first; its label is "local" and its color the reserved signature.
+    expect(rows[0]!.id).toBe(STACK_HUB_NODE_ID);
+    expect(rows[0]!.label).toBe("local");
+    expect(rows[0]!.color).toBe(LOCAL_STACK_COLOR);
+
+    // Peers carry their `{principal}/{stack}` label + their hub's color.
+    const labels = rows.map((r) => r.label);
+    expect(labels).toContain("andreas/work");
+    expect(labels).toContain("jc/research");
+
+    // Each legend color equals its hub node's stackColor (one source of truth).
+    for (const row of rows) {
+      const hub = g.nodes.find((n) => n.id === row.id)!.data as StackHubNodeData;
+      expect(row.color).toBe(hub.stackColor);
+    }
+    // The three colors are distinct.
+    expect(new Set(rows.map((r) => r.color)).size).toBe(3);
   });
 });
