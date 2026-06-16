@@ -146,20 +146,25 @@ function FlowCanvas({
 
   // Node click →
   //   - AGENT node → lift its key up (D.4): open the detail panel.
-  //   - STACK-HUB node → toggle its subtree selection (#1068) and DESELECT any
-  //     open agent panel (the hub isn't an agent). `agentKeyFromClickedNode`
-  //     already resolves agent→key / hub→null, so we branch on the node type.
+  //   - STACK-HUB node → DESELECT any open agent panel (the hub isn't an agent).
+  //     The subtree-selection TOGGLE is owned by the hub card's own
+  //     `onClick`/`onKeyDown` (network-nodes.tsx — the a11y `role=button` control
+  //     with `aria-pressed` + keyboard activation). The hub card does NOT stop
+  //     propagation, so this `onNodeClick` ALSO fires on a hub click; it must NOT
+  //     toggle here too, or the two functional `setSelection` calls in the same
+  //     event tick cancel out (EMPTY→selected→EMPTY) and the highlight never
+  //     sticks (#1070 regression — caught in browser-QA, invisible to the pure-
+  //     function unit tests). `agentKeyFromClickedNode` resolves hub→null anyway.
   const onNodeClick = useCallback(
     (_evt: unknown, node: RfNode) => {
       const n = node as unknown as NetworkGraphNode;
       if (n.type === "stackHub") {
-        toggleHubSelection(n.id);
         onSelectAgent?.(null);
         return;
       }
       onSelectAgent?.(agentKeyFromClickedNode(n));
     },
-    [onSelectAgent, toggleHubSelection],
+    [onSelectAgent],
   );
 
   // Click on empty canvas → deselect EVERYTHING: close the panel AND clear the
