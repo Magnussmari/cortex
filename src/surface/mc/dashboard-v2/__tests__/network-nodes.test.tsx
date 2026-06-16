@@ -37,6 +37,7 @@ function agentData(over: Partial<AgentNodeData> = {}): AgentNodeData {
     state: "online",
     offlineReason: null,
     lastHeartbeatAt: null,
+    stackColor: "#5b8cd4",
     ...over,
   };
 }
@@ -139,6 +140,7 @@ describe("StackHubCard (G-1114.D.1)", () => {
       principal: null,
       stack: null,
       agentCount: 0,
+      stackColor: "#5b8cd4",
       ...over,
     };
     return renderToStaticMarkup(createElement(StackHubCard, { data }));
@@ -334,5 +336,132 @@ describe("AgentNodeCard — F.2 hover highlight", () => {
     );
     const lit = (html.match(/network-node-cap-highlighted/g) ?? []).length;
     expect(lit).toBe(1);
+  });
+});
+
+describe("#1068 — per-stack color", () => {
+  it("the agent card carries its stack color as --stack-color + data attr", () => {
+    const html = renderAgent(agentData({ stackColor: "#2e8b7a" }));
+    expect(html).toContain("--stack-color:#2e8b7a");
+    expect(html).toContain('data-stack-color="#2e8b7a"');
+  });
+
+  it("the hub card carries its stack color as --stack-color + data attr", () => {
+    const html = renderToStaticMarkup(
+      createElement(StackHubCard, {
+        data: {
+          kind: "stack-hub",
+          origin: "local",
+          servingPrincipal: "andreas",
+          principal: "andreas",
+          stack: "research",
+          agentCount: 1,
+          stackColor: "#d4915b",
+        } satisfies StackHubNodeData,
+      }),
+    );
+    expect(html).toContain("--stack-color:#d4915b");
+    expect(html).toContain('data-stack-color="#d4915b"');
+  });
+
+  it("the legend renders a swatch + label per stack passed in", () => {
+    const html = renderToStaticMarkup(
+      createElement(NetworkLegend, {
+        stacks: [
+          { id: "__stack__", label: "local", color: "#5b8cd4" },
+          { id: "__stack__:jc/research", label: "jc/research", color: "#2e8b7a" },
+        ],
+      }),
+    );
+    expect(html).toContain("network-legend-swatch-stack");
+    expect(html).toContain("local");
+    expect(html).toContain("jc/research");
+    expect(html).toContain("background:#5b8cd4");
+    expect(html).toContain("background:#2e8b7a");
+  });
+});
+
+describe("#1068 — hub-subtree selection (a11y + emphasis/dim)", () => {
+  it("a non-interactive hub (no toggle handler) carries no role/aria-pressed", () => {
+    const html = renderToStaticMarkup(
+      createElement(StackHubCard, {
+        data: {
+          kind: "stack-hub",
+          origin: "local",
+          servingPrincipal: "andreas",
+          principal: "andreas",
+          stack: "research",
+          agentCount: 1,
+          stackColor: "#5b8cd4",
+        } satisfies StackHubNodeData,
+      }),
+    );
+    expect(html).not.toContain('role="button"');
+    expect(html).not.toContain("aria-pressed");
+  });
+
+  it("an interactive selected hub stamps role=button, aria-pressed=true, data-selected", () => {
+    const html = renderToStaticMarkup(
+      createElement(StackHubCard, {
+        data: {
+          kind: "stack-hub",
+          origin: "local",
+          servingPrincipal: "andreas",
+          principal: "andreas",
+          stack: "research",
+          agentCount: 1,
+          stackColor: "#5b8cd4",
+        } satisfies StackHubNodeData,
+        selected: true,
+        onToggleSelect: () => {},
+      }),
+    );
+    expect(html).toContain('role="button"');
+    expect(html).toContain('aria-pressed="true"');
+    expect(html).toContain('data-selected="true"');
+    expect(html).toContain("network-node-selected");
+  });
+
+  it("a dimmed (non-selected, selection active) hub carries data-dimmed + the dim class", () => {
+    const html = renderToStaticMarkup(
+      createElement(StackHubCard, {
+        data: {
+          kind: "stack-hub",
+          origin: "local",
+          servingPrincipal: "andreas",
+          principal: "andreas",
+          stack: "research",
+          agentCount: 1,
+          stackColor: "#5b8cd4",
+        } satisfies StackHubNodeData,
+        dimmed: true,
+        onToggleSelect: () => {},
+      }),
+    );
+    expect(html).toContain('data-dimmed="true"');
+    expect(html).toContain("network-node-dimmed");
+    expect(html).toContain('aria-pressed="false"');
+  });
+
+  it("an emphasized agent (in the selected subtree) carries data-selected + the emphasis class", () => {
+    const html = renderToStaticMarkup(
+      createElement(AgentNodeCard, {
+        data: agentData(),
+        subtreeEmphasized: true,
+      }),
+    );
+    expect(html).toContain('data-selected="true"');
+    expect(html).toContain("network-node-selected");
+  });
+
+  it("a dimmed agent (outside the selected subtree) carries data-dimmed + the dim class", () => {
+    const html = renderToStaticMarkup(
+      createElement(AgentNodeCard, {
+        data: agentData(),
+        dimmed: true,
+      }),
+    );
+    expect(html).toContain('data-dimmed="true"');
+    expect(html).toContain("network-node-dimmed");
   });
 });

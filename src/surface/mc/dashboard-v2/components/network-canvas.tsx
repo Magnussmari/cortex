@@ -32,6 +32,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import ELK from "elkjs/lib/elk.bundled.js";
 import {
+  collectLegendStacks,
   type NetworkGraph,
   type NetworkGraphNode,
 } from "../lib/network-graph-adapter";
@@ -45,6 +46,7 @@ import NetworkElkEdge from "./network-elk-edge";
 import { NetworkLegend } from "./network-legend";
 import {
   NetworkHoverContext,
+  useNetworkHover,
   type NetworkHoverContextValue,
 } from "../lib/network-hover-context";
 
@@ -105,6 +107,14 @@ function FlowCanvas({
   // we cast at this single boundary rather than polluting the adapter's data type.
   const rfNodes = nodes as unknown as RfNode[];
 
+  // #1068 — the per-stack legend rows (one swatch per stack-hub), derived from
+  // the positioned nodes. Hub emission order (local first, then peers) is
+  // preserved, so the legend reads in layout order.
+  const legendStacks = useMemo(
+    () => collectLegendStacks({ nodes, edges: [] }),
+    [nodes],
+  );
+
   // #1008 — render the ORIGIN-GROUPED edges from the adapter (each agent wired to
   // ITS OWN stack's hub — local, sibling, or foreign), typed `elk` so the custom
   // edge draws ELK's orthogonal route from `data.elkPoints`. This replaces the
@@ -119,29 +129,45 @@ function FlowCanvas({
         target: e.target,
         type: "elk",
         // The layout payload (elkPoints + face geometry) drives the custom edge.
-        data: e.layout as unknown as Record<string, unknown>,
+        // #1068 — fold in the per-stack `stackColor` (from the adapter's edge
+        // `data`) so the edge can stroke in its hub's hue.
+        data: {
+          ...(e.layout as unknown as Record<string, unknown>),
+          stackColor: e.data?.stackColor,
+        } as Record<string, unknown>,
       })),
     [laidOutEdges],
   );
 
-  // Node click → lift the agent key up (D.4). The pure
-  // `agentKeyFromClickedNode` resolves agent-node→key / hub→null, so this
-  // handler is a thin delegation (the click→lift logic itself is unit-tested
-  // off the helper, since xyflow can't mount in `bun test`).
+  // #1068 — the sticky hub-subtree selection lives in the hover context (set by
+  // the view, broadcast through the provider). The canvas reads the toggle here
+  // so a hub click flips the selection.
+  const { toggleHubSelection } = useNetworkHover();
+
+  // Node click →
+  //   - AGENT node → lift its key up (D.4): open the detail panel.
+  //   - STACK-HUB node → toggle its subtree selection (#1068) and DESELECT any
+  //     open agent panel (the hub isn't an agent). `agentKeyFromClickedNode`
+  //     already resolves agent→key / hub→null, so we branch on the node type.
   const onNodeClick = useCallback(
     (_evt: unknown, node: RfNode) => {
-      if (!onSelectAgent) return;
-      onSelectAgent(
-        agentKeyFromClickedNode(node as unknown as NetworkGraphNode),
-      );
+      const n = node as unknown as NetworkGraphNode;
+      if (n.type === "stackHub") {
+        toggleHubSelection(n.id);
+        onSelectAgent?.(null);
+        return;
+      }
+      onSelectAgent?.(agentKeyFromClickedNode(n));
     },
-    [onSelectAgent],
+    [onSelectAgent, toggleHubSelection],
   );
 
-  // Click on empty canvas → deselect (close the panel).
+  // Click on empty canvas → deselect EVERYTHING: close the panel AND clear the
+  // hub-subtree selection (#1068).
   const onPaneClick = useCallback(() => {
     onSelectAgent?.(null);
-  }, [onSelectAgent]);
+    toggleHubSelection(null);
+  }, [onSelectAgent, toggleHubSelection]);
 
   return (
     <ReactFlow
@@ -160,7 +186,7 @@ function FlowCanvas({
     >
       <Background gap={20} size={1} />
       <Controls position="bottom-left" showInteractive={false} />
-      <NetworkLegend />
+      <NetworkLegend stacks={legendStacks} />
     </ReactFlow>
   );
 }

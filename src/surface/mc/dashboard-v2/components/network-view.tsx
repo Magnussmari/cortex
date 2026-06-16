@@ -53,6 +53,11 @@ import {
   computeHighlight,
   type HoverTarget,
 } from "../lib/capability-highlight";
+import {
+  EMPTY_SUBTREE_SELECTION,
+  toggleHubSelection as computeToggleHubSelection,
+  type SubtreeSelection,
+} from "../lib/network-subtree-highlight";
 import type { NetworkHoverContextValue } from "../lib/network-hover-context";
 import {
   DEFAULT_NETWORK_FILTER,
@@ -204,9 +209,44 @@ export function NetworkView({
     () => computeHighlight(hoverTarget, matchIndex),
     [hoverTarget, matchIndex],
   );
+
+  // #1068 — the STICKY hub-subtree selection. The view owns the graph, so it
+  // computes the next selection (pure `toggleHubSelection`) when the canvas
+  // reports a hub click. Recomputed against the LIVE graph so the highlight set
+  // tracks presence changes; if the selected hub vanishes (its stack dropped out
+  // of the snapshot) we clear the stale selection (the effect below).
+  const [selection, setSelection] = useState<SubtreeSelection>(
+    EMPTY_SUBTREE_SELECTION,
+  );
+  const onToggleHubSelection = useCallback(
+    (clickedHubId: string | null) =>
+      setSelection((prev) => computeToggleHubSelection(prev, clickedHubId, graph)),
+    [graph],
+  );
+  // Re-derive the highlight set when the graph changes while a hub is selected
+  // (an agent popped in/out of that stack), and clear a selection whose hub no
+  // longer exists.
+  useEffect(() => {
+    setSelection((prev) => {
+      if (prev.selectedHubId === null) return prev;
+      const stillExists = graph.nodes.some((n) => n.id === prev.selectedHubId);
+      if (!stillExists) return EMPTY_SUBTREE_SELECTION;
+      return computeToggleHubSelection(
+        EMPTY_SUBTREE_SELECTION,
+        prev.selectedHubId,
+        graph,
+      );
+    });
+  }, [graph]);
+
   const hover = useMemo<NetworkHoverContextValue>(
-    () => ({ highlight, setHoverTarget }),
-    [highlight],
+    () => ({
+      highlight,
+      setHoverTarget,
+      selection,
+      toggleHubSelection: onToggleHubSelection,
+    }),
+    [highlight, selection, onToggleHubSelection],
   );
 
   // Filter callbacks.

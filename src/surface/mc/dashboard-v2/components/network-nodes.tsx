@@ -22,6 +22,7 @@
  * state, reason, heartbeat) — NEVER session interiors.
  */
 
+import type { CSSProperties } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import {
   formatRelativeTime,
@@ -38,16 +39,42 @@ import type {
 } from "../lib/network-graph-adapter";
 import { isAgentHighlighted } from "../lib/capability-highlight";
 import { useNetworkHover } from "../lib/network-hover-context";
+import {
+  hasSubtreeSelection,
+  isInSubtreeHighlight,
+} from "../lib/network-subtree-highlight";
 import { verdictBadge, formatRtt } from "../lib/network-transport-overlay";
 
 // --- Stack hub -------------------------------------------------------------
 
 export interface StackHubCardProps {
   data: StackHubNodeData;
+  /**
+   * #1068 — true when THIS hub is the selected one (its subtree is highlighted).
+   * Drives `aria-pressed`/`data-selected` + the emphasis outline. Defaults false.
+   */
+  selected?: boolean;
+  /**
+   * #1068 — true when SOME OTHER hub is selected, so this hub is outside the
+   * active subtree and should DIM. Conveyed by opacity, not hue (a11y). Defaults
+   * false (no selection → no dimming).
+   */
+  dimmed?: boolean;
+  /**
+   * #1068 — toggle this hub's selection on click / Enter / Space. Wired by the
+   * node wrapper to the hover context; omitted in isolation tests (the card then
+   * renders without the interactive affordance).
+   */
+  onToggleSelect?: () => void;
 }
 
 /** Pure presentational stack-hub card (no `Handle`; unit-testable). */
-export function StackHubCard({ data }: StackHubCardProps) {
+export function StackHubCard({
+  data,
+  selected = false,
+  dimmed = false,
+  onToggleSelect,
+}: StackHubCardProps) {
   const label =
     data.principal && data.stack
       ? `${data.principal}/${data.stack}`
@@ -63,17 +90,52 @@ export function StackHubCard({ data }: StackHubCardProps) {
   // transport overlay is on AND signal observed it). Taken verbatim from signal.
   const badge =
     data.transportVerdict !== undefined ? verdictBadge(data.transportVerdict) : null;
+  // #1068 — the hub is a toggle button for its subtree selection. When
+  // interactive (a toggle handler is wired), it's focusable + Enter/Space
+  // activates it; the selected/dimmed state is on `aria-pressed` + `data-*` +
+  // opacity/outline (never hue alone — a11y).
+  const interactive = onToggleSelect !== undefined;
   return (
     <div
       className={
         "network-node network-node-hub" +
         (foreign ? " network-node-hub-foreign" : " network-node-hub-local") +
-        ` network-node-hub-${category}`
+        ` network-node-hub-${category}` +
+        (selected ? " network-node-selected" : "") +
+        (dimmed ? " network-node-dimmed" : "")
       }
+      // #1068 — the stack's deterministic color, exposed as a CSS custom property
+      // the hub styling references for its accent/border. ADDITIVE: the shape
+      // treatments (solid/dashed border, eyebrow) come from the classes above.
+      style={{ "--stack-color": data.stackColor } as CSSProperties}
       data-node-kind="stack-hub"
+      data-stack-color={data.stackColor}
       data-hub-origin={foreign ? "foreign" : "local"}
       data-hub-category={category}
+      data-selected={selected ? "true" : undefined}
+      data-dimmed={dimmed ? "true" : undefined}
       data-transport-verdict={data.transportVerdict ?? undefined}
+      role={interactive ? "button" : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      aria-pressed={interactive ? selected : undefined}
+      aria-label={
+        interactive
+          ? `${label} stack — ${selected ? "selected; activate to clear" : "activate to highlight its agents"}`
+          : undefined
+      }
+      onClick={onToggleSelect}
+      onKeyDown={
+        interactive
+          ? (e) => {
+              // Enter/Space toggles the subtree selection (keyboard a11y). Stop
+              // Space from scrolling the canvas.
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onToggleSelect();
+              }
+            }
+          : undefined
+      }
     >
       <span className="network-hub-eyebrow dim">
         {foreign ? "federated stack" : "stack"}
@@ -96,11 +158,23 @@ export function StackHubCard({ data }: StackHubCardProps) {
   );
 }
 
-/** xyflow node wrapper for the stack hub — adds the source handle. */
-export function StackHubNode({ data }: NodeProps) {
+/** xyflow node wrapper for the stack hub — adds the source handle + #1068 the
+ * subtree-selection wiring (read off the shared hover context, same as the agent
+ * wrapper reads the capability highlight). */
+export function StackHubNode({ id, data }: NodeProps) {
+  const { selection, toggleHubSelection } = useNetworkHover();
+  const selected = selection.selectedHubId === id;
+  // Dim a NON-selected hub only when SOME hub is selected (a selection is active
+  // and this hub isn't in its subtree — a hub is never inside another hub's).
+  const dimmed = hasSubtreeSelection(selection) && !selected;
   return (
     <>
-      <StackHubCard data={data as unknown as StackHubNodeData} />
+      <StackHubCard
+        data={data as unknown as StackHubNodeData}
+        selected={selected}
+        dimmed={dimmed}
+        onToggleSelect={() => toggleHubSelection(id)}
+      />
       <Handle
         type="source"
         position={Position.Bottom}
@@ -128,6 +202,17 @@ export interface AgentNodeCardProps {
   onHoverCapability?: (capability: string | null) => void;
   /** G-1114.F.2 — report an agent hover up (or `null` on leave). */
   onHoverAgent?: (agentKey: string | null) => void;
+  /**
+   * #1068 — true when this agent is in the SELECTED hub's subtree (emphasized).
+   * Distinct from the capability-hover `highlighted`; both end up emphasizing the
+   * card. Defaults false.
+   */
+  subtreeEmphasized?: boolean;
+  /**
+   * #1068 — true when a hub subtree is selected and this agent is OUTSIDE it, so
+   * it DIMS. Conveyed by opacity (a11y — not hue). Defaults false.
+   */
+  dimmed?: boolean;
 }
 
 /** Pure presentational agent card (no `Handle`; unit-testable). */
@@ -138,6 +223,8 @@ export function AgentNodeCard({
   highlightedCapabilities,
   onHoverCapability,
   onHoverAgent,
+  subtreeEmphasized = false,
+  dimmed = false,
 }: AgentNodeCardProps) {
   const offline = data.state === "offline";
   const ttlLapse = offline && isTtlLapse(data.offlineReason);
@@ -159,14 +246,23 @@ export function AgentNodeCard({
         `network-node network-node-agent network-node-${data.state}` +
         (ttlLapse ? " network-node-ttl-lapse" : "") +
         (foreign ? " network-node-foreign" : "") +
-        (highlighted ? " network-node-highlighted" : "")
+        (highlighted ? " network-node-highlighted" : "") +
+        (subtreeEmphasized ? " network-node-selected" : "") +
+        (dimmed ? " network-node-dimmed" : "")
       }
+      // #1068 — the agent shares its stack's color (same as its hub), exposed as
+      // `--stack-color` and applied as a left accent border, grouping the card
+      // with its hub. ADDITIVE over the foreign dashed-border treatment.
+      style={{ "--stack-color": data.stackColor } as CSSProperties}
       data-node-kind="agent"
       data-agent-id={data.agentId}
       data-state={data.state}
+      data-stack-color={data.stackColor}
       data-agent-origin={foreign ? "foreign" : "local"}
       data-agent-category={category}
       data-highlighted={highlighted ? "true" : undefined}
+      data-selected={subtreeEmphasized ? "true" : undefined}
+      data-dimmed={dimmed ? "true" : undefined}
       data-offline-reason={offline ? (data.offlineReason ?? "") : undefined}
       aria-label={
         `${name} — ${offline ? `offline (${reasonLabel})` : "online"}` +
@@ -286,7 +382,11 @@ export function AgentNodeCard({
  * highlight + hover callbacks onto the pure card. */
 export function AgentNode({ data }: NodeProps) {
   const agentData = data as unknown as AgentNodeData;
-  const { highlight, setHoverTarget } = useNetworkHover();
+  const { highlight, setHoverTarget, selection } = useNetworkHover();
+  // #1068 — subtree selection: this agent is EMPHASIZED when it's in the selected
+  // hub's subtree, DIMMED when a hub is selected and this agent is outside it.
+  const inSubtree = isInSubtreeHighlight(selection, agentData.key);
+  const subtreeActive = hasSubtreeSelection(selection);
   return (
     <>
       <Handle type="target" position={Position.Top} isConnectable={false} />
@@ -298,6 +398,8 @@ export function AgentNode({ data }: NodeProps) {
           // doesn't allocate per node.
           highlight.capabilities.size > 0 ? highlight.capabilities : undefined
         }
+        subtreeEmphasized={subtreeActive && inSubtree}
+        dimmed={subtreeActive && !inSubtree}
         onHoverCapability={(cap) =>
           setHoverTarget(cap === null ? null : { kind: "capability", capability: cap })
         }
