@@ -55,7 +55,7 @@ describe("stackColor (#1068)", () => {
   });
 
   it("gives distinct colors to the distinct stacks present today", () => {
-    // The 4 local stacks the operator runs (meta-factory is the local self) +
+    // The 4 local stacks the principal runs (meta-factory is the local self) +
     // a couple of federated peers — assert no two NON-self stacks collide.
     const stacks: AgentOrigin[] = [
       peer("andreas", "work"),
