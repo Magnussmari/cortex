@@ -403,3 +403,107 @@ describe("buildNetworkGraph — local-sibling vs federated classification (#1008
     }
   });
 });
+
+describe("buildNetworkGraph — agent node ids namespaced by stack (#1065)", () => {
+  // #1065: browser-QA of the multi-stack graph (#1060) saw 16 React
+  // `Encountered two children with the same key` errors for `andreas`/`luna` —
+  // multiple stacks now host an agent with the SAME logical id, so a bare
+  // `agent_id` node id collides across the per-stack hubs. React Flow keys its
+  // internal node list by `node.id`, so the node id MUST be globally unique.
+  // These tests pin the invariant: the node id is the full registry key
+  // (`{principal}/{stack}/{agent_id}`), so same-id-different-stack agents get
+  // DISTINCT node ids (zero duplicate-key collisions), and the edges + the
+  // click→detail selection key + the hover/highlight key all line up on that
+  // SAME id so the graph still wires + highlights + selects correctly.
+
+  it("gives two agents that share an agent_id on DIFFERENT stacks DISTINCT node ids", () => {
+    // `luna` on andreas/meta-factory AND andreas/work — the real collision the
+    // pane-of-glass aggregation surfaced. Bare-id node ids would collide on
+    // `luna`; namespaced ids do not.
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna", stack: "meta-factory", key: "andreas/meta-factory/luna" }),
+      siblingTile({ agent_id: "luna", stack: "work" }),
+    ]);
+    const agentNodes = g.nodes.filter((n) => n.type === "agent");
+    expect(agentNodes).toHaveLength(2);
+
+    const ids = agentNodes.map((n) => n.id);
+    expect(ids).toContain("andreas/meta-factory/luna");
+    expect(ids).toContain("andreas/work/luna");
+    // The load-bearing assertion: no duplicate node ids → no duplicate React keys.
+    expect(new Set(ids).size).toBe(ids.length);
+    // And specifically NOT the bare logical id that collided in QA.
+    expect(ids).not.toContain("luna");
+  });
+
+  it("keeps EVERY node id globally unique across local + sibling + foreign hubs sharing agent_ids", () => {
+    // The worst case the QA hit: `andreas` and `luna` each present on several
+    // stacks at once. Every node id (hubs + agents) must be unique.
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna", stack: "meta-factory", key: "andreas/meta-factory/luna" }),
+      tile({ agent_id: "andreas", stack: "meta-factory", key: "andreas/meta-factory/andreas" }),
+      siblingTile({ agent_id: "luna", stack: "work" }),
+      siblingTile({ agent_id: "andreas", stack: "work" }),
+      foreignTile({ agent_id: "luna", principal: "jc", stack: "research" }),
+      foreignTile({ agent_id: "andreas", principal: "jc", stack: "research" }),
+    ]);
+    const allIds = g.nodes.map((n) => n.id);
+    expect(new Set(allIds).size).toBe(allIds.length);
+    // The six agents resolve to six distinct namespaced ids.
+    const agentIds = g.nodes.filter((n) => n.type === "agent").map((n) => n.id);
+    expect(new Set(agentIds)).toEqual(
+      new Set([
+        "andreas/meta-factory/luna",
+        "andreas/meta-factory/andreas",
+        "andreas/work/luna",
+        "andreas/work/andreas",
+        "jc/research/luna",
+        "jc/research/andreas",
+      ]),
+    );
+  });
+
+  it("targets each hub→agent edge at the SAME namespaced node id (edges still connect)", () => {
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna", stack: "meta-factory", key: "andreas/meta-factory/luna" }),
+      siblingTile({ agent_id: "luna", stack: "work" }),
+    ]);
+    const nodeIds = new Set(g.nodes.map((n) => n.id));
+    // Every edge's source + target must reference a node that actually exists —
+    // a stale bare-id target would orphan the edge (no line drawn).
+    for (const e of g.edges) {
+      expect(nodeIds.has(e.source)).toBe(true);
+      expect(nodeIds.has(e.target)).toBe(true);
+    }
+    // The two `luna` edges point at the two DISTINCT namespaced agent nodes.
+    const targets = g.edges.map((e) => e.target).sort();
+    expect(targets).toEqual(
+      ["andreas/meta-factory/luna", "andreas/work/luna"].sort(),
+    );
+  });
+
+  it("uses the registry key as the node id so click→detail selection + hover/highlight align", () => {
+    // The detail panel resolves a clicked node via `agents.find(a => a.key === id)`
+    // and the hover/highlight match index keys on `a.key` — both the namespaced
+    // registry key. The node id MUST equal `data.key` so a click/hover on a node
+    // resolves the right agent (and the right ONE of two same-id siblings).
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna", stack: "meta-factory", key: "andreas/meta-factory/luna" }),
+      siblingTile({ agent_id: "luna", stack: "work" }),
+    ]);
+    for (const n of g.nodes.filter((n) => n.type === "agent")) {
+      const d = n.data as AgentNodeData;
+      // node.id (the React key + the lifted selection key) === data.key (the
+      // hover/match key + the detail-panel lookup key). One id, three consumers.
+      expect(n.id).toBe(d.key);
+    }
+  });
+
+  it("still produces a stable single-stack id (regression: no namespacing change for the common case)", () => {
+    const g = buildNetworkGraph([tile({ agent_id: "luna" })]);
+    const agentNode = g.nodes.find((n) => n.type === "agent")!;
+    expect(agentNode.id).toBe("andreas/research/luna");
+    expect(g.edges).toHaveLength(1);
+    expect(g.edges[0]!.target).toBe("andreas/research/luna");
+  });
+});
