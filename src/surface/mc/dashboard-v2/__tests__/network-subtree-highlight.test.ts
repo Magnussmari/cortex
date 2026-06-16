@@ -145,6 +145,22 @@ describe("toggleHubSelection (#1068)", () => {
     expect(hasSubtreeSelection(cleared)).toBe(false);
   });
 
+  it("#1070 regression — toggling the SAME hub TWICE in one click cancels to EMPTY", () => {
+    // The shipped-but-inert bug: a hub click fired the toggle from BOTH the hub
+    // card's own `onClick` AND React Flow's bubbling `onNodeClick`, so the
+    // selection went EMPTY → selected → EMPTY within one event tick and the
+    // highlight never stuck. This pins WHY exactly ONE handler may toggle: a
+    // double application of the same-id toggle is a no-op. The fix removes the
+    // second (onNodeClick) toggle so a single click lands on `selected`.
+    const once = toggleHubSelection(EMPTY_SUBTREE_SELECTION, STACK_HUB_NODE_ID, g);
+    const twice = toggleHubSelection(once, STACK_HUB_NODE_ID, g);
+    expect(once.selectedHubId).toBe(STACK_HUB_NODE_ID); // single click → selected
+    expect(hasSubtreeSelection(once)).toBe(true);
+    expect(twice.selectedHubId).toBeNull(); // double toggle → back to nothing
+    expect(hasSubtreeSelection(twice)).toBe(false);
+    expect(twice).toEqual(EMPTY_SUBTREE_SELECTION);
+  });
+
   it("clicking a DIFFERENT hub switches the selection", () => {
     const first = toggleHubSelection(EMPTY_SUBTREE_SELECTION, STACK_HUB_NODE_ID, g);
     const second = toggleHubSelection(first, foreignHubId, g);
