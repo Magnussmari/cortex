@@ -22,6 +22,7 @@ function hub(over: Partial<StackHubNodeData> = {}): StackHubNodeData {
     principal: "andreas",
     stack: "research",
     agentCount: 2,
+    stackColor: "#5b8cd4",
     ...over,
   };
 }
@@ -38,6 +39,7 @@ function agent(over: Partial<AgentNodeData> = {}): AgentNodeData {
     state: "online",
     offlineReason: null,
     lastHeartbeatAt: null,
+    stackColor: "#5b8cd4",
     ...over,
   };
 }

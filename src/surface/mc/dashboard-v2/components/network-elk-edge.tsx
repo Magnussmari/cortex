@@ -14,13 +14,18 @@
  * didn't route them) fall back to a straight line.
  */
 
-import { useMemo } from "react";
+import { useMemo, type CSSProperties } from "react";
 import {
   BaseEdge,
   getSmoothStepPath,
   Position,
   type EdgeProps,
 } from "@xyflow/react";
+import { useNetworkHover } from "../lib/network-hover-context";
+import {
+  hasSubtreeSelection,
+  isInSubtreeHighlight,
+} from "../lib/network-subtree-highlight";
 
 interface Point {
   x: number;
@@ -124,6 +129,8 @@ export default function NetworkElkEdge(props: EdgeProps) {
 
   const edgeData = data as Record<string, unknown> | undefined;
   const elkPoints = edgeData?.["elkPoints"] as Point[] | undefined;
+  // #1068 — the hub→agent connector strokes in its stack's deterministic color.
+  const stackColor = edgeData?.["stackColor"] as string | undefined;
   const layoutSourceX = edgeData?.["layoutSourceX"] as number | undefined;
   const layoutSourceY = edgeData?.["layoutSourceY"] as number | undefined;
   const layoutTargetX = edgeData?.["layoutTargetX"] as number | undefined;
@@ -180,5 +187,32 @@ export default function NetworkElkEdge(props: EdgeProps) {
     targetBottomY,
   ]);
 
-  return <BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} />;
+  // #1068 — the stack's color is the edge stroke (additive: any incoming `style`
+  // still applies; we only set the stroke when a color is present, so an
+  // un-colored edge is unchanged).
+  const baseStyle: Record<string, unknown> =
+    stackColor !== undefined ? { ...style, stroke: stackColor } : { ...style };
+
+  // #1068 — subtree selection: a hub→agent edge in the SELECTED subtree is
+  // EMPHASIZED (thicker, full opacity); when a subtree is selected and this edge
+  // is OUTSIDE it, the edge DIMS (opacity — not hue). Resting (no selection):
+  // unchanged. Read off the shared hover context like the node cards do.
+  const { selection } = useNetworkHover();
+  if (hasSubtreeSelection(selection)) {
+    if (isInSubtreeHighlight(selection, id)) {
+      baseStyle["strokeWidth"] = 2.5;
+      baseStyle["opacity"] = 1;
+    } else {
+      baseStyle["opacity"] = 0.18;
+    }
+  }
+
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      style={baseStyle as CSSProperties}
+      markerEnd={markerEnd}
+    />
+  );
 }
