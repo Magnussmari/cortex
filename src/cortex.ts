@@ -191,6 +191,13 @@ import {
   startFederatedAgentPresenceSubscriber,
   type FederatedAgentPresenceSubscriberHandle,
 } from "./bus/agent-network/federated-subscriber";
+// P3 (cortex#1088) — continuous federation roster reconciler. Mutates the LIVE
+// `policy.federated.networks[]` the gate reads so a later-joining roster peer is
+// admitted within one reconcile interval, no manual `network join`.
+import {
+  startFederationReconciler,
+  type FederationReconcilerHandle,
+} from "./bus/agent-network/federation-reconciler";
 // P-14 U3.3 (#937) — trust-verified federated OBSERVABILITY fold (the
 // observability sibling of the presence subscriber; same Option-D trust path +
 // the curation gate, origin-badged).
@@ -229,6 +236,7 @@ import {
   RegistryClient,
   PrincipalPubkeyResolver,
   MultiPrincipalIdentityRegistry,
+  NetworkRegistryClient,
 } from "./common/registry";
 import type {
   RegistryClientReader,
@@ -4936,6 +4944,11 @@ export async function startCortex(
   // G-1114.E.2 — trust-verified federated presence subscriber (folds peers'
   // agents into the SAME registry, tagged with foreign provenance).
   let federatedPresenceHandle: FederatedAgentPresenceSubscriberHandle | null = null;
+  // P3 (cortex#1088) — continuous federation roster reconciler. Mutates the
+  // LIVE `resolvedPolicy.federated.networks[]` (the SAME objects the gate above
+  // reads) so a later-joining roster peer's presence is admitted within one
+  // reconcile interval. INERT unless a network opts in (`reconcile.enabled`).
+  let federationReconcilerHandle: FederationReconcilerHandle | null = null;
   // P-14 U3.3 (#937) — trust-verified federated OBSERVABILITY fold (folds peers'
   // curated+signed system.{transport,federation}.* into the observability
   // projection, ORIGIN-BADGED — the Option-D sibling of the presence subscriber).
@@ -5118,6 +5131,62 @@ export async function startCortex(
         }),
         ...(resolveFederatedPeer !== undefined && { resolveFederatedPeer }),
       });
+
+      // P3 (cortex#1088, design §4/§7) — the continuous federation roster
+      // reconciler. The subscriber above binds the principal-WILDCARD presence
+      // firehose (`federated.*.*.agent.>`) ONCE and gates admissibility at fold
+      // time off `resolvedPolicy.federated.networks[]`. So to admit a peer that
+      // joins a shared network AFTER us, we don't re-bind NATS — we re-resolve
+      // the registry roster on an interval and MUTATE those SAME network objects
+      // (peers + accept_subjects, OWN ∪ peer subtrees) IN PLACE. The gate sees
+      // the widened accept-list on the next inbound envelope; the firehose
+      // already carries every peer's presence. OPT-IN per network (OQ1, default
+      // OFF); cortex-owned self-poll (OQ3, signal-optional — no signal import).
+      // Best-effort: a registry outage / poison network never throws out of the
+      // tick or perturbs the serving stack (mirrors the #989 aggregator).
+      //
+      // The roster READ uses cortex's OWN NetworkRegistryClient (P1's
+      // NetworkRosterProvider slice), built from `policy.federated.registry` —
+      // the SAME verified-fetch + DD-10 cache the boot peer-resolve + CLI join
+      // use. A test seam (`options.bootFederatedRosterProvider`) injects a fake
+      // so the reconciler runs with no network I/O. When no registry is
+      // configured AND no test provider is injected, the reconciler stays inert
+      // (a fully hand-pinned deployment has no roster to poll).
+      const reconcileNetworks = resolvedPolicy?.federated?.networks;
+      const reconcileRegistry = resolvedPolicy?.federated?.registry;
+      const reconcileProvider: NetworkRosterProvider | undefined =
+        options.bootFederatedRosterProvider ??
+        (reconcileRegistry !== undefined
+          ? new NetworkRegistryClient({
+              url: reconcileRegistry.url,
+              ...(reconcileRegistry.pubkey !== undefined && {
+                pubkey: reconcileRegistry.pubkey,
+              }),
+            })
+          : undefined);
+      if (
+        reconcileNetworks !== undefined &&
+        reconcileNetworks.some((n) => n.reconcile?.enabled === true) &&
+        reconcileProvider !== undefined
+      ) {
+        federationReconcilerHandle = startFederationReconciler({
+          networks: reconcileNetworks,
+          self: { principal: principalId, stack: derivedStack.stack },
+          client: reconcileProvider,
+          onResult: (result) => {
+            if (result.outcome === "applied") {
+              console.log(
+                `cortex: federation reconcile — ${result.networkId}: ${result.detail}`,
+              );
+            }
+          },
+        });
+        if (federationReconcilerHandle.active) {
+          console.log(
+            "cortex: federation roster reconciler started — continuously admitting roster-named peers (opt-in per network; registry-authoritative; chain-verify unchanged)",
+          );
+        }
+      }
 
       // P-14 U3.3 (#937) — the trust-verified federated OBSERVABILITY fold, the
       // observability sibling of the presence subscriber above. Reuses the EXACT
@@ -5577,6 +5646,14 @@ export async function startCortex(
       await completeAsync(
         "federated agent-presence subscriber stop",
         federatedPresenceHandle?.stop(),
+      );
+      // P3 (cortex#1088) — stop the federation roster reconciler poller (cancels
+      // the interval + awaits any in-flight pass). It only mutates the in-memory
+      // policy objects, so ordering vs. the registry/subscriber teardown is
+      // immaterial; stopping it here keeps it adjacent to the subscriber it feeds.
+      await completeAsync(
+        "federation roster reconciler stop",
+        federationReconcilerHandle?.stop(),
       );
       // P-14 U3.3 — stop the federated observability fold (drains its push
       // subscriber + unregisters its fan-out handler). Projected observability

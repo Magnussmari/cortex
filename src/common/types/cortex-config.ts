@@ -1880,6 +1880,48 @@ export const PolicyFederatedNetworkNatsSchema = z.object({
 export type PolicyFederatedNetworkNats = z.infer<typeof PolicyFederatedNetworkNatsSchema>;
 
 /**
+ * P3 (cortex#1088, design-roster-driven-federation-wiring §7 OQ1) — the OPTIONAL
+ * per-network opt-in for the runtime federation roster reconciler.
+ *
+ * The reconciler continuously resolves a network's registry roster and applies
+ * the derived federation policy (peers[] + accept_subjects = OWN ∪ peer
+ * subtrees) to the LIVE policy, so a peer that joins a shared network AFTER the
+ * local stack joined renders on the Network view within one reconcile interval —
+ * WITHOUT a manual `cortex network join`.
+ *
+ * **OQ1 — per-network, default OFF.** Enabling the reconciler is a conscious
+ * per-network choice (mirroring `policy.federated.networks[]` itself): a stack
+ * may auto-wire `metafactory` but NOT `community`. Absence of this block ⇒
+ * reconcile disabled for the network — byte-identical to pre-P3 behaviour (the
+ * accept-list is whatever the last `network join` wrote and never moves at
+ * runtime). This is the prevent-side complement to the trust posture: the
+ * reconciler ONLY widens *presence* acceptance to roster-named peers; it never
+ * bypasses the chain-verify gate (design §5) and never opens an interior
+ * subtree.
+ */
+export const PolicyFederatedReconcileSchema = z.object({
+  /**
+   * Master switch — `true` opts THIS network into continuous reconcile. Default
+   * `false`: a network with no `reconcile:` block (or `enabled: false`) is never
+   * touched by the reconciler. The opt-in is deliberate; auto-widening an
+   * accept-list at runtime is a trust-sensitive action a principal must elect.
+   */
+  enabled: z.boolean().default(false),
+  /**
+   * Refresh interval (ms) for the cortex-owned self-poll (OQ3). The reconciler
+   * re-resolves the roster and re-applies the derived policy every
+   * `interval_ms`. Floored at 5s to avoid hammering the registry; defaults to
+   * 60s — the same order as the cockpit refresh + presence heartbeat cadence.
+   * The self-poll is the SIGNAL-OPTIONAL baseline: it works with signal not
+   * installed; piggybacking signal's `roster_snapshot` cadence is an additive
+   * follow-up (P4), never a prerequisite (design §4).
+   */
+  interval_ms: z.number().int().min(5000).default(60000),
+}).strict();
+
+export type PolicyFederatedReconcile = z.infer<typeof PolicyFederatedReconcileSchema>;
+
+/**
  * A single federation network — IAW Phase D.1 (cortex#116).
  *
  * Networks are the unit of federation policy in cortex per Q4
@@ -1996,6 +2038,15 @@ export const PolicyFederatedNetworkSchema = z.object({
    * `PolicySchema.superRefine`).
    */
   nats: PolicyFederatedNetworkNatsSchema.optional(),
+  /**
+   * P3 (cortex#1088, design §7 OQ1) — OPTIONAL per-network reconcile opt-in.
+   * When present + `enabled: true`, the runtime federation roster reconciler
+   * continuously re-resolves this network's roster and applies the derived
+   * federation policy (peers + accept_subjects) to the LIVE gate, so a
+   * later-joining peer is admitted without a manual `network join`. Absent ⇒
+   * reconcile OFF (default), byte-identical to pre-P3 behaviour.
+   */
+  reconcile: PolicyFederatedReconcileSchema.optional(),
 });
 
 export type PolicyFederatedNetwork = z.infer<typeof PolicyFederatedNetworkSchema>;
