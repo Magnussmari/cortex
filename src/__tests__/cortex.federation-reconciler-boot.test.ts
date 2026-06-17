@@ -176,13 +176,13 @@ describe("startCortex — federation roster reconciler boot (P3 #1088)", () => {
     // doesn't join its first tick, so poll briefly for the applied result.)
     const net = resolvedPolicy?.federated?.networks[0];
     await waitFor(() =>
-      (net?.accept_subjects ?? []).includes("federated.jc.research.>"),
+      (net?.accept_subjects ?? []).includes("federated.jc.research.agent.>"),
     );
 
     // peers[] now carries jc (gate's resolveSourceNetwork needs this).
     expect(net?.peers.map((p) => p.principal_id)).toEqual(["jc"]);
     // accept_subjects widened OWN ∪ jc's subtree (the defect-#1 fix at runtime).
-    expect(net?.accept_subjects).toContain("federated.jc.research.>");
+    expect(net?.accept_subjects).toContain("federated.jc.research.agent.>");
     expect(net?.accept_subjects).toContain("federated.andreas.default.>");
 
     await handle.stop();
@@ -223,7 +223,7 @@ describe("startCortex — federation roster reconciler boot (P3 #1088)", () => {
     // Give any (erroneously-started) loop a moment; assert jc never appears.
     await new Promise((r) => setTimeout(r, 30));
     const net = resolvedPolicy?.federated?.networks[0];
-    expect(net?.accept_subjects).not.toContain("federated.jc.research.>");
+    expect(net?.accept_subjects).not.toContain("federated.jc.research.agent.>");
     // The OWN-only configured accept-list is untouched.
     expect(net?.accept_subjects).toEqual(["federated.andreas.default.>"]);
 

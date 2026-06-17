@@ -128,7 +128,7 @@ describe("reconcileNetwork — derive + apply in place", () => {
     // accept_subjects = OWN ∪ jc's subtree (the defect-#1 fix).
     expect(net.accept_subjects).toEqual([
       "federated.andreas.meta-factory.>",
-      "federated.jc.research.>",
+      "federated.jc.research.agent.>",
     ]);
   });
 
@@ -142,7 +142,7 @@ describe("reconcileNetwork — derive + apply in place", () => {
     await reconcileNetwork(net, SELF, client);
 
     // The gate reads `ref.accept_subjects` live — same object, mutated in place.
-    expect(ref.accept_subjects).toContain("federated.jc.research.>");
+    expect(ref.accept_subjects).toContain("federated.jc.research.agent.>");
     expect(ref).toBe(net);
   });
 
@@ -169,7 +169,7 @@ describe("reconcileNetwork — derive + apply in place", () => {
       peers: [{ principal_id: "jc", stack_id: "jc/research" }],
       accept_subjects: [
         "federated.andreas.meta-factory.>",
-        "federated.jc.research.>",
+        "federated.jc.research.agent.>",
       ],
     });
     // Empty roster (jc registered but announced no caps into the net yet).
@@ -180,7 +180,7 @@ describe("reconcileNetwork — derive + apply in place", () => {
     expect(result.outcome).toBe("preserved-handpins");
     // Hand-pin survives — NOT wiped to [].
     expect(net.peers.map((p) => p.principal_id)).toEqual(["jc"]);
-    expect(net.accept_subjects).toContain("federated.jc.research.>");
+    expect(net.accept_subjects).toContain("federated.jc.research.agent.>");
   });
 
   it("#762 — 0 resolved peers + NO prior peers ⇒ collapses to OWN-only (first-join case)", async () => {
@@ -210,7 +210,7 @@ describe("reconcileNetwork — derive + apply in place", () => {
     expect(net.accept_subjects).not.toContain("federated.mallory.evil.>");
   });
 
-  it("never writes an interior subtree — only `federated.{principal}.{stack}.>` presence/dispatch subtrees", async () => {
+  it("never writes a literal interior — only wildcard subtrees (own `.>`, peer presence `.agent.>`)", async () => {
     const net = network({ id: "metafactory", peers: [] });
     const client = fakeClient({
       rosters: { metafactory: [member("jc", "jc/research")] },
@@ -219,9 +219,12 @@ describe("reconcileNetwork — derive + apply in place", () => {
     await reconcileNetwork(net, SELF, client);
 
     for (const subj of net.accept_subjects) {
-      // Each accept entry is a top-level federated subtree wildcard, NOT a
-      // narrowed interior (e.g. `…agent.online` literal or a tool/prompt path).
-      expect(subj).toMatch(/^federated\.[a-z0-9-]+\.[a-z0-9-]+\.>$/);
+      // Each accept entry is a WILDCARD subtree (terminal `>`), never a narrowed
+      // interior literal (e.g. `…agent.online` or a tool/prompt path). The OWN
+      // entry is the full `federated.{me}.{stack}.>` (dispatch addressed to me);
+      // a PEER entry is the presence-only `federated.{peer}.{stack}.agent.>`
+      // (#1105 least-privilege). Both end in `.>` — a wildcard, not a literal.
+      expect(subj).toMatch(/^federated\.[a-z0-9-]+\.[a-z0-9-]+(\.agent)?\.>$/);
     }
   });
 
@@ -233,7 +236,7 @@ describe("reconcileNetwork — derive + apply in place", () => {
       peers: [{ principal_id: "jc", stack_id: "jc/research" }],
       accept_subjects: [
         "federated.andreas.meta-factory.>",
-        "federated.jc.research.>",
+        "federated.jc.research.agent.>",
       ],
     });
     const before = {
@@ -260,14 +263,14 @@ describe("reconcileNetwork — derive + apply in place", () => {
 
     expect(result.outcome).toBe("applied");
     expect(result.usedCache).toBe(true);
-    expect(net.accept_subjects).toContain("federated.jc.research.>");
+    expect(net.accept_subjects).toContain("federated.jc.research.agent.>");
   });
 
   it("registry unreachable + NO cache ⇒ UNCHANGED (keeps last-good live policy)", async () => {
     const net = network({
       id: "metafactory",
       peers: [{ principal_id: "jc", stack_id: "jc/research" }],
-      accept_subjects: ["federated.jc.research.>"],
+      accept_subjects: ["federated.jc.research.agent.>"],
     });
     const before = [...net.accept_subjects];
     const client = fakeClient({ unreachable: true });
@@ -310,7 +313,7 @@ describe("reconcileOnce — per-network opt-in (OQ1)", () => {
     });
 
     // metafactory reconciled — jc admitted.
-    expect(optedIn.accept_subjects).toContain("federated.jc.research.>");
+    expect(optedIn.accept_subjects).toContain("federated.jc.research.agent.>");
     // community NOT touched — mallory never appears (opt-out honoured).
     expect(optedOut.accept_subjects).toEqual([
       "federated.andreas.community.>",
@@ -357,7 +360,7 @@ describe("reconcileOnce — per-network opt-in (OQ1)", () => {
     });
 
     // good still reconciled despite broken erroring first.
-    expect(good.accept_subjects).toContain("federated.jc.research.>");
+    expect(good.accept_subjects).toContain("federated.jc.research.agent.>");
     expect(summary.applied).toBe(1);
     expect(summary.errors).toBe(1);
   });
@@ -436,13 +439,13 @@ describe("startFederationReconciler — scheduled loop", () => {
     });
 
     expect(handle.active).toBe(true);
-    expect(net.accept_subjects).not.toContain("federated.jc.research.>");
+    expect(net.accept_subjects).not.toContain("federated.jc.research.agent.>");
 
     // Fire one tick — the reconcile pass runs.
     tickFn!();
     await handle.settle();
 
-    expect(net.accept_subjects).toContain("federated.jc.research.>");
+    expect(net.accept_subjects).toContain("federated.jc.research.agent.>");
     await handle.stop();
   });
 
