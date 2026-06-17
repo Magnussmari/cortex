@@ -12,12 +12,15 @@
  * ## Reuse, do not rebuild (design §3)
  *
  * The verified fetch + DD-10 disk cache already live in
- * `src/common/registry/`:
+ * `src/common/registry/` and are abstracted by the existing
+ * {@link NetworkRosterProvider} interface (the minimal `{fetchAndCache,
+ * loadCached}` slice of `NetworkRegistryClient`, already exported + structurally
+ * satisfied by the concrete client — reused here rather than re-declared):
  *
- *   - {@link NetworkRegistryClient.fetchAndCache} — `GET /networks/{id}` +
- *     `/roster`, pin+verify (DD-9), cache the pair on success (DD-10).
- *   - {@link NetworkRegistryClient.loadCached} — last-known-good pair when the
- *     registry is unreachable (DD-10 fallback).
+ *   - `fetchAndCache` — `GET /networks/{id}` + `/roster`, pin+verify (DD-9),
+ *     cache the pair on success (DD-10).
+ *   - `loadCached` — last-known-good pair when the registry is unreachable
+ *     (DD-10 fallback).
  *
  * This module is the small piece the CLI kept private: the
  * `fetchAndCache → unreachable → loadCached` orchestration plus the
@@ -27,8 +30,8 @@
  *
  * ## Signal-optional (design §4, hard constraint)
  *
- * This module reads the registry **directly** via cortex's own
- * {@link NetworkRegistryClient}. It has **zero** dependency on the `signal`
+ * This module reads the registry **directly** via cortex's own registry client
+ * (the {@link NetworkRosterProvider} slice). It has **zero** dependency on the `signal`
  * package — signal independently reads the same registry behind its own
  * `RegistryIntentSource` seam (shared *registry*, not shared *package*; the
  * dependency direction is cortex→registry and signal→registry, never
@@ -44,10 +47,8 @@
  * a READ.
  */
 
-import type {
-  NetworkRegistryClient,
-  NetworkFetchResult,
-} from "../../common/registry/network-client";
+import type { NetworkFetchResult } from "../../common/registry/network-client";
+import type { NetworkRosterProvider } from "../../common/registry/resolve-federated-peers";
 import type { NetworkRosterResult } from "../../common/registry/types";
 import { base64PubkeyToNkey } from "../../common/registry/encoding";
 
@@ -137,10 +138,10 @@ export type ResolveNetworkRosterResult =
  * Resolve "who is on `networkId`" from the registry, runtime-callable.
  *
  * Drives the same DD-9/DD-10 path the CLI join does:
- *   1. {@link NetworkRegistryClient.fetchAndCache} — verified live fetch
- *      (refreshes the DD-10 cache on success).
- *   2. On `unreachable`, fall back to {@link NetworkRegistryClient.loadCached}
- *      (DD-10). No cached pair ⇒ `unreachable_uncached`.
+ *   1. `client.fetchAndCache` — verified live fetch (refreshes the DD-10 cache
+ *      on success).
+ *   2. On `unreachable`, fall back to `client.loadCached` (DD-10). No cached
+ *      pair ⇒ `unreachable_uncached`.
  *   3. `not_found` / `unverified` ⇒ a definitive negative (do NOT render a
  *      roster we couldn't verify).
  *
@@ -153,12 +154,13 @@ export type ResolveNetworkRosterResult =
  *
  * @param networkId        Network whose roster to resolve.
  * @param localPrincipalId The local principal — excluded from the peer set.
- * @param client           cortex's OWN registry client (no signal; §4).
+ * @param client           cortex's OWN registry client (the
+ *                         {@link NetworkRosterProvider} slice — no signal; §4).
  */
 export async function resolveNetworkRoster(
   networkId: string,
   localPrincipalId: string,
-  client: Pick<NetworkRegistryClient, "fetchAndCache" | "loadCached">,
+  client: NetworkRosterProvider,
 ): Promise<ResolveNetworkRosterResult> {
   let roster: NetworkRosterResult;
   let usedCache = false;
