@@ -75,14 +75,46 @@ presence subscription so peers' **assistants** (not just transport verdicts)
 render. We do **not** duplicate signal's reconciliation; we consume the roster
 (same source) and, optionally, signal's liveness verdicts.
 
-## 4. The missing wire — a roster→federation reconciler
+## 4. Signal is optional — cortex's simple status stands alone
+
+**Signal is not always installed. Cortex must give a useful Network view out of
+the box, with signal as an additive deep-observability layer — never a hard
+dependency.** This already holds at the code level (verified 2026-06-17): cortex
+has **zero** code dependency on signal (no import — the only `signal` matches in
+the tree are undici's `AbortSignal`); signal's contribution arrives **bus-only**
+(`system.transport.*`), is rendered **absent-safe**
+(`transportVerdict !== undefined ? badge : null`, `network-nodes.tsx:92`), and is
+gated behind an **opt-in overlay**.
+
+The two layers are distinct, not redundant — they answer different questions:
+
+| Layer | Answers | Source | Without it |
+|---|---|---|---|
+| **cortex presence** (ADR-0007, ~L7) | "is the agent PROCESS up + heartbeating?" — online/idle/offline, 5-min-TTL liveness FSM | cortex's own `agent.{online,heartbeat,offline}` + in-memory registry | — this IS the baseline |
+| **signal transport** (P-13/P-14, ~L0/L1) | "is the LEAF actually connected to the network, and does it match the registry roster?" — connected / registered-absent / unregistered-present + RTT | signal `system.transport.*`, folded by cortex, badged on hubs | overlay simply absent |
+
+A cortex agent can be heartbeating (cortex says **online**) on a stack whose leaf
+has actually dropped (signal says **registered-absent**) — signal catches a
+transport-reality discrepancy cortex's own presence cannot see. **Standalone
+cortex = "my agents are up"; cortex + signal = "…and the network plumbing matches
+the roster."**
+
+This principle **constrains the auto-wiring below**: the reconciler reads the
+roster via cortex's OWN registry client and renders peers from cortex's OWN
+federated presence; signal, when present, only *enriches* with the transport
+verdict. The feature must work with signal **not installed**.
+
+## 5. The missing wire — a roster→federation reconciler
 
 A single new component (cortex-side): the **federation roster reconciler**. For
 each network the stack is a member of:
 
-1. **Resolve** the registry roster (reuse the `network-lib` registry client /
-   the `RegistryIntentSource` seam — the cortex-registry implementation that
-   signal also wants; build it once, both consume it).
+1. **Resolve** the registry roster via **cortex's OWN registry client**
+   (`network-lib.ts` already resolves `network.meta-factory.ai`) — **no import
+   from signal**. signal independently reads the same registry behind its
+   `RegistryIntentSource` seam; the dependency direction is cortex→registry and
+   signal→registry, never cortex→signal (a shared *registry*, not a shared
+   *package*).
 2. **Derive** the desired federation policy:
    - `accept_subjects` = OWN subject **∪** `federated.{peer.principal}.{peer.stack}.>`
      for every roster member (this is the fix for defect #1).
@@ -94,16 +126,19 @@ each network the stack is a member of:
 4. **Reconcile continuously** — re-run on a refresh interval and/or a roster-change
    signal, not just at `join` (the fix for defect #2). Preserve the #762
    "never clobber a hand-pin with 0 resolved peers" guard.
-5. **Compose with signal's liveness (optional, recommended):** key the accept-list
-   / rendered state off signal's already-folded verdict — a `registered-absent`
-   peer (registered, no live leaf) renders muted/offline rather than a stale
-   online; an `unregistered-present` leaf is surfaced as an anomaly, never
-   silently trusted.
+5. **Compose with signal's liveness — OPTIONAL enrichment, never required.**
+   Baseline: foreign peers render from cortex's OWN federated `agent.*` presence
+   (works with signal absent). WHEN signal is present, ALSO key the hub's
+   transport badge off its already-folded `roster_snapshot`/`liveness_drift`
+   verdict — a `registered-absent` peer (registered, no live leaf) renders muted
+   rather than stale-online; an `unregistered-present` leaf is surfaced as an
+   anomaly. Absent signal → no badge, peers still render. Never a hard dependency
+   (§4).
 
 Everything downstream (chain-verify, fold-into-registry, foreign-hub render) is
 the existing path.
 
-## 5. Trust & privacy invariants (unchanged, must hold)
+## 6. Trust & privacy invariants (unchanged, must hold)
 
 - **Metadata only** — presence + dispatch-lifecycle; interiors never federate
   (ADR-0005/0007). The auto-wiring only widens *presence* acceptance; it must not
@@ -119,26 +154,38 @@ the existing path.
   level; this feature automates the *roster→accept-list* step, not the decision to
   federate. (Whether enabling the reconciler is itself a per-network opt-in is
   Open Question 1.)
+- **Signal-optional (cortex stands alone)** — the feature reads the roster via
+  cortex's own registry client and renders peers from cortex's own federated
+  presence. Signal is additive (the transport verdict badge), bus-only, absent-
+  safe. No code dependency on signal; the Network view federates with signal not
+  installed (§4).
 
-## 6. Phasing & dependency order
+## 7. Phasing & dependency order
 
-- **P1 — registry-roster source (shared).** The cortex-registry `RegistryIntentSource`
-  read (the seam signal already shapes for; reuse cortex's `network-lib` client).
-  Unblocks both this feature and signal's live roster.
+- **P1 — registry-roster read (cortex-owned).** Harden cortex's OWN registry
+  roster read (`network-lib.ts`) into the reconciler's input. **No signal import.**
+  signal reads the same registry independently behind its own `RegistryIntentSource`
+  seam — shared *registry*, not shared *package*. (cortex never depends on signal;
+  if anything, signal's cortex-registry source depends on the registry cortex
+  already calls.)
 - **P2 — accept-list derivation fix.** `network join` (and the reconciler) derive
   `accept_subjects` from the roster (OWN ∪ peer subtrees), not OWN-only. Smallest
-  correctness fix; makes a *manual* `network join` actually admit peers.
+  correctness fix; makes a *manual* `network join` actually admit peers. **No
+  signal needed.**
 - **P3 — continuous reconciler + subscription follow.** The refresh loop +
-  (re)subscribe; preserve hand-pin guard.
-- **P4 — liveness composition.** Key rendered state off signal's folded
-  `roster_snapshot`/`liveness_drift` verdict.
+  (re)subscribe; preserve hand-pin guard. **No signal needed** (peers render from
+  cortex's own federated presence).
+- **P4 — liveness enrichment (signal-OPTIONAL).** WHEN signal is present, key the
+  hub transport badge off its folded `roster_snapshot`/`liveness_drift` verdict
+  (`registered-absent` → muted). Absent signal → peers still render from federated
+  presence, no badge. Strictly additive; not a dependency.
 - **Parallel / independent — ADR-0006 Phase-3 (hosted).** The meta-factory.ai
   pane's NKey-signed own-slice push is a *separate* surface; this feature is the
   **local** pane's federation. They share the roster source (P1) but do not block
   each other. Sequence P1→P2 first (fastest path to "jc shows on my local pane"),
   then P3/P4; ADR-0006 Phase-3 on its own track.
 
-## 7. Open questions
+## 8. Open questions
 
 1. **Per-network opt-in granularity.** Is enabling the reconciler all-or-nothing
    per stack, or per-network (federate into `metafactory` but not `community`)?
@@ -150,19 +197,24 @@ the existing path.
    needs to read `peers[]`). The live `in=0` with `peers:[jc]` strongly implies
    `accept_subjects` is the gate — verify against `evaluateFederationGate` before
    building.
-3. **Reconcile trigger.** Poll interval vs. a registry change-feed vs. piggyback
-   on signal's `roster_snapshot` cadence (cortex already consumes it). Reusing the
-   signal cadence avoids a second poller.
+3. **Reconcile trigger.** Baseline must be cortex-owned (signal-optional §4): a
+   self-poll of the registry roster on an interval (and/or a registry change-feed).
+   *Optimization when signal is present:* piggyback the reconcile on signal's
+   `roster_snapshot` cadence (cortex already consumes it) to avoid a second poller —
+   but the self-poll is the fallback so the feature works with signal absent.
 4. **`registered-absent` rendering.** Show a roster member with no live leaf as a
    muted/offline hub (presence-absent) vs. omit it. Recommendation: render muted —
    the principal wants to see *who is on the network*, live or not.
 
-## 8. Acceptance
+## 9. Acceptance
 
 - A peer that joins a shared network *after* the local stack joined renders on the
   local Network view within one reconcile interval, without a manual `network join`.
 - `cortex network status` shows the peer's subtree on `accept:` and `in>0`.
-- A roster member with no live leaf renders muted (signal verdict
-  `registered-absent`), not stale-online.
+- **With signal NOT installed**, foreign peers still render on the Network view
+  from federated presence — the feature has no hard signal dependency; signal
+  only adds the transport verdict badge when present.
+- With signal present, a roster member with no live leaf renders muted (signal
+  verdict `registered-absent`), not stale-online.
 - No interior subtree is ever accept-listed; chain-verify still rejects a
   scope-spoofed envelope under `enforce`.
