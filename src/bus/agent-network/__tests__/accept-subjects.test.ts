@@ -52,7 +52,7 @@ describe("deriveAcceptSubjects — dual-grammar union", () => {
     const subjects = deriveAcceptSubjects(SELF, [peer("jc", "default")]);
     expect(subjects).toEqual([
       OWN_SUBTREE, // dispatch addressed TO me (RECEIVER-addressed)
-      "federated.jc.default.>", // presence sourced FROM jc (SOURCE-addressed)
+      "federated.jc.default.agent.>", // presence sourced FROM jc (SOURCE-addressed, presence-only)
     ]);
   });
 
@@ -63,14 +63,14 @@ describe("deriveAcceptSubjects — dual-grammar union", () => {
     ]);
     expect(subjects).toEqual([
       OWN_SUBTREE,
-      "federated.jc.sage-host.>",
-      "federated.dana.default.>",
+      "federated.jc.sage-host.agent.>",
+      "federated.dana.default.agent.>",
     ]);
   });
 
   test("a peer with a non-default stack slug uses that slug, not 'default'", () => {
     const subjects = deriveAcceptSubjects(SELF, [peer("jc", "research")]);
-    expect(subjects).toContain("federated.jc.research.>");
+    expect(subjects).toContain("federated.jc.research.agent.>");
   });
 });
 
@@ -114,7 +114,7 @@ describe("deriveAcceptSubjects — ordering + de-dupe", () => {
       peer("jc", "default"),
       peer("jc", "default"),
     ]);
-    expect(subjects).toEqual([OWN_SUBTREE, "federated.jc.default.>"]);
+    expect(subjects).toEqual([OWN_SUBTREE, "federated.jc.default.agent.>"]);
   });
 
   test("same principal, different stacks → two distinct subtrees", () => {
@@ -124,8 +124,8 @@ describe("deriveAcceptSubjects — ordering + de-dupe", () => {
     ]);
     expect(subjects).toEqual([
       OWN_SUBTREE,
-      "federated.jc.default.>",
-      "federated.jc.sage-host.>",
+      "federated.jc.default.agent.>",
+      "federated.jc.sage-host.agent.>",
     ]);
   });
 
@@ -164,5 +164,22 @@ describe("deriveAcceptSubjects — derived patterns match real wire subjects", (
       subjectMatches(p, "federated.stranger.default.agent.online"),
     );
     expect(hit).toBe(false);
+  });
+
+  test("least-privilege — a PEER's NON-presence subject (dispatch destined for the peer) is NOT admitted", () => {
+    // The peer accept-list is presence-only (`…agent.>`), so traffic on the
+    // peer's subtree that is NOT presence — e.g. dispatch addressed TO the peer
+    // (receiver-addressed, the peer's business, not mine) — must NOT match. This
+    // is the design §6 invariant: the auto-wiring widens PRESENCE acceptance only.
+    const dispatchToPeer = subjects.some((p) =>
+      subjectMatches(p, "federated.jc.default.tasks.code-review.ts"),
+    );
+    expect(dispatchToPeer).toBe(false);
+    const dispatchLifecycleToPeer = subjects.some((p) =>
+      subjectMatches(p, "federated.jc.default.dispatch.task.started"),
+    );
+    expect(dispatchLifecycleToPeer).toBe(false);
+    // And the own subtree (`.>`) must NOT accidentally cover the peer's subjects.
+    expect(subjectMatches(OWN_SUBTREE, "federated.jc.default.agent.online")).toBe(false);
   });
 });
