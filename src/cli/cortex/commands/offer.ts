@@ -203,6 +203,79 @@ function capabilityAcceptSubject(
 }
 
 /**
+ * cortex#1097 (umbrella #1084 P2.1) — the prefix the offer-mode DISPATCH writer
+ * OWNS on `accept_subjects`: this stack's OWN-identity tasks subtree
+ * `federated.{me}.{stack}.tasks.`. Every row beginning with this prefix is a
+ * capability-dispatch accept-subject GENERATED from the offerings; the offer
+ * writer regenerates exactly these and PRESERVES everything else.
+ */
+function ownDispatchPrefix(principal: string, stack: string): string {
+  return `federated.${principal}.${stack}.tasks.`;
+}
+
+/**
+ * cortex#1097 (umbrella #1084 P2.1) — merge the offer-mode capability-DISPATCH
+ * projection into the network's EXISTING `accept_subjects` WITHOUT clobbering
+ * the rows the PRESENCE-wiring writer owns.
+ *
+ * ## Why a merge, not an overwrite (the investigation finding)
+ *
+ * `policy.federated.networks[].accept_subjects` has TWO independent writers that
+ * share ONE array:
+ *
+ *   - the **presence** path (`cortex network join` / the P3 reconciler, via
+ *     `deriveAcceptSubjects`, #1087/#1105) writes the OWN `.>` subtree ∪ each
+ *     roster peer's PRESENCE-only `.agent.>` subtree (source-addressed presence
+ *     FROM peers, ADR-0007).
+ *   - this **offer-mode dispatch** writer regenerates the capability rows
+ *     `federated.{me}.{stack}.tasks.{cap}.>` (receiver-addressed dispatch TO me).
+ *
+ * Offer-mode dispatch is purely RECEIVER-addressed — it never legitimately
+ * RECEIVES a peer-SOURCED subject (the verdict a provider emits is an OUTBOUND
+ * publish to the requester's subtree, not an accept; probe-responder + the
+ * federated review consumer both subscribe the stack's OWN subtree). So the
+ * offer writer's OWN-only `…tasks.{cap}.>` rows are already the least-privilege
+ * accept-list for dispatch — they must NOT widen to a peer's full `.>`. The bug
+ * #1097 fixes is that the old overwrite ALSO erased the presence writer's rows,
+ * silently regressing peer-presence admission (P2/#1105) after any `offer --apply`.
+ *
+ * The merge rule is least-privilege on BOTH sides: the offer writer owns ONLY the
+ * own-identity `…tasks.` dispatch rows (it regenerates exactly those, dropping a
+ * capability that's no longer offered), and preserves every other row verbatim —
+ * the OWN `.>` subtree and the peer `.agent.>` presence subtrees the presence
+ * writer owns. It never invents a peer subtree (it has no roster) and never
+ * widens to `.>`.
+ *
+ * Order: preserved (non-offer) rows first in their original order, then the
+ * regenerated capability-dispatch rows (sorted, as `projectFederationConfig`
+ * already emits them). De-duped — a capability row that also appears in the
+ * preserved set (a hand-pin) is not duplicated.
+ *
+ * PURE.
+ */
+export function mergeOfferAcceptSubjects(
+  priorAccept: readonly string[],
+  capabilityDispatchSubjects: readonly string[],
+  principal: string,
+  stack: string,
+): string[] {
+  const ownPrefix = ownDispatchPrefix(principal, stack);
+  // Preserve every prior row that the offer writer does NOT own (the OWN `.>`
+  // subtree, peer `.agent.>` presence rows, any hand-pin) — i.e. anything that
+  // is not one of THIS stack's own-identity `…tasks.*.>` dispatch rows.
+  const preserved = priorAccept.filter((s) => !s.startsWith(ownPrefix));
+
+  const seen = new Set<string>(preserved);
+  const out = [...preserved];
+  for (const subject of capabilityDispatchSubjects) {
+    if (seen.has(subject)) continue;
+    seen.add(subject);
+    out.push(subject);
+  }
+  return out;
+}
+
+/**
  * Compute the per-network federation-config projection from a stack's
  * offerings — the GENERATE half of DD-CO-2. PURE + total.
  *
@@ -864,9 +937,16 @@ export function reconcileLayer(
     policy.offerings = offerings.map((o) => structuredClone(o));
   }
 
-  // Federation projection — overwrite announce_capabilities + accept_subjects on
-  // each DECLARED network. We never create networks here (that's `cortex network
-  // join`); we only project onto networks the stack already declares.
+  // Federation projection — regenerate announce_capabilities + MERGE the
+  // capability-dispatch accept_subjects on each DECLARED network. We never create
+  // networks here (that's `cortex network join`); we only project onto networks
+  // the stack already declares. `announce_capabilities` is authoritative (the
+  // offer writer is the only writer of the per-network announce list, so an
+  // overwrite is correct); `accept_subjects` is SHARED with the presence-wiring
+  // writer (`network join` / reconciler, #1087/#1105), so we MERGE rather than
+  // overwrite — the offer writer owns only its own-identity `…tasks.{cap}.>`
+  // dispatch rows and must preserve the presence path's OWN `.>` ∪ peer `.agent.>`
+  // rows (cortex#1097). See `mergeOfferAcceptSubjects`.
   const federated = isPlainObject(policy.federated) ? structuredClone(policy.federated) : undefined;
   let dangling: string[];
   if (federated !== undefined && Array.isArray(federated.networks)) {
@@ -888,7 +968,17 @@ export function reconcileLayer(
       const proj = byId.get(id);
       if (proj === undefined) continue;
       network.announce_capabilities = [...proj.announce_capabilities];
-      network.accept_subjects = [...proj.accept_subjects];
+      const priorAccept = Array.isArray(network.accept_subjects)
+        ? (network.accept_subjects as unknown[]).filter(
+            (s): s is string => typeof s === "string",
+          )
+        : [];
+      network.accept_subjects = mergeOfferAcceptSubjects(
+        priorAccept,
+        proj.accept_subjects,
+        wirePrincipal,
+        wireStack,
+      );
     }
     federated.networks = networks;
     policy.federated = federated;
