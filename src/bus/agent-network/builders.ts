@@ -104,12 +104,26 @@ function defaultPresenceSovereignty(
   source: AgentPresenceSource,
   classification: Classification = "local",
 ): Envelope["sovereignty"] {
+  // #1110 — a FEDERATED presence copy (G-1114.E) must be cleared to CROSS the
+  // frontier. The pre-#1110 code hardcoded `frontier_ok:false / max_hop:0 /
+  // model_class:"local-only"` regardless of `classification`, so `sovereignty-
+  // gate.ts` (`demandsLocal = model_class==="local-only" || frontier_ok!==true`)
+  // held even a `classification:"federated"` envelope local — a federated-scope/
+  // local-only-sovereignty contradiction, so federated presence NEVER crossed
+  // the leaf. Presence is metadata only (identity + capabilities, never session
+  // interiors — ADR-0005), and CONTEXT.md is explicit that cross-principal
+  // presence metadata IS visible + `federated.` always crosses — so the federated
+  // copy is cleared for the frontier; the LOCAL copy stays principal-private.
+  const federated = classification === "federated";
   return {
     classification,
     data_residency: source.dataResidency ?? "NZ",
-    max_hop: 0,
-    frontier_ok: false,
-    model_class: "local-only",
+    // Single direct hop — matches the direct-peer topology (the metafactory
+    // network's `max_hop: 1`). Deriving max_hop from per-network config is a
+    // follow-up if multi-hop presence federation is ever needed.
+    max_hop: federated ? 1 : 0,
+    frontier_ok: federated,
+    model_class: federated ? "frontier" : "local-only",
   };
 }
 

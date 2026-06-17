@@ -21,6 +21,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { evaluateSovereignty } from "../../sovereignty-gate";
 import {
   validateEnvelope,
   deriveNatsSubject,
@@ -131,6 +132,51 @@ describe("createAgentHeartbeatEvent (presence, not dispatch)", () => {
     expect(env.correlation_id).toBeUndefined();
     expect(validateEnvelope(env).ok).toBe(true);
     AGENT_PRESENCE_PAYLOAD_SCHEMAS[AGENT_HEARTBEAT_TYPE].parse(env.payload);
+  });
+});
+
+describe("#1110 — federated presence sovereignty CROSSES the frontier", () => {
+  test("classification:federated → frontier_ok:true, max_hop:1, model_class:'frontier'", () => {
+    const env = createAgentHeartbeatEvent({
+      source: SOURCE,
+      identity: IDENTITY,
+      scope: SCOPE,
+      sentAt: SENT_AT,
+      classification: "federated",
+    });
+    expect(env.sovereignty).toEqual({
+      classification: "federated",
+      data_residency: "NZ",
+      max_hop: 1,
+      frontier_ok: true,
+      model_class: "frontier",
+    });
+  });
+
+  test("the federated copy PASSES the sovereignty gate (it would never cross before #1110)", () => {
+    const federated = createAgentHeartbeatEvent({
+      source: SOURCE,
+      identity: IDENTITY,
+      scope: SCOPE,
+      sentAt: SENT_AT,
+      classification: "federated",
+    });
+    // The gate (sovereignty-gate.ts) holds an envelope local when
+    // model_class==="local-only" OR frontier_ok!==true. The federated copy clears
+    // both → admitted to cross. agentClass undefined is fine (no local demand).
+    expect(evaluateSovereignty(federated.sovereignty, undefined).decision).toBe("allow");
+  });
+
+  test("the LOCAL copy still demands local — does NOT cross (the contrast / no regression)", () => {
+    const local = createAgentHeartbeatEvent({
+      source: SOURCE,
+      identity: IDENTITY,
+      scope: SCOPE,
+      sentAt: SENT_AT,
+    });
+    expect(local.sovereignty).toMatchObject({ frontier_ok: false, model_class: "local-only", max_hop: 0 });
+    // local-only + no agent class proof → fail closed (held local).
+    expect(evaluateSovereignty(local.sovereignty, undefined).decision).toBe("deny");
   });
 });
 
