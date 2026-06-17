@@ -56,6 +56,7 @@ import {
   applyRevoke,
   buildListRows,
   reconcileLayer,
+  mergeOfferAcceptSubjects,
   resolveTarget,
   dispatchOffer,
 } from "../offer";
@@ -390,6 +391,171 @@ describe("reconcileLayer", () => {
     ]);
     // Defensive: the stack.id principal half must NOT leak onto the wire.
     expect((net[0]?.accept_subjects as string[])[0]).not.toContain("jcfischer");
+  });
+});
+
+// ===========================================================================
+// mergeOfferAcceptSubjects — the pure least-privilege preserve-merge (#1097)
+// ===========================================================================
+
+describe("mergeOfferAcceptSubjects", () => {
+  test("preserves non-offer rows (OWN `.>`, peer `.agent.>`), appends capability rows", () => {
+    const prior = [
+      "federated.andreas.work.>",
+      "federated.jc.sage-host.agent.>",
+    ];
+    const caps = ["federated.andreas.work.tasks.code-review.typescript.>"];
+    expect(mergeOfferAcceptSubjects(prior, caps, "andreas", "work")).toEqual([
+      "federated.andreas.work.>",
+      "federated.jc.sage-host.agent.>",
+      "federated.andreas.work.tasks.code-review.typescript.>",
+    ]);
+  });
+
+  test("regenerates own `…tasks.*.>` rows — a stale capability row is dropped", () => {
+    const prior = [
+      "federated.andreas.work.>",
+      "federated.andreas.work.tasks.old-cap.>", // stale — offer-owned, not in caps
+    ];
+    const caps = ["federated.andreas.work.tasks.new-cap.>"];
+    expect(mergeOfferAcceptSubjects(prior, caps, "andreas", "work")).toEqual([
+      "federated.andreas.work.>",
+      "federated.andreas.work.tasks.new-cap.>",
+    ]);
+  });
+
+  test("does not duplicate a capability row already hand-pinned in prior", () => {
+    const cap = "federated.andreas.work.tasks.code-review.typescript.>";
+    // The hand-pin is an own-`…tasks.` row → the offer writer OWNS it, so it is
+    // dropped from `preserved` and re-added once from caps (no duplicate).
+    expect(mergeOfferAcceptSubjects([cap], [cap], "andreas", "work")).toEqual([cap]);
+  });
+
+  test("empty caps + only presence rows → presence rows survive, no dispatch rows", () => {
+    const prior = ["federated.andreas.work.>", "federated.jc.sage-host.agent.>"];
+    expect(mergeOfferAcceptSubjects(prior, [], "andreas", "work")).toEqual(prior);
+  });
+
+  test("a DIFFERENT principal's `…tasks.` row is NOT offer-owned → preserved", () => {
+    // Defensive: the own-prefix is identity-scoped. A peer's tasks row (should
+    // never appear, but if it does) is not this writer's to regenerate.
+    const prior = ["federated.jc.sage-host.tasks.code-review.>"];
+    const caps = ["federated.andreas.work.tasks.chat.>"];
+    expect(mergeOfferAcceptSubjects(prior, caps, "andreas", "work")).toEqual([
+      "federated.jc.sage-host.tasks.code-review.>",
+      "federated.andreas.work.tasks.chat.>",
+    ]);
+  });
+});
+
+// ===========================================================================
+// reconcileLayer — co-existence with the PRESENCE-wiring accept-list writer
+// (cortex#1097, umbrella #1084 P2.1; least-privilege per #1105)
+//
+// `policy.federated.networks[].accept_subjects` has TWO writers:
+//   - the PRESENCE path (`network join` / reconciler, via `deriveAcceptSubjects`)
+//     writes the OWN `.>` subtree ∪ each roster peer's `.agent.>` presence subtree.
+//   - this offer-mode DISPATCH writer regenerates the capability-dispatch rows
+//     `federated.{me}.{stack}.tasks.{cap}.>` from the offerings.
+// They share ONE array. The offer writer must own ONLY its own-identity
+// `…tasks.*.>` dispatch rows and PRESERVE everything else, or an `offer --apply`
+// silently clobbers the peer presence subtrees and regresses P2/#1105.
+// ===========================================================================
+
+describe("reconcileLayer — preserves presence-wiring accept-subjects (#1097)", () => {
+  const OWN_SUBTREE = "federated.andreas.work.>";
+  const PEER_PRESENCE_JC = "federated.jc.sage-host.agent.>";
+  const PEER_PRESENCE_KZ = "federated.kz.research.agent.>";
+  const CAP_DISPATCH = "federated.andreas.work.tasks.code-review.typescript.>";
+
+  /** A layer whose network already carries the presence-wiring accept-list
+   *  (OWN `.>` ∪ two peer `.agent.>` subtrees), as `network join` would write. */
+  const layerWithPresence = (extraAccept: string[] = []): Rec => ({
+    principal: { id: "andreas" },
+    stack: { id: "andreas/work" },
+    policy: {
+      federated: {
+        networks: [
+          {
+            id: "metafactory-net",
+            leaf_node: "leaf",
+            max_hop: 1,
+            peers: [
+              { principal: "jc", stack: "sage-host" },
+              { principal: "kz", stack: "research" },
+            ],
+            accept_subjects: [OWN_SUBTREE, PEER_PRESENCE_JC, PEER_PRESENCE_KZ, ...extraAccept],
+            announce_capabilities: [],
+          },
+        ],
+        registry: { url: "https://registry.example" },
+      },
+    },
+  });
+
+  test("adding a federated offering PRESERVES the OWN `.>` + peer `.agent.>` presence rows", () => {
+    const { layer } = reconcileLayer(layerWithPresence(), [OFFER_FED_NET]);
+    const net = ((layer.policy as Rec).federated as Rec).networks as Rec[];
+    const accept = net[0]?.accept_subjects as string[];
+    // Presence-wiring rows survive untouched.
+    expect(accept).toContain(OWN_SUBTREE);
+    expect(accept).toContain(PEER_PRESENCE_JC);
+    expect(accept).toContain(PEER_PRESENCE_KZ);
+    // The capability-dispatch row is added alongside them.
+    expect(accept).toContain(CAP_DISPATCH);
+  });
+
+  test("the offer writer never widens to a peer's FULL `.>` subtree (least-privilege #1105)", () => {
+    const { layer } = reconcileLayer(layerWithPresence(), [OFFER_FED_NET]);
+    const net = ((layer.policy as Rec).federated as Rec).networks as Rec[];
+    const accept = net[0]?.accept_subjects as string[];
+    // A peer's full subtree (which would admit peer-DESTINED dispatch) must NOT appear.
+    expect(accept).not.toContain("federated.jc.sage-host.>");
+    expect(accept).not.toContain("federated.kz.research.>");
+  });
+
+  test("revoking the last federated offering drops the stale capability row but KEEPS presence rows", () => {
+    // Seed: presence rows + a stale capability-dispatch row, plus the offering.
+    const seeded = layerWithPresence([CAP_DISPATCH]);
+    (seeded.policy as Rec).offerings = [OFFER_FED_NET];
+    const { layer } = reconcileLayer(seeded, []); // all offerings revoked
+    const net = ((layer.policy as Rec).federated as Rec).networks as Rec[];
+    const accept = net[0]?.accept_subjects as string[];
+    // The offer writer's own stale dispatch row is gone…
+    expect(accept).not.toContain(CAP_DISPATCH);
+    // …but the presence-wiring rows it does NOT own are preserved.
+    expect(accept).toContain(OWN_SUBTREE);
+    expect(accept).toContain(PEER_PRESENCE_JC);
+    expect(accept).toContain(PEER_PRESENCE_KZ);
+  });
+
+  test("regenerating is idempotent — re-running with the same offering does not duplicate rows", () => {
+    const first = reconcileLayer(layerWithPresence(), [OFFER_FED_NET]).layer;
+    const firstNet = ((first.policy as Rec).federated as Rec).networks as Rec[];
+    const second = reconcileLayer(first, [OFFER_FED_NET]).layer;
+    const secondNet = ((second.policy as Rec).federated as Rec).networks as Rec[];
+    expect(secondNet[0]?.accept_subjects).toEqual(firstNet[0]?.accept_subjects);
+    // And exactly one capability-dispatch row.
+    const dispatchRows = (secondNet[0]?.accept_subjects as string[]).filter((s) => s === CAP_DISPATCH);
+    expect(dispatchRows).toHaveLength(1);
+  });
+
+  test("a network with NO prior accept-list (greenfield) still gets the capability dispatch row", () => {
+    // Regression guard: the preserve-merge must not break the empty-prior case
+    // (the existing `reconcileLayer` happy path).
+    const greenfield: Rec = {
+      principal: { id: "andreas" },
+      stack: { id: "andreas/work" },
+      policy: {
+        federated: {
+          networks: [{ id: "metafactory-net", leaf_node: "leaf", max_hop: 1, peers: [] }],
+          registry: { url: "https://registry.example" },
+        },
+      },
+    };
+    const { layer } = reconcileLayer(greenfield, [OFFER_FED_NET]);
+    const net = ((layer.policy as Rec).federated as Rec).networks as Rec[];
+    expect(net[0]?.accept_subjects).toEqual([CAP_DISPATCH]);
   });
 });
 
