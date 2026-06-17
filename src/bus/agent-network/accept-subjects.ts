@@ -109,14 +109,29 @@ export function deriveAcceptSubjects(
   self: AcceptSubjectsSelf,
   peers: readonly FederatedWireIdentity[],
 ): string[] {
+  // OWN subtree is the FULL `federated.{me}.{stack}.>` — I must accept every
+  // inbound federated subject addressed TO me (dispatch is RECEIVER-addressed, so
+  // a peer dispatching to me publishes onto MY subtree).
   const ownSubtree = federatedSubtree(self.principal, self.stack);
 
-  // Insertion-ordered de-dupe: own subtree first, then each peer's subtree.
+  // Insertion-ordered de-dupe: own subtree first, then each peer's PRESENCE subtree.
   const seen = new Set<string>([ownSubtree]);
   const out: string[] = [ownSubtree];
 
   for (const peer of peers) {
-    const subtree = federatedSubtree(peer.principal, peer.stack);
+    // A self-shaped peer (P1 excludes self, but defensive) is fully covered by
+    // the own `.>` subtree above — skip it rather than emit a redundant
+    // `federated.{me}.{stack}.agent.>` row the own subtree already subsumes.
+    if (peer.principal === self.principal && peer.stack === self.stack) continue;
+    // PEER subtree is PRESENCE-ONLY (`…agent.>`), NOT the full `.>` — least
+    // privilege + the design §6 invariant ("only widens PRESENCE acceptance").
+    // The only source-addressed traffic I legitimately receive from a peer is its
+    // presence (`federated.{peer}.{stack}.agent.*`, ADR-0007). A peer's full
+    // subtree ALSO carries dispatch addressed TO that peer (receiver-addressed) —
+    // traffic destined for the peer, not me; I must not ingest it. Federated
+    // DISPATCH admission is a separate accept-list path (offer-mode, #1097), not
+    // this presence-wiring derivation.
+    const subtree = federatedPresenceSubtree(peer.principal, peer.stack);
     if (seen.has(subtree)) continue;
     seen.add(subtree);
     out.push(subtree);
@@ -126,12 +141,22 @@ export function deriveAcceptSubjects(
 }
 
 /**
- * The `federated.{principal}.{stack}.>` subtree wildcard for one wire identity —
- * the single accept-list pattern that admits every federated subject addressed
- * to (dispatch) or sourced from (presence) `{principal}/{stack}`. The terminal
- * `>` matches one-or-more trailing segments (`subjectMatches`, surface-router),
- * covering `…agent.online`, `…tasks.code-review.ts`, and every other action.
+ * The FULL `federated.{principal}.{stack}.>` subtree wildcard — admits every
+ * federated subject addressed to (dispatch) or sourced from (presence)
+ * `{principal}/{stack}`. Used for the OWN subtree only (I accept all traffic
+ * addressed to me). The terminal `>` matches one-or-more trailing segments.
  */
 function federatedSubtree(principal: string, stack: string): string {
   return `federated.${principal}.${stack}.>`;
+}
+
+/**
+ * The PRESENCE-ONLY `federated.{principal}.{stack}.agent.>` subtree — admits a
+ * peer's source-addressed presence stream (`agent.online|heartbeat|offline|
+ * capabilities-changed`) and NOTHING ELSE on the peer's subtree. Used for ROSTER
+ * PEERS, so the auto-wiring widens presence acceptance without admitting
+ * peer-destined dispatch (least privilege; design §6 invariant).
+ */
+function federatedPresenceSubtree(principal: string, stack: string): string {
+  return `federated.${principal}.${stack}.agent.>`;
 }

@@ -1027,7 +1027,7 @@ describe("join", () => {
     // FROM peers). rosterFor() resolves one peer, jc/sage-host.
     expect(net.accept_subjects).toEqual([
       "federated.andreas.meta-factory.>",
-      "federated.jc.sage-host.>",
+      "federated.jc.sage-host.agent.>", // peer = PRESENCE-ONLY (least privilege)
     ]);
     // The wire contract STILL holds: subjects gate by principal/stack segments,
     // never the network id `metafactory` (note `meta-factory` is the stack SLUG,
@@ -1386,8 +1386,8 @@ describe("P2 #1087 accept_subjects derivation", () => {
     expect(res.ok).toBe(true);
     const net = storeRef.networks.find((n) => n.id === "metafactory")!;
     expect(net.accept_subjects).toEqual([
-      "federated.andreas.meta-factory.>", // dispatch addressed TO me
-      "federated.jc.sage-host.>", // jc's presence, SOURCE-addressed
+      "federated.andreas.meta-factory.>", // dispatch addressed TO me (full subtree)
+      "federated.jc.sage-host.agent.>", // jc's presence, SOURCE-addressed (presence-only)
     ]);
   });
 
@@ -1400,7 +1400,7 @@ describe("P2 #1087 accept_subjects derivation", () => {
       res.steps.some(
         (s) =>
           s.includes("federated.andreas.meta-factory.>") &&
-          s.includes("federated.jc.sage-host.>"),
+          s.includes("federated.jc.sage-host.agent.>"),
       ),
     ).toBe(true);
   });
