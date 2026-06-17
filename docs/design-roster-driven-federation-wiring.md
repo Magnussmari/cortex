@@ -168,10 +168,15 @@ the existing path.
   seam — shared *registry*, not shared *package*. (cortex never depends on signal;
   if anything, signal's cortex-registry source depends on the registry cortex
   already calls.)
-- **P2 — accept-list derivation fix.** `network join` (and the reconciler) derive
-  `accept_subjects` from the roster (OWN ∪ peer subtrees), not OWN-only. Smallest
-  correctness fix; makes a *manual* `network join` actually admit peers. **No
-  signal needed.**
+- **P2 — accept-list derivation fix** (OQ2-confirmed mandatory). `network join`
+  (and the reconciler) derive `accept_subjects` = OWN subtree (`federated.{self}.{stack}.>`,
+  for dispatch addressed to me) **∪** `federated.{peer.principal}.{peer.stack}.>` per
+  roster peer (for source-addressed presence FROM peers — the dual-grammar nuance,
+  OQ2). Smallest correctness fix; makes a *manual* `network join` actually admit
+  peers' presence at the cortex gate (`evaluateFederationGate` step 3). **No signal
+  needed.** Sibling-check: the producer `federate` flag (default OFF) must be on for
+  the emit side, and `cortex network status` must show `in>0` end-to-end (transport),
+  not just app-gate admit.
 - **P3 — continuous reconciler + subscription follow.** The refresh loop +
   (re)subscribe; preserve hand-pin guard. **No signal needed** (peers render from
   cortex's own federated presence).
@@ -191,12 +196,29 @@ the existing path.
    per stack, or per-network (federate into `metafactory` but not `community`)?
    Recommendation: per-network (mirrors `policy.federated.networks[]`), default
    off, explicit enable.
-2. **Accept-list semantics vs. peers[].** Confirm whether `accept_subjects` is the
-   sole inbound gate (then P2 is mandatory) or whether a per-peer rule derived
-   from `peers[]` already admits them (then P2 is redundant and the gate just
-   needs to read `peers[]`). The live `in=0` with `peers:[jc]` strongly implies
-   `accept_subjects` is the gate — verify against `evaluateFederationGate` before
-   building.
+2. **[RESOLVED 2026-06-17 — P2 confirmed mandatory.]** Traced `evaluateFederationGate`
+   (`surface-router.ts:818`) + the federated presence subscriber. The gate runs in
+   order: (1) resolve the SOURCE network from `envelope.source`'s principal via
+   `peers[]` (`resolveSourceNetwork`) — jc IS in `peers[]`, so this passes; (2)
+   `deny_subjects`; (3) **`accept_subjects` must contain a pattern matching the
+   SUBJECT** — empty/no-match ⇒ reject; (4) hop budget. The presence subscriber
+   subscribes `federated.*.*.agent.>` where **segment[1] = the SOURCE peer**
+   (ADR-0007 grammar), so jc's presence arrives as `federated.jc.{stack}.agent.*`.
+   That does NOT match andreas's OWN-only `accept_subjects:[federated.andreas.meta-factory.>]`
+   → **the gate rejects it at step 3 even though jc is in `peers[]`.** So
+   `accept_subjects` IS the effective gate; **P2 is mandatory** — `accept_subjects`
+   must include each peer's `federated.{peer.principal}.{peer.stack}.>`.
+   - **Dual-grammar nuance the impl must honor:** dispatch is RECEIVER-addressed
+     (`federated.{me}.{stack}` — accept own subtree), presence is SOURCE-addressed
+     (`federated.{peer}.{stack}` — accept the peer's subtree). A stack's
+     `accept_subjects` therefore legitimately needs BOTH `federated.{self}.*` (for
+     dispatch to me) AND `federated.{peer}.*` per peer (for presence from peers).
+   - **Transport sibling-concern (verify in P2/P3):** `accept_subjects` is the
+     cortex APP gate (post-arrival). The NATS leaf carries subjects by
+     subscription interest (`federated.*.*.agent.>`), not a static import list — so
+     the `in=0` likely ALSO needs the producer `federate` flag ON (default OFF) on
+     BOTH peers + leaf interest propagation. Confirm `in>0` end-to-end, not just
+     that the app gate admits.
 3. **Reconcile trigger.** Baseline must be cortex-owned (signal-optional §4): a
    self-poll of the registry roster on an interval (and/or a registry change-feed).
    *Optimization when signal is present:* piggyback the reconcile on signal's
