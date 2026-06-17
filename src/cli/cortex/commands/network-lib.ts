@@ -34,7 +34,7 @@ import type {
 } from "../../../common/types/cortex-config";
 import type { NetworkRosterResult } from "../../../common/registry/types";
 import type { OperatorModeLeafPackage } from "../../../common/nats/leaf-remote-renderer";
-import { base64PubkeyToNkey } from "../../../common/registry/encoding";
+import { buildRosterPeers } from "../../../bus/agent-network/roster-read";
 
 import {
   brandVerified,
@@ -568,27 +568,25 @@ export async function joinNetwork(
  * `stack_id`; `principal_pubkey` is filled from the roster (re-encoded to
  * nkey-U, DD-8) when the roster carries a re-encodable key — otherwise it is
  * LEFT OFF so the S2 config-load resolver resolves it (DD-5: declare by id).
+ *
+ * P1 (cortex#1086) — the roster-members → peers projection now lives in the
+ * runtime-callable `buildRosterPeers` (`src/bus/agent-network/roster-read.ts`)
+ * so the federation reconciler (P3) shares the exact same read. This is the
+ * thin config-shape adapter: `RosterPeer` → `PolicyFederatedPeer`
+ * (dropping the wire-segment view the config doesn't carry). Behavior-
+ * preserving — `buildRosterPeers` lifted this loop verbatim.
  */
 function buildPeers(
   localPrincipalId: string,
   roster: NetworkRosterResult,
 ): PolicyFederatedPeer[] {
-  const peers: PolicyFederatedPeer[] = [];
-  for (const member of roster.members) {
-    if (member.principal_id === localPrincipalId) continue; // never self
-    const stackId =
-      member.stack_id ?? `${member.principal_id}/default`;
-    const nkey = base64PubkeyToNkey(member.principal_pubkey);
-    const peer: PolicyFederatedPeer = nkey === undefined
-      ? { principal_id: member.principal_id, stack_id: stackId }
-      : {
-          principal_id: member.principal_id,
-          stack_id: stackId,
-          principal_pubkey: nkey,
-        };
-    peers.push(peer);
-  }
-  return peers;
+  return buildRosterPeers(localPrincipalId, roster).map((p) => ({
+    principal_id: p.principal_id,
+    stack_id: p.stack_id,
+    ...(p.principal_pubkey !== undefined && {
+      principal_pubkey: p.principal_pubkey,
+    }),
+  }));
 }
 
 /**
