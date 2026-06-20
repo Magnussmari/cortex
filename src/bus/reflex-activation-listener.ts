@@ -94,6 +94,19 @@ export interface ReflexDedup {
 }
 
 /**
+ * A code handler that fulfils a `handler`-flagged target IN-PROCESS — no bus
+ * re-emit, no Claude session. The bridge is the single gated entry point (it
+ * durably consumes reflex `fired` events, which reflex policy-gated), so a code
+ * handler runs without a second bus hop or an ungated subscriber. Throw to
+ * signal a TRANSIENT failure (the bridge leaves the Decision id un-marked so
+ * reflex can re-fire); return for a handled outcome (success, or a
+ * deterministic skip that re-firing won't fix).
+ */
+export type ReflexActivationHandler = (
+  activation: FiredActivation,
+) => Promise<void>;
+
+/**
  * In-memory dedup default for v1. Sufficient within a single process
  * lifetime: JetStream's durable ack floor handles cross-restart redelivery
  * (DeliverPolicy.New means no historical replay), and a redelivery within
@@ -216,7 +229,13 @@ function renderPrompt(prompt: string, payload: Record<string, unknown>): string 
 
 export interface BuildReflexDispatchOpts {
   activation: FiredActivation;
-  target: ReflexTarget;
+  /**
+   * A CC-path target — `prompt` is required here. Code-handler targets never
+   * reach this builder (the bridge invokes their handler directly), so the
+   * type narrows to a prompt target rather than carrying an unreachable
+   * handler shape.
+   */
+  target: ReflexTarget & { prompt: string };
   /** Cortex principal the dispatch lands under (where the executor listens). */
   reEmitPrincipal: string;
   /** Cortex stack, when stack-aware subjects are wired. */
@@ -226,11 +245,11 @@ export interface BuildReflexDispatchOpts {
 }
 
 /**
- * Pure builder for the re-emitted dispatch. Produces the executor's
- * `DispatchTaskReceivedPayload` contract (`task_id` UUID, `agent_id`,
- * non-empty `prompt`), `distribution_mode: "direct"`, `target_assistant`
- * DID, and the canonical `tasks.@{did}.{capability}` subject. Classification
- * and correlation_id are preserved from the fired event; provenance (reflex
+ * Pure builder for the re-emitted CC dispatch. Produces the executor's
+ * `DispatchTaskReceivedPayload` contract (`task_id` UUID, `agent_id`, non-empty
+ * `prompt`), `distribution_mode: "direct"`, `target_assistant` DID, and the
+ * canonical `tasks.@{did}.{capability}` subject. Classification and
+ * correlation_id are preserved from the fired event; provenance (reflex
  * Decision id + original target) rides in `extensions` for traceability.
  */
 export function buildReflexDispatch(opts: BuildReflexDispatchOpts): {
@@ -248,6 +267,7 @@ export function buildReflexDispatch(opts: BuildReflexDispatchOpts): {
   const subject = `${wildcard.slice(0, -2)}.${opts.target.capability}`;
 
   const taskId = crypto.randomUUID();
+  const prompt = renderPrompt(opts.target.prompt, opts.activation.payload);
   const base = buildBaseEnvelope({
     // Envelope `type` forbids `@`; the @{did} form lives only in the
     // subject. `tasks.{capability}` is the bare type.
@@ -266,7 +286,7 @@ export function buildReflexDispatch(opts: BuildReflexDispatchOpts): {
     payload: {
       task_id: taskId,
       agent_id: opts.target.assistant,
-      prompt: renderPrompt(opts.target.prompt, opts.activation.payload),
+      prompt,
       // Provenance also echoed in the payload so executor-side worklogs
       // can surface the originating reflex Decision without parsing
       // extensions.
@@ -310,6 +330,13 @@ export interface ReflexActivationListenerOpts {
   reflexStack: string;
   /** Target→capability resolver (config-backed). */
   resolveTarget: (target: string) => ReflexTarget | undefined;
+  /**
+   * Code handlers by name, for `handler`-flagged targets (e.g.
+   * `discord-webhook` → the notify.discord poster). A target whose `handler`
+   * has no registered entry yields a typed failure. Default: none (all targets
+   * must be CC-prompt targets).
+   */
+  handlers?: Record<string, ReflexActivationHandler>;
   /** Decision-id dedup surface. */
   dedup: ReflexDedup;
   /** Originator DID stamped on re-emitted dispatches. Default `did:mf:reflex`. */
@@ -336,6 +363,7 @@ export class ReflexActivationListener {
   private readonly reflexPrincipal: string;
   private readonly reflexStack: string;
   private readonly resolveTarget: (target: string) => ReflexTarget | undefined;
+  private readonly handlers: Record<string, ReflexActivationHandler>;
   private readonly dedup: ReflexDedup;
   private readonly systemDid: string;
   private readonly stream: string;
@@ -353,6 +381,7 @@ export class ReflexActivationListener {
     this.reflexPrincipal = opts.reflexPrincipal;
     this.reflexStack = opts.reflexStack;
     this.resolveTarget = opts.resolveTarget;
+    this.handlers = opts.handlers ?? {};
     this.dedup = opts.dedup;
     this.systemDid = opts.systemDid ?? DEFAULT_SYSTEM_DID;
     this.stream = opts.stream ?? REFLEX_STREAM_NAME;
@@ -407,11 +436,24 @@ export class ReflexActivationListener {
       return { kind: "ack" };
     }
 
+    // Code-handler target → its own arm; CC-prompt target falls through.
+    if (target.handler !== undefined) {
+      return this.handleHandlerTarget(envelope, act, target);
+    }
+
+    // CC path: a non-handler target must carry a prompt (schema enforces the
+    // prompt-XOR-handler invariant; this guard also narrows the type).
+    if (target.prompt === undefined) {
+      await this.emitFailed(envelope, act, "target-missing-prompt-and-handler");
+      return { kind: "ack" };
+    }
+    const ccTarget = { ...target, prompt: target.prompt };
+
     let built: { envelope: Envelope; subject: string };
     try {
       built = buildReflexDispatch({
         activation: act,
-        target,
+        target: ccTarget,
         reEmitPrincipal: this.reEmitPrincipal,
         ...(this.reEmitStack !== undefined && { reEmitStack: this.reEmitStack }),
         source: this.source,
@@ -440,6 +482,35 @@ export class ReflexActivationListener {
     return { kind: "ack" };
   }
 
+  /**
+   * Fulfil a `handler`-flagged target by invoking the registered code handler
+   * IN-PROCESS — no bus re-emit (no second hop, no ungated subscriber; the
+   * bridge is the gated entry). A throw from the handler = transient → ack but
+   * DON'T mark the Decision id, so a later reflex re-fire of the same Decision
+   * is not deduped away.
+   */
+  private async handleHandlerTarget(
+    fired: Envelope,
+    act: FiredActivation,
+    target: ReflexTarget,
+  ): Promise<AckDecision> {
+    const handlerName = target.handler;
+    const handler = handlerName !== undefined ? this.handlers[handlerName] : undefined;
+    if (handler === undefined) {
+      await this.emitFailed(fired, act, `unknown_handler:${handlerName ?? ""}`);
+      return { kind: "ack" };
+    }
+    try {
+      await handler(act);
+    } catch (err) {
+      await this.emitFailed(fired, act, `handler:${errMsg(err)}`);
+      return { kind: "ack" };
+    }
+    await this.dedup.mark(act.decisionId);
+    await this.emitHandlerDispatched(act, target);
+    return { kind: "ack" };
+  }
+
   private async emitDispatched(
     act: FiredActivation,
     target: ReflexTarget,
@@ -450,9 +521,26 @@ export class ReflexActivationListener {
       decisionId: act.decisionId,
       target: act.target,
       capability: target.capability,
+      via: "dispatch",
       targetAssistant: built.envelope.target_assistant ?? `did:mf:${target.assistant}`,
       dispatchSubject: built.subject,
       dispatchEnvelopeId: built.envelope.id,
+      ...(act.correlationId !== undefined && { correlationId: act.correlationId }),
+      classification: act.classification,
+    });
+    await this.runtime.publish(event);
+  }
+
+  private async emitHandlerDispatched(
+    act: FiredActivation,
+    target: ReflexTarget,
+  ): Promise<void> {
+    const event = createSystemBusReflexActivationDispatchedEvent({
+      source: this.source,
+      decisionId: act.decisionId,
+      target: act.target,
+      capability: target.capability,
+      via: "handler",
       ...(act.correlationId !== undefined && { correlationId: act.correlationId }),
       classification: act.classification,
     });

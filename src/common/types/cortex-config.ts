@@ -2540,22 +2540,44 @@ export type Policy = z.infer<typeof PolicySchema>;
  * `<untrusted-content>` fence — it is NEVER interpolated into the prompt text,
  * so a malicious payload cannot become executable prompt instructions.
  */
-export const ReflexTargetSchema = z.object({
-  /** Reflex target ref, e.g. `@jc/notify-discord`. */
-  target: z.string().min(1),
-  /** Cortex capability the bridge re-emits on, e.g. `notify.discord`. */
-  capability: z.string().min(1),
-  /** Assistant (agent name) the dispatch is addressed to, e.g. `luna`. */
-  assistant: z.string().min(1),
-  /**
-   * Trusted task the capability runs — the sole instruction channel. The
-   * (untrusted, webhook-controlled) activation payload is appended by the
-   * bridge inside a quarantined `<untrusted-content>` fence, NEVER
-   * interpolated into this text, so a malicious payload cannot become
-   * executable prompt instructions.
-   */
-  prompt: z.string().min(1),
-});
+export const ReflexTargetSchema = z
+  .object({
+    /** Reflex target ref, e.g. `@jc/notify-discord`. */
+    target: z.string().min(1),
+    /** Cortex capability the bridge re-emits on, e.g. `notify.discord`. */
+    capability: z.string().min(1),
+    /** Assistant (agent name) the dispatch is addressed to, e.g. `luna`. */
+    assistant: z.string().min(1),
+    /**
+     * CC-path: trusted task the capability runs — the sole instruction
+     * channel. The (untrusted, webhook-controlled) activation payload is
+     * appended by the bridge inside a quarantined `<untrusted-content>`
+     * fence, NEVER interpolated into this text, so a malicious payload cannot
+     * become executable prompt instructions. Mutually exclusive with
+     * `handler` — a target is EITHER a CC-prompt dispatch OR a code handler.
+     */
+    prompt: z.string().min(1).optional(),
+    /**
+     * Code-path: the capability is fulfilled by an in-process code handler
+     * (no Claude session, no prompt). `discord-webhook` → the F-6 bridge
+     * invokes the notify.discord handler DIRECTLY with the activation payload
+     * (it posts to a per-repo Discord webhook — see the top-level
+     * `notify.discord` block); there is no bus re-emit and no `tasks.*`
+     * dispatch for a handler target. Mutually exclusive with `prompt`.
+     */
+    handler: z.enum(["discord-webhook"]).optional(),
+  })
+  .superRefine((t, ctx) => {
+    // Exactly one fulfilment channel: a CC prompt, or a code handler.
+    if ((t.prompt === undefined) === (t.handler === undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "reflex target must set exactly one of `prompt` (CC dispatch) or `handler` (code responder)",
+        path: ["prompt"],
+      });
+    }
+  });
 
 /**
  * F-6 — Reflex activation bridge block. Optional; when `targets` is empty the
@@ -2579,6 +2601,40 @@ export const ReflexActivationConfigSchema = z.object({
 
 export type ReflexTarget = z.infer<typeof ReflexTargetSchema>;
 export type ReflexActivationConfig = z.infer<typeof ReflexActivationConfigSchema>;
+
+/**
+ * One repo → Discord-webhook mapping for the `notify.discord` code capability.
+ * The webhook URL embeds the channel + token (`https://discord.com/api/
+ * webhooks/{id}/{token}`) — per-repo routing, no bot token. Treat the URL as
+ * a secret (it grants post access to that channel).
+ */
+export const DiscordNotifyTargetSchema = z.object({
+  /** GitHub repo full name, e.g. `owner/repo` (matched against the activation payload). */
+  repo: z.string().min(1),
+  /**
+   * Env/secret BINDING NAME holding the Discord webhook URL — never the URL
+   * itself. The webhook URL embeds a bearer token (it grants post access to the
+   * channel), so it must not live in cortex.yaml; it is resolved from the named
+   * env var at boot (symmetric with reflex's `secret_env` for
+   * `GITHUB_WEBHOOK_SECRET`). The resolved value is host-validated against the
+   * Discord webhook shape before any POST (SSRF guard).
+   */
+  webhook_url_env: z.string().min(1),
+});
+
+/**
+ * Top-level `notify:` block — outbound notification routing for code-only
+ * capabilities (no Claude session). v1: `discord` repo→webhook map read by the
+ * notify.discord code handler, which the F-6 reflex bridge invokes DIRECTLY
+ * in-process for a `handler: discord-webhook` target (no bus re-emit).
+ * Optional; empty `discord` → no handler registered.
+ */
+export const NotifyConfigSchema = z.object({
+  discord: z.array(DiscordNotifyTargetSchema).default([]),
+});
+
+export type DiscordNotifyTarget = z.infer<typeof DiscordNotifyTargetSchema>;
+export type NotifyConfig = z.infer<typeof NotifyConfigSchema>;
 
 /**
  * The cortex deployment configuration. One file per principal
@@ -2789,6 +2845,9 @@ export const CortexConfigSchema = z.object({
 
   /** F-6 — reflex activation bridge. Optional; empty `targets` → not mounted. */
   reflex_activation: emptyDefault(ReflexActivationConfigSchema),
+
+  /** Outbound notification routing for code-only capabilities (notify.discord). */
+  notify: emptyDefault(NotifyConfigSchema),
 }).refine(
   (config) => {
     const ids = config.agents.map((a) => a.id);

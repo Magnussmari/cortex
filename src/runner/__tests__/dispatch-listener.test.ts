@@ -3688,3 +3688,4 @@ describe("createDispatchListener — S2 per-agent subject isolation (cortex#1160
     await listener.stop();
   });
 });
+
