@@ -2532,6 +2532,55 @@ export type Policy = z.infer<typeof PolicySchema>;
 // =============================================================================
 
 /**
+ * F-6 — Reflex activation bridge config. A single target→capability mapping:
+ * the reflex `target` (opaque Execution Blueprint ref) resolves to the cortex
+ * `capability` + `assistant` a re-emitted dispatch is addressed to, and the
+ * trusted `prompt` that capability runs. The (untrusted, webhook-controlled)
+ * activation payload is appended by the bridge inside a quarantined
+ * `<untrusted-content>` fence — it is NEVER interpolated into the prompt text,
+ * so a malicious payload cannot become executable prompt instructions.
+ */
+export const ReflexTargetSchema = z.object({
+  /** Reflex target ref, e.g. `@jc/notify-discord`. */
+  target: z.string().min(1),
+  /** Cortex capability the bridge re-emits on, e.g. `notify.discord`. */
+  capability: z.string().min(1),
+  /** Assistant (agent name) the dispatch is addressed to, e.g. `luna`. */
+  assistant: z.string().min(1),
+  /**
+   * Trusted task the capability runs — the sole instruction channel. The
+   * (untrusted, webhook-controlled) activation payload is appended by the
+   * bridge inside a quarantined `<untrusted-content>` fence, NEVER
+   * interpolated into this text, so a malicious payload cannot become
+   * executable prompt instructions.
+   */
+  prompt: z.string().min(1),
+});
+
+/**
+ * F-6 — Reflex activation bridge block. Optional; when `targets` is empty the
+ * `ReflexActivationListener` is not mounted (zero behaviour change).
+ *
+ * The bridge is **same-principal only (v1)**: it consumes the cortex
+ * principal's own `local.{principal}.{stack}.reflex.activation.fired` and
+ * re-emits under that same principal. There is deliberately NO `principal`
+ * override — bridging another principal's `local.` subject onto this stack's
+ * `local.` dispatch would violate the principal boundary (CONTEXT.md §Network:
+ * `local.` never crosses principals; cross-principal reach is the `federated.`
+ * scope, a separate path). Only the reflex `stack` (a within-principal subject
+ * segment) is configurable.
+ */
+export const ReflexActivationConfigSchema = z.object({
+  /** Reflex source stack (second subject segment). Defaults to `default`. */
+  stack: z.string().min(1).default("default"),
+  /** Target→capability mappings. Empty → bridge not mounted. */
+  targets: z.array(ReflexTargetSchema).default([]),
+});
+
+export type ReflexTarget = z.infer<typeof ReflexTargetSchema>;
+export type ReflexActivationConfig = z.infer<typeof ReflexActivationConfigSchema>;
+
+/**
  * The cortex deployment configuration. One file per principal
  * (`~/.config/cortex/cortex.yaml`). Loaded at startup; hot-reloaded by
  * `config-watcher.ts` for fields that don't require a restart.
@@ -2737,6 +2786,9 @@ export const CortexConfigSchema = z.object({
 
   /** Application-level bus provisioning knobs. Optional; defaults are production-safe. */
   bus: emptyDefault(BusConfigSchema),
+
+  /** F-6 — reflex activation bridge. Optional; empty `targets` → not mounted. */
+  reflex_activation: emptyDefault(ReflexActivationConfigSchema),
 }).refine(
   (config) => {
     const ids = config.agents.map((a) => a.id);
