@@ -25,6 +25,8 @@ import {
   ClaudeConfigSchema,
   CortexConfigSchema,
   DashboardRendererSchema,
+  DiscordNotifyTargetSchema,
+  ReflexTargetSchema,
   ExecutionConfigSchema,
   GithubConfigSchema,
   NatsConfigSchema,
@@ -1870,5 +1872,42 @@ describe("round-2: exec-brain capability wildcard rejection", () => {
     expect(
       AgentRuntimeSchema.safeParse({ mode: "in-process", capabilities: ["WEIRD CAPS"] }).success,
     ).toBe(true); // builtin: legacy looseness preserved
+  });
+});
+
+describe("DiscordNotifyTargetSchema (F-6 notify.discord)", () => {
+  test("accepts repo + webhook_url_env (secret reference, not the URL)", () => {
+    expect(
+      DiscordNotifyTargetSchema.safeParse({
+        repo: "jc/reflex",
+        webhook_url_env: "DISCORD_WEBHOOK_REFLEX",
+      }).success,
+    ).toBe(true);
+  });
+  test("rejects a raw webhook_url (must be an env binding, not the secret)", () => {
+    expect(
+      DiscordNotifyTargetSchema.safeParse({
+        repo: "jc/reflex",
+        webhook_url: "https://discord.com/api/webhooks/123/abc",
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("ReflexTargetSchema (F-6 prompt XOR handler)", () => {
+  const base = { target: "@jc/notify-discord", capability: "notify.discord", assistant: "luna" };
+  test("accepts a prompt-only (CC) target", () => {
+    expect(ReflexTargetSchema.safeParse({ ...base, prompt: "do it" }).success).toBe(true);
+  });
+  test("accepts a handler-only (code) target", () => {
+    expect(ReflexTargetSchema.safeParse({ ...base, handler: "discord-webhook" }).success).toBe(true);
+  });
+  test("rejects neither prompt nor handler", () => {
+    expect(ReflexTargetSchema.safeParse(base).success).toBe(false);
+  });
+  test("rejects both prompt and handler", () => {
+    expect(
+      ReflexTargetSchema.safeParse({ ...base, prompt: "x", handler: "discord-webhook" }).success,
+    ).toBe(false);
   });
 });

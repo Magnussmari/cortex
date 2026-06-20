@@ -219,11 +219,19 @@ describe("reflexActivationFilterSubject", () => {
 // 2. buildReflexDispatch
 // =============================================================================
 
+// A CC-path target (prompt required) for the dispatch builder.
+const CC_TARGET = {
+  target: "@jc/notify-discord",
+  capability: "notify.discord",
+  assistant: "luna",
+  prompt: "Post this GitHub issue to Discord.",
+};
+
 describe("buildReflexDispatch", () => {
   test("produces canonical subject + executor payload contract + provenance", () => {
     const { envelope, subject } = buildReflexDispatch({
       activation: activationFixture(),
-      target: TARGETS[0]!,
+      target: CC_TARGET,
       reEmitPrincipal: "metafactory",
       reEmitStack: "default",
       source: SOURCE,
@@ -259,7 +267,7 @@ describe("buildReflexDispatch", () => {
   test("preserves federated classification onto the dispatch", () => {
     const { envelope } = buildReflexDispatch({
       activation: activationFixture({ classification: "federated" }),
-      target: TARGETS[0]!,
+      target: CC_TARGET,
       reEmitPrincipal: "metafactory",
       source: SOURCE,
       systemDid: "did:mf:reflex",
@@ -296,6 +304,7 @@ describe("buildReflexDispatch", () => {
     // the structural fence) — the attacker contributed none.
     expect((prompt.match(/<\/untrusted-content>/g) ?? []).length).toBe(2);
   });
+
 });
 
 // =============================================================================
@@ -400,6 +409,95 @@ describe("ReflexActivationListener.handleFired", () => {
     expect(fail).toBeDefined();
     expect((fail!.payload).reason as string).toContain(
       "publish:",
+    );
+  });
+
+  function handlerListener(
+    ctrl: FakeRuntimeControls,
+    handler: (a: FiredActivation) => Promise<void>,
+  ) {
+    const dedup = inMemoryReflexDedup();
+    const listener = new ReflexActivationListener({
+      runtime: ctrl.runtime,
+      source: SOURCE,
+      reEmitPrincipal: "metafactory",
+      reEmitStack: "default",
+      reflexPrincipal: "jc",
+      reflexStack: "default",
+      resolveTarget: () => ({
+        target: "@jc/notify-discord",
+        capability: "notify.discord",
+        assistant: "reflex",
+        handler: "discord-webhook",
+      }),
+      handlers: { "discord-webhook": handler },
+      dedup,
+    });
+    return { listener, dedup };
+  }
+
+  test("handler target: invokes handler in-process, marks dedup, via=handler, no bus re-emit", async () => {
+    const ctrl = fakeRuntime();
+    const calls: FiredActivation[] = [];
+    const { listener, dedup } = handlerListener(ctrl, async (a) => {
+      calls.push(a);
+    });
+
+    const decision = await listener.handleFired(firedEnvelope({}), "subj");
+
+    expect(decision).toEqual({ kind: "ack" });
+    expect(calls).toHaveLength(1);
+    expect(ctrl.onSubject).toHaveLength(0); // no bus re-emit
+    expect(await dedup.seen("decision-123")).toBe(true);
+    const vis = ctrl.published.find(
+      (e) => e.type === "system.bus.reflex_activation_dispatched",
+    );
+    expect((vis!.payload).via).toBe("handler");
+  });
+
+  test("handler throws → _failed + ack, dedup NOT marked (re-fireable)", async () => {
+    const ctrl = fakeRuntime();
+    const { listener, dedup } = handlerListener(ctrl, async () => {
+      throw new Error("boom");
+    });
+
+    const decision = await listener.handleFired(firedEnvelope({}), "subj");
+
+    expect(decision).toEqual({ kind: "ack" });
+    expect(await dedup.seen("decision-123")).toBe(false);
+    const fail = ctrl.published.find(
+      (e) => e.type === "system.bus.reflex_activation_failed",
+    );
+    expect((fail!.payload).reason as string).toContain("handler:");
+  });
+
+  test("handler target with no registered handler → _failed + ack", async () => {
+    const ctrl = fakeRuntime();
+    const dedup = inMemoryReflexDedup();
+    const listener = new ReflexActivationListener({
+      runtime: ctrl.runtime,
+      source: SOURCE,
+      reEmitPrincipal: "metafactory",
+      reflexPrincipal: "jc",
+      reflexStack: "default",
+      resolveTarget: () => ({
+        target: "@jc/notify-discord",
+        capability: "notify.discord",
+        assistant: "reflex",
+        handler: "discord-webhook",
+      }),
+      handlers: {},
+      dedup,
+    });
+
+    const decision = await listener.handleFired(firedEnvelope({}), "subj");
+    expect(decision).toEqual({ kind: "ack" });
+    expect(ctrl.onSubject).toHaveLength(0);
+    const fail = ctrl.published.find(
+      (e) => e.type === "system.bus.reflex_activation_failed",
+    );
+    expect((fail!.payload).reason as string).toContain(
+      "unknown_handler",
     );
   });
 });
