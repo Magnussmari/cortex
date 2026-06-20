@@ -138,9 +138,11 @@ import type {
   DiscordPresence,
   MattermostPresence,
   Policy,
+  ReflexActivationConfig,
   SlackPresence,
   StackConfig,
 } from "./common/types/cortex-config";
+import { ReflexActivationListener, inMemoryReflexDedup } from "./bus/reflex-activation-listener";
 import { policyEngineFromConfig } from "./common/policy/factory";
 import {
   buildPlatformPrincipalIndex,
@@ -553,6 +555,15 @@ export interface StartCortexOptions {
    * @internal — not part of the public API; semver does not apply.
    */
   bus?: BusConfig;
+  /**
+   * F-6 — reflex activation bridge block from `LoadedConfig.reflexActivation`.
+   * The boot path mounts `ReflexActivationListener` only when `targets` is
+   * non-empty; absent/empty → no listener, zero behaviour change. Undefined
+   * for legacy `bot.yaml` input.
+   *
+   * @internal — not part of the public API; semver does not apply.
+   */
+  reflexActivation?: ReflexActivationConfig;
   /**
    * IAW GW (cortex#524) — validated surface binding map from
    * `LoadedConfig.surfaces`. Consumed ONLY by the flag-gated
@@ -4268,6 +4279,34 @@ export async function startCortex(
     await listener.start();
   }
 
+  // F-6 — reflex activation bridge. Config-gated: mounted only when the
+  // principal declared `reflex_activation.targets`. Binds a durable consumer
+  // on the reflex-owned REFLEX stream and re-emits fired activations as
+  // `tasks.*` dispatches the executor above already runs. Dormant (and not
+  // constructed) otherwise → zero behaviour change on default deployments.
+  let reflexActivationListener: ReflexActivationListener | undefined;
+  const reflexTargets = options.reflexActivation?.targets ?? [];
+  if (reflexTargets.length > 0) {
+    reflexActivationListener = new ReflexActivationListener({
+      runtime,
+      source: systemEventSource,
+      reEmitPrincipal: principalId,
+      reEmitStack: derivedStack.stack,
+      // Same-principal only (v1): consume + re-emit under THIS principal.
+      // Bridging another principal's `local.` subject would breach the
+      // principal boundary (CONTEXT.md §Network) — that's a federated path,
+      // out of scope here. Only the reflex stack segment is configurable.
+      reflexPrincipal: principalId,
+      reflexStack: options.reflexActivation?.stack ?? "default",
+      resolveTarget: (target) => reflexTargets.find((t) => t.target === target),
+      dedup: inMemoryReflexDedup(),
+    });
+    await reflexActivationListener.start();
+    console.log(
+      `cortex: reflex-activation-listener mounted — ${reflexTargets.length} target(s)`,
+    );
+  }
+
   // signal#113 P-11 (#56) — federated echo responder. The ICMP-analog of the
   // agent network: answers a reserved `probe.echo` capability IN THE RUNTIME
   // (no harness, no `claude`, no Discord, no tools) on our own
@@ -5916,6 +5955,17 @@ export async function startCortex(
           );
         }
       }
+      // F-6 — drain the reflex activation bridge BEFORE the executors it feeds.
+      // Stopping the bridge first guarantees it can't consume + re-emit a
+      // `tasks.*` dispatch after the dispatch listeners have drained (which
+      // would leave the activation unhandled mid-shutdown). Only present when
+      // config-gated on; `stop()` is idempotent.
+      if (reflexActivationListener !== undefined) {
+        await completeAsync(
+          "reflex-activation-listener stop",
+          reflexActivationListener.stop(),
+        );
+      }
       // S2 (cortex#1160) — drain every per-agent chat dispatch listener.
       for (let i = 0; i < dispatchListeners.length; i++) {
         const listener = dispatchListeners[i];
@@ -6386,7 +6436,7 @@ if (import.meta.main) {
       // exits the process non-zero instead of being swallowed as a "non-fatal"
       // unhandled rejection. The daemon must not survive a failed security gate.
       const handle = await bootOrDie(async () => {
-        const { config, inlineAgents, stack, policy, principal, bus, surfaces } =
+        const { config, inlineAgents, stack, policy, principal, bus, surfaces, reflexActivation } =
           loadConfigWithAgents(options.config);
         return startCortex(config, {
           configPath: options.config,
@@ -6397,6 +6447,8 @@ if (import.meta.main) {
           // the canonical `.principal` field.
           ...(principal !== undefined && { principal }),
           ...(bus !== undefined && { bus }),
+          // F-6 — thread the reflex activation bridge block through.
+          ...(reflexActivation !== undefined && { reflexActivation }),
           // IAW GW (cortex#524) — thread the validated surface binding map
           // through so the flag-gated gateway block in startCortex can read it.
           // Dormant unless CORTEX_GATEWAY is set; undefined when no surfaces:
