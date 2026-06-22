@@ -4,6 +4,34 @@
 
 ### Non-breaking
 
+- **F-6 reflex bridge — review-consumer dispatch (`review: true`)**. A new
+  fulfilment channel on `reflex_activation.targets[]`, alongside `prompt` (CC
+  agent-session) and `handler` (code responder). With `review: true` +
+  `capability: code-review.<flavor>`, the bridge no longer addresses an agent
+  session on `tasks.@{did}.{capability}`; it emits a **`tasks.code-review.<flavor>`
+  REVIEW REQUEST** (`{repo, pr, post:true, forge:"github"}`, adapted from the
+  GitHub PR event in the activation payload) on `local.{p}.{s}.tasks.code-review.
+  <flavor>` — the capability subject cortex's `engine: sage` ReviewConsumer binds
+  (verified producer-side here; the consumer claim path is covered by the existing
+  ReviewConsumer suite). This closes the gap where a review target's `@{did}`
+  subject previously fell onto the claude-session dispatch-listener instead of the
+  review consumer. Mirrors how the public-surface `translatePrOpenedToOffer`
+  builds a `tasks.code-review.<flavor>` request from a PR event — but on the
+  LOCAL bus and without that path's public-Offer admission / surface-predicate
+  gating (this is a trusted internal reflex activation, not a public Offer).
+  `skip_authors` runs first: a trusted author — identified by GitHub login
+  (`pull_request.user.login` → `issue.user.login` → `sender.login`) — is
+  skipped before any review publish. The gate fails OPEN by design: a payload
+  with no extractable author is reviewed, not silently skipped (for reflex's
+  GitHub-PR webhooks the login is always present). Schema enforces exactly one of
+  prompt|handler|review and a flavored `code-review.*` capability for review
+  targets. Pure helpers `reviewFlavorOf` / `extractReviewRequest` +
+  `buildReflexReviewDispatch` are exported and unit-tested. Ordering: a trusted
+  `skip_authors` author is skipped first (regardless of payload); otherwise a
+  non-reviewable payload (no repo / non-positive PR number) is an honest
+  `_failed` (re-firing won't fix), and a publish error stays re-fireable. Drives
+  reflex `@jc/sage-pr-review` (the-metafactory/reflex#28).
+
 - **F-6 reflex bridge — configurable author trust gate (`skip_authors`)**.
   `reflex_activation.targets[].skip_authors` (optional `string[]`) lets a
   target deterministically DROP a fired activation when its GitHub author is
