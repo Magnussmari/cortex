@@ -2566,6 +2566,14 @@ export const ReflexTargetSchema = z
      * dispatch for a handler target. Mutually exclusive with `prompt`.
      */
     handler: z.enum(["discord-webhook"]).optional(),
+    /**
+     * Configurable author trust gate: GitHub author logins the F-6 bridge
+     * drops (deterministically, before any dispatch) instead of reviewing.
+     * Empty / absent = no gate. Rationale, author-resolution order, and the
+     * `@jc/sage-pr-review` use case live in CHANGELOG (Unreleased) + the
+     * `matchSkippedAuthor` helper — not duplicated here.
+     */
+    skip_authors: z.array(z.string().min(1)).optional(),
   })
   .superRefine((t, ctx) => {
     // Exactly one fulfilment channel: a CC prompt, or a code handler.
