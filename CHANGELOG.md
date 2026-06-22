@@ -4,6 +4,28 @@
 
 ### Non-breaking
 
+- **Review consumers no longer fan out + double-post (cortex#1186).** Each
+  per-agent review durable (local + federated-offer + federated-direct) is now
+  provisioned with a `filterSubject` matching the subject pattern its consumer
+  binds — previously omitted, so every durable had `filter_subject: ""` and
+  claimed EVERY message on the CODE_REVIEW stream. An agent with >1 scope
+  consumer therefore processed (and `--post`ed) the SAME review N times — a real
+  PR (the-metafactory/arc#241) got 3 identical sage reviews. Filters are now
+  disjoint by scope, so a `local.…` request reaches exactly the local durable —
+  proven in `review-filter-disjoint.test.ts` (a `local.…` subject matches only
+  the local pattern; `local.`/`federated.` never both match).
+  `provisionReviewConsumer` also gains a **filter-drift migration**:
+  `filter_subject` is immutable on a JetStream durable, so a drift (e.g. a
+  pre-fix `""`-filter durable) is reconciled by **delete + recreate** on the next
+  boot — no manual `nats consumer rm`. The recreated durable is forced to
+  `DeliverPolicy.New` so the migration does NOT replay the backlog (no mass
+  re-review/re-post); a message in-flight at migration is dropped (re-fireable —
+  the safe direction). Provisioning runs at boot before the consumer pulls, so
+  there is no concurrently-processing delivery to race. NOTE: the
+  CODE_REVIEW stream subjects must include the `federated.…` patterns for the
+  federated filters to bind (already in `reviewStreamSubjects` when federation is
+  configured; a drifted live stream needs its subjects updated).
+
 - **F-6 reflex bridge — review-consumer dispatch (`review: true`)**. A new
   fulfilment channel on `reflex_activation.targets[]`, alongside `prompt` (CC
   agent-session) and `handler` (code responder). With `review: true` +
