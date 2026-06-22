@@ -37,7 +37,8 @@
  */
 
 import { DeliverPolicy } from "nats";
-import { directTaskSubject } from "@the-metafactory/myelin/subjects";
+import { directTaskSubject, taskSubject } from "@the-metafactory/myelin/subjects";
+import { reviewFlavorOfCapability } from "../common/types/review-flavors";
 
 import {
   UNTRUSTED_CLOSE,
@@ -313,6 +314,118 @@ export function buildReflexDispatch(opts: BuildReflexDispatchOpts): {
   return { envelope, subject };
 }
 
+// `reviewFlavorOf` is the shared parser in `common/types/review-flavors.ts`
+// (single source for vocabulary AND `code-review.<flavor>` syntax — the config
+// schema uses the same function). Re-exported under the historical name so
+// existing importers (and tests) are unaffected.
+export { reviewFlavorOfCapability as reviewFlavorOf } from "../common/types/review-flavors";
+
+/** The `owner/repo` full name from a GitHub `repository` field. Accepts both
+ *  the reflex-flattened string (reflex `src/edge/http.ts`) and GitHub's native
+ *  `{ full_name }` object, so the bridge is robust to either delivery shape. */
+function repoFullName(repoRaw: unknown): string | undefined {
+  if (typeof repoRaw === "string") return repoRaw.length > 0 ? repoRaw : undefined;
+  if (repoRaw !== null && typeof repoRaw === "object") {
+    const fullName = (repoRaw as { full_name?: unknown }).full_name;
+    if (typeof fullName === "string" && fullName.length > 0) return fullName;
+  }
+  return undefined;
+}
+
+/** The review routing keys adapted from a fired activation's GitHub PR event,
+ *  or null when the payload is not a reviewable PR (no repo, or no positive PR
+ *  number — the ReviewConsumer rejects `pr <= 0`, so we never dispatch one). */
+export function extractReviewRequest(
+  payload: Record<string, unknown>,
+): { repo: string; pr: number; title?: string } | null {
+  const repo = repoFullName(payload.repository);
+  if (repo === undefined) return null;
+  const pull = payload.pull_request;
+  if (pull === null || typeof pull !== "object") return null;
+  const pr = (pull as { number?: unknown }).number;
+  if (typeof pr !== "number" || !Number.isInteger(pr) || pr <= 0) return null;
+  const titleRaw = (pull as { title?: unknown }).title;
+  const title = typeof titleRaw === "string" && titleRaw.length > 0 ? titleRaw : undefined;
+  return { repo, pr, ...(title !== undefined && { title }) };
+}
+
+export interface BuildReflexReviewDispatchOpts {
+  activation: FiredActivation;
+  /** A review target: `review: true`, `capability: code-review.<flavor>`. */
+  target: ReflexTarget;
+  reEmitPrincipal: string;
+  reEmitStack?: string;
+  source: SystemEventSource;
+  systemDid: string;
+}
+
+/**
+ * Build a `tasks.code-review.<flavor>` REVIEW REQUEST for a review-kind target.
+ *
+ * Unlike {@link buildReflexDispatch} (which addresses an agent SESSION on
+ * `tasks.@{did}.{capability}` with a prompt — consumed by the claude-session
+ * dispatch-listener), this lands on the ReviewConsumer's capability subject
+ * `local.{p}.{s}.tasks.code-review.<flavor>` with a `ReviewRequestPayload`
+ * (`{repo, pr, post}`), so cortex's `engine: sage` runner reviews the PR. The
+ * `{repo, pr}` are adapted from the GitHub PR event in the activation payload.
+ *
+ * Returns null when the capability is not a known flavor (schema-guarded;
+ * defensive) or the payload is not a reviewable PR event.
+ */
+export function buildReflexReviewDispatch(
+  opts: BuildReflexReviewDispatchOpts,
+): { envelope: Envelope; subject: string } | null {
+  const flavor = reviewFlavorOfCapability(opts.target.capability);
+  if (flavor === undefined) return null;
+  const review = extractReviewRequest(opts.activation.payload);
+  if (review === null) return null;
+
+  const subject = taskSubject(opts.reEmitPrincipal, opts.target.capability, opts.reEmitStack);
+  const base = buildBaseEnvelope({
+    // Bare `tasks.code-review.<flavor>` type; the subject carries the same
+    // path. The ReviewConsumer routes on the `<flavor>` suffix, NOT a `@{did}`.
+    type: `tasks.code-review.${flavor}`,
+    source: buildSource(opts.source),
+    ...(opts.activation.correlationId !== undefined && {
+      correlationId: opts.activation.correlationId,
+    }),
+    sovereignty: {
+      classification: opts.activation.classification,
+      data_residency: opts.source.dataResidency ?? "NZ",
+      max_hop: 0,
+      frontier_ok: false,
+      model_class: "local-only",
+    },
+    payload: {
+      repo: review.repo,
+      pr: review.pr,
+      // Informational — the consumer routes by subject flavor, not this field.
+      reviewer: opts.target.assistant,
+      // Post the verdict back to the PR. The only review target today
+      // (`@jc/sage-pr-review`) wants this; if a non-posting review target ever
+      // appears, lift this to a per-target field rather than a constant.
+      post: true,
+      forge: "github",
+      ...(review.title !== undefined && { title: review.title }),
+      reflex_decision_id: opts.activation.decisionId,
+      reflex_target: opts.activation.target,
+    },
+  });
+  const envelope: Envelope = {
+    ...base,
+    originator: {
+      identity: opts.systemDid,
+      attribution: "delegated",
+    },
+    extensions: {
+      reflex_decision_id: opts.activation.decisionId,
+      reflex_target: opts.activation.target,
+    },
+  };
+
+  return { envelope, subject };
+}
+
 export interface ReflexActivationListenerOpts {
   runtime: MyelinRuntime;
   /** Source attribution for emitted `system.bus.*` visibility events. */
@@ -455,7 +568,11 @@ export class ReflexActivationListener {
       return { kind: "ack" };
     }
 
-    // Code-handler target → its own arm; CC-prompt target falls through.
+    // Review target → ReviewConsumer dispatch; code-handler → its own arm;
+    // CC-prompt target falls through.
+    if (target.review === true) {
+      return this.handleReviewTarget(envelope, act, target);
+    }
     if (target.handler !== undefined) {
       return this.handleHandlerTarget(envelope, act, target);
     }
@@ -527,6 +644,68 @@ export class ReflexActivationListener {
     }
     await this.dedup.mark(act.decisionId);
     await this.emitHandlerDispatched(act, target);
+    return { kind: "ack" };
+  }
+
+  /**
+   * Fulfil a review target (`review: true`) by re-emitting a
+   * `tasks.code-review.<flavor>` REVIEW REQUEST on the capability subject the
+   * `engine: sage` ReviewConsumer binds (NOT the `@{did}` agent-session subject
+   * the CC path uses) — so that consumer can claim and review it. This arm is
+   * producer-side only; the consumer/lens execution is its own pipeline. A
+   * payload that is not a reviewable PR (no repo / PR number) is a deterministic
+   * skip-as-failure (re-firing won't fix it → emit `_failed`, then mark, no
+   * poison loop); a publish error is transient (ack, NOT marked → re-fireable),
+   * mirroring the CC arm. Note `skip_authors` is enforced BEFORE this arm, so a
+   * trusted author is skipped regardless of payload shape.
+   */
+  private async handleReviewTarget(
+    fired: Envelope,
+    act: FiredActivation,
+    target: ReflexTarget,
+  ): Promise<AckDecision> {
+    const built = buildReflexReviewDispatch({
+      activation: act,
+      target,
+      reEmitPrincipal: this.reEmitPrincipal,
+      ...(this.reEmitStack !== undefined && { reEmitStack: this.reEmitStack }),
+      source: this.source,
+      systemDid: this.systemDid,
+    });
+    if (built === null) {
+      // Not a reviewable PR event (or non-flavor capability) — re-firing the
+      // same Decision can't fix it, so we mark to stop re-evaluation. But emit
+      // the audit event BEFORE marking (skip/publish-arm invariant): if
+      // emitFailed throws, the mark never lands and a redelivery re-emits it,
+      // rather than silently suppressing the promised `_failed`.
+      await this.emitFailed(fired, act, "review-payload-not-a-reviewable-pr");
+      await this.dedup.mark(act.decisionId);
+      return { kind: "ack" };
+    }
+    if (typeof this.runtime.publishOnSubject !== "function") {
+      await this.emitFailed(fired, act, "publish:runtime-no-publishOnSubject");
+      return { kind: "ack" };
+    }
+    try {
+      await this.runtime.publishOnSubject(built.envelope, built.subject);
+    } catch (err) {
+      await this.emitFailed(fired, act, `publish:${errMsg(err)}`);
+      return { kind: "ack" };
+    }
+    // Mark only after a successful publish — a publish failure leaves the
+    // activation re-fireable on the next reflex impulse (CC-arm invariant).
+    // The review request IS now published, so we mark BEFORE the audit event:
+    // re-firing would DOUBLE-publish the review (worse than a lost audit line).
+    // The `_dispatched` visibility is therefore best-effort — a failure to emit
+    // it is logged, never propagated (which would trigger that double-publish).
+    await this.dedup.mark(act.decisionId);
+    try {
+      await this.emitDispatched(act, target, built);
+    } catch (err) {
+      this.log.warn(
+        `reflex-activation: _dispatched audit emit failed for decision ${act.decisionId} (review published, dedup marked): ${errMsg(err)}`,
+      );
+    }
     return { kind: "ack" };
   }
 
@@ -712,6 +891,11 @@ export function extractAuthorLogin(payload: Record<string, unknown>): string | u
  * login (for the audit trail) when the fired activation's author is in
  * `skipAuthors`; GitHub logins are case-insensitive, so the compare is too.
  * An empty/absent list never matches (no gate configured).
+ *
+ * Fails OPEN by design: if the payload has no extractable author, this returns
+ * undefined (proceed/dispatch), NOT a skip. For a review-trigger gate that is
+ * the safe direction — better to review an unclassifiable PR than to silently
+ * skip a real external one. (Reflex's GitHub-PR webhooks always carry a login.)
  */
 export function matchSkippedAuthor(
   skipAuthors: readonly string[] | undefined,
@@ -719,7 +903,7 @@ export function matchSkippedAuthor(
 ): string | undefined {
   if (skipAuthors === undefined || skipAuthors.length === 0) return undefined;
   const author = extractAuthorLogin(payload);
-  if (author === undefined) return undefined;
+  if (author === undefined) return undefined; // fail open — see doc above
   const lowered = author.toLowerCase();
   return skipAuthors.some((a) => a.toLowerCase() === lowered) ? author : undefined;
 }
