@@ -4,6 +4,29 @@
 
 ### Non-breaking
 
+- **F-6 reflex bridge — configurable author trust gate (`skip_authors`)**.
+  `reflex_activation.targets[].skip_authors` (optional `string[]`) lets a
+  target deterministically DROP a fired activation when its GitHub author is
+  trusted, BEFORE any Claude session or code handler runs. The author login is
+  read in code from the payload —
+  `pull_request.user.login` → `issue.user.login` → `sender.login`,
+  case-insensitive. Because it is a code comparison, not an LLM instruction, it
+  cannot be subverted by prompt-injection CONTENT in the PR (the failure mode an
+  LLM "please skip" prompt has). Scope of the guarantee: the gate is only as
+  trustworthy as the author field it reads — that field's integrity rests on
+  reflex's upstream HMAC verification of the GitHub delivery (reflex#24), NOT on
+  anything in this PR. The bridge trusts the already-verified fired payload; it
+  does not re-authenticate it. A spoofed author on an unverified delivery is an
+  upstream concern, out of scope here. A trusted-author drop is an honest policy
+  SKIP, not a failure: it emits the new `system.bus.reflex_activation_skipped`
+  visibility event (reason `author_trusted`, with the matched `author`) and
+  marks the Decision id so a redelivery re-skips silently. Empty/absent list =
+  no gate (dispatch everyone). Drives reflex's `@jc/sage-pr-review` target
+  (the-metafactory/reflex#28): review any PR whose author is NOT on the
+  maintained `skip_authors` login list, skip the rest. It is a literal login
+  list, not org-membership or external-contributor detection — "trusted" means
+  exactly "a login you put in this list"; you keep it current in config, no
+  code or blueprint change.
 - **`migrate-config` now produces Stage-4/5-complete output** (cortex#428,
   PR-B of cortex#426 follow-up). The migrator's emitted `cortex.yaml`
   runs Stage 4-A end-to-end on v3.0.x without manual editing. Three
