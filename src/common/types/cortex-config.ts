@@ -2560,13 +2560,25 @@ export const ReflexTargetSchema = z
     prompt: z.string().min(1).optional(),
     /**
      * Code-path: the capability is fulfilled by an in-process code handler
-     * (no Claude session, no prompt). `discord-webhook` → the F-6 bridge
-     * invokes the notify.discord handler DIRECTLY with the activation payload
-     * (it posts to a per-repo Discord webhook — see the top-level
-     * `notify.discord` block); there is no bus re-emit and no `tasks.*`
-     * dispatch for a handler target. Mutually exclusive with `prompt`.
+     * (no Claude session, no prompt). The F-6 bridge invokes it DIRECTLY with
+     * the activation payload — no bus re-emit, no `tasks.*` dispatch. Mutually
+     * exclusive with `prompt`.
+     *
+     *  - `discord-webhook` → posts a GitHub-issue summary to a per-repo Discord
+     *    webhook (see the top-level `notify.discord` block).
+     *  - `process` → the GENERIC config-driven command runner: it runs the
+     *    process spec named by the sibling `process:` field (a DATA file in the
+     *    processes directory — see `process-runner.ts`). New automated processes
+     *    are added as spec files, with NO cortex code change / re-release.
      */
-    handler: z.enum(["discord-webhook"]).optional(),
+    handler: z.enum(["discord-webhook", "process"]).optional(),
+    /**
+     * For a `handler: "process"` target: the process spec NAME to run (the
+     * basename of `<processes-dir>/<name>.yaml`). TRUSTED (deployment config) —
+     * the runner never takes the spec name from the untrusted activation
+     * payload. Required iff `handler === "process"`; forbidden otherwise.
+     */
+    process: z.string().min(1).optional(),
     /**
      * Configurable author trust gate: GitHub author logins the F-6 bridge
      * drops (deterministically, before any dispatch) instead of reviewing.
@@ -2608,6 +2620,24 @@ export const ReflexTargetSchema = z
         code: "custom",
         message: `a review target (\`review: true\`) requires \`capability: code-review.<flavor>\` (${REVIEW_FLAVORS.join("|")})`,
         path: ["capability"],
+      });
+    }
+    // The generic command runner is selected by `handler: "process"` and routed
+    // by `process:` (the spec name). The two travel together: a `process` name
+    // without the handler would never run; the handler without a name has
+    // nothing to run.
+    if (t.handler === "process" && t.process === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: 'a `handler: "process"` target requires `process: <spec-name>`',
+        path: ["process"],
+      });
+    }
+    if (t.process !== undefined && t.handler !== "process") {
+      ctx.addIssue({
+        code: "custom",
+        message: '`process:` is only valid with `handler: "process"`',
+        path: ["process"],
       });
     }
   });
