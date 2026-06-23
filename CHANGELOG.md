@@ -4,6 +4,48 @@
 
 ### Non-breaking
 
+- **F-6 reflex bridge — generic `process` code handler (config-driven command
+  runner).** A new code-handler channel (`handler: "process"` on a
+  `reflex_activation.targets[]` entry, with a sibling `process: "<name>"`),
+  alongside `discord-webhook`. Ships ONCE; new automated processes are added as
+  DATA — a spec file dropped into the processes directory
+  (`$CORTEX_PROCESSES_DIR`, else `<config-dir>/processes`, else
+  `~/.config/cortex/processes/*.yaml`) — with **no cortex code change and no
+  re-release**. Each spec declares `cwd`, `argv` (with typed `{param}` tokens),
+  `timeout_ms`, and `params`. The handler reads the spec FRESH per fire (a new
+  file is picked up with no restart), fills `{param}` tokens from the activation
+  payload (type-validated against the declared `params`), and spawns argv with
+  **no shell**. Trust: the spec NAME comes from the trusted `target.process`
+  (never the payload), `cwd`/`argv` come only from the on-disk spec, and a param
+  value is always a single argv element. So with NO shell there is no
+  word-splitting and no shell-command injection; and the COMMAND (`cwd`/`argv`/
+  the spec name) comes from spec/target config, never the payload, so a payload
+  can't pick what runs or traverse the processes dir (name is `[a-z0-9-]`). The
+  remaining surface is per-arg: a `string` param is `enum`-constrained by default
+  (an enum value can't be an arbitrary flag), and an unconstrained value is only
+  possible via explicit `freeform: true` — which IS a single arbitrary arg the
+  child may read as a flag (that is exactly why it is opt-in, not the default). Param defaults are type/enum-validated at load. Each spec may
+  declare an `env` allow-list; omitting it inherits cortex's full env (handy for
+  a trusted spec, but it then sees every cortex secret — prefer an allow-list).
+  The handler logs the un-substituted argv TEMPLATE, never resolved param values. `timeout_ms` is
+  capped under the JetStream `ack_wait` so the watchdog's "kills before
+  redelivery" guarantee is enforced by the schema, not just asserted. A 15-minute (spec-`timeout_ms`) watchdog kills a hung run (under
+  the 20-minute JetStream `ack_wait`); deterministic misconfig (no name / bad
+  spec / param violation) emits `system.bus.process{failed}` and RETURNS, while
+  a runtime failure (non-zero exit / spawn error / timeout) emits `failed` and
+  THROWS to leave the Decision re-fireable. The watchdog escalates **SIGTERM →
+  SIGKILL** (after a grace) so a child that traps SIGTERM can't park the handler
+  on `proc.exited` forever. Specs that run for minutes set **`detach: true`**:
+  the handler spawns + emits `started` + RETURNS so the run does NOT block the
+  single, serial reflex bridge pull loop (other activations — issue→Discord,
+  PR→sage — keep flowing); a detached run reports `completed`/`failed` via
+  visibility only (it cannot re-fire — fine for an idempotent scheduled job).
+  Covered by `process-runner.test.ts`. First user: the weekly public build
+  journal — `examples/processes/build-journal.yaml` (`detach: true`; operator
+  copies it in), fired by reflex's `build-journal-weekly` schedule; the
+  blueprint and the operator runbook (`docs/deploy-build-journal-weekly.md`)
+  live in the **reflex** repo (reflex#30), not here.
+
 - **Review consumers no longer fan out + double-post (cortex#1186).** Each
   per-agent review durable (local + federated-offer + federated-direct) is now
   provisioned with a `filterSubject` matching the subject pattern its consumer

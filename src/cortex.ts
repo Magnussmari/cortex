@@ -150,6 +150,7 @@ import {
   type ReflexActivationHandler,
 } from "./bus/reflex-activation-listener";
 import { createDiscordNotifier } from "./bus/notify-discord";
+import { createProcessRunner } from "./bus/process-runner";
 import { policyEngineFromConfig } from "./common/policy/factory";
 import {
   buildPlatformPrincipalIndex,
@@ -4337,6 +4338,23 @@ export async function startCortex(
         targets: notifyDiscordTargets,
       });
     }
+    // Generic command runner for `handler: "process"` targets. Shipped once;
+    // each process is a DATA spec file in the processes directory (read fresh
+    // per fire, so a new spec needs no restart). Always registered when the
+    // bridge mounts — inert unless a `handler: process` target fires. The dir:
+    // $CORTEX_PROCESSES_DIR, else `<config-dir>/processes`, else
+    // `~/.config/cortex/processes`.
+    const expandedConfigPath = options.configPath?.replace(/^~/, homedir());
+    const processesDir =
+      process.env.CORTEX_PROCESSES_DIR ??
+      (expandedConfigPath !== undefined
+        ? join(dirname(expandedConfigPath), "processes")
+        : join(homedir(), ".config", "cortex", "processes"));
+    handlers.process = createProcessRunner({
+      runtime,
+      source: systemEventSource,
+      processesDir,
+    });
     reflexActivationListener = new ReflexActivationListener({
       runtime,
       source: systemEventSource,

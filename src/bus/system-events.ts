@@ -764,6 +764,51 @@ export function createSystemBusNotifyDiscordEvent(
 }
 
 // ---------------------------------------------------------------------------
+// system.bus.process — generic `process` reflex code-handler visibility
+// ---------------------------------------------------------------------------
+
+export interface SystemBusProcessOpts {
+  /** Standard source attribution — who emitted this visibility event. */
+  source: SystemEventSource;
+  /** `started` (run spawned), `completed` (exit 0), `failed` (non-zero / spawn error / timeout / misconfig). */
+  outcome: "started" | "completed" | "failed";
+  /** The process spec name that ran (from the trusted `target.process`). */
+  process: string;
+  /** Reflex Decision id carried on the activation (provenance), when present. */
+  decisionId?: string;
+  /** Human-readable detail for the failed outcome (e.g. `exit-1`, `timeout-900000ms`, `spec:…`). */
+  reason?: string;
+  /** Correlation id carried from the activation. */
+  correlationId?: string;
+  classification?: Classification;
+}
+
+/**
+ * Visibility event emitted by the generic `process` code handler as it runs a
+ * config-declared command (the F-6 bridge invokes it for a `handler: process`
+ * target; the spec is named by `target.process`). Bookkeeping about our own
+ * stack — sovereignty defaults to local.
+ */
+export function createSystemBusProcessEvent(
+  opts: SystemBusProcessOpts,
+): Envelope {
+  return buildBaseEnvelope({
+    type: "system.bus.process",
+    source: buildSource(opts.source),
+    sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
+    payload: {
+      outcome: opts.outcome,
+      process: opts.process,
+      ...(opts.decisionId !== undefined && { decision_id: opts.decisionId }),
+      ...(opts.reason !== undefined && { reason: opts.reason }),
+      ...(opts.correlationId !== undefined && {
+        correlation_id: opts.correlationId,
+      }),
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // system.access.allowed / system.access.denied — IAW Phase C.4 (cortex#115)
 // ---------------------------------------------------------------------------
 
