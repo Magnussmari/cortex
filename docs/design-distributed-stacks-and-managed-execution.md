@@ -118,6 +118,27 @@ runtime:
 
 **The reframed pitch:** the enterprise win is *not* "agents can't reach the internet." It's **"agents reach exactly what's allowed, with credentials they can never steal, every call audited"** — which is *more* useful and *more* secure than an agent on the host with raw env creds and unrestricted egress. Egress is a feature of the sandbox model, not a casualty of it.
 
+### 2.4 Auth + billing — OAuth (subscription) vs API, and the scaling tension
+
+A sharp real-world constraint, not a footnote. The goal is **Claude OAuth** (a Pro/Max subscription, `sk-ant-oat01-`), not per-token API. Three facts (researched 2026-06):
+
+- **OAuth is ToS-restricted to *official Anthropic clients*** (Feb-2026): Claude Code CLI, claude.ai, Desktop, Cowork. Using the OAuth token from any *other* tool is a ToS violation → third-party integrations must use an API key. **Implication — and another reason harness-preservation (§2.2) is load-bearing: the OAuth path is only legitimate when cortex runs the *real* `claude` CLI, never a wrapper that reuses the token.** Cortex already invokes the official CLI, so `backend: managed` running `claude -p` in a Container is ToS-safe; extracting the OAuth token is not.
+- **Headless/autonomous billing changed (June 15, 2026):** non-interactive `claude -p` / Agent-SDK usage on a subscription draws from a *separate, limited* monthly "Agent SDK credit" pool, then usage credits at standard API rates — NOT the unlimited interactive quota.
+- **The subscription throttles parallelism** (the crux): two caps (a 5-hour rolling window + a 7-day roll; Max 5×/20×), and reportedly *"~10 parallel agents exhaust a weekly quota in hours; switch to API beyond 3–5 concurrent."*
+
+**Honest position:** OAuth hands *work* — official `claude -p` in a CF Container is a permitted client — but **OAuth and *heavy* horizontal scaling conflict by design.** OAuth fits the head + a handful of hands (cost-sensitive, moderate concurrency); a wide fan-out (the very thing distributed execution enables) exhausts subscription caps and pushes you to API rates anyway. Anthropic deliberately routes autonomous/parallel work to API.
+
+**Design — the `ExecutionBackend` is auth-mode-aware:**
+```yaml
+runtime:
+  execution:
+    backend: managed
+    auth: oauth        # oauth (subscription, official CLI, low concurrency) | api (per-token, scales)
+```
+OAuth for low-volume / cost-sensitive; API for high fan-out. Provision OAuth creds into the Container via the egress credential-injection (§2.3) so the sandbox never holds the raw token. Do NOT adopt Managed Agents' *native* service for OAuth tasks — it is API/Agent-SDK-credit oriented (and a thinner harness, §2.2).
+
+*(Billing here is evolving — the June-15 Agent-SDK-credit model + a reported `claude -p`-OAuth-bills-as-API issue mean: verify live billing before committing any scale plan.)*
+
 ## 3. Mode B — Isolated self-hosted stack (relocate the head)
 
 The **entire daemon** runs on separate infrastructure — its own identity, bus participation, lifecycle, and management, independent of the Mac (Mac can be off).
