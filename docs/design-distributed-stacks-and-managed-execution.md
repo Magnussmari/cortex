@@ -180,6 +180,34 @@ A 3-stack federation **test zone** ≈ **$12–30/mo** (Hetzner/Fly), or near-ze
 
 **Hands (Mode A) on CF:** active-only CPU billing (since Nov-2025) + scale-to-zero is exactly right for bursty per-task execution — you pay for execution, not idle. (CF's pricing is criticised as expensive for *always-on* workloads; that's the head's concern, never the ephemeral hands'.)
 
+## 4d. Identity & privilege — agent proposes, principal approves, a scoped credential executes
+
+The sandbox isolates *compute*; this isolates *authority*. The principle: **a hand never executes from a privileged position and never holds the principal's standing credentials.** When an action needs the principal's authority, the agent *proposes* it; the principal *approves* it (step-up authenticated for high stakes); and a *just-in-time, narrowly-scoped, ephemeral* credential executes that one action — then expires. This is the 2026 agentic-auth consensus, and cortex already has the bones.
+
+**Industry patterns (researched 2026-06):**
+- **Tier-zero rule:** no standing credentials, no unscoped tokens, no shared secrets across agents.
+- **On-Behalf-Of (OBO), not impersonation:** the action token carries BOTH the agent's identity AND the principal's, in structured claims → downstream enforces least privilege *and* traces back to the principal. Impersonation would lose attribution.
+- **Per-operation JIT scoping (RFC 8693 token exchange):** agents adapt at runtime, so scope per-*action* — exchange a base moderate-scope token for a narrow, audience-restricted, minutes-long ephemeral token right before a high-privilege call.
+- **HITL, step-up authenticated, for high-blast-radius actions:** when the policy engine flags an action that is irreversible / costly / regulated / high-blast-radius (prod writes, deletes, refunds/wires, key rotation, admin grants), it triggers a HITL gate — the principal confirms with **MFA + a signed request**, out-of-band (**CIBA**: agent initiates → push to the principal's device with a rich "binding message" → approve with MFA). Approvers authenticated + traceable; EU AI Act Art. 14 + NIST AI RMF require it *provable*.
+
+**Mapping to cortex:**
+
+| Pattern | Cortex today | Gap |
+|---|---|---|
+| Agent identity ≠ principal | ✅ each agent has its own NKey/DID (stack-local runtime identity) | OBO claim (agent-on-behalf-of-principal) on the action |
+| Policy gates WHAT runs | ✅ the policy engine (`engine.check`, capabilities) | a high-impact **classifier** → trigger HITL |
+| Surface → approve → execute | ✅ the Pier/admission pattern (agent surfaces, principal approves, trusted executor acts) | **step-up MFA** on the approval (today it's a chat "yes") |
+| Use-cred-without-holding | ✅ egress credential-injection (§2.3) | mint a **JIT, narrow, ephemeral** cred per approved action (token exchange) |
+
+**The cortex flow:**
+1. A sandboxed hand runs least-privilege, NO principal standing creds.
+2. The policy engine classifies the requested action: low-impact → proceed on the hand's scoped grant; high-impact → HITL.
+3. The agent **surfaces** the action with full context; the principal **approves** — chat-grade for trivial, **MFA / signed step-up** (CIBA-style push) for serious.
+4. On approval, cortex mints a **just-in-time, audience-restricted, minutes-long** credential for *that one action* (RFC 8693 exchange), carrying an **OBO claim**. The egress proxy injects it; the sandbox never holds it.
+5. The action executes; the chain — agent identity, the signed approval, the scoped token, the call — is **audited** (the provable oversight regulators require).
+
+**Headline:** the agent never wields the principal's credentials. It *proposes*; the principal *approves* (with MFA when it matters); a scoped, one-time credential does the specific thing, then expires. This is the natural hardening of the surface-don't-execute pattern already shipped (Pier surfaces, a human admits) — now with step-up auth + JIT scoped creds for actions that warrant it. It is also the enterprise story's spine: combined with sandboxed execution (§2.2) and proxied egress (§2.3), an agent has *no host privilege, no standing creds, no unapproved high-impact authority* — three independent walls.
+
 ## 5. Spawn disposition
 
 `the-metafactory/spawn` stays on ice. Its valuable thinking (head/hands/session, capacity gauge, dispatch UX) is now embodied by Managed Agents + this design. The forward work is **integration** (Mode A backend) + **portability/hosting** (Mode B), not reviving the engine. Close/relabel the grove-era Spawn issues accordingly.
