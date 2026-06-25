@@ -51,6 +51,31 @@ This very project is the pattern in miniature: a head spawns parallel adversaria
 
 The vocabulary is deliberate and now industry-aligned: cortex's "persistent heads vs anonymous hands" = Anthropic's Brain / Hands / Session. The head is **sovereign and persistent** (Mode B — its own infra); the hands are **fungible and ephemeral** (Mode A — elastic sandboxes); the session is the **durable spine** that outlives any hand dying or the brain (model) being upgraded. The three can fail and be replaced independently — which is exactly why a head on a VM can keep spawning hands on CF while the model underneath improves.
 
+### 2.2 Configurable execution backend (`local` | `sandboxed`) — the enterprise lever
+
+WHERE a hand runs is a **per-stack config knob**, defaulting to local, selectable up to fully-sandboxed. The runner gets a pluggable `ExecutionBackend` seam (the dispatch path branches on it; the head/orchestration is unchanged):
+
+| Backend | Where it runs | Privilege | Fit |
+|---|---|---|---|
+| `local` *(today)* | `Bun.spawn` on the host | **full host env**, constrained only by `allowedTools` / `allowedDirs` / bash-guard | solo / dev — lowest latency, zero infra |
+| `subprocess-isolated` | host, via `@anthropic-ai/sandbox-runtime` (Spawn S-027) | reduced-privilege subprocess, no host env leakage | middle ground — isolation without going off-box |
+| `managed` / `sandboxed` | CF sandbox / Managed Agents, off-host | **only the scoped tools + injected creds the head lends it**, egress-policed | **enterprise / regulated** |
+
+Proposed config (per-agent, with a stack-level default):
+
+```yaml
+runtime:
+  execution:
+    backend: managed         # local | subprocess-isolated | managed
+    # managed-only:
+    sandbox: cloudflare      # provider
+    egress: deny-by-default  # per-task allowlist the head injects
+```
+
+**Decoupled by construction.** The head depends only on the `ExecutionBackend` *interface* — `dispatch(task) → stream(effects/result)`. Concrete backends sit behind it and are injected by config; adding a substrate, or swapping CF for another sandbox provider, or an enterprise flipping the whole org to `managed`, never touches the head, the dispatch path, the agents, or the sovereignty checks. The selector is the *only* thing that knows which backend is live.
+
+**Why this is the enterprise unlock.** With `backend: managed`, **no agent code ever runs with host privileges**. Every hand is a fresh isolated environment that holds only what the head hands it for one task — no host filesystem, no host env vars, no ambient credentials, egress denied-by-default. A prompt-injected or supply-chain-compromised task can't read the host, exfiltrate data, or touch the stack identity/secrets — the blast radius is one disposable sandbox with reduced privileges. That is precisely the de-risking a regulated buyer needs, and it's a **config flip**, not a re-architecture: the same head, the same dispatch, the same sovereignty checks gating WHAT runs — only WHERE and WITH-WHAT-PRIVILEGE the hand executes changes. Solo operators keep `local`; enterprises set `managed` org-wide.
+
 ## 3. Mode B — Isolated self-hosted stack (relocate the head)
 
 The **entire daemon** runs on separate infrastructure — its own identity, bus participation, lifecycle, and management, independent of the Mac (Mac can be off).
@@ -70,6 +95,27 @@ Today the Mac almost certainly hosts the NATS hub. The instant a stack lives off
 2. **Fully sovereign per-stack operators** — each stack roots its own NSC operator and leaf-links peer-to-peer / to a network. The real sovereign model; more setup per stack.
 
 This — not the compute substrate — is the architectural fork. Pick (1) for the first test zone; (2) is the production-sovereign end state.
+
+## 4b. Hosting: sizing + pricing (researched 2026-06)
+
+**Size by execution backend — this is the load-bearing sizing decision:**
+
+- **Head only (`backend: managed`):** the cortex daemon is a light Bun process (bus client + adapters + orchestration), no local inference. **1–2 GB / 1 vCPU is plenty.** 2 GB is *not* slim here.
+- **Head + `backend: local`:** Claude Code itself needs **~4 GB minimum**, ~8 GB comfortable for one-thing-at-a-time, **16 GB+** for parallel sub-agents — and it carries documented **memory-leak** behaviour (RSS ballooning to 8–13 GB+, pathologically 100 GB+, over 30–60 min sessions). On a small box, 2 GB is unworkable for local execution; size at 8–16 GB+ with session-restart hygiene.
+- **Ephemeral sandboxed hands sidestep the leak entirely** — a hand runs one task and is torn down, so the long-session leak never accumulates. A further reason the hybrid (small always-on head + ephemeral CF hands) is the resilient shape, not just the cheap one.
+
+**Always-on VM options for the head (lightweight, 1–2 GB):**
+
+| Provider | ~Spec | ~Price/mo | Notes |
+|---|---|---|---|
+| **Hetzner** | CX23 (shared) → CPX22 2vCPU/4GB | ~€3.49 → €7.99 (Apr-2026) | best value; EU regions |
+| **DigitalOcean** | 1 vCPU / 1 GB basic droplet | ~$4 | simple, global |
+| **Fly.io** | shared-cpu-1x / 1 GB (256 MB ≈ $2) | ~$6.79 | per-second billing, easy deploy, scale-to-zero option |
+| **CF Containers** | microVM | per-10ms-active CPU + provisioned mem | great for *hands*; awkward/pricey for an always-on *head* |
+
+A 3-stack federation **test zone** ≈ **$12–30/mo** (Hetzner/Fly), or near-zero with Fly's scale-to-zero for non-always-on test stacks.
+
+**Hands (Mode A) on CF:** active-only CPU billing (since Nov-2025) + scale-to-zero is exactly right for bursty per-task execution — you pay for execution, not idle. (CF's pricing is criticised as expensive for *always-on* workloads; that's the head's concern, never the ephemeral hands'.)
 
 ## 5. Spawn disposition
 
