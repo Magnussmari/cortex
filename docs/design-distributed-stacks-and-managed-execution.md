@@ -35,6 +35,22 @@ The stack stays where it is; the runner dispatches CC sessions to **Managed Agen
 - **Build:** a runner execution backend that submits a task (brain=Claude, hands=CF sandbox) and bridges results back onto the bus. The runner's backend seam (`execution-backend`-style) is the integration point.
 - **Sovereignty:** the existing per-task sovereignty/policy checks still gate WHAT runs; this only changes WHERE.
 
+### 2.1 What "scale horizontally" actually looks like (head + hands)
+
+The **head** is the persistent, identity-bearing orchestrator — the cortex daemon. It holds the stack's identity, bus presence, surface adapters (Discord), dispatch + conversation state, and the durable session log. It is long-lived, stateful, connection-holding, and it *decides* what work happens.
+
+The **hands** are ephemeral, stateless execution units — one sandboxed Claude session per unit of work (review a PR, implement a slice, answer a newcomer). They carry no identity of their own; the head lends each one scoped tools + credentials for its single task, then it's torn down.
+
+Scaling horizontally means the head stops running CC sessions as local `Bun.spawn` — bounded by one machine's CPU/RAM, and a blast-radius risk (a runaway task shares the host) — and instead **spawns each task as a fresh sandboxed hand on separate infrastructure** (Managed Agents / CF). Concretely:
+
+- N concurrent tasks → N sandboxes, not N processes contending for one box. Burst wide for a big review sweep; scale to zero when idle.
+- The head stays light — orchestration + connections only; the heavy inference/execution is elastic and off-machine.
+- Each hand is isolated: a compromised or runaway task can't reach the head, the stack identity, the secrets, or sibling tasks — egress proxies + per-agent policy enforce the boundary.
+
+This very project is the pattern in miniature: a head spawns parallel adversarial-review hands (correctness / security / behavior lenses), collects their verdicts, and drives the merge — today locally. Moving those hands onto elastic sandboxes is the same shape at scale, off the machine.
+
+The vocabulary is deliberate and now industry-aligned: cortex's "persistent heads vs anonymous hands" = Anthropic's Brain / Hands / Session. The head is **sovereign and persistent** (Mode B — its own infra); the hands are **fungible and ephemeral** (Mode A — elastic sandboxes); the session is the **durable spine** that outlives any hand dying or the brain (model) being upgraded. The three can fail and be replaced independently — which is exactly why a head on a VM can keep spawning hands on CF while the model underneath improves.
+
 ## 3. Mode B — Isolated self-hosted stack (relocate the head)
 
 The **entire daemon** runs on separate infrastructure — its own identity, bus participation, lifecycle, and management, independent of the Mac (Mac can be off).
@@ -43,6 +59,7 @@ The **entire daemon** runs on separate infrastructure — its own identity, bus 
 - **Key insight:** Mode B does **not** require Managed Agents. It requires cortex to be a **portable, self-hosting, sovereign deployable unit** — which `arc install Cortex` + config-split layout + ADR-0013 sovereign federation already mostly deliver. Substrate is a choice:
   - **CF Container (microVM)** — elegant (egress/credential proxies, managed provisioning), but CF-coupled.
   - **VPS / fly.io / dedicated box** — full control, no coupling. Likely the better first target for a stack you "manage on its own infrastructure."
+- **Does CF host the *head* too?** CF's "full VM" is **Cloudflare Containers** (Linux microVMs). They *can* run a stack daemon, but their model is on-demand / Worker-fronted / scale-to-zero — which suits ephemeral *hands* far better than an always-on, identity-bearing *head* holding persistent NATS-leaf + Discord-gateway connections (those connections never go idle, fighting scale-to-zero + the per-instance duration model). So CF answers Mode A cleanly; for an always-on isolated head, a classic VM/VPS is the natural host. **The elegant shape is the hybrid: head on a VM (Mode B) + hands on CF Managed Agents (Mode A)** — CF does elastic sandboxed execution; the sovereign daemon lives where always-on is cheap and simple. (Verify CF Containers' current always-on / duration limits before betting the head on them.)
 - **What a Mode-B stack needs on its box:** Bun + (its own NATS or a leaf to a hub) + config-split dir + its own NKey seed / NSC operator + its bot tokens + its own `arc upgrade` / restart lifecycle.
 
 ## 4. The load-bearing decision: the hub must leave the Mac
