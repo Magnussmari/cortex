@@ -2,6 +2,10 @@
 
 **Status:** direction / pre-ADR · **Date:** 2026-06-19 · **Supersedes premise of:** `docs/design-spawn-integration.md` (on ice, grove-era) · **Refs:** ADR-0013 (sovereign federation), ADR-0017 (surface bundles), the-metafactory/spawn (dormant since 2026-04)
 
+![Distributed execution — head, hands & sandboxes](diagrams/cortex-distributed-execution.jpg)
+
+*Extends the "one principal — many stacks — many networks" diagram with the head/hands/session split, the configurable `local` ↔ `managed` execution backend, off-host Cloudflare sandboxes for ephemeral hands, and a fully-isolated stack on its own VM.*
+
 ## 0. Why now
 
 Two external products shipped since Spawn was designed, and they *are* what Spawn set out to build:
