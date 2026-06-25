@@ -80,6 +80,42 @@ runtime:
 
 **Why this is the enterprise unlock.** With `backend: managed`, **no agent code ever runs with host privileges**. Every hand is a fresh isolated environment that holds only what the head hands it for one task — no host filesystem, no host env vars, no ambient credentials, egress denied-by-default. A prompt-injected or supply-chain-compromised task can't read the host, exfiltrate data, or touch the stack identity/secrets — the blast radius is one disposable sandbox with reduced privileges. That is precisely the de-risking a regulated buyer needs, and it's a **config flip**, not a re-architecture: the same head, the same dispatch, the same sovereignty checks gating WHAT runs — only WHERE and WITH-WHAT-PRIVILEGE the hand executes changes. Solo operators keep `local`; enterprises set `managed` org-wide.
 
+### 2.3 Egress — sandboxed ≠ offline (the proxy *is* the feature)
+
+"Egress denied-by-default" was imprecise and worth correcting: a useful agent must call APIs, search the web, hit GitHub, reach MCP servers. A sandboxed hand is **not cut off** — its outbound traffic runs through a **programmable zero-trust egress proxy** (Cloudflare Outbound Workers, GA Apr-2026) that makes internet access *safer* than raw host access, not absent:
+
+- **Allowlist / denylist** — `allowedHosts` / `deniedHosts` (glob). Setting `allowedHosts` makes it a deny-by-default *allowlist*; the hand reaches the hosts its task needs and nothing else.
+- **Credential injection (zero-trust)** — the hand makes a **plain** request; the proxy (running *outside* the sandbox) attaches the secret before forwarding. The agent authenticates to GitHub / an API **without ever holding the token** — so a prompt-injected or supply-chain-compromised hand can't exfiltrate creds it never had. *This is the headline win over `local`, where a CC session inherits host env vars.*
+- **TLS interception** — a per-sandbox ephemeral CA lets the proxy inspect/filter HTTPS (the private key never leaves the sidecar).
+- **Audit** — via Workers VPC + Cloudflare Gateway, every DNS/HTTP/network call is logged; you can *prove* what an agent reached.
+- **Private services** — Cloudflare Mesh / Workers VPC reach internal APIs without exposing them to the public internet.
+- **Dynamic** — `setOutboundHandler()` adjusts a running hand's policy per task, no restart.
+
+**What cortex hands need egress for → per-capability egress profiles:**
+
+| Need | Hosts | Who |
+|---|---|---|
+| the Claude brain | `api.anthropic.com` | **always** |
+| code work | `github.com`, `*.githubusercontent.com`, `registry.npmjs.org` (token injected) | dev / review agents |
+| web research | broad web via Gateway category-filter | research agents |
+| MCP tools | the configured MCP endpoints | per agent |
+| task API | the one endpoint the task needs | per task |
+
+**Config (extends §2.2):**
+
+```yaml
+runtime:
+  execution:
+    backend: managed
+    egress:
+      profile: code              # code | research | narrow | custom — a per-capability preset
+      allow: [api.anthropic.com, github.com, "*.githubusercontent.com"]
+      credentials:               # held by the proxy, NEVER injected into the sandbox
+        github.com: ${GITHUB_TOKEN}
+```
+
+**The reframed pitch:** the enterprise win is *not* "agents can't reach the internet." It's **"agents reach exactly what's allowed, with credentials they can never steal, every call audited"** — which is *more* useful and *more* secure than an agent on the host with raw env creds and unrestricted egress. Egress is a feature of the sandbox model, not a casualty of it.
+
 ## 3. Mode B — Isolated self-hosted stack (relocate the head)
 
 The **entire daemon** runs on separate infrastructure — its own identity, bus participation, lifecycle, and management, independent of the Mac (Mac can be off).
