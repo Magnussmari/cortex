@@ -24,6 +24,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/bun": "latest",
+    "@types/libsodium-wrappers": "^0.8.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "eslint": "^10.3.0",
@@ -48,6 +49,7 @@
     "discord.js": "^14.25.1",
     "elkjs": "^0.11.1",
     "hono": "4.12.10",
+    "libsodium-wrappers": "^0.8.4",
     "nats": "^2.29.3",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
