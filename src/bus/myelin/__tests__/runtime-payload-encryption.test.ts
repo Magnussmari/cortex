@@ -162,6 +162,86 @@ describe("runtime outbound seal", () => {
     await runtime.stop();
   });
 
+  test("seals a SELF-addressed federated Offer subject (cortex#1246) — federated.{ownPrincipal}.…", async () => {
+    // A federated Offer is published on a self-addressed subject
+    // `federated.{ownPrincipal}.{ownStack}.tasks.<cap>` — segment[1] is the
+    // offerer's OWN principal, never in its own peers[]. The seal must still
+    // engage (resolve by the own network, not a peer). Single encryption-enabled
+    // network (the metafactory deployment) is the case that MUST work now.
+    const key = await makeKey();
+    const fake = makeFakeNats();
+    const runtime = await startMyelinRuntime(
+      makeConfig({ url: "nats://localhost:4222", name: "cortex", subjects: [] }),
+      {
+        connectImpl: async () => fake.nc,
+        signer: await signerOpt(),
+        principal: "andreas",
+        stack: "meta-factory",
+        federatedNetworks: [
+          network({ id: "research", encryption: "required", payload_key: key.b64 }),
+        ],
+      },
+    );
+    // Self-addressed: target-principal segment == our own principal "andreas".
+    await runtime.publishOnSubject!(
+      federatedEnvelope(),
+      "federated.andreas.meta-factory.tasks.code-review.requested",
+    );
+
+    expect(fake.publishes).toHaveLength(1);
+    const published = JSON.parse(fake.publishes[0]!.payload) as Envelope;
+    // SEALED — extensions.enc marker + ciphertext-only payload, no cleartext.
+    expect(readMarker(published)).toEqual({
+      alg: "xchacha20poly1305",
+      net: "research",
+      kid: "research/k1",
+    });
+    expect(typeof published.payload.ciphertext).toBe("string");
+    expect(fake.publishes[0]!.payload).not.toContain("do-not-leak");
+    expect(fake.publishes[0]!.payload).not.toContain("confidential");
+    // A member holding K recovers the Offer plaintext.
+    const opened = await openPayload(
+      published,
+      new NetworkKeyring([{ net: "research", keys: [{ kid: "research/k1", key: key.bytes }] }]),
+    );
+    expect(opened.payload).toEqual(federatedEnvelope().payload);
+    await runtime.stop();
+  });
+
+  test("multi-network self-addressed Offer cannot resolve → cleartext + loud warn-once (cortex#1246)", async () => {
+    // On MULTIPLE encryption-enabled networks the seal network is unresolvable
+    // from a self-addressed subject alone — we MUST NOT seal with a guessed key.
+    // Publish cleartext but warn ONCE so the gap is never silent.
+    const key = await makeKey();
+    const fake = makeFakeNats();
+    const runtime = await startMyelinRuntime(
+      makeConfig({ url: "nats://localhost:4222", name: "cortex", subjects: [] }),
+      {
+        connectImpl: async () => fake.nc,
+        signer: await signerOpt(),
+        principal: "andreas",
+        stack: "meta-factory",
+        federatedNetworks: [
+          network({ id: "research", encryption: "required", payload_key: key.b64 }),
+          network({ id: "lab", encryption: "enabled", payload_key: key.b64 }),
+        ],
+      },
+    );
+    await runtime.publishOnSubject!(
+      federatedEnvelope(),
+      "federated.andreas.meta-factory.tasks.code-review.requested",
+    );
+    await runtime.publishOnSubject!(
+      federatedEnvelope(),
+      "federated.andreas.meta-factory.tasks.code-review.requested",
+    );
+    const published = JSON.parse(fake.publishes[0]!.payload) as Envelope;
+    expect(readMarker(published)).toBeUndefined(); // cleartext (not sealed with a guessed key)
+    const warns = errors.filter((e) => e.includes("could NOT be sealed"));
+    expect(warns).toHaveLength(1); // warned, only ONCE despite two publishes
+    await runtime.stop();
+  });
+
   test("never seals a local.* payload", async () => {
     const key = await makeKey();
     const fake = makeFakeNats();

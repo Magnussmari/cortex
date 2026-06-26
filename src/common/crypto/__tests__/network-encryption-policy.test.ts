@@ -7,6 +7,7 @@ import type { PolicyFederatedNetwork } from "../../types/cortex-config";
 import {
   buildNetworkKeyring,
   buildSealPolicyByPrincipal,
+  countEncryptionEnabledNetworks,
   defaultKeyId,
   networkKeyFromConfig,
 } from "../network-encryption-policy";
@@ -120,5 +121,71 @@ describe("buildSealPolicyByPrincipal", () => {
       }),
     ]);
     expect(map.get("jc")?.net).toBe("first");
+  });
+
+  // cortex#1246 — self-addressed federated Offer seal.
+  test("ownPrincipal mapped to its sole encryption-enabled network (self-addressed Offer seals)", () => {
+    const map = buildSealPolicyByPrincipal(
+      [
+        network({
+          id: "research",
+          encryption: "required",
+          payload_key: K32_A,
+          peers: [{ principal_id: "jc", stack_id: "jc/host" }] as never,
+        }),
+      ],
+      "andreas",
+    );
+    const own = map.get("andreas");
+    expect(own?.net).toBe("research");
+    expect(own?.key?.kid).toBe("research/k1");
+  });
+
+  test("ownPrincipal NOT mapped under multiple encryption-enabled networks (ambiguous → unsealed + warn-once at publish)", () => {
+    const map = buildSealPolicyByPrincipal(
+      [
+        network({ id: "research", encryption: "required", payload_key: K32_A }),
+        network({ id: "lab", encryption: "enabled", payload_key: K32_B }),
+      ],
+      "andreas",
+    );
+    expect(map.has("andreas")).toBe(false);
+  });
+
+  test("ownPrincipal NOT mapped when no encryption-enabled network", () => {
+    const map = buildSealPolicyByPrincipal(
+      [network({ id: "research", encryption: "off", payload_key: K32_A })],
+      "andreas",
+    );
+    expect(map.has("andreas")).toBe(false);
+  });
+
+  test("ownPrincipal omitted when it already names a peer (peer mapping wins)", () => {
+    const map = buildSealPolicyByPrincipal(
+      [
+        network({
+          id: "research",
+          encryption: "enabled",
+          payload_key: K32_A,
+          peers: [{ principal_id: "andreas", stack_id: "andreas/h" }] as never,
+        }),
+      ],
+      "andreas",
+    );
+    // Single mapping, from the peers[] pass (idempotent — not double-set).
+    expect(map.get("andreas")?.net).toBe("research");
+  });
+});
+
+describe("countEncryptionEnabledNetworks", () => {
+  test("counts enabled/required, ignores off/unset", () => {
+    expect(
+      countEncryptionEnabledNetworks([
+        network({ id: "a", encryption: "required" }),
+        network({ id: "b", encryption: "enabled" }),
+        network({ id: "c", encryption: "off" }),
+        network({ id: "d" }), // unset
+      ]),
+    ).toBe(2);
   });
 });

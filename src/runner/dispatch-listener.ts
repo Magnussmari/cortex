@@ -103,7 +103,7 @@ import type { PolicyEngine } from "../common/policy/engine";
 import { extractAgentIdFromDid } from "../common/policy/did";
 import { isUuid } from "../common/types/uuid";
 // M3 (cortex#1241, ADR-0019) — verify-then-decrypt the sealed dispatch payload.
-import { readMarker } from "../common/crypto/payload-encryption";
+import { readMarker, NetworkKeyring } from "../common/crypto/payload-encryption";
 import { openInboundEnvelope } from "../common/crypto/inbound-payload";
 import { buildNetworkKeyring } from "../common/crypto/network-encryption-policy";
 import type {
@@ -658,18 +658,30 @@ interface DispatchTraceContext {
  *
  * `correlationId` / `taskId` fall back to `envelope.correlation_id` then
  * `envelope.id` so the trace always carries a non-empty join key.
- * `agentId` is an untrusted peek at `payload.agent_id` — purely for the
- * trace's human-facing detail; the authoritative agent id is resolved by
- * the verified parse downstream.
+ * `agentId` / `taskId` are an untrusted peek at the payload — purely for the
+ * trace's human-facing detail; the authoritative ids are resolved by the
+ * verified parse downstream.
+ *
+ * M3 (cortex#1246 NIT) — this is a PRE-VERIFY peek, so it must honour the
+ * "nothing reads the sealed payload before verify→decrypt" invariant in letter,
+ * not just in spirit. A SEALED body is `{ciphertext,nonce}` (no `task_id` /
+ * `agent_id`), so the peek would read `undefined` and leak nothing today — but
+ * to keep the invariant true regardless of future fields, the payload peek is
+ * skipped entirely when an `extensions.enc` marker is present. A sealed envelope
+ * therefore traces on `correlation_id` / `id` only; the real ids appear once the
+ * verified parse runs post-decrypt. Cleartext (transition-window) envelopes,
+ * whose fields were on the wire anyway, keep the richer trace detail.
  */
 function rawEnvelopeTraceContext(
   envelope: Envelope,
   subject: string | undefined,
 ): DispatchTraceContext {
   const join = envelope.correlation_id ?? envelope.id;
-  const payload = envelope.payload as
-    | Partial<DispatchTaskReceivedPayload>
-    | undefined;
+  // Never peek a sealed payload pre-verify — fall back to the join key only.
+  const sealed = readMarker(envelope) !== undefined;
+  const payload = sealed
+    ? undefined
+    : (envelope.payload as Partial<DispatchTaskReceivedPayload> | undefined);
   const taskId =
     typeof payload?.task_id === "string" ? payload.task_id : join;
   const agentId =
@@ -1090,6 +1102,30 @@ function routingDescriptorPreVerify(
   };
 }
 
+/**
+ * cortex#1246 NIT — memoise the inbound {@link NetworkKeyring} per networks map.
+ * `decryptInboundDispatch` rebuilt the keyring on EVERY sealed/`required`
+ * inbound; the `federatedNetworksById` map is constructed once in the listener
+ * factory and read-only for its lifetime (`payload_key` is read-only in M3), so
+ * keying a `WeakMap` on the map identity yields the same keyring on every call
+ * without re-deriving it. The `WeakMap` lets the cache entry GC with the map.
+ */
+const inboundKeyringByNetworksMap = new WeakMap<
+  Map<string, PolicyFederatedNetwork>,
+  NetworkKeyring
+>();
+
+function inboundKeyringFor(
+  networksById: Map<string, PolicyFederatedNetwork>,
+): NetworkKeyring {
+  let keyring = inboundKeyringByNetworksMap.get(networksById);
+  if (keyring === undefined) {
+    keyring = buildNetworkKeyring([...networksById.values()]);
+    inboundKeyringByNetworksMap.set(networksById, keyring);
+  }
+  return keyring;
+}
+
 /** Outcome of {@link decryptInboundDispatch}. */
 type InboundDecryptOutcome =
   | { status: "cleartext"; envelope: Envelope }
@@ -1124,7 +1160,7 @@ async function decryptInboundDispatch(
   if (marker === undefined && mode !== "required") {
     return { status: "cleartext", envelope };
   }
-  const keyring = buildNetworkKeyring([...networksById.values()]);
+  const keyring = inboundKeyringFor(networksById);
   const outcome = await openInboundEnvelope(envelope, keyring, { mode });
   if (outcome.status === "rejected") {
     return { status: "rejected", reason: outcome.reason };

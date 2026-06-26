@@ -70,29 +70,82 @@ export interface NetworkSealPolicy {
  * win). A principal listed on more than one network resolves to the FIRST
  * declaring network (deterministic by config order).
  *
+ * **Self-addressed federated subjects (cortex#1246 BLOCKER fix).** A federated
+ * *Offer* (and probe-echo Offer) is published on a SELF-addressed subject —
+ * `federated.{ownPrincipal}.{ownStack}.tasks.<cap>` (`review-subjects.ts`,
+ * `probe-responder.ts`) — so the publish path's `subject.split(".")[1]` is the
+ * offerer's OWN principal id, which is never in its own `peers[]`. Keyed by peers
+ * alone, that resolves to `undefined` and the Offer would federate in CLEARTEXT,
+ * unsealed and unwarned — contradicting the "ALL federated payloads (Direct /
+ * Delegate / Offer) sealed" invariant (ADR-0019). To close that, when
+ * `ownPrincipalId` is supplied we ALSO map it → its own network's seal policy, so
+ * a self-addressed federated egress seals with the network's `K`.
+ *
+ * **Multi-network ambiguity.** A self-addressed subject does NOT name the
+ * network, so when the stack is on MORE THAN ONE encryption-enabled network the
+ * correct `K` cannot be resolved from the subject alone. We deliberately leave
+ * `ownPrincipalId` UNMAPPED in that case rather than seal with a guessed (wrong)
+ * network's key — the publish path warns-once on the resulting cleartext egress
+ * so the gap is visible, never silent. Single encryption-enabled network (the
+ * metafactory deployment today) is unambiguous and seals correctly. Resolving
+ * the network for a self-addressed subject under multi-network federation is a
+ * tracked follow-up.
+ *
  * Only networks with `encryption` set to `enabled`/`required` produce a sealing
  * entry; `off` (or unset) networks are omitted so the publish path leaves their
  * traffic cleartext exactly as today.
  */
 export function buildSealPolicyByPrincipal(
   networks: readonly PolicyFederatedNetwork[],
+  ownPrincipalId?: string,
 ): Map<string, NetworkSealPolicy> {
   const byPrincipal = new Map<string, NetworkSealPolicy>();
+  const encryptionEnabled: NetworkSealPolicy[] = [];
   for (const network of networks) {
     const mode = (network.encryption ?? "off");
     if (mode === "off") continue;
+    const key = networkKeyFromConfig(network);
     const policy: NetworkSealPolicy = {
       net: network.id,
       mode,
-      ...(networkKeyFromConfig(network) !== undefined && {
-        key: networkKeyFromConfig(network),
-      }),
+      ...(key !== undefined && { key }),
     };
+    encryptionEnabled.push(policy);
     for (const peer of network.peers) {
       if (!byPrincipal.has(peer.principal_id)) {
         byPrincipal.set(peer.principal_id, policy);
       }
     }
   }
+  // Self-addressed seal (cortex#1246): map the OWN principal → its network's
+  // policy so a federated Offer published on `federated.{ownPrincipal}.…` seals.
+  // Only the unambiguous single-encryption-network case resolves here; multiple
+  // encryption-enabled networks are left unmapped (never seal with the wrong K —
+  // the publish path warns-once on that cleartext egress).
+  const soleEncryptionPolicy =
+    encryptionEnabled.length === 1 ? encryptionEnabled[0] : undefined;
+  if (
+    ownPrincipalId !== undefined &&
+    soleEncryptionPolicy !== undefined &&
+    !byPrincipal.has(ownPrincipalId)
+  ) {
+    byPrincipal.set(ownPrincipalId, soleEncryptionPolicy);
+  }
   return byPrincipal;
+}
+
+/**
+ * Count the encryption-enabled (`enabled`/`required`) networks in a roster.
+ * The publish path uses this to detect the multi-network self-addressed-Offer
+ * ambiguity that {@link buildSealPolicyByPrincipal} leaves unmapped, so it can
+ * warn-once instead of silently federating an Offer in the clear (cortex#1246).
+ */
+export function countEncryptionEnabledNetworks(
+  networks: readonly PolicyFederatedNetwork[],
+): number {
+  let n = 0;
+  for (const network of networks) {
+    if ((network.encryption ?? "off") !== "off") n += 1;
+  }
+  return n;
 }

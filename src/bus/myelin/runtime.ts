@@ -45,6 +45,7 @@ import { signEnvelope } from "@the-metafactory/myelin/identity";
 import { sealPayload } from "../../common/crypto/payload-encryption";
 import {
   buildSealPolicyByPrincipal,
+  countEncryptionEnabledNetworks,
   type NetworkSealPolicy,
 } from "../../common/crypto/network-encryption-policy";
 
@@ -1088,12 +1089,33 @@ export async function startMyelinRuntime(
   // to the network it lives on + that network's encryption posture + key. Empty
   // when no network sets `encryption: enabled|required` — the seal step below is
   // then a pure no-op and the publish path is byte-identical to pre-M3.
-  const sealPolicyByPrincipal = buildSealPolicyByPrincipal(federatedNetworks);
+  //
+  // cortex#1246 BLOCKER fix: also pass the OWN principal id so a SELF-addressed
+  // federated subject (`federated.{ownPrincipal}.…` — how a federated Offer /
+  // probe-echo is published) resolves to its own network's seal policy and seals,
+  // instead of falling through unsealed (segment[1] == own principal is never in
+  // its own `peers[]`). Only the unambiguous single-encryption-network case maps
+  // here; `encryptionEnabledNetworkCount` drives the multi-network warn-once
+  // below.
+  const myPrincipal = principalFromConfig(options?.principal);
+  const sealPolicyByPrincipal = buildSealPolicyByPrincipal(
+    federatedNetworks,
+    myPrincipal,
+  );
+  const encryptionEnabledNetworkCount =
+    countEncryptionEnabledNetworks(federatedNetworks);
   // Loud-but-not-fatal warning dedup: warn ONCE per network when sealing is
   // requested (`enabled`/`required`) but the network key is absent (PR5b has
   // not yet delivered `K`). We publish cleartext in that case — federation
   // stays up, but "federating in the clear" is visible (ADR-0019 §7).
   const sealKeyMissingWarned = new Set<string>();
+  // cortex#1246 — warn-once dedup for a self-addressed federated egress
+  // (`federated.{ownPrincipal}.…`, e.g. an Offer) that could NOT be sealed
+  // because the stack is on MULTIPLE encryption-enabled networks and the network
+  // is unresolvable from a self-addressed subject alone. Single-network seals
+  // correctly (own principal is mapped in `sealPolicyByPrincipal`); this defends
+  // the multi-network gap so it is loud, never silent.
+  let selfAddressedAmbiguousSealWarned = false;
 
   // Back-compat alias: every existing reference to the single `link` now
   // targets the primary link's `NatsLink`. The subscribe/pull/jsm helpers
@@ -1306,7 +1328,7 @@ export async function startMyelinRuntime(
   // reconnect attaches the link but re-binding its interest on reconnect is
   // deferred (the leaf comes back publish-capable; inbound re-bind is a TC-2d-
   // adjacent follow-up, noted in the PR).
-  const myPrincipal = principalFromConfig(options?.principal);
+  // `myPrincipal` is resolved once above (seal-policy build site).
   const myStack = options?.stack;
   // `federated.{my-principal}.{my-stack}.>` (stack-aware) or
   // `federated.{my-principal}.>` (stack-less — the `>` multi-segment wildcard
@@ -1540,7 +1562,27 @@ export async function startMyelinRuntime(
     }
     const policy: NetworkSealPolicy | undefined =
       sealPolicyByPrincipal.get(targetPrincipal);
-    if (policy === undefined) return envelope; // network not encryption-enabled
+    if (policy === undefined) {
+      // cortex#1246 — no seal policy resolved for this federated subject. For a
+      // peer-addressed subject this is correct (the target's network is not
+      // encryption-enabled → cleartext as today). But a SELF-addressed subject
+      // (`federated.{ownPrincipal}.…`, e.g. an Offer) only lands here when the
+      // stack is on MULTIPLE encryption-enabled networks (single-network maps the
+      // own principal in `sealPolicyByPrincipal`): the network is unresolvable
+      // from a self-addressed subject alone, so we publish cleartext but WARN
+      // ONCE — a federated Offer in the clear must never be silent (ADR-0019 §7).
+      if (
+        targetPrincipal === myPrincipal &&
+        encryptionEnabledNetworkCount > 1 &&
+        !selfAddressedAmbiguousSealWarned
+      ) {
+        selfAddressedAmbiguousSealWarned = true;
+        console.error(
+          `myelin-runtime: self-addressed federated subject "${subject}" (own principal="${myPrincipal}") could NOT be sealed — the stack is on ${encryptionEnabledNetworkCount} encryption-enabled networks and the network is not resolvable from a self-addressed subject alone (cortex#1246 multi-network follow-up). Publishing IN THE CLEAR. This is a loud-but-not-fatal warning.`,
+        );
+      }
+      return envelope; // network not encryption-enabled (or unresolvable self-addr)
+    }
     if (policy.key === undefined) {
       // Encryption requested but PR5b has not delivered `K` yet — warn once,
       // publish cleartext (ADR-0019 §7 loud-but-not-fatal). The federated link
