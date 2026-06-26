@@ -86,15 +86,16 @@ describe("join usage", () => {
     expect(res.stderr).toContain("principal.id");
   });
 
-  test("#753 — principal flagged but no registry derivable → names registry field (exit 2)", async () => {
+  test("#753 — principal flagged, empty config → names the next missing field (exit 2)", async () => {
     const res = await dispatchNetwork(
       ["join", "metafactory", "--principal", "andreas"],
       EMPTY_READER,
     );
     expect(res.exitCode).toBe(2);
-    // First underivable required value after seed surfaces; with empty config
-    // the seed is also missing, so seed is named first.
-    expect(res.stderr).toMatch(/cannot resolve (signing seed|registry URL)/);
+    // cortex#1228 — the registry is no longer a missing-field error (it falls
+    // back to the default anchor), so the seed is the first underivable
+    // required value with an empty config.
+    expect(res.stderr).toContain("cannot resolve signing seed");
   });
 
   test("--apply and --dry-run are mutually exclusive (exit 2)", async () => {
@@ -179,6 +180,45 @@ describe("join dry-run safety", () => {
     ], EMPTY_READER);
     // Failure output goes to stderr; it still carries the dry-run banner.
     expect(res.stderr).toContain("dry-run");
+  });
+});
+
+// =============================================================================
+// cortex#1228 — TOFU is never silent for a custom registry; pinned ⇒ no warning
+// =============================================================================
+
+describe("#1228 — custom-registry TOFU warning", () => {
+  test("custom registry, NO pubkey → emits the explicit TOFU warning", async () => {
+    const dir = freshDir();
+    const res = await dispatchNetwork([
+      "join", "metafactory",
+      "--principal", "andreas",
+      "--registry-url", "http://127.0.0.1:0", // custom + unreachable by construction
+      "--seed-path", join(dir, "seed.nk"),
+      "--creds", join(dir, "andreas.creds"),
+      "--account", "A" + "B".repeat(55),
+      "--nats-config", join(dir, "local.conf"),
+      "--plist", join(dir, "nats.plist"),
+    ], EMPTY_READER);
+    // The warning is emitted before the (failing) register step.
+    expect(res.stderr).toContain("TOFU");
+    expect(res.stderr).toContain("custom");
+  });
+
+  test("custom registry WITH --registry-pubkey → NO TOFU warning (pinned)", async () => {
+    const dir = freshDir();
+    const res = await dispatchNetwork([
+      "join", "metafactory",
+      "--principal", "andreas",
+      "--registry-url", "http://127.0.0.1:0",
+      "--registry-pubkey", "Z".repeat(43) + "=",
+      "--seed-path", join(dir, "seed.nk"),
+      "--creds", join(dir, "andreas.creds"),
+      "--account", "A" + "B".repeat(55),
+      "--nats-config", join(dir, "local.conf"),
+      "--plist", join(dir, "nats.plist"),
+    ], EMPTY_READER);
+    expect(res.stderr).not.toContain("Trusting it on first use");
   });
 });
 

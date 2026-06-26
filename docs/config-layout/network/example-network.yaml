@@ -35,10 +35,24 @@
 #     # registry — the network-registry endpoint + DD-9 trust pin.
 #     # `cortex network join <network>` (#753) derives its --registry-url /
 #     # --registry-pubkey from here, so the one-liner needs no registry flags.
+#     #
+#     # cortex#1228 — you usually DON'T need this block at all for the
+#     # metafactory network: the default registry (URL + Ed25519 pubkey) is
+#     # PRE-PINNED, compiled into cortex (the "root-CA" anchor), so a fresh
+#     # install trusts it with zero paste and zero TOFU. Only declare `registry:`
+#     # below to (a) point at a CUSTOM (non-default) network, or (b) override the
+#     # baked default. TODO(arc-populate): `arc upgrade Cortex` is intended to
+#     # also WRITE this block from the compiled-in DEFAULT_REGISTRY anchor
+#     # (defense-in-depth — pinned in binary AND visible in config); that
+#     # arc-side populate is a follow-up (tracked on #1228).
 #     registry:
-#       url: https://registry.meta-factory.ai
-#       # OPTIONAL pinned Ed25519 pubkey (base64, 44 chars). Omit for TOFU on
-#       # first boot; paste the pinned value here for zero-TOFU.
+#       # The canonical host that serves GET /registry/pubkey. (NOT
+#       # `registry.meta-factory.ai`, which does not resolve.)
+#       url: https://network.meta-factory.ai
+#       # OPTIONAL pinned Ed25519 pubkey (base64, 44 chars). On the DEFAULT url
+#       # above you can omit this — cortex pins the compiled-in anchor (no TOFU).
+#       # For a CUSTOM registry, omit ⇒ TOFU on first boot (with a warning);
+#       # paste the pinned value here for zero-TOFU.
 #       # pubkey: <REPLACE_ME_REGISTRY_PUBKEY>
 #
 #     networks:

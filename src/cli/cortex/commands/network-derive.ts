@@ -19,8 +19,9 @@
  *   | principal         | --principal       | principal.id                                   | —                                  |
  *   | stack             | --stack           | stack.id (single configured stack)             | {principal}/default                |
  *   | seed-path         | --seed-path       | stack.nkey_seed_path                            | —                                  |
- *   | registry-url      | --registry-url    | policy.federated.registry.url                  | —                                  |
- *   | registry-pubkey   | --registry-pubkey | policy.federated.registry.pubkey               | — (TOFU when absent)               |
+ *   | registry-url      | --registry-url    | policy.federated.registry.url                  | DEFAULT_REGISTRY.url (#1228)        |
+ *   | registry-pubkey   | --registry-pubkey | policy.federated.registry.pubkey               | DEFAULT_REGISTRY.pubkey on the      |
+ *   |                   |                   |                                                | default URL; else TOFU (#1228)      |
  *   | nats-config       | --nats-config     | stack.nats_infra.config_path                   | —                                  |
  *   | plist             | --plist           | stack.nats_infra.plist_path                     | —                                  |
  *   | account           | --account         | stack.nats_infra.account                       | —                                  |
@@ -39,6 +40,7 @@
 import type { LoadedConfig } from "../../../common/config/loader";
 import type { ServicePlatform } from "../../../common/nats/nats-service-manager";
 import type { OperatorModeLeafPackage } from "../../../common/nats/leaf-remote-renderer";
+import { resolveRegistryAnchor } from "./default-registry";
 // network-leaf-package import removed — ADR-0015 retired O-4b / Model-A.
 
 // =============================================================================
@@ -53,6 +55,13 @@ export interface DerivedJoinInputs {
   seedPath: string;
   registryUrl: string;
   registryPubkey?: string;
+  /**
+   * cortex#1228 — `true` ⇒ the resolved registry is a CUSTOM (non-default)
+   * registry with no pinned pubkey, so the join will trust-on-first-use. The
+   * CLI surfaces an explicit warning when this is set (TOFU is never silent).
+   * Absent ⇒ the registry is pinned (default-anchor / config / flag), no TOFU.
+   */
+  registryTofu?: boolean;
   natsConfigPath: string;
   /**
    * macOS — the nats-server launchd plist path (`stack.nats_infra.plist_path`
@@ -339,16 +348,22 @@ export function deriveJoinInputs(
     );
   }
 
-  // registry — flag wins, else policy.federated.registry.{url,pubkey}.
+  // registry — cortex#1228: resolved through the shared anchor chokepoint.
+  // Precedence flag → config → the compiled-in DEFAULT_REGISTRY anchor, so the
+  // URL ALWAYS resolves (closes the old hard-error gap: a fresh install with no
+  // `policy.federated.registry` now defaults to the metafactory registry,
+  // PINNED, with NO TOFU window). pubkey: explicit pin wins; else the default
+  // anchor's baked pubkey when the URL is the default; else absent (TOFU on a
+  // custom registry, flagged via `registryTofu`).
   const registry = cfg.policy?.federated?.registry;
-  const registryUrl = overrides.registryUrl ?? registry?.url;
-  if (registryUrl === undefined || registryUrl === "") {
-    return fail(
-      "cannot resolve registry URL — pass --registry-url or set `policy.federated.registry.url` in cortex.yaml",
-    );
-  }
-  // pubkey stays optional everywhere (TOFU when absent).
-  const registryPubkey = overrides.registryPubkey ?? registry?.pubkey;
+  const resolvedRegistry = resolveRegistryAnchor({
+    ...(overrides.registryUrl !== undefined && { flagUrl: overrides.registryUrl }),
+    ...(overrides.registryPubkey !== undefined && { flagPubkey: overrides.registryPubkey }),
+    ...(registry?.url !== undefined && { configUrl: registry.url }),
+    ...(registry?.pubkey !== undefined && { configPubkey: registry.pubkey }),
+  });
+  const registryUrl = resolvedRegistry.url;
+  const registryPubkey = resolvedRegistry.pubkey;
 
   // nats-infra — flag wins, else stack.nats_infra.{config_path,plist_path,account}.
   const natsInfra = cfg.stack?.nats_infra;
@@ -428,6 +443,7 @@ export function deriveJoinInputs(
       seedPath,
       registryUrl,
       ...(registryPubkey !== undefined && { registryPubkey }),
+      ...(resolvedRegistry.tofu && { registryTofu: true }),
       natsConfigPath,
       ...(descriptor.plistPath !== undefined && { plistPath: descriptor.plistPath }),
       ...(descriptor.unitPath !== undefined && { unitPath: descriptor.unitPath }),

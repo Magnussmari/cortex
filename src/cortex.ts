@@ -253,6 +253,7 @@ import { WorklogManager } from "./runner/worklog-manager";
 // `cortex provision-stack register …` work directly (no `bun src/...` prefix).
 // These do NOT boot the daemon — only `start` does.
 import { dispatchNetwork } from "./cli/cortex/commands/network";
+import { resolveRegistryAnchor } from "./cli/cortex/commands/default-registry";
 import { dispatchOffer } from "./cli/cortex/commands/offer";
 import { dispatchProvisionStack } from "./cli/cortex/commands/provision-stack";
 import { dispatchRelease } from "./cli/cortex/commands/release";
@@ -3372,11 +3373,22 @@ export async function startCortex(
           `stack NKey pubkey ${stackNKeyPubForVerifier} to base64 ed25519\n`,
       );
     } else {
+      // cortex#1228 — resolve the registry pubkey through the shared anchor:
+      // when the configured URL is the default metafactory registry but no
+      // pubkey is pinned in config, pin the compiled-in anchor pubkey (no TOFU
+      // window on the default). A custom registry with no pin still falls
+      // through to the client's TOFU (pubkey left undefined here).
+      const resolvedFederationRegistry = resolveRegistryAnchor({
+        configUrl: federationRegistryConfig.url,
+        ...(federationRegistryConfig.pubkey !== undefined && {
+          configPubkey: federationRegistryConfig.pubkey,
+        }),
+      });
       const peerResolver = new PrincipalPubkeyResolver({
         enabled: federationVerifyEnabled,
-        baseUrl: federationRegistryConfig.url,
-        ...(federationRegistryConfig.pubkey !== undefined && {
-          registryPubkey: federationRegistryConfig.pubkey,
+        baseUrl: resolvedFederationRegistry.url,
+        ...(resolvedFederationRegistry.pubkey !== undefined && {
+          registryPubkey: resolvedFederationRegistry.pubkey,
         }),
       });
       const peerRegistry = new MultiPrincipalIdentityRegistry({
@@ -3519,9 +3531,16 @@ export async function startCortex(
         `cortex: policy.federated.registry configured (${registryConfig.url}) but no peers declared — registry client dormant`,
       );
     } else {
+      // cortex#1228 — pin the compiled-in anchor pubkey when the configured URL
+      // is the default registry and config omits the pubkey (no TOFU on the
+      // default). Custom registries keep the client's TOFU (pubkey undefined).
+      const resolvedRegistry = resolveRegistryAnchor({
+        configUrl: registryConfig.url,
+        ...(registryConfig.pubkey !== undefined && { configPubkey: registryConfig.pubkey }),
+      });
       registryClient = new RegistryClient({
-        url: registryConfig.url,
-        ...(registryConfig.pubkey !== undefined && { pubkey: registryConfig.pubkey }),
+        url: resolvedRegistry.url,
+        ...(resolvedRegistry.pubkey !== undefined && { pubkey: resolvedRegistry.pubkey }),
         principalIds: peerPrincipalIds,
       });
       // Boot the client asynchronously — TOFU + initial refresh must
