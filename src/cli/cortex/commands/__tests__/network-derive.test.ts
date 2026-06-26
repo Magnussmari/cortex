@@ -19,6 +19,7 @@ import {
   defaultCredsPath,
   type ConfigReader,
 } from "../network-derive";
+import { DEFAULT_REGISTRY } from "../default-registry";
 import type { LoadedConfig } from "../../../../common/config/loader";
 import type { AgentConfig } from "../../../../common/types/config";
 
@@ -173,7 +174,7 @@ describe("deriveJoinInputs — config-only (the one-liner)", () => {
     expect(defaultCredsPath("metafactory")).toBe("~/.config/nats/metafactory.creds");
   });
 
-  test("registry pubkey absent → omitted (TOFU), still ok", () => {
+  test("CUSTOM registry, pubkey absent → omitted (TOFU) + registryTofu flag set", () => {
     const cfg = loaded({
       principal: { id: "andreas" },
       stack: {
@@ -183,13 +184,17 @@ describe("deriveJoinInputs — config-only (the one-liner)", () => {
       },
       policy: {
         principals: [], roles: [],
+        // A CUSTOM (non-default) registry with no pubkey ⇒ TOFU.
         federated: { networks: [], registry: { url: "https://r.test" } },
       },
     });
     // Pin darwin — `plist_path` fixture (cortex#771; see above).
     const res = deriveJoinInputs("metafactory", {}, "/cfg", reader(cfg), "darwin");
     expect(res.ok).toBe(true);
+    expect(res.inputs?.registryUrl).toBe("https://r.test");
     expect(res.inputs?.registryPubkey).toBeUndefined();
+    // cortex#1228 — the CLI uses this to surface the explicit TOFU warning.
+    expect(res.inputs?.registryTofu).toBe(true);
   });
 
   test("no stack.id → convention {principal}/default", () => {
@@ -296,16 +301,10 @@ describe("deriveJoinInputs — actionable missing-config errors", () => {
     expect(res.reason).toContain("stack.nkey_seed_path");
   });
 
-  test("no registry anywhere → names policy.federated.registry.url", () => {
-    const cfg = loaded({
-      principal: { id: "andreas" },
-      stack: { id: "andreas/mf", nkey_seed_path: "~/s" },
-    });
-    const res = deriveJoinInputs("metafactory", {}, "/cfg", reader(cfg));
-    expect(res.ok).toBe(false);
-    expect(res.reason).toContain("policy.federated.registry.url");
-  });
-
+  // cortex#1228 — the registry is NO LONGER a missing-field error: when neither
+  // flag nor config supplies it, the derive falls back to the compiled-in
+  // DEFAULT_REGISTRY anchor (pinned, no TOFU). See the dedicated default-anchor
+  // describe block below. The next still-required field surfaces normally.
   test("no nats config path → names stack.nats_infra.config_path", () => {
     const cfg = loaded({
       principal: { id: "andreas" },
@@ -362,6 +361,79 @@ describe("deriveJoinInputs — actionable missing-config errors", () => {
     const res = deriveJoinInputs("metafactory", { account: acct }, "/cfg", reader(cfg), "darwin");
     expect(res.ok).toBe(true);
     expect(res.inputs?.account).toBe(acct);
+  });
+});
+
+// =============================================================================
+// cortex#1228 — default registry trust anchor: derive fallback + TOFU gating
+// =============================================================================
+
+describe("deriveJoinInputs — default registry anchor (#1228)", () => {
+  // A complete stack config WITHOUT a policy.federated.registry block. The
+  // registry must fall back to the compiled-in DEFAULT_REGISTRY anchor.
+  const NO_REGISTRY = loaded({
+    principal: { id: "andreas" },
+    stack: {
+      id: "andreas/meta-factory",
+      nkey_seed_path: "~/seed.nk",
+      nats_infra: { config_path: "~/c", plist_path: "~/p", account: "A" + "D".repeat(55) },
+    },
+    policy: { principals: [], roles: [], federated: { networks: [] } },
+  });
+
+  test("NO registry in config → falls back to DEFAULT_REGISTRY, PINNED, no TOFU", () => {
+    const res = deriveJoinInputs("metafactory", {}, "/cfg", reader(NO_REGISTRY), "darwin");
+    expect(res.ok).toBe(true);
+    expect(res.inputs?.registryUrl).toBe(DEFAULT_REGISTRY.url);
+    expect(res.inputs?.registryPubkey).toBe(DEFAULT_REGISTRY.pubkey);
+    // The default is pre-pinned — registryTofu must be ABSENT (no warning).
+    expect(res.inputs?.registryTofu).toBeUndefined();
+  });
+
+  test("default URL configured but NO pubkey → still default-pinned (no TOFU)", () => {
+    const cfg = loaded({
+      principal: { id: "andreas" },
+      stack: {
+        id: "andreas/meta-factory",
+        nkey_seed_path: "~/seed.nk",
+        nats_infra: { config_path: "~/c", plist_path: "~/p", account: "A" + "D".repeat(55) },
+      },
+      policy: {
+        principals: [], roles: [],
+        federated: { networks: [], registry: { url: DEFAULT_REGISTRY.url } },
+      },
+    });
+    const res = deriveJoinInputs("metafactory", {}, "/cfg", reader(cfg), "darwin");
+    expect(res.ok).toBe(true);
+    expect(res.inputs?.registryPubkey).toBe(DEFAULT_REGISTRY.pubkey);
+    expect(res.inputs?.registryTofu).toBeUndefined();
+  });
+
+  test("--registry-url override to a CUSTOM registry (no pubkey) → TOFU flagged", () => {
+    const res = deriveJoinInputs(
+      "metafactory",
+      { registryUrl: "https://my.custom.registry" },
+      "/cfg",
+      reader(NO_REGISTRY),
+      "darwin",
+    );
+    expect(res.ok).toBe(true);
+    expect(res.inputs?.registryUrl).toBe("https://my.custom.registry");
+    expect(res.inputs?.registryPubkey).toBeUndefined();
+    expect(res.inputs?.registryTofu).toBe(true);
+  });
+
+  test("--registry-pubkey override pins a custom registry (no TOFU)", () => {
+    const res = deriveJoinInputs(
+      "metafactory",
+      { registryUrl: "https://my.custom.registry", registryPubkey: "Z".repeat(43) + "=" },
+      "/cfg",
+      reader(NO_REGISTRY),
+      "darwin",
+    );
+    expect(res.ok).toBe(true);
+    expect(res.inputs?.registryPubkey).toBe("Z".repeat(43) + "=");
+    expect(res.inputs?.registryTofu).toBeUndefined();
   });
 });
 
