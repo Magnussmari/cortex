@@ -2111,6 +2111,58 @@ export const PolicyFederatedNetworkSchema = z.object({
    * reconcile OFF (default), byte-identical to pre-P3 behaviour.
    */
   reconcile: PolicyFederatedReconcileSchema.optional(),
+  /**
+   * M3 (cortex#1241, ADR-0019) — per-network payload-encryption posture.
+   * Encryption is a property of the NETWORK (one admin flag), not a per-member
+   * chore (plug-and-play, zero per-principal key handling). Default `off`.
+   *
+   *   - `off`      — never seal (today's behaviour; warn when federating).
+   *   - `enabled`  — seal ALL federated.* payloads (Direct/Delegate/Offer) with
+   *                  the network key `K`; ACCEPT BOTH cleartext-but-signed and
+   *                  sealed inbound (the transition window — never breaks an
+   *                  in-flight peer).
+   *   - `required` — seal all outbound; REJECT inbound cleartext federated
+   *                  payloads (flip here once every member confirms sealing).
+   *
+   * The key `K` itself is NOT this flag — see `payload_key` below.
+   */
+  encryption: z.enum(["off", "enabled", "required"]).optional(),
+  /**
+   * M3 (cortex#1241, ADR-0019 §5) — the per-network symmetric AEAD key `K`,
+   * base64 (standard alphabet), decoding to exactly 32 bytes. EVERY admitted
+   * member of the network holds the same `K`; sealing/unsealing is transparent
+   * in the publish/receive path.
+   *
+   * **PR5b populates this over the admission/seal channel** (the same pipe that
+   * delivers the per-member leaf secret, sealed-to-pubkey). M3 only CONSUMES it:
+   * this is the clean config field PR5b writes and the runtime reads. Until PR5b
+   * lands it may be staged manually for testing; in production no principal key
+   * handling is required (ADR-0019 plug-and-play lock).
+   *
+   * When `encryption` is `enabled`/`required` but this is ABSENT, the runtime
+   * emits a loud-but-not-fatal warning and publishes cleartext (it cannot seal
+   * without `K`) — federation stays up, but "federating in the clear" is visible.
+   */
+  payload_key: z
+    .string()
+    .refine(
+      (s) => {
+        try {
+          return Buffer.from(s, "base64").length === 32;
+        } catch {
+          return false;
+        }
+      },
+      "payload_key must be base64 decoding to exactly 32 bytes (a 256-bit AEAD key)",
+    )
+    .optional(),
+  /**
+   * M3 — OPTIONAL key id (rotation epoch) for `payload_key`, stamped into the
+   * sealed envelope's `extensions.enc.kid` so a member selects the right `K`
+   * (current, or a grace-window previous) on open. Defaults to `<network-id>/k1`
+   * when omitted. PR5b bumps this on each network-key rotation.
+   */
+  payload_key_id: z.string().optional(),
 });
 
 export type PolicyFederatedNetwork = z.infer<typeof PolicyFederatedNetworkSchema>;

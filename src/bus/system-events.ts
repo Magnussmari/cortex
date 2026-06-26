@@ -1372,6 +1372,12 @@ export type SystemDispatchStage =
   // before the policy gate. `pass` = re-stamped; `fail` = sign failed and the
   // dispatch fell through with the original unsigned envelope.
   | "resigned-on-ingest"
+  // M3 (cortex#1241, ADR-0019) — verify-then-decrypt. Emitted on a `federated`
+  // dispatch whose sealed payload could NOT be decrypted after the chain
+  // verified (cleartext on a `required` network, missing network key, or AEAD
+  // open failure). Always `fail`; the dispatch is dropped before any payload
+  // field is parsed. A successful decrypt is silent (flows on to `parsed`).
+  | "payload-decrypt-rejected"
   | "policy-decision"
   | "session-spawning"
   | "started";
