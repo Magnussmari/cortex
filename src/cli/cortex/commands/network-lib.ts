@@ -63,8 +63,28 @@ export interface JoiningStack {
   principalId: string;
   /** Local stack slug — the `{stack}` segment (the part after the `/`). */
   stackSlug: string;
-  /** Path to the leaf `.creds` file (absolute). */
-  credentials: string;
+  /**
+   * Path to the leaf `.creds` file (absolute). OPTIONAL since C-1224: a
+   * secret-authenticated leaf ({@link JoiningStack.leafSecret}) carries no creds
+   * file — its credential is the URL userinfo.
+   */
+  credentials?: string;
+  /**
+   * C-1224 (ADR-0013 Model B, §Decision-1) — the **leaf shared secret** for a
+   * secret-authenticated transport-pipe leaf. Present ⇒ `joinNetwork` renders a
+   * leaf that authenticates via URL userinfo (`tls://user:secret@host`) and binds
+   * the principal's OWN local {@link JoiningStack.account}, instead of a
+   * `.creds`-file leaf. The hub authenticates the remote with the matching
+   * `authorization { user, password: <leaf-secret> }`; each side binds locally,
+   * no cross-operator JWT trust. Absent ⇒ the legacy `.creds` path.
+   */
+  leafSecret?: string;
+  /**
+   * C-1224 — the userinfo USER paired with {@link JoiningStack.leafSecret}
+   * (matches the hub's `authorization { user, … }`). The CLI defaults it to the
+   * principal id; required whenever `leafSecret` is set.
+   */
+  leafUser?: string;
   /**
    * Local nkey-U account the leaf binds to (DD-8 already in nkey-U) — OPTIONAL
    * (#799). Present for an operator-mode bus; OMITTED for a `$G`/default bus
@@ -241,7 +261,18 @@ export async function joinNetwork(
   // This is a READ (no mutation), so dry-run surfaces the same decision.
   const hasCreds =
     typeof stack.credentials === "string" && stack.credentials.trim().length > 0;
-  let bindMode = ports.leafFile.resolveBindMode(stack.account, hasCreds);
+  // C-1224 (ADR-0013 Model B) — a leaf SECRET is an auth method on par with a
+  // `.creds` file: it authenticates the secret-auth transport pipe via URL
+  // userinfo. So it satisfies `resolveBindMode`'s "has an auth method" gate (the
+  // function only uses this to refuse a bus with NO way to authenticate, and to
+  // allow the creds-only/$G no-account render). The account-bind safety (#794:
+  // an `account:` line must resolve against the local operator-mode tree) is
+  // ORTHOGONAL and still enforced — a secret-auth leaf on an operator-mode bus
+  // still binds (and #794-validates) the local `account`.
+  const hasSecret =
+    typeof stack.leafSecret === "string" && stack.leafSecret.trim().length > 0;
+  const hasLeafAuth = hasCreds || hasSecret;
+  let bindMode = ports.leafFile.resolveBindMode(stack.account, hasLeafAuth);
 
   // (b.5.1) O-3 (cortex#1053, spec §4-D2) — AUTO-CONVERT an anonymous bus.
   //
@@ -367,7 +398,12 @@ export async function joinNetwork(
   // incident's rendered remote pointed at a creds file that did not exist. A
   // READ (identical in live + dry-run); refuse here rather than render a leaf
   // that can never connect.
-  if (!ports.leafFile.credsExist(stack.credentials)) {
+  //
+  // C-1224 (ADR-0013 Model B) — SKIP this for a secret-auth leaf: it carries no
+  // `.creds` file (its credential is the URL userinfo secret), so there is
+  // nothing on disk to pre-flight here. The secret's presence was already
+  // confirmed by `hasSecret` above.
+  if (!hasSecret && !ports.leafFile.credsExist(stack.credentials ?? "")) {
     return {
       ok: false,
       steps,
@@ -389,10 +425,21 @@ export async function joinNetwork(
   try {
     ports.leafFile.write({
       descriptor: verified,
-      binding: {
-        credentials: stack.credentials,
-        ...(leafAccount !== undefined && { account: leafAccount }),
-      },
+      // C-1224 (ADR-0013 Model B) — render the SECRET-AUTH leaf when a leaf
+      // secret is present (URL userinfo, no creds file); else the legacy
+      // `.creds`-file leaf. Both still carry the local `account:` (`leafAccount`)
+      // when the bus is operator-mode (#799). Mutually exclusive: the renderer
+      // prefers the secret when both are somehow present.
+      binding: hasSecret
+        ? {
+            ...(stack.leafSecret !== undefined && { leafSecret: stack.leafSecret }),
+            ...(stack.leafUser !== undefined && { leafUser: stack.leafUser }),
+            ...(leafAccount !== undefined && { account: leafAccount }),
+          }
+        : {
+            ...(stack.credentials !== undefined && { credentials: stack.credentials }),
+            ...(leafAccount !== undefined && { account: leafAccount }),
+          },
     });
   } catch (err) {
     return {

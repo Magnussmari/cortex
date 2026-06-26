@@ -785,7 +785,7 @@ describe("join", () => {
       expect(res.reason).toContain("creds file not found");
       expect(res.reason).toContain("cortex#821");
       // The creds path was checked...
-      expect(rec.credsChecks).toEqual([LOCAL.credentials]);
+      expect(rec.credsChecks).toEqual([LOCAL.credentials ?? ""]);
       // ...and NOTHING was written/restarted (the refusal is before any mutation).
       expect(rec.writes.length).toBe(0);
       expect(rec.includesEnsured).toEqual([]);
@@ -801,7 +801,7 @@ describe("join", () => {
       const { ports, rec } = makeFakes({ busType: "operator-mode" });
       const res = await joinNetwork("metafactory", LOCAL, ports);
       expect(res.ok).toBe(true);
-      expect(rec.credsChecks).toEqual([LOCAL.credentials]);
+      expect(rec.credsChecks).toEqual([LOCAL.credentials ?? ""]);
     });
   });
 
@@ -1673,5 +1673,87 @@ describe("status", () => {
     });
     const res = await networkStatus(ports);
     expect(res.networks[0]!.link.state).toBe("unknown");
+  });
+});
+
+// =============================================================================
+// C-1224 (ADR-0013 Model B) — secret-authenticated leaf join.
+//
+// A Model-B join carries a leaf SHARED SECRET (not a `.creds` file): the leaf
+// authenticates the transport pipe via URL userinfo and binds the principal's
+// OWN local account. These assert the orchestration delta: the secret counts as
+// an auth method (bind-mode resolves), the `.creds` pre-flight is SKIPPED (no
+// creds file exists), and the write binding carries the secret + own account,
+// never a credentials path.
+// =============================================================================
+
+const LOCAL_SECRET: JoiningStack = {
+  principalId: "andreas",
+  stackSlug: "meta-factory",
+  // Model B — NO creds file; the credential is the leaf secret (URL userinfo).
+  leafSecret: "s3cr3t-leaf-pipe",
+  leafUser: "andreas",
+  account: "A" + "B".repeat(55),
+};
+
+describe("C-1224 — secret-auth leaf join (Model B)", () => {
+  test("operator-mode bus + secret binds own account; SKIPS the creds pre-flight", async () => {
+    const { ports, rec } = makeFakes({ busType: "operator-mode" });
+    const res = await joinNetwork("metafactory", LOCAL_SECRET, ports);
+
+    expect(res.ok).toBe(true);
+    // The `.creds` pre-flight is skipped — a secret-auth leaf has no creds file.
+    expect(rec.credsChecks).toEqual([]);
+    // Bind-mode WAS resolved (the secret satisfied the has-auth gate → hasCreds true).
+    expect(rec.bindModeChecks).toEqual([
+      { account: LOCAL_SECRET.account, hasCreds: true },
+    ]);
+    // The write binding carries the secret + the OWN account, and NO credentials.
+    expect(rec.writes.length).toBe(1);
+    const binding = rec.writes[0]!.binding;
+    expect(binding.leafSecret).toBe("s3cr3t-leaf-pipe");
+    expect(binding.leafUser).toBe("andreas");
+    expect(binding.account).toBe(LOCAL_SECRET.account);
+    expect(binding.credentials).toBeUndefined();
+  });
+
+  test("$G/default bus + secret-only (no account) renders no-account secret leaf", async () => {
+    const noAccount: JoiningStack = {
+      principalId: "andreas",
+      stackSlug: "meta-factory",
+      leafSecret: "s3cr3t",
+      leafUser: "andreas",
+    };
+    const { ports, rec } = makeFakes({ busType: "default-g" });
+    const res = await joinNetwork("metafactory", noAccount, ports);
+
+    expect(res.ok).toBe(true);
+    expect(rec.credsChecks).toEqual([]);
+    const binding = rec.writes[0]!.binding;
+    expect(binding.leafSecret).toBe("s3cr3t");
+    expect(binding.account).toBeUndefined();
+    expect(binding.credentials).toBeUndefined();
+  });
+
+  test("creds-path join is UNCHANGED — still pre-flights the creds file (no regression)", async () => {
+    const { ports, rec } = makeFakes({ busType: "operator-mode" });
+    const res = await joinNetwork("metafactory", LOCAL, ports);
+    expect(res.ok).toBe(true);
+    // The legacy creds path STILL runs the #821 creds pre-flight.
+    expect(rec.credsChecks).toEqual([LOCAL.credentials ?? ""]);
+    const binding = rec.writes[0]!.binding;
+    expect(binding.credentials).toBe(LOCAL.credentials);
+    expect(binding.leafSecret).toBeUndefined();
+  });
+
+  test("operator-mode auto-convert path is untouched by the secret delta (Model-B survivor)", async () => {
+    // An anonymous bus + a leaf package still auto-converts (O-3) — the secret
+    // delta did not disturb the operator-mode-package flow. Here we exercise the
+    // creds-path join on an anonymous bus that converts, confirming no regression.
+    const withPkg: JoiningStack = { ...LOCAL, operatorModePackage: LOCAL_PACKAGE };
+    const { ports, rec } = makeFakes({ busType: "anonymous" });
+    const res = await joinNetwork("metafactory", withPkg, ports);
+    expect(res.ok).toBe(true);
+    expect(rec.conversions.length).toBe(1);
   });
 });

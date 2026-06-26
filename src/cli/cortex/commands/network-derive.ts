@@ -86,6 +86,21 @@ export interface DerivedJoinInputs {
   account?: string;
   credsPath: string;
   /**
+   * C-1224 (ADR-0013 Model B) — the **leaf shared secret** for a secret-
+   * authenticated transport-pipe leaf (`--leaf-secret` /
+   * `stack.nats_infra.leaf_secret`). Present ⇒ the join renders a secret-auth
+   * leaf (URL userinfo) binding the principal's OWN local account, instead of a
+   * `.creds`-file leaf. Absent ⇒ the legacy creds path.
+   */
+  leafSecret?: string;
+  /**
+   * C-1224 — the userinfo USER paired with {@link DerivedJoinInputs.leafSecret}
+   * (`--leaf-user` / `stack.nats_infra.leaf_user`). Resolved ONLY when a leaf
+   * secret is present; defaults to the principal id when neither flag nor config
+   * supplies one.
+   */
+  leafUser?: string;
+  /**
    * O-3 (cortex#1053) — the operator-mode leaf package, assembled from
    * `--operator-jwt` / `--account-jwt` / `--account` (+ optional
    * `--system-account` / `--system-account-jwt`) flags or the matching
@@ -142,6 +157,10 @@ export interface JoinOverrides {
   unitPath?: string;
   account?: string;
   credsPath?: string;
+  /** C-1224 (ADR-0013 Model B) — `--leaf-secret` (the secret-auth pipe secret). */
+  leafSecret?: string;
+  /** C-1224 — `--leaf-user` (userinfo user; defaults to the principal id). */
+  leafUser?: string;
   /** O-3 (#1053) — `--operator-jwt`. */
   operatorJwt?: string;
   /** O-3 (#1053) — `--account-jwt`. */
@@ -400,6 +419,20 @@ export function deriveJoinInputs(
   const credsPath =
     overrides.credsPath ?? natsInfra?.creds_path ?? defaultCredsPath(networkId);
 
+  // C-1224 (ADR-0013 Model B) — the leaf shared secret (secret-auth pipe). Flag
+  // wins, else `stack.nats_infra.leaf_secret`. When present, the join renders a
+  // secret-auth leaf binding the principal's OWN local `account` instead of a
+  // `.creds`-file leaf. The userinfo USER defaults to the principal id (the hub's
+  // `authorization { user, password }` user) unless flagged/configured. The user
+  // is resolved ONLY alongside a secret — it is meaningless without one.
+  const leafSecretRaw = overrides.leafSecret ?? natsInfra?.leaf_secret;
+  const leafSecret =
+    leafSecretRaw === undefined || leafSecretRaw === "" ? undefined : leafSecretRaw;
+  const leafUser =
+    leafSecret === undefined
+      ? undefined
+      : (overrides.leafUser ?? natsInfra?.leaf_user ?? principal);
+
   // O-3 (cortex#1053) — assemble the operator-mode leaf package. Precedence per
   // field: explicit flag > config (`stack.nats_infra.{operator_jwt,account_jwt,…}`).
   // The package materialises ONLY when its minimum (operator JWT + account + account
@@ -450,6 +483,8 @@ export function deriveJoinInputs(
       platform: descriptor.platform,
       ...(account !== undefined && { account }),
       credsPath,
+      ...(leafSecret !== undefined && { leafSecret }),
+      ...(leafUser !== undefined && { leafUser }),
       ...(operatorModePackage !== undefined && { operatorModePackage }),
       announceCapabilities,
     },
