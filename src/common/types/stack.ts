@@ -131,6 +131,29 @@ export const StackNatsInfraSchema = z.object({
    */
   creds_path: z.string().min(1).optional(),
   /**
+   * C-1224 (ADR-0013 Model B, §Decision-1) — the **leaf shared secret** for a
+   * secret-authenticated transport-pipe leaf. When set, `cortex network join`
+   * renders the network's leaf remote to authenticate to the hub with this
+   * secret (URL userinfo — the hub's `leafnodes{}` accept block carries the
+   * matching `authorization { user, password: <leaf-secret> }`) and binds the
+   * link to the principal's OWN local {@link StackNatsInfraSchema.shape.account}
+   * in their own NSC operator — no hub-minted `.creds`, no cross-operator JWT
+   * trust. OPTIONAL: a stack on the legacy `.creds` path, or one that never
+   * federates, omits it.
+   *
+   * This is SENSITIVE material (like the bot token + a `.creds` file): keep the
+   * stack file chmod 600. PR4/#1224 only RENDERS a secret already in config; the
+   * secret DISTRIBUTION path (out-of-band today; the admission gate later) is
+   * out of scope.
+   */
+  leaf_secret: z.string().min(1).optional(),
+  /**
+   * C-1224 — the userinfo USER paired with {@link StackNatsInfraSchema.shape.leaf_secret},
+   * matching the `user` in the hub's `authorization { user, password }` accept
+   * block. OPTIONAL: when omitted the join defaults it to the principal id.
+   */
+  leaf_user: z.string().min(1).optional(),
+  /**
    * O-3 (cortex#1053) — the operator-mode "leaf package": the material
    * `cortex network join` needs to AUTO-CONVERT an anonymous/hard-isolated bus
    * to operator-mode (rendering the SOP §B0.1 blocks) instead of fail-fasting

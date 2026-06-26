@@ -519,3 +519,116 @@ describe("#821 natsConfigMonitorUrl", () => {
     expect(natsConfigMonitorUrl(community)).toBe("http://127.0.0.1:8224");
   });
 });
+
+// =============================================================================
+// C-1224 (ADR-0013 Model B) — SECRET-AUTHENTICATED leaf rendering.
+//
+// The Model-B leaf is a secret-authenticated transport pipe: it binds the
+// principal's OWN local account (in their own operator-mode NSC store) + authenticates
+// to the hub with the shared leaf secret, presented via the dial URL's userinfo
+// (`tls://user:secret@host:port`) — the ONLY remote-side form nats-server v2.x
+// accepts (a literal `authorization {}`/`username`/`password` field inside a
+// remote is rejected at config load). These tests assert the rendered fragment;
+// the empirical nats-server `-t` validation lives in the PR description.
+// =============================================================================
+
+const SECRET_BINDING: StackLeafBinding = {
+  // Model B: NO creds file — the credential is the URL userinfo secret.
+  leafSecret: "s3cr3t-leaf-pipe",
+  leafUser: "andreas",
+  // The principal's OWN local federation account (provision writes this).
+  account: "AADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX",
+};
+
+describe("renderLeafRemote — C-1224 Model B secret-auth", () => {
+  test("renders secretAuth + own account, NO credentials, clean url", () => {
+    const remote = renderLeafRemote(DESCRIPTOR, SECRET_BINDING);
+    // Clean dial URL — the secret is NOT spliced into the structured url
+    // (status/logging surfaces stay secret-free).
+    expect(remote.url).toBe("tls://nats.meta-factory.dev:7422");
+    expect(remote.url).not.toContain("s3cr3t");
+    expect(remote.credentials).toBeUndefined();
+    expect(remote.secretAuth).toEqual({
+      user: "andreas",
+      secret: "s3cr3t-leaf-pipe",
+    });
+    // Own-account binding (operator-mode local account).
+    expect(remote.account).toBe(
+      "AADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX",
+    );
+    expect(remote.network_id).toBe("metafactory");
+  });
+
+  test("secret-auth on a $G bus (no account) renders secretAuth, no account line", () => {
+    const noAccount: StackLeafBinding = {
+      leafSecret: "s3cr3t",
+      leafUser: "andreas",
+    };
+    const remote = renderLeafRemote(DESCRIPTOR, noAccount);
+    expect(remote.secretAuth).toEqual({ user: "andreas", secret: "s3cr3t" });
+    expect(remote.account).toBeUndefined();
+    expect(remote.credentials).toBeUndefined();
+  });
+
+  test("a leaf secret without a user is a hard error (userinfo needs the user)", () => {
+    const noUser: StackLeafBinding = { leafSecret: "s3cr3t" };
+    expect(() => renderLeafRemote(DESCRIPTOR, noUser)).toThrow(/leaf user/);
+  });
+
+  test("the secret wins when BOTH a secret and a creds path are present", () => {
+    const both: StackLeafBinding = {
+      ...SECRET_BINDING,
+      credentials: "/Users/andreas/.config/nats/andreas.creds",
+    };
+    const remote = renderLeafRemote(DESCRIPTOR, both);
+    expect(remote.secretAuth).toBeDefined();
+    expect(remote.credentials).toBeUndefined();
+  });
+
+  test("an invalid account nkey on the secret path still throws", () => {
+    const badAccount: StackLeafBinding = {
+      leafSecret: "s3cr3t",
+      leafUser: "andreas",
+      account: "BADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX",
+    };
+    expect(() => renderLeafRemote(DESCRIPTOR, badAccount)).toThrow();
+  });
+});
+
+describe("renderLeafIncludeFile — C-1224 Model B secret-auth serialization", () => {
+  test("emits userinfo in the url, NO credentials line, with the account line", () => {
+    const conf = renderLeafIncludeFile(DESCRIPTOR, SECRET_BINDING);
+    // userinfo spliced into the dial URL (URL-encoded user:secret@host).
+    expect(conf).toContain(
+      'url: "tls://andreas:s3cr3t-leaf-pipe@nats.meta-factory.dev:7422"',
+    );
+    // No `.creds` file on a Model-B leaf.
+    expect(conf).not.toContain("credentials:");
+    // Own local account still bound (operator-mode).
+    expect(conf).toContain(
+      "account: AADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX",
+    );
+    expect(conf).toContain("leafnodes {");
+  });
+
+  test("URL-encodes a secret containing @ : / and space (authority boundary safe)", () => {
+    const tricky: StackLeafBinding = {
+      leafSecret: "p@ss:w/rd x",
+      leafUser: "andreas",
+    };
+    const conf = renderLeafIncludeFile(DESCRIPTOR, tricky);
+    // The raw secret must not appear unencoded (would break the userinfo@host
+    // boundary and could inject into the authority).
+    expect(conf).not.toContain("p@ss:w/rd x");
+    expect(conf).toContain("p%40ss%3Aw%2Frd%20x");
+  });
+
+  test("the creds path is unchanged — no userinfo, keeps the credentials line", () => {
+    const conf = renderLeafIncludeFile(DESCRIPTOR, BINDING);
+    expect(conf).toContain('url: "tls://nats.meta-factory.dev:7422"');
+    expect(conf).toContain(
+      'credentials: "/Users/andreas/.config/nats/andreas.creds"',
+    );
+    expect(conf).not.toContain("@nats.meta-factory.dev");
+  });
+});

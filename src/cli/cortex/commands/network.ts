@@ -195,6 +195,14 @@ const SPEC: SubcommandSpec<NetworkSubcommand> = {
         "--principal-seed": "value",
         "--creds": "value",
         "--account": "value",
+        // C-1224 (ADR-0013 Model B) — the secret-authenticated leaf pipe. When
+        // set, the join renders a leaf that authenticates to the hub via URL
+        // userinfo (`tls://<user>:<secret>@host`) and binds the principal's OWN
+        // local account, instead of a `.creds`-file leaf. Map to
+        // stack.nats_infra.{leaf_secret,leaf_user}; `--leaf-user` defaults to the
+        // principal id. The secret DISTRIBUTION is out-of-band (held PR5).
+        "--leaf-secret": "value",
+        "--leaf-user": "value",
         // O-3 (cortex#1053) — the operator-mode "leaf package" flags. When the
         // stack's bus is anonymous/hard-isolated (the #794 fail-fast input),
         // these let `cortex network join` AUTO-CONVERT it to operator-mode
@@ -556,6 +564,9 @@ async function runJoin(
         ...readOverride(flags, "--unit", "unitPath"),
         ...readOverride(flags, "--account", "account"),
         ...readOverride(flags, "--creds", "credsPath"),
+        // C-1224 (ADR-0013 Model B) — secret-auth leaf overrides.
+        ...readOverride(flags, "--leaf-secret", "leafSecret"),
+        ...readOverride(flags, "--leaf-user", "leafUser"),
         // O-3 (cortex#1053) — operator-mode leaf-package overrides.
         ...readOverride(flags, "--operator-jwt", "operatorJwt"),
         ...readOverride(flags, "--account-jwt", "accountJwt"),
@@ -613,6 +624,11 @@ async function runJoin(
     stackSlug: slugRes.slug,
     credentials: expandTilde(inputs.credsPath),
     account: inputs.account,
+    // C-1224 (ADR-0013 Model B) — pass the secret-auth leaf material (when
+    // resolved) so the join renders a secret-auth pipe binding the principal's
+    // OWN local account instead of a `.creds`-file leaf.
+    ...(inputs.leafSecret !== undefined && { leafSecret: inputs.leafSecret }),
+    ...(inputs.leafUser !== undefined && { leafUser: inputs.leafUser }),
     leafNode: optionalValueFlag(flags, "--leaf-node"),
     maxHop,
     // O-3 (cortex#1053) — pass the operator-mode leaf package (when resolved)

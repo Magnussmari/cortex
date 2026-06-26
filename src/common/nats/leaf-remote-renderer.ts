@@ -77,8 +77,47 @@ export interface StackLeafBinding {
    * authenticates with (e.g. `~/.config/nats/andreas.creds`, expanded).
    * Must be absolute — nats-server resolves it relative to its working
    * directory otherwise, which under launchd is unpredictable.
+   *
+   * OPTIONAL since C-1224 (ADR-0013 Model B): a secret-authenticated leaf
+   * ({@link StackLeafBinding.leafSecret}) presents its credential via the dial
+   * URL's userinfo, NOT a `.creds` file — so the binding carries no creds path.
+   * EITHER `credentials` OR `leafSecret` must be present; `renderLeafRemote`
+   * fails loud when neither is.
    */
-  credentials: string;
+  credentials?: string;
+  /**
+   * C-1224 (ADR-0013 Model B, §Decision-1) — the **leaf shared secret** for a
+   * secret-authenticated transport-pipe leaf. When present, the leaf remote
+   * authenticates to the hub with this secret (the hub's `leafnodes{}` accept
+   * block carries the matching `authorization { user, password: <leaf-secret> }`)
+   * instead of a `.creds` JWT, and binds the link to a LOCAL NATS account
+   * ({@link StackLeafBinding.account}) in the joiner's OWN operator-mode NSC
+   * store. No cross-operator JWT trust.
+   *
+   * The secret is presented to nats-server via the dial URL's **userinfo**
+   * (`tls://<user>:<secret>@host:port`) — empirically the ONLY remote-side form
+   * nats-server v2.x accepts (a literal `authorization {}` / `username` /
+   * `password` field inside a `remotes[]` entry is rejected at config load).
+   * User + secret are URL-encoded on serialization so an `@`/`:`/`/` in the
+   * secret can never break the authority boundary.
+   *
+   * SECURITY: a leaf secret is sensitive material (like a `.creds` file). It is
+   * folded into the rendered config file's URL only — never into the structured
+   * {@link LeafRemote.url} (so status/log surfaces stay secret-free). Keep the
+   * rendered `leafnodes-<network>.conf` chmod 600.
+   *
+   * NOTE: PR4/#1224 only RENDERS a secret already present in config — the secret
+   * DISTRIBUTION path (how a joiner obtains it: out-of-band today, the admission
+   * gate later) is out of scope here (held PR5).
+   */
+  leafSecret?: string;
+  /**
+   * C-1224 — the userinfo USER paired with {@link StackLeafBinding.leafSecret}.
+   * Matches the `user` in the hub's `authorization { user, password }` accept
+   * block. Required whenever `leafSecret` is set; the caller defaults it to the
+   * principal id. Ignored on the `.creds` path.
+   */
+  leafUser?: string;
   /**
    * The LOCAL NATS account (nkey-U `A…`) that leaf traffic binds to —
    * OPTIONAL (#799).
@@ -109,17 +148,38 @@ export interface StackLeafBinding {
 export interface LeafRemote {
   /** Idempotency key — the network this remote dials. */
   network_id: string;
-  /** Fully-qualified leaf dial URL, e.g. `tls://nats.meta-factory.dev:7422`. */
+  /**
+   * Fully-qualified leaf dial URL, e.g. `tls://nats.meta-factory.dev:7422`.
+   * Always the CLEAN url — userinfo for a secret-authenticated leaf
+   * ({@link LeafRemote.secretAuth}) is NOT spliced in here; it is added only at
+   * serialization time so the structured remote (status/logging) stays
+   * secret-free. (C-1224)
+   */
   url: string;
-  /** Absolute path to the `.creds` file (leaf auth). */
-  credentials: string;
+  /**
+   * Absolute path to the `.creds` file (leaf auth). Present for the JWT-creds
+   * path; ABSENT for a secret-authenticated leaf ({@link LeafRemote.secretAuth}),
+   * whose credential is the URL userinfo. (C-1224 made this optional.)
+   */
+  credentials?: string;
   /**
    * The local NATS account (nkey-U) the leaf binds to — present ONLY in
    * operator-mode (#799). Absent (`undefined`) for a `$G`/default bus, where
    * the account binding rides in the `.creds` JWT and an `account:` line would
    * crash nats-server. When absent, {@link serializeRemote} omits the line.
+   *
+   * For a secret-authenticated leaf (C-1224, Model B) this is the principal's
+   * OWN local federation account — the leaf binds it locally while the secret
+   * authenticates the pipe. Present whenever the bus is operator-mode.
    */
   account?: string;
+  /**
+   * C-1224 (ADR-0013 Model B) — secret-auth material for a transport-pipe leaf.
+   * Present ⇒ {@link serializeRemote} splices `user:secret` (URL-encoded) into
+   * the dial URL's userinfo and emits NO `credentials:` line. Absent ⇒ the
+   * JWT-creds path. Mutually exclusive with {@link LeafRemote.credentials}.
+   */
+  secretAuth?: { user: string; secret: string };
 }
 
 /** A network id may only be a single path segment of safe characters. */
@@ -211,38 +271,54 @@ export function renderLeafRemote(
     );
   }
 
-  const credentials = binding.credentials.trim();
-  if (credentials.length === 0 || !credentials.startsWith("/")) {
+  // #799 — the account is OPTIONAL. When absent/empty the remote is rendered
+  // WITHOUT an `account:` line (the `$G`/default-bus mode — binding rides in the
+  // creds JWT / the secret-auth pipe). When present it must be a valid nkey-U:
+  // it is emitted BARE (unquoted) into HOCON (matching local.conf), so anything
+  // outside the nkey-U grammar could break out of the remotes[] block and inject
+  // directives.
+  const account = binding.account?.trim();
+  const accountIsSet = account !== undefined && account.length > 0;
+  if (accountIsSet && !NKEY_ACCOUNT.test(account)) {
     throw new Error(
-      `leaf-remote-renderer: credentials must be an absolute path, got ${JSON.stringify(binding.credentials)}`,
+      `leaf-remote-renderer: account for network "${descriptor.network_id}" is not a valid nkey-U account public key (expected ${NKEY_ACCOUNT}); got ${JSON.stringify(binding.account)}`,
     );
   }
 
-  // #799 — the account is OPTIONAL. When absent/empty the remote is rendered
-  // WITHOUT an `account:` line (the `$G`/default-bus mode — binding rides in the
-  // creds JWT). When present it must be a valid nkey-U: it is emitted BARE
-  // (unquoted) into HOCON (matching local.conf), so anything outside the nkey-U
-  // grammar could break out of the remotes[] block and inject directives.
-  const account = binding.account?.trim();
-  if (account !== undefined && account.length > 0) {
-    if (!NKEY_ACCOUNT.test(account)) {
+  // C-1224 (ADR-0013 Model B) — SECRET-AUTH path. When the binding carries a
+  // leaf secret, the leaf authenticates via URL userinfo (the secret-auth pipe),
+  // NOT a `.creds` file. It still binds the principal's OWN local `account` (when
+  // operator-mode). Mutually exclusive with the creds path: the secret wins (a
+  // Model-B join carries no creds).
+  const leafSecret = binding.leafSecret?.trim();
+  if (leafSecret !== undefined && leafSecret.length > 0) {
+    const leafUser = binding.leafUser?.trim();
+    if (leafUser === undefined || leafUser.length === 0) {
       throw new Error(
-        `leaf-remote-renderer: account for network "${descriptor.network_id}" is not a valid nkey-U account public key (expected ${NKEY_ACCOUNT}); got ${JSON.stringify(binding.account)}`,
+        `leaf-remote-renderer: a leaf secret was supplied for network "${descriptor.network_id}" without a leaf user — secret-auth needs the userinfo USER that matches the hub's \`authorization { user, password }\` (set stack.nats_infra.leaf_user or pass --leaf-user; it defaults to the principal id)`,
       );
     }
     return {
       network_id: descriptor.network_id,
       url: resolveLeafUrl(descriptor),
-      credentials,
-      account,
+      ...(accountIsSet && { account }),
+      secretAuth: { user: leafUser, secret: leafSecret },
     };
   }
 
-  // No account → `$G`/default mode: omit `account:` entirely.
+  // CREDS path — require an absolute creds file (the JWT-auth leaf).
+  const credentials = binding.credentials?.trim();
+  if (credentials === undefined || credentials.length === 0 || !credentials.startsWith("/")) {
+    throw new Error(
+      `leaf-remote-renderer: leaf binding for network "${descriptor.network_id}" needs either an absolute \`.creds\` path or a leaf secret — credentials must be an absolute path, got ${JSON.stringify(binding.credentials)}`,
+    );
+  }
+
   return {
     network_id: descriptor.network_id,
     url: resolveLeafUrl(descriptor),
     credentials,
+    ...(accountIsSet && { account }),
   };
 }
 
@@ -1033,22 +1109,50 @@ function monitorUrlForPort(port: string): string | undefined {
   return `http://127.0.0.1:${n.toString()}`;
 }
 
+/**
+ * C-1224 (ADR-0013 Model B) — splice `user:secret` into a clean dial URL's
+ * userinfo, URL-encoding both components so an `@`/`:`/`/`/space in the secret
+ * cannot break the authority boundary (and so nats-server — Go `url.Parse`,
+ * which DECODES userinfo — recovers the exact secret). This is the ONLY
+ * remote-side form nats-server v2.x accepts for user/password leaf auth (a
+ * literal `authorization {}` / `username` / `password` field inside a remote is
+ * rejected at config load — verified empirically).
+ */
+function buildSecretAuthUrl(url: string, user: string, secret: string): string {
+  const u = new URL(url);
+  u.username = encodeURIComponent(user);
+  u.password = encodeURIComponent(secret);
+  return u.toString();
+}
+
 /** Serialize one {@link LeafRemote} as a HOCON object literal (indented). */
 function serializeRemote(remote: LeafRemote, indent: string): string {
   // `url` + `credentials` are quoted (they contain `:`, `/`, `.` which are
   // HOCON-significant); `account` is a bare nkey-U token (matches the live
   // local.conf, which leaves the account pubkey unquoted).
   //
+  // C-1224 — for a SECRET-AUTH leaf the credential rides in the URL userinfo
+  // (`tls://user:secret@host:port`), so the emitted `url` carries it and there
+  // is NO `credentials:` line. For the JWT-creds leaf the `url` is clean and a
+  // `credentials:` line points at the `.creds` file. Exactly one of the two.
+  const emittedUrl =
+    remote.secretAuth !== undefined
+      ? buildSecretAuthUrl(remote.url, remote.secretAuth.user, remote.secretAuth.secret)
+      : remote.url;
+
+  const lines = [
+    `${indent}{`,
+    `${indent}  url: ${JSON.stringify(emittedUrl)}`,
+  ];
+  if (remote.credentials !== undefined && remote.credentials.length > 0) {
+    lines.push(`${indent}  credentials: ${JSON.stringify(remote.credentials)}`);
+  }
   // #799 — `account:` is OMITTED entirely for a `$G`/default-bus remote (no
   // account on the binding). A working hand-built `$G` leaf has no `account:`
   // line — the binding rides in the creds JWT — and emitting one would crash
   // nats-server (`cannot find local account "<A…>"`). Only an operator-mode
-  // remote (account present) carries the line.
-  const lines = [
-    `${indent}{`,
-    `${indent}  url: ${JSON.stringify(remote.url)}`,
-    `${indent}  credentials: ${JSON.stringify(remote.credentials)}`,
-  ];
+  // remote (account present) carries the line. A Model-B secret-auth leaf on an
+  // operator-mode bus carries BOTH the userinfo secret AND the local `account:`.
   if (remote.account !== undefined && remote.account.length > 0) {
     lines.push(`${indent}  account: ${remote.account}`);
   }
