@@ -77,6 +77,8 @@ type ProvisionSubcommand = "generate" | "claim" | "register";
 
 const PRINCIPAL_ID_RE = /^[a-z][a-z0-9-]*$/;
 const STACK_ID_RE = /^[a-z][a-z0-9_-]*\/[a-z][a-z0-9_-]*$/;
+/** ADR-0018 Gap-A — network id grammar (mirrors the registry's NETWORK_ID_RE). */
+const NETWORK_ID_RE = /^[a-z][a-z0-9-]*$/;
 
 const SPEC: SubcommandSpec<ProvisionSubcommand> = {
   cliName: "provision-stack",
@@ -89,6 +91,9 @@ const SPEC: SubcommandSpec<ProvisionSubcommand> = {
         "--force": "bool",
         "--register": "bool",
         "--registry-url": "value",
+        // ADR-0018 Gap-A — name the target network when registering, so the
+        // PENDING admission request is pinned to it.
+        "--network": "value",
       },
     },
     claim: {
@@ -113,6 +118,10 @@ const SPEC: SubcommandSpec<ProvisionSubcommand> = {
         // drives the destructive full-overwrite re-attestation, so a
         // compromised registry can't omit a stack and cause a silent drop.
         "--registry-pubkey": "value",
+        // ADR-0018 Gap-A — the target network this registration requests
+        // admission into. Signed into the claim; the register hook stamps it
+        // onto the PENDING admission row (per-network idempotency).
+        "--network": "value",
       },
     },
   },
@@ -148,6 +157,27 @@ function resolveStackId(
     };
   }
   return { ok: true, stackId: stackIdFlag };
+}
+
+/**
+ * ADR-0018 Gap-A — resolve the optional `--network <id>` flag. Returns the
+ * validated network id, `undefined` when the flag is absent (a plain register
+ * that names no network), or an error result on a malformed value.
+ */
+function resolveNetworkId(
+  networkFlag: string | true | string[] | undefined,
+): { ok: true; networkId: string | undefined } | { ok: false; reason: string } {
+  if (networkFlag === undefined) return { ok: true, networkId: undefined };
+  if (networkFlag === true || typeof networkFlag !== "string") {
+    return { ok: false, reason: "--network requires a value" };
+  }
+  if (!NETWORK_ID_RE.test(networkFlag)) {
+    return {
+      ok: false,
+      reason: `--network "${networkFlag}" must be a valid network id (lowercase, letter-prefixed)`,
+    };
+  }
+  return { ok: true, networkId: networkFlag };
 }
 
 /** Pull a required value-flag; returns the string or an error result. */
@@ -224,7 +254,17 @@ async function runGenerate(ctx: HandlerCtx): Promise<ExitResult> {
     if (!urlRes.ok) {
       return usageError("generate", `--register also needs ${urlRes.reason}`, ctx.json);
     }
-    const reg = await doRegister(ctx.principalId, material, stackIdRes.stackId, urlRes.value);
+    const networkRes = resolveNetworkId(ctx.flags["--network"]);
+    if (!networkRes.ok) return usageError("generate", networkRes.reason, ctx.json);
+    const reg = await doRegister(
+      ctx.principalId,
+      material,
+      stackIdRes.stackId,
+      urlRes.value,
+      undefined,
+      undefined,
+      networkRes.networkId,
+    );
     if (!reg.ok) return opError(reg.reason, ctx.json, { fingerprint: material.fingerprint });
     registerNote = reg.note;
   }
@@ -331,6 +371,10 @@ async function runRegister(ctx: HandlerCtx): Promise<ExitResult> {
     registryPubkey = pubkeyFlag;
   }
 
+  // ADR-0018 Gap-A — optional target network for the admission request.
+  const networkRes = resolveNetworkId(ctx.flags["--network"]);
+  if (!networkRes.ok) return usageError("register", networkRes.reason, ctx.json);
+
   const reg = await doRegister(
     ctx.principalId,
     matRes.material,
@@ -338,6 +382,7 @@ async function runRegister(ctx: HandlerCtx): Promise<ExitResult> {
     urlRes.value,
     rootMaterial,
     registryPubkey,
+    networkRes.networkId,
   );
   if (!reg.ok) return opError(reg.reason, ctx.json, { fingerprint: matRes.material.fingerprint });
 
@@ -361,6 +406,7 @@ async function doRegister(
   registryUrl: string,
   rootMaterial?: StackIdentityMaterial,
   registryPubkey?: string,
+  networkId?: string,
 ): Promise<{ ok: true; note: string } | { ok: false; reason: string }> {
   // C-787 — build the COMPLETE intended `stacks[]`. The register route does a
   // FULL-OVERWRITE upsert of the `stacks` column with no read-merge, so a claim
@@ -425,6 +471,8 @@ async function doRegister(
       // #825 — CAS token: the updated_at the merge read. The route rejects
       // (409 stale_record) if a concurrent host changed the row since.
       ...(stacksRes.existingUpdatedAt !== undefined && { expectedUpdatedAt: stacksRes.existingUpdatedAt }),
+      // ADR-0018 Gap-A — pin the PENDING admission request to the target network.
+      ...(networkId !== undefined && { networkId }),
     });
   } catch (err) {
     return { ok: false, reason: `failed to build registration claim: ${err instanceof Error ? err.message : String(err)}` };
@@ -534,9 +582,9 @@ function topLevelHelp(): string {
   return `cortex provision-stack — stack-identity provisioning (TC-1b, #632)
 
 Usage:
-  cortex provision-stack generate <principal-id> --seed-path <path> [--stack-id <id>] [--force] [--register --registry-url <url>] [--json]
+  cortex provision-stack generate <principal-id> --seed-path <path> [--stack-id <id>] [--force] [--register --registry-url <url> [--network <id>]] [--json]
   cortex provision-stack claim    <principal-id> --seed-path <path> [--stack-id <id>] [--json]
-  cortex provision-stack register <principal-id> --seed-path <path> --registry-url <url> [--stack-id <id>] [--principal-seed <root-path> --registry-pubkey <b64>] [--json]
+  cortex provision-stack register <principal-id> --seed-path <path> --registry-url <url> [--network <id>] [--stack-id <id>] [--principal-seed <root-path> --registry-pubkey <b64>] [--json]
 
 Subcommands:
   generate   Generate a fresh NKey signing identity; write seed chmod 600
@@ -553,6 +601,9 @@ Flags:
   --force                Allow overwriting an existing seed (DELIBERATE rotation).
   --register             (generate only) also register the pubkey after generating.
   --registry-url <url>   Network-registry base URL for registration.
+  --network <id>         (register, ADR-0018) Target network to request admission
+                         into. Pins the PENDING admission request to this network
+                         so a stack can request admission to two networks.
   --principal-seed <p>   (register, #787) The principal ROOT seed (the FIRST
                          stack's seed) for adding a SECOND+ stack. The add-stack
                          claim is then root-signed; --seed-path is the new

@@ -158,12 +158,14 @@ export interface LivePortsConfig {
   /**
    * #762 — the capability ids this stack announces INTO `networkId`, sourced
    * from the network's `announce_capabilities[]` policy block. The federated
-   * `registerStack` step announces these to the registry with
-   * `networks: [networkId]` so the principal joins the network's roster
-   * (`membersFromPrincipals` — implicit membership via `capability.networks[]`).
-   * Empty/absent → the stack registers with no capability targeting the network
-   * (the pre-#762 behaviour that left the roster empty); the join then warns and
-   * preserves any existing hand-pins rather than wiping them.
+   * `registerStack` step announces these to the registry tagged
+   * `networks: [networkId]`. Under ADR-0018 Gap-B these caps NO LONGER confer
+   * roster membership (that is now ADMITTED-derived — `rosterFromAdmissions`);
+   * they are the member's capability FACET, surfaced in the roster once the
+   * principal's network-pinned admission row is ADMITTED. Empty/absent → the
+   * stack still requests admission (the join names `networkId`) but advertises
+   * no capability for it; the join warns and preserves any existing hand-pins
+   * rather than wiping them.
    */
   announceCapabilities?: string[];
   /**
@@ -250,6 +252,20 @@ async function registerWithCapabilities(
    * of `deregisterCapabilities` is to shrink it to empty), so it must NOT union.
    */
   mergeExistingCaps = false,
+  /**
+   * ADR-0018 Gap-A/Gap-B (BLOCK-1) — the target network this registration
+   * REQUESTS ADMISSION INTO. When set, it is signed into the claim as
+   * `network_id`; the registry's register hook stamps it onto the PENDING
+   * admission row, so a `cortex network join <X>` writes a network-PINNED
+   * (`network_id = X`) PENDING row that an admin `admit` can promote to an
+   * ADMITTED row in network X's roster (`rosterFromAdmissions`). Only the
+   * FEDERATED join (`registerStack`) passes this — `cfg.networkId`. The
+   * public-index announce/deregister paths and the leave re-attestation pass
+   * the default `undefined`: they must NOT raise a network-admission request (a
+   * de-advertise / a LEAVE is not a join). Omitted → a network-less identity
+   * register (the pre-ADR-0018 row), exactly as before.
+   */
+  networkId?: string,
 ): Promise<{ ok: true; note: string } | { ok: false; reason: string }> {
   const url = cfg.registryUrl ?? "";
   const registryPubkey = cfg.registryPubkey;
@@ -331,6 +347,11 @@ async function registerWithCapabilities(
     // #825 — CAS token: the updated_at the merge read. The route 409s on a
     // concurrent change so two hosts joining/registering can't lost-update.
     ...(stacksRes.existingUpdatedAt !== undefined && { expectedUpdatedAt: stacksRes.existingUpdatedAt }),
+    // ADR-0018 Gap-A/Gap-B (BLOCK-1) — pin the join's PENDING admission row to
+    // the target network so an admin `admit` lands the principal in network
+    // `networkId`'s `rosterFromAdmissions`. Only the federated `registerStack`
+    // passes a `networkId`; the announce/deregister/leave paths omit it.
+    ...(networkId !== undefined && { networkId }),
   });
   let result;
   try {
@@ -353,15 +374,20 @@ function buildRegistryPort(cfg: LivePortsConfig): NetworkRegistryPort {
 
   return {
     async registerStack() {
-      // #762 — federated register MUST announce the stack's declared
-      // capabilities INTO this network so the principal joins the network's
-      // roster. Roster membership is implicit (`membersFromPrincipals`): a
-      // principal is "in" `networkId` iff one of its announced capabilities
-      // lists `networkId` in `capability.networks[]`. The pre-#762 code
-      // registered with an EMPTY capability list — the principal appeared at
-      // `/principals/{id}` but never in `/networks/{networkId}/roster`, so a
-      // registry-resolved join wrote 0 peers (and risked wiping a working
-      // hand-pin). We tag each announced capability with `networks: [networkId]`.
+      // ADR-0018 Gap-B (BLOCK-1/N3) — roster membership is NO LONGER implicit in
+      // the announced capabilities. Under Gap-B a principal is "in" `networkId`
+      // iff they hold an ADMITTED admission row for it (`rosterFromAdmissions`);
+      // the announced caps are an orthogonal FACET ("what an admitted member
+      // offers"), joined on top of membership. So this register does TWO things:
+      //   1. names the target network (`networkId` below) so the register hook
+      //      raises a network-PINNED PENDING admission row an admin can `admit`
+      //      (the actual roster-membership lever); and
+      //   2. tags each announced cap with `networks: [networkId]` so that, ONCE
+      //      ADMITTED, the member's capability facet surfaces in the roster.
+      //
+      // #762 history: the pre-#762 code registered with an EMPTY capability list
+      // AND no network_id, so the principal never entered the network's roster
+      // and a registry-resolved join wrote 0 peers (risking a hand-pin wipe).
       //
       // This is a registry CONTROL-PLANE action (a signed HTTP POST to
       // /principals/.../register), NOT a `federated.*` wire envelope — the
@@ -377,7 +403,12 @@ function buildRegistryPort(cfg: LivePortsConfig): NetworkRegistryPort {
       // (4th arg `true`), decoupled from the root seed: a plain re-join into a
       // SECOND network must accumulate `networks[]` (metafactory ∪ community),
       // not clobber the prior tag and evict the principal from that roster.
-      return registerWithCapabilities(cfg, announced, true, true);
+      // ADR-0018 Gap-A/Gap-B (BLOCK-1) — 5th arg `cfg.networkId` pins the join's
+      // PENDING admission row to the joined network so `admit` lands it on that
+      // network's `rosterFromAdmissions`. WITHOUT this the join writes a
+      // network-less (`network_id = null`) row that can NEVER enter the named
+      // roster — even after `admit`.
+      return registerWithCapabilities(cfg, announced, true, true, cfg.networkId);
     },
     fetchVerified(networkId) {
       // S1's fetchAndCache returns { descriptor, roster } on ok and refreshes

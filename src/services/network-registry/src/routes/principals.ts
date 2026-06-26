@@ -223,7 +223,17 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
       const peerPubkey =
         stacksWithPubkeys[0]?.stack_pubkey ?? claim.principal_pubkey;
       const requestedScope = `federated.${principalId}.>`;
-      await issuanceStore.upsertPending(principalId, peerPubkey, requestedScope);
+      // ADR-0018 Gap-A — stamp the target network the joiner named (signed into
+      // the claim) onto the PENDING admission row. This makes the idempotency
+      // key `(principal_id, peer_pubkey, network_id)`, so the same stack can
+      // request admission to two networks. A network-less register (no
+      // `network_id` in the claim) creates a network-less PENDING row.
+      await issuanceStore.upsertPending(
+        principalId,
+        peerPubkey,
+        requestedScope,
+        claim.network_id,
+      );
     } catch (err) {
       console.error(
         `[network-registry] issuance upsert failed for principal ${principalId}: ${err instanceof Error ? err.message : String(err)}`,

@@ -40,7 +40,9 @@ import {
   InMemoryRegistryStore,
   rosterFromPrincipals,
   membersFromPrincipals,
+  rosterFromAdmissions,
 } from "../../../../services/network-registry/src/store";
+import type { AdmissionRequest } from "../../../../services/network-registry/src/types";
 import registryApp from "../../../../services/network-registry/src/index";
 import type { Env } from "../../../../services/network-registry/src/index";
 import {
@@ -1330,6 +1332,9 @@ describe("#762 registerStack announces capabilities into the network", () => {
       principal_pubkey: string;
       stacks: { stack_id: string }[];
       capabilities: { id: string; networks?: string[] }[];
+      // ADR-0018 Gap-A/Gap-B (BLOCK-1) — the register hook stamps this onto the
+      // PENDING admission row; the federated join MUST set it.
+      network_id?: string;
     };
   }
 
@@ -1419,6 +1424,61 @@ describe("#762 registerStack announces capabilities into the network", () => {
       expect(roster.members[0]?.capabilities).toEqual(["chat", "release"]);
     });
   });
+
+    // ADR-0018 Gap-A/Gap-B (BLOCK-1) — the REAL join producer
+    // (`registerStack` → `registerWithCapabilities` → `buildRegistrationClaim`)
+    // MUST pin the registration to the joined network (`network_id`), or the
+    // register hook raises a network-LESS PENDING row that can never enter the
+    // named-network roster — even after an admin `admit`.
+    test("a real join pins the claim to network_id → ADMITTED row lands in rosterFromAdmissions", async () => {
+      const dir = freshDir();
+      const seedPath = join(dir, "jc.nk");
+      generateStackIdentity({ seedPath });
+
+      await withFetchCapture(async (capture) => {
+        const ports = buildLivePorts(cfgWithSeed(seedPath, ["chat"]));
+        const res = await ports.registry.registerStack();
+        expect(res.ok).toBe(true);
+
+        const claim = capture.last!.claim;
+        // The join is network-PINNED (NOT null/undefined) — this is the BLOCK-1 fix.
+        expect(claim.network_id).toBe("metafactory");
+
+        // PROOF the pinned row, once ADMITTED, lands in the admission-sourced
+        // roster. Mirror the register hook: store the principal, raise the
+        // (now network-pinned) admission row, admit it, derive the roster.
+        const store = new InMemoryRegistryStore();
+        await store.putPrincipal(
+          claim.principal_id,
+          claim.principal_pubkey,
+          claim.stacks,
+          claim.capabilities,
+        );
+        const admitted: AdmissionRequest[] = [
+          {
+            request_id: "req-1",
+            principal_id: claim.principal_id,
+            peer_pubkey: claim.principal_pubkey,
+            requested_scope: `federated.${claim.principal_id}.>`,
+            network_id: claim.network_id!, // the pinned network
+            status: "ADMITTED",
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-01T00:00:00Z",
+            granted_by: "admin-pubkey",
+          },
+        ];
+        const principals = await store.listPrincipals();
+        const roster = rosterFromAdmissions(admitted, principals, "metafactory");
+        expect(roster.members.map((m) => m.principal_id)).toEqual(["jc"]);
+        expect(roster.members[0]?.capabilities).toEqual(["chat"]);
+
+        // CONTROL — had the join NOT pinned the network (the pre-fix bug), the
+        // same admission machinery with a network-less row yields an EMPTY
+        // roster: proof the pin is load-bearing, not incidental.
+        const networkless: AdmissionRequest[] = [{ ...admitted[0]!, network_id: null }];
+        expect(rosterFromAdmissions(networkless, principals, "metafactory").members).toEqual([]);
+      });
+    });
 
   test("a cap targeting ANOTHER network is NOT in this network's roster", async () => {
     const store = new InMemoryRegistryStore();

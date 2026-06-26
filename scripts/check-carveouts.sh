@@ -201,6 +201,13 @@ ALLOWLIST_PATHS=(
   # account-tree root, never the principal. Class: NSC.
   # RETIRE: never (NSC operator is the permanent qualified survivor, CONTEXT.md).
   'docs/adr/0015-two-tier-onboarding-and-admission-gate.md'
+  # ADR-0018 companion design — network-admission gate + leaf-secret distribution
+  # (the supplementary design ADR-0018 ratifies). Same sovereign-federation subject
+  # as ADR-0013/0015: every "operator" is the NSC operator (the NATS account-tree
+  # root the joiner keeps — the leaf PSK never crosses into a hub's operator),
+  # never the principal. Class: NSC.
+  # RETIRE: never (NSC operator is the permanent qualified survivor, CONTEXT.md).
+  'docs/design-admission-gate-leaf-secret.md'
   # ADR-0015 companion runbook — retired leaf-cred issuance runbook (Model-A, now
   # tombstoned). Its body carries legacy NSC operator issuance steps as historical
   # reference; the tombstone header also uses "NSC operator" in its summary of what

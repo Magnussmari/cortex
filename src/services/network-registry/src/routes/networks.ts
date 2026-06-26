@@ -28,7 +28,13 @@
 import { Hono } from "hono";
 import { getRegistryPublicKey, parseAdminPubkeys, type Env } from "../index";
 import { signAssertion } from "./principals";
-import { getNonceCache, getStore, membersFromPrincipals, rosterFromPrincipals } from "../store";
+import {
+  getIssuanceStore,
+  getNonceCache,
+  getStore,
+  membersFromAdmissions,
+  rosterFromAdmissions,
+} from "../store";
 import {
   isValidNetworkId,
   validateNetworkCreateClaim,
@@ -191,12 +197,17 @@ export function networkRoutes(): Hono<{ Bindings: Env }> {
     if (!record) {
       return c.json({ error: "not_found" }, 404);
     }
+    // ADR-0018 Q3/Gap-B — membership is sourced from ADMITTED admission rows
+    // (the source of truth), NOT derived from announced capabilities. A
+    // principal appears in `members[]` iff they hold an ADMITTED row for this
+    // network; capabilities are joined on as an orthogonal facet (in /roster).
     const principals = await store.listPrincipals();
+    const admitted = await getIssuanceStore(c.env).listIssuanceRequests("ADMITTED");
     const descriptor: NetworkDescriptor = {
       network_id: record.network_id,
       hub_url: record.hub_url,
       leaf_port: record.leaf_port,
-      members: membersFromPrincipals(principals, networkId),
+      members: membersFromAdmissions(admitted, principals, networkId),
     };
     const assertion = await signAssertion(c.env, descriptor);
     return c.json(assertion);
@@ -208,8 +219,11 @@ export function networkRoutes(): Hono<{ Bindings: Env }> {
       return c.json({ error: "invalid network_id in path" }, 400);
     }
     const store = getStore(c.env);
+    // ADR-0018 Q3/Gap-B — roster sourced from ADMITTED admission rows, joining
+    // each admitted principal's pubkey + this-network capabilities (the facet).
     const principals = await store.listPrincipals();
-    const roster = rosterFromPrincipals(principals, networkId);
+    const admitted = await getIssuanceStore(c.env).listIssuanceRequests("ADMITTED");
+    const roster = rosterFromAdmissions(admitted, principals, networkId);
     const assertion = await signAssertion(c.env, roster);
     return c.json(assertion);
   });
