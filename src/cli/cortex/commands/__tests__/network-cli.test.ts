@@ -130,6 +130,22 @@ describe("join usage", () => {
     expect(res.exitCode).toBe(2);
     expect(res.stderr).toContain("prefix matching");
   });
+
+  // ADR-0015 (R2) — the Model-A leaf-package INGESTION flag `--from-package`
+  // (O-4b) is retired. `cortex network join` no longer accepts an injected
+  // operator JWT + account JWT package; a Model-B stack mints its own and joins
+  // via the sovereign secret-auth pipe (or the O-3 operator-mode flags for its
+  // OWN NSC operator-mode bus). The flag must now be rejected as unknown rather
+  // than silently consuming an injected hub-minted package.
+  test("ADR-0015 — `--from-package` (Model-A ingestion) is rejected as unknown (exit 2)", async () => {
+    const res = await dispatchNetwork([
+      "join", "metafactory",
+      "--principal", "andreas",
+      "--from-package", "/tmp/leaf-package.json",
+    ], EMPTY_READER);
+    expect(res.exitCode).toBe(2);
+    expect(res.stderr).toContain("unknown flag: --from-package");
+  });
 });
 
 // =============================================================================
