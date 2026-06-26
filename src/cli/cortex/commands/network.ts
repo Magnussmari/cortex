@@ -74,6 +74,7 @@ import {
   tolerantReader,
   type ConfigReader,
 } from "./network-derive";
+import { DEFAULT_REGISTRY } from "./default-registry";
 // network-leaf-package import removed — ADR-0015 retired O-4b / Model-A.
 
 /**
@@ -130,8 +131,12 @@ export { type ExitResult } from "./_shared/exit-result";
 
 type NetworkSubcommand = "join" | "leave" | "status" | "create" | "ping" | "admit";
 
-/** Default registry URL when neither --registry-url nor config provides one. */
-const DEFAULT_REGISTRY_URL = "https://network.meta-factory.ai";
+/**
+ * Default registry URL when neither --registry-url nor config provides one.
+ * cortex#1228 — sourced from the single compiled-in {@link DEFAULT_REGISTRY}
+ * anchor (the host that actually serves `/registry/pubkey`).
+ */
+const DEFAULT_REGISTRY_URL = DEFAULT_REGISTRY.url;
 
 /**
  * #753 — default cortex.yaml path the config-deriver reads when no `--config`
@@ -521,6 +526,21 @@ async function runJoin(
   }
   const inputs = derived.inputs;
 
+  // cortex#1228 — TOFU is NEVER silent. A custom (non-default) registry with no
+  // pinned pubkey is trusted-on-first-use; surface a loud warning so the
+  // principal knows a network-path attacker could substitute the anchor. The
+  // default metafactory registry is pre-pinned (compiled-in) and never reaches
+  // this branch. Folded into the returned ExitResult.stderr (below) so it is
+  // both visible on the terminal AND captured by the CLI test harness.
+  const tofuWarning =
+    inputs.registryTofu === true
+      ? `cortex network join: WARNING — registry ${inputs.registryUrl} is a custom ` +
+        `(non-default) registry with NO pinned pubkey. Trusting it on first use (TOFU): ` +
+        `a network-path attacker could substitute their own trust anchor. Pin it with ` +
+        `--registry-pubkey <key> or policy.federated.registry.pubkey, or join the default ` +
+        `metafactory network (${DEFAULT_REGISTRY.url}, pre-pinned) with no --registry-url.\n`
+      : undefined;
+
   // Grammar checks on the RESOLVED principal (derived or flagged).
   if (!PRINCIPAL_ID_RE.test(inputs.principal)) {
     return usageError("join", `principal "${inputs.principal}" must be lowercase alphanumeric + hyphen, letter-prefixed`, json);
@@ -558,10 +578,15 @@ async function runJoin(
   const ports = applyRes.apply ? buildLivePorts(cfg) : buildDryRunPorts(cfg);
 
   const res = await joinNetwork(networkId, stack, ports);
-  return renderFlowResult("join", networkId, res.ok, res.reason, res.steps, applyRes.apply, json, {
+  const flow = renderFlowResult("join", networkId, res.ok, res.reason, res.steps, applyRes.apply, json, {
     used_cache: res.usedCache === true ? "true" : "false",
     peers: (res.resolvedPeers ?? []).join(","),
   });
+  // cortex#1228 — prepend the custom-registry TOFU warning to stderr (when set)
+  // so it is surfaced regardless of the flow's success/JSON mode.
+  return tofuWarning !== undefined
+    ? { ...flow, stderr: tofuWarning + flow.stderr }
+    : flow;
 }
 
 async function runLeave(
@@ -1245,8 +1270,8 @@ function opError(sub: string, reason: string, json: boolean): ExitResult {
 // ADR-0015 — runAdmit: one-command admin admission decision (R2, cortex#1142)
 // =============================================================================
 
-/** Default registry URL — mirrors network create / join constants. */
-const DEFAULT_ADMIT_REGISTRY_URL = "https://network.meta-factory.ai";
+/** Default registry URL — mirrors network create / join constants (#1228). */
+const DEFAULT_ADMIT_REGISTRY_URL = DEFAULT_REGISTRY.url;
 
 /** Default Discord role for O-5 community-fleet admission. */
 const DEFAULT_ADMIT_DISCORD_ROLE = "community-fleet";
