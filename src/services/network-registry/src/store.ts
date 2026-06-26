@@ -226,6 +226,31 @@ export interface IssuanceRequestStore {
     newStatus: "ADMITTED" | "REJECTED",
     adminPubkey: string,
   ): Promise<AdmissionRequest | undefined>;
+
+  /**
+   * ADR-0018 Q1 (b′) / PR5b — persist the OPAQUE sealed ciphertext onto an
+   * ADMITTED admission row (the hub-admin `add-member` / `rotate` delivery).
+   * The store only writes the blob it is handed; it never reads or interprets
+   * it. Guarded on `status = 'ADMITTED'`: a not-yet-admitted (or revoked) row
+   * cannot carry a sealed secret, so a write against a non-ADMITTED row is a
+   * no-op and returns `undefined` (the route maps that to 409). Returns the
+   * updated row on success, `undefined` when the row is missing or not ADMITTED.
+   * `rotate` calls this again to REPLACE the blob in place (old copy inert).
+   */
+  setSealedSecret(
+    requestId: string,
+    sealedSecret: string,
+  ): Promise<AdmissionRequest | undefined>;
+
+  /**
+   * ADR-0018 Q6 / PR5b — transition an ADMITTED row to REVOKED and CLEAR its
+   * sealed blob (the bearer copy is dead once the hub `authorization` user is
+   * dropped). Guarded on `status = 'ADMITTED'`. Returns the updated row;
+   * `undefined` when the row is missing. Already-REVOKED is idempotent (returns
+   * the REVOKED row); a PENDING/REJECTED row throws {@link AlreadyDecidedError}
+   * (you cannot revoke a member that was never admitted).
+   */
+  revokeAdmission(requestId: string): Promise<AdmissionRequest | undefined>;
 }
 
 // =============================================================================
@@ -281,6 +306,7 @@ export class InMemoryIssuanceRequestStore implements IssuanceRequestStore {
       created_at: now,
       updated_at: now,
       granted_by: null,
+      sealed_secret: null,
     };
     this.requests.set(request.request_id, request);
     this.byPeer.set(peerKey, request.request_id);
@@ -317,6 +343,39 @@ export class InMemoryIssuanceRequestStore implements IssuanceRequestStore {
       ...existing,
       status: newStatus,
       granted_by: adminPubkey,
+      updated_at: new Date().toISOString(),
+    };
+    this.requests.set(requestId, updated);
+    return updated;
+  }
+
+  async setSealedSecret(
+    requestId: string,
+    sealedSecret: string,
+  ): Promise<AdmissionRequest | undefined> {
+    const existing = this.requests.get(requestId);
+    if (!existing) return undefined;
+    if (existing.status !== "ADMITTED") return undefined; // route → 409 not_admitted
+    const updated: AdmissionRequest = {
+      ...existing,
+      sealed_secret: sealedSecret,
+      updated_at: new Date().toISOString(),
+    };
+    this.requests.set(requestId, updated);
+    return updated;
+  }
+
+  async revokeAdmission(requestId: string): Promise<AdmissionRequest | undefined> {
+    const existing = this.requests.get(requestId);
+    if (!existing) return undefined;
+    if (existing.status === "REVOKED") return existing; // idempotent
+    if (existing.status !== "ADMITTED") {
+      throw new AlreadyDecidedError(existing);
+    }
+    const updated: AdmissionRequest = {
+      ...existing,
+      status: "REVOKED",
+      sealed_secret: null,
       updated_at: new Date().toISOString(),
     };
     this.requests.set(requestId, updated);
@@ -456,6 +515,53 @@ export class D1IssuanceRequestStore implements IssuanceRequestStore {
       updated_at: now,
     };
   }
+
+  async setSealedSecret(
+    requestId: string,
+    sealedSecret: string,
+  ): Promise<AdmissionRequest | undefined> {
+    const existing = await this.getIssuanceRequest(requestId);
+    if (!existing) return undefined;
+    if (existing.status !== "ADMITTED") return undefined; // route → 409 not_admitted
+    const now = new Date().toISOString();
+    // CAS-ish guard: only an ADMITTED row can carry a sealed secret. A concurrent
+    // revoke between our read and this UPDATE flips the guard false → changes 0 →
+    // undefined (the route maps it to 409). `rotate` REPLACES the blob in place.
+    const res = await this.db
+      .prepare(
+        `UPDATE admission_requests
+         SET sealed_secret = ?, updated_at = ?
+         WHERE request_id = ? AND status = 'ADMITTED'`,
+      )
+      .bind(sealedSecret, now, requestId)
+      .run();
+    if ((res.meta?.changes ?? 0) === 0) return undefined;
+    return { ...existing, sealed_secret: sealedSecret, updated_at: now };
+  }
+
+  async revokeAdmission(requestId: string): Promise<AdmissionRequest | undefined> {
+    const existing = await this.getIssuanceRequest(requestId);
+    if (!existing) return undefined;
+    if (existing.status === "REVOKED") return existing; // idempotent no-op
+    if (existing.status !== "ADMITTED") {
+      throw new AlreadyDecidedError(existing);
+    }
+    const now = new Date().toISOString();
+    const res = await this.db
+      .prepare(
+        `UPDATE admission_requests
+         SET status = 'REVOKED', sealed_secret = NULL, updated_at = ?
+         WHERE request_id = ? AND status = 'ADMITTED'`,
+      )
+      .bind(now, requestId)
+      .run();
+    if ((res.meta?.changes ?? 0) === 0) {
+      // A concurrent revoke won the race; the row is already REVOKED.
+      const current = await this.getIssuanceRequest(requestId);
+      return current;
+    }
+    return { ...existing, status: "REVOKED", sealed_secret: null, updated_at: now };
+  }
 }
 
 /** Raw column shape for an admission_requests row. */
@@ -469,6 +575,8 @@ interface AdmissionRequestRow {
   created_at: string;
   updated_at: string;
   granted_by: string | null;
+  /** ADR-0018 b′ — opaque sealed ciphertext; NULL until add-member delivers it. */
+  sealed_secret: string | null;
 }
 
 function rowToAdmissionRequest(row: AdmissionRequestRow): AdmissionRequest {
@@ -482,6 +590,8 @@ function rowToAdmissionRequest(row: AdmissionRequestRow): AdmissionRequest {
     created_at: row.created_at,
     updated_at: row.updated_at,
     granted_by: row.granted_by,
+    // A row read from a pre-0010 isolate (column absent) coalesces to null.
+    sealed_secret: row.sealed_secret ?? null,
   };
 }
 

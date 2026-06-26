@@ -342,6 +342,35 @@ export function materialFromSeedString(seed: string): StackIdentityMaterial {
   return materialFromKeyPair(kp);
 }
 
+/**
+ * ADR-0018 PR5b — extract the RAW 32-byte ed25519 seed from a `SU…` NKey seed
+ * string. The leaf-secret open path ({@link openSealed} in
+ * `src/common/crypto/seal-to-principal.ts`) needs the raw seed bytes, not the
+ * nkey-wrapped form: the member unseals their leaf PSK with the SAME ed25519
+ * identity the stack signs envelopes with (no new key material, ADR-0019 L3).
+ *
+ * This is the single place the nkeys.js `getRawSeed()` accessor is surfaced for
+ * the crypto layer, keeping the ed25519→nkey bridge in one module.
+ *
+ * @throws if the seed is not a valid `SU…` user-class NKey seed.
+ */
+export function rawEd25519SeedFromNkeySeed(seed: string): Uint8Array {
+  const trimmed = seed.trim();
+  if (!trimmed.startsWith("SU")) {
+    throw new Error(
+      `stack-provisioning: expected a user-class NKey seed (SU…), got ${trimmed.slice(0, 2)}…`,
+    );
+  }
+  const kp = fromSeed(new TextEncoder().encode(trimmed));
+  const raw = rawSeedOf(kp);
+  if (raw.length !== 32) {
+    throw new Error(
+      `stack-provisioning: expected a 32-byte ed25519 seed, got ${raw.length.toString()}`,
+    );
+  }
+  return raw;
+}
+
 // =============================================================================
 // Registration claim (proof-of-possession)
 // =============================================================================

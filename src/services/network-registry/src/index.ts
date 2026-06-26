@@ -75,6 +75,22 @@ export interface Env extends RateLimitEnv, StoreEnv {
    * ignored.
    */
   REGISTRY_ADMIN_PUBKEYS?: string;
+  /**
+   * ADR-0018 Q5 (PR5b) — comma-separated allowlist of base64 Ed25519 pubkeys
+   * authorised to MINT/DELIVER per-member leaf secrets: the hub-admin authority
+   * that writes the opaque sealed blob (`POST /admission-requests/{id}/
+   * sealed-secret`) and revokes it (`/revoke`). DISTINCT from
+   * `REGISTRY_ADMIN_PUBKEYS` (the registry-admin that signs the admit decision
+   * and mints NOTHING) so a future network whose registry-admin ≠ hub-host keeps
+   * the two authorities separable.
+   *
+   * COLLAPSE CASE: when this is unset/blank the gate FALLS BACK to
+   * `REGISTRY_ADMIN_PUBKEYS` — for `metafactory` both authorities collapse into
+   * Luna (FleetAdmit Tier-2 runs admit AND secret-delivery as one concierge
+   * action), so one allowlist suffices. Set this separately only when the two
+   * authorities must diverge.
+   */
+  REGISTRY_HUB_ADMIN_PUBKEYS?: string;
   ENVIRONMENT?: string;
 }
 
@@ -85,7 +101,23 @@ export interface Env extends RateLimitEnv, StoreEnv {
  * fail-closed. Entries are trimmed; blank entries dropped.
  */
 export function parseAdminPubkeys(env: Env): Set<string> {
-  const raw = env.REGISTRY_ADMIN_PUBKEYS;
+  return parsePubkeySet(env.REGISTRY_ADMIN_PUBKEYS);
+}
+
+/**
+ * ADR-0018 Q5 (PR5b) — parse the HUB-admin allowlist (`REGISTRY_HUB_ADMIN_PUBKEYS`)
+ * for the sealed-secret-write + revoke routes. When that var is unset/blank the
+ * two authorities collapse: we FALL BACK to `REGISTRY_ADMIN_PUBKEYS` (the
+ * metafactory case where Luna is both authorities). Returns an EMPTY set only
+ * when NEITHER var is configured → the hub-admin routes 503 fail-closed.
+ */
+export function parseHubAdminPubkeys(env: Env): Set<string> {
+  const hub = parsePubkeySet(env.REGISTRY_HUB_ADMIN_PUBKEYS);
+  return hub.size > 0 ? hub : parseAdminPubkeys(env);
+}
+
+/** Shared parser: comma-separated base64 pubkeys → trimmed, non-empty set. */
+function parsePubkeySet(raw: string | undefined): Set<string> {
   if (typeof raw !== "string" || raw.trim().length === 0) return new Set();
   return new Set(
     raw

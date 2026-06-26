@@ -124,6 +124,18 @@ import {
 } from "./network-provision-lib";
 import { buildLiveProvisionPorts } from "./network-provision-adapters";
 import {
+  runNetworkSecret,
+  type SecretAction,
+  type DeliveryMode,
+  type SecretInputs,
+} from "./network-secret-lib";
+import type { NetworkSecretPorts } from "./network-secret-ports";
+import {
+  buildLiveSecretPorts,
+  hubAdminMaterialFromSeedFile,
+} from "./network-secret-adapters";
+import { fetchSealedLeafSecret } from "../../../common/registry/fetch-sealed-secret";
+import {
   createLiveProbeBus,
   type LiveProbeBus,
 } from "./network-ping-adapters";
@@ -136,7 +148,7 @@ export { type ExitResult } from "./_shared/exit-result";
 // Grammar
 // =============================================================================
 
-type NetworkSubcommand = "join" | "leave" | "status" | "create" | "ping" | "admit" | "provision";
+type NetworkSubcommand = "join" | "leave" | "status" | "create" | "ping" | "admit" | "provision" | "secret";
 
 /**
  * Default registry URL when neither --registry-url nor config provides one.
@@ -346,6 +358,27 @@ const SPEC: SubcommandSpec<NetworkSubcommand> = {
         "--dry-run": "bool",
       },
     },
+    // ADR-0018 PR5b (#1240) — leaf-secret tooling. `cortex network secret
+    // <action> <network> <member-pubkey>` where <action> ∈ {add-member,
+    // revoke-member, rotate}. Hub-admin authority (Q5): mints the per-member
+    // leaf PSK, writes the member's hub `authorization` user + reloads, and
+    // seals/delivers (or revokes) the secret. DRY-RUN by default; --apply mutates.
+    secret: {
+      positionals: ["action", "network", "member"],
+      flags: {
+        // The HUB-ADMIN seed (mints + seals + signs the registry delivery/revoke).
+        "--admin-seed": "value",
+        "--registry-url": "value",
+        // The hub nats-server config the per-member authorization user lands in.
+        "--hub-config": "value",
+        // add-member: sealed (default, plug-and-play) | oob (trusted bootstrap).
+        "--deliver": "value",
+        // Override the hub leaf user (defaults to the member's principal id).
+        "--leaf-user": "value",
+        "--apply": "bool",
+        "--dry-run": "bool",
+      },
+    },
   },
   universal: { "--json": "bool", "--help": "bool", "-h": "bool" },
 };
@@ -505,6 +538,60 @@ function resolveApply(
 // Subcommand handlers
 // =============================================================================
 
+/**
+ * ADR-0018 PR5b (#1240) — plug-and-play leaf-secret auto-fetch for `join`.
+ *
+ * The locked #1240 constraint: the joiner NEVER handles a secret. When no leaf
+ * secret is resolved from `--leaf-secret` / `stack.nats_infra.leaf_secret`,
+ * `join` AUTO-fetches the sealed blob from the member PoP-read endpoint,
+ * decrypts it with the joiner's OWN seed, and renders the leaf — fully
+ * automatic. BEST-EFFORT + SOFT-CLOSED: any failure (not yet admitted, no
+ * secret delivered, registry down, odd seed) returns `undefined` and the join
+ * falls through to its existing behaviour, so this never breaks a join that
+ * supplied its secret another way.
+ */
+type LeafSecretFetcher = typeof fetchSealedLeafSecret;
+let joinLeafSecretFetcherOverride: LeafSecretFetcher | null = null;
+
+/** Test-only — inject a fake leaf-secret fetcher for the join wiring. */
+export function __setJoinLeafSecretFetcherForTests(f: LeafSecretFetcher | null): void {
+  joinLeafSecretFetcherOverride = f;
+}
+
+async function maybeAutoFetchLeafSecret(
+  networkId: string,
+  inputs: { leafSecret?: string; seedPath: string; registryUrl: string; principal: string },
+): Promise<{ leafSecret: string; leafUser: string } | undefined> {
+  // Only when no leaf secret was resolved from flag/config (don't override an
+  // explicit secret-auth join).
+  if (inputs.leafSecret !== undefined) return undefined;
+
+  const seedExpanded = expandTilde(inputs.seedPath);
+  if (!existsSync(seedExpanded)) return undefined;
+
+  let material;
+  try {
+    enforceChmod600(seedExpanded);
+    const seed = await readFile(seedExpanded, "utf-8");
+    material = materialFromSeedString(seed);
+  } catch (_err) {
+    // Best-effort: a missing/group-readable/odd seed means we cannot auto-fetch.
+    // The join continues without an auto-secret (it may use creds, or fail later
+    // with a clearer leaf-binding error). Safe to ignore here.
+    return undefined;
+  }
+
+  const fetcher = joinLeafSecretFetcherOverride ?? fetchSealedLeafSecret;
+  const res = await fetcher({
+    registryUrl: inputs.registryUrl,
+    networkId,
+    principalId: inputs.principal,
+    material,
+  });
+  if (!res.ok) return undefined;
+  return { leafSecret: res.leafPsk, leafUser: res.leafUser };
+}
+
 async function runJoin(
   networkId: string,
   flags: FlagMap,
@@ -619,16 +706,24 @@ async function runJoin(
   const applyRes = resolveApply(flags);
   if (!applyRes.ok) return usageError("join", applyRes.reason, json);
 
+  // ADR-0018 PR5b — plug-and-play: when no leaf secret came from flag/config,
+  // auto-fetch + unseal it from the admission gate (the joiner never handles a
+  // secret). Best-effort: undefined ⇒ fall through to the existing behaviour.
+  const autoSecret = await maybeAutoFetchLeafSecret(networkId, inputs);
+  const resolvedLeafSecret = inputs.leafSecret ?? autoSecret?.leafSecret;
+  const resolvedLeafUser = inputs.leafUser ?? autoSecret?.leafUser;
+
   const stack: JoiningStack = {
     principalId: inputs.principal,
     stackSlug: slugRes.slug,
     credentials: expandTilde(inputs.credsPath),
     account: inputs.account,
     // C-1224 (ADR-0013 Model B) — pass the secret-auth leaf material (when
-    // resolved) so the join renders a secret-auth pipe binding the principal's
-    // OWN local account instead of a `.creds`-file leaf.
-    ...(inputs.leafSecret !== undefined && { leafSecret: inputs.leafSecret }),
-    ...(inputs.leafUser !== undefined && { leafUser: inputs.leafUser }),
+    // resolved, including PR5b's auto-fetched leaf PSK) so the join renders a
+    // secret-auth pipe binding the principal's OWN local account instead of a
+    // `.creds`-file leaf.
+    ...(resolvedLeafSecret !== undefined && { leafSecret: resolvedLeafSecret }),
+    ...(resolvedLeafUser !== undefined && { leafUser: resolvedLeafUser }),
     leafNode: optionalValueFlag(flags, "--leaf-node"),
     maxHop,
     // O-3 (cortex#1053) — pass the operator-mode leaf package (when resolved)
@@ -1602,6 +1697,129 @@ async function runAdmit(
 }
 
 // =============================================================================
+// ADR-0018 PR5b (#1240) — `cortex network secret <action> <network> <member>`
+// =============================================================================
+
+/** Default registry for the secret tooling — mirrors admit / create (#1228). */
+const DEFAULT_SECRET_REGISTRY_URL = DEFAULT_REGISTRY.url;
+/** Default hub nats-server config (the operator-mode hub local.conf). */
+const DEFAULT_HUB_CONFIG_PATH = "~/.config/nats/local.conf";
+/** Member pubkey grammar — 32-byte Ed25519, base64 (44 chars, padded). */
+const MEMBER_PUBKEY_RE = /^[A-Za-z0-9+/]{43}=$/;
+
+/**
+ * Factory for the secret port bundle. Production builds the live adapters (hub
+ * config fs + reload, registry admin-read + hub-admin delivery/revoke). Tests
+ * inject fakes that record calls without touching fs/registry/nats.
+ */
+export type SecretPortsFactory = (cfg: {
+  hubConfigPath: string;
+  registryUrl: string;
+  material: import("../../../bus/stack-provisioning").StackIdentityMaterial;
+}) => NetworkSecretPorts;
+
+const DEFAULT_SECRET_PORTS_FACTORY: SecretPortsFactory = (cfg) => buildLiveSecretPorts(cfg);
+
+async function runSecret(
+  actionArg: string,
+  networkId: string,
+  member: string,
+  flags: FlagMap,
+  json: boolean,
+  portsFactory: SecretPortsFactory,
+): Promise<ExitResult> {
+  // 1. Validate the action.
+  const validActions: SecretAction[] = ["add-member", "revoke-member", "rotate"];
+  if (!validActions.includes(actionArg as SecretAction)) {
+    return usageError("secret", `unknown action "${actionArg}" (expected one of: ${validActions.join(", ")})`, json);
+  }
+  const action = actionArg as SecretAction;
+
+  // 2. Validate network + member pubkey grammar.
+  if (!NETWORK_ID_RE.test(networkId)) {
+    return usageError("secret", `network "${networkId}" must be lowercase alphanumeric + hyphen, letter-prefixed`, json);
+  }
+  if (!MEMBER_PUBKEY_RE.test(member)) {
+    return usageError("secret", `member "${member}" must be a 32-byte Ed25519 pubkey, base64-encoded (44 chars)`, json);
+  }
+
+  // 3. Resolve delivery mode (add-member / rotate only — rotate is always sealed).
+  const deliverRaw = optionalValueFlag(flags, "--deliver") ?? "sealed";
+  if (deliverRaw !== "sealed" && deliverRaw !== "oob") {
+    return usageError("secret", `--deliver must be "sealed" or "oob" (got "${deliverRaw}")`, json);
+  }
+  const deliver: DeliveryMode = deliverRaw;
+  if (action === "rotate" && deliver === "oob") {
+    return usageError("secret", `rotate always re-seals; --deliver oob is only valid for add-member`, json);
+  }
+
+  const applyRes = resolveApply(flags);
+  if (!applyRes.ok) return usageError("secret", applyRes.reason, json);
+
+  const seedRes = requireValueFlag(flags, "--admin-seed");
+  if (!seedRes.ok) return usageError("secret", seedRes.reason, json);
+
+  const registryUrl = optionalValueFlag(flags, "--registry-url") ?? DEFAULT_SECRET_REGISTRY_URL;
+  const hubConfigPath = optionalValueFlag(flags, "--hub-config") ?? DEFAULT_HUB_CONFIG_PATH;
+  const leafUserOverride = optionalValueFlag(flags, "--leaf-user");
+
+  // 4. Load + chmod-600-gate the hub-admin seed.
+  const matRes = await hubAdminMaterialFromSeedFile(seedRes.value);
+  if (!matRes.ok) return opError("secret", matRes.reason, json);
+
+  const ports = portsFactory({ hubConfigPath, registryUrl, material: matRes.material });
+  const inputs: SecretInputs = {
+    action,
+    networkId,
+    memberPubkey: member,
+    deliver,
+    ...(leafUserOverride !== undefined && { leafUserOverride }),
+    apply: applyRes.apply,
+  };
+
+  let report;
+  try {
+    report = await runNetworkSecret(inputs, ports);
+  } catch (err) {
+    return opError("secret", `secret ${action} failed: ${err instanceof Error ? err.message : String(err)}`, json);
+  }
+
+  // 5. Render. SECRETS never appear in steps/data; the oob PSK is surfaced in a
+  // dedicated, explicitly-labelled block (the one place a secret reaches stdout).
+  if (json) {
+    const data: Record<string, string> = {
+      subcommand: "secret",
+      applied: report.applied ? "true" : "false",
+      ...report.data,
+      hub_admin_fingerprint: matRes.material.fingerprint,
+    };
+    // The oob PSK is the hub-admin's to hand over — include it under an explicit
+    // key so a machine consumer can pluck it, never folded into the plan text.
+    if (report.surfaced) {
+      data.oob_leaf_user = report.surfaced.leafUser;
+      data.oob_leaf_secret = report.surfaced.psk;
+    }
+    const env = report.ok ? envelopeOk([], data) : envelopeError(report.reason ?? "secret command failed", data);
+    return report.ok ? ok(renderJson(env)) : { exitCode: 1, stdout: "", stderr: renderJson(env) };
+  }
+
+  const header = report.applied
+    ? `cortex network secret ${action} ${networkId}: ${report.ok ? "ok" : "FAILED"}`
+    : `cortex network secret ${action} ${networkId}: dry-run (no mutation; pass --apply)`;
+  const lines = [header, ...report.steps.map((s) => `  ${s}`)];
+  if (!report.ok) lines.push(`  ✗ ${report.reason ?? "unknown failure"}`);
+  if (report.surfaced) {
+    lines.push("");
+    lines.push("  ── OUT-OF-BAND SECRET (hand this to the member over a secure channel) ──");
+    lines.push(`  leaf user:   ${report.surfaced.leafUser}`);
+    lines.push(`  leaf secret: ${report.surfaced.psk}`);
+  }
+  lines.push("");
+  const body = lines.join("\n");
+  return report.ok ? ok(body) : { exitCode: 1, stdout: "", stderr: body };
+}
+
+// =============================================================================
 // G1d / T1 (cortex#1139) — `cortex network provision <stack>`
 // =============================================================================
 
@@ -1842,6 +2060,9 @@ export async function dispatchNetwork(
   // auto-provision CLI tests drive fake arc/fs ports. Production omits it → the
   // live adapters (arc account-tree seam + signing + config write-back).
   provisionPortsFactory: ProvisionPortsFactory = DEFAULT_PROVISION_PORTS_FACTORY,
+  // ADR-0018 PR5b — injectable secret-ports factory so the `secret` CLI tests
+  // drive fake hub/registry/crypto ports. Production omits → the live adapters.
+  secretPortsFactory: SecretPortsFactory = DEFAULT_SECRET_PORTS_FACTORY,
 ): Promise<ExitResult> {
   let parsed;
   try {
@@ -1881,6 +2102,15 @@ export async function dispatchNetwork(
       return runAdmit(parsed.positionals["request-id"] ?? "", parsed.flags, json);
     case "provision":
       return runProvision(parsed.positionals.stack ?? "", parsed.flags, json, load, provisionPortsFactory);
+    case "secret":
+      return runSecret(
+        parsed.positionals.action ?? "",
+        parsed.positionals.network ?? "",
+        parsed.positionals.member ?? "",
+        parsed.flags,
+        json,
+        secretPortsFactory,
+      );
   }
 }
 
@@ -1902,6 +2132,9 @@ Usage:
                         [--discord-role <name>] [--apply] [--dry-run] [--json]
   cortex network provision <stack> [--config <p>] [--principal <id>] [--seed-path <p>]
                         [--creds <p>] [--force] [--apply] [--dry-run] [--json]
+  cortex network secret <add-member|revoke-member|rotate> <network> <member-pubkey>
+                        --admin-seed <hub-admin-seed> [--registry-url <url>] [--hub-config <p>]
+                        [--deliver sealed|oob] [--leaf-user <u>] [--apply] [--dry-run] [--json]
 
 The one-liner (#753): \`cortex network join <network>\` derives EVERYTHING from
 the loaded cortex.yaml — principal (principal.id), stack (stack.id), signing

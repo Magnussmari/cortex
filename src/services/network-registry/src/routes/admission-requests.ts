@@ -44,13 +44,17 @@
  */
 
 import { Hono, type Context } from "hono";
-import { parseAdminPubkeys, type Env } from "../index";
+import { parseAdminPubkeys, parseHubAdminPubkeys, type Env } from "../index";
 import { getNonceCache, getIssuanceStore, AlreadyDecidedError } from "../store";
 import {
   validateSignedAdmissionDecision,
   validateAdmissionDecisionClaim,
   validateSignedAdmissionRead,
   validateSignedAdmissionMineRead,
+  validateSignedSealedSecretWrite,
+  validateSealedSecretClaim,
+  validateSignedAdmissionRevoke,
+  validateAdmissionRevokeClaim,
   isValidRequestId,
 } from "../validate";
 import { canonicalJSON, verifyEd25519 } from "../signing";
@@ -275,6 +279,189 @@ export function admissionRequestRoutes(): Hono<{ Bindings: Env }> {
   app.post("/admission-requests/:request_id/reject", (c) => handleDecision(c, "reject"));
 
   // ---------------------------------------------------------------------------
+  // Helper: HUB-ADMIN-signed write gate (ADR-0018 Q5, PR5b).
+  //
+  // Distinct authority from the registry-admin admit gate: the HUB-admin mints
+  // the per-member secret + writes/clears the opaque sealed blob. Gated on
+  // `REGISTRY_HUB_ADMIN_PUBKEYS` (falling back to `REGISTRY_ADMIN_PUBKEYS` when
+  // the two authorities collapse into one principal — parseHubAdminPubkeys).
+  //
+  // Mirrors handleDecision's gate ORDER verbatim:
+  //   M2 request_id grammar → 503 fail-closed (FIRST) → M1 rate-limit →
+  //   JSON parse → envelope+claim validate → clock-skew → sig verify (FIRST) →
+  //   allowlist → nonce replay. Returns the verified claim or a Response to
+  //   short-circuit.
+  // ---------------------------------------------------------------------------
+
+  async function verifyHubAdminWrite<C extends { hub_admin_pubkey: string; issued_at: string; nonce: string }>(
+    c: Context<{ Bindings: Env }>,
+    requestId: string,
+    validateEnvelope: (body: unknown) => { ok: true; signed: { claim: unknown; signature: string } } | { ok: false; errors: unknown },
+    validateClaim: (claim: unknown, expectedRequestId: string) => { ok: true; claim: C } | { ok: false; errors: unknown },
+  ): Promise<{ ok: true; claim: C } | { ok: false; response: Response }> {
+    // M2 — validate request_id path param BEFORE body parse or crypto.
+    if (!isValidRequestId(requestId)) {
+      return { ok: false, response: c.json({ error: "invalid_request_id" }, 400) };
+    }
+
+    // 1. FAIL-CLOSED, FIRST: hub-admin allowlist must be configured.
+    const hubAdminPubkeys = parseHubAdminPubkeys(c.env);
+    if (hubAdminPubkeys.size === 0) {
+      return {
+        ok: false,
+        response: c.json(
+          {
+            error: "admin_not_configured",
+            details:
+              "neither REGISTRY_HUB_ADMIN_PUBKEYS nor REGISTRY_ADMIN_PUBKEYS provisioned; " +
+              "secret delivery is disabled (fail-closed). Set the hub-admin allowlist via " +
+              "`wrangler secret put` to enable signed hub-admin writes.",
+          },
+          503,
+        ),
+      };
+    }
+
+    // M1 — rate-limit BEFORE the expensive Ed25519 verify (register bucket).
+    const allowed = await checkRateLimit(c.env, "register", clientKey(c.req.raw, requestId));
+    if (!allowed) {
+      return {
+        ok: false,
+        response: c.json(TOO_MANY_REQUESTS_BODY, 429, {
+          "Retry-After": String(retryAfterSeconds("register")),
+        }),
+      };
+    }
+
+    // 2. Parse + validate envelope.
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch (_err) {
+      return { ok: false, response: c.json({ error: "body must be valid JSON" }, 400) };
+    }
+    const envelopeCheck = validateEnvelope(body);
+    if (!envelopeCheck.ok) {
+      return { ok: false, response: c.json({ error: "validation_failed", details: envelopeCheck.errors }, 400) };
+    }
+    const claimResult = validateClaim(envelopeCheck.signed.claim, requestId);
+    if (!claimResult.ok) {
+      return { ok: false, response: c.json({ error: "validation_failed", details: claimResult.errors }, 400) };
+    }
+    const claim = claimResult.claim;
+
+    // 3. Clock-skew check.
+    const issued = Date.parse(claim.issued_at);
+    const now = Date.now();
+    if (Math.abs(now - issued) > CLOCK_SKEW_MS) {
+      return {
+        ok: false,
+        response: c.json(
+          { error: "issued_at out of skew window", details: { skew_ms: now - issued, max_ms: CLOCK_SKEW_MS } },
+          400,
+        ),
+      };
+    }
+
+    // 4. Signature verification FIRST (before recording nonce), then allowlist.
+    const message = new TextEncoder().encode(canonicalJSON(claim)) as Uint8Array<ArrayBuffer>;
+    const gateResult = await applyAdminGate(
+      hubAdminPubkeys,
+      claim.hub_admin_pubkey,
+      envelopeCheck.signed.signature,
+      message,
+    );
+    if (gateResult) {
+      return { ok: false, response: c.json({ error: gateResult.error }, gateResult.status as 401 | 403) };
+    }
+
+    // 5. Replay check — only on the authentic + authorised path.
+    const nonceCache = getNonceCache(c.env);
+    const fresh = await nonceCache.recordIfFresh(claim.nonce, now);
+    if (!fresh) {
+      return { ok: false, response: c.json({ error: "nonce_replayed" }, 409) };
+    }
+
+    return { ok: true, claim };
+  }
+
+  // ---------------------------------------------------------------------------
+  // POST /admission-requests/:request_id/sealed-secret — ADR-0018 Q1 b′ / Q5
+  //
+  // The HUB-ADMIN delivers the opaque per-member sealed blob onto the ADMITTED
+  // row (add-member sealed mode; rotate REPLACES it). The registry persists the
+  // ciphertext it is handed and NEVER reads it. Gated on the hub-admin
+  // authority — the admit route mints nothing, this route is the only mint/seal
+  // sink. 409 not_admitted if the row is not ADMITTED (a secret can only be
+  // delivered to an admitted member).
+  // ---------------------------------------------------------------------------
+
+  app.post("/admission-requests/:request_id/sealed-secret", async (c) => {
+    const requestId = c.req.param("request_id") ?? "";
+    const gate = await verifyHubAdminWrite(
+      c,
+      requestId,
+      validateSignedSealedSecretWrite,
+      validateSealedSecretClaim,
+    );
+    if (!gate.ok) return gate.response;
+
+    const store = getIssuanceStore(c.env);
+    const updated = await store.setSealedSecret(requestId, gate.claim.sealed_secret);
+    if (!updated) {
+      // Row missing OR not ADMITTED — distinguish for the caller.
+      const existing = await store.getIssuanceRequest(requestId);
+      if (!existing) return c.json({ error: "not_found" }, 404);
+      return c.json(
+        { error: "not_admitted", details: `request ${requestId} is ${existing.status}, not ADMITTED — cannot deliver a sealed secret` },
+        409,
+      );
+    }
+    return c.json(updated, 200);
+  });
+
+  // ---------------------------------------------------------------------------
+  // POST /admission-requests/:request_id/revoke — ADR-0018 Q6
+  //
+  // The HUB-ADMIN marks an ADMITTED row REVOKED and CLEARS its sealed blob. The
+  // CLI cuts transport at the hub (drops the `authorization` user + reloads)
+  // BEFORE calling this — this is the registry-side half (roster + member
+  // PoP-read both stop serving the member). Idempotent: a second revoke of an
+  // already-REVOKED row returns 200. 409 if the row was never ADMITTED.
+  // ---------------------------------------------------------------------------
+
+  app.post("/admission-requests/:request_id/revoke", async (c) => {
+    const requestId = c.req.param("request_id") ?? "";
+    const gate = await verifyHubAdminWrite(
+      c,
+      requestId,
+      validateSignedAdmissionRevoke,
+      validateAdmissionRevokeClaim,
+    );
+    if (!gate.ok) return gate.response;
+
+    const store = getIssuanceStore(c.env);
+    let updated;
+    try {
+      updated = await store.revokeAdmission(requestId);
+    } catch (err) {
+      if (err instanceof AlreadyDecidedError) {
+        return c.json(
+          {
+            error: "not_admitted",
+            details: `request ${requestId} is ${err.request.status}, not ADMITTED — nothing to revoke`,
+            current: err.request,
+          },
+          409,
+        );
+      }
+      throw err;
+    }
+    if (!updated) return c.json({ error: "not_found" }, 404);
+    return c.json(updated, 200);
+  });
+
+  // ---------------------------------------------------------------------------
   // GET /admission-requests?status=<status>
   // ---------------------------------------------------------------------------
 
@@ -356,11 +543,15 @@ export function admissionRequestRoutes(): Hono<{ Bindings: Env }> {
       return c.json({ error: "signature_invalid" }, 401);
     }
 
-    // Return the caller's OWN admission rows (by the proven pubkey), each with
-    // the (empty-in-PR5a) sealed_secret slot. Never another member's queue.
+    // Return the caller's OWN admission rows (by the proven pubkey), each
+    // carrying its sealed_secret slot — POPULATED (PR5b) once the hub-admin has
+    // delivered the opaque blob (sealed to THIS member's pubkey, useless to
+    // anyone else), NULL before delivery and after revoke. Never another
+    // member's queue. The blob needs no extra auth: it is opaque to everyone but
+    // the holder of the matching seed (ADR-0018 Q4 b′).
     const store = getIssuanceStore(c.env);
     const rows = await store.listIssuanceRequestsByPeer(signed.claim.peer_pubkey);
-    const mine: AdmissionMineRow[] = rows.map((r) => ({ ...r, sealed_secret: null }));
+    const mine: AdmissionMineRow[] = rows;
     return c.json(mine, 200);
   });
 

@@ -49,6 +49,8 @@ interface IssuanceRequestRow {
   created_at: string;
   updated_at: string;
   granted_by: string | null;
+  /** ADR-0018 b′ (PR5b) — opaque sealed ciphertext; NULL until add-member. */
+  sealed_secret: string | null;
 }
 
 /** What D1's `.run()` returns — we only populate `meta.changes`. */
@@ -224,9 +226,29 @@ export class MockD1 {
         created_at: createdAt,
         updated_at: updatedAt,
         granted_by: null,
+        sealed_secret: null,
       };
       this.issuanceRequests.set(requestId, row);
       this.issuancePeerIndex.set(peerKey, requestId);
+      return { meta: { changes: 1 } };
+    }
+
+    // admission_requests: revoke (ADR-0018 Q6 — CAS on status='ADMITTED').
+    // `UPDATE ... SET status = 'REVOKED', sealed_secret = NULL ... WHERE ... AND status = 'ADMITTED'`.
+    // Checked BEFORE the generic `SET status` branch (that branch binds a
+    // newStatus param this literal-status statement does not carry).
+    if (sql.startsWith("UPDATE admission_requests SET status = 'REVOKED'")) {
+      const [updatedAt, requestId] = args as [string, string];
+      const existing = this.issuanceRequests.get(requestId);
+      if (!existing || existing.status !== "ADMITTED") {
+        return { meta: { changes: 0 } };
+      }
+      this.issuanceRequests.set(requestId, {
+        ...existing,
+        status: "REVOKED",
+        sealed_secret: null,
+        updated_at: updatedAt,
+      });
       return { meta: { changes: 1 } };
     }
 
@@ -250,6 +272,22 @@ export class MockD1 {
         updated_at: updatedAt,
       };
       this.issuanceRequests.set(requestId, updated);
+      return { meta: { changes: 1 } };
+    }
+
+    // admission_requests: setSealedSecret (ADR-0018 b′ — CAS on status='ADMITTED').
+    // `UPDATE ... SET sealed_secret = ?, updated_at = ? WHERE request_id = ? AND status = 'ADMITTED'`.
+    if (sql.startsWith("UPDATE admission_requests SET sealed_secret")) {
+      const [sealedSecret, updatedAt, requestId] = args as [string, string, string];
+      const existing = this.issuanceRequests.get(requestId);
+      if (!existing || existing.status !== "ADMITTED") {
+        return { meta: { changes: 0 } };
+      }
+      this.issuanceRequests.set(requestId, {
+        ...existing,
+        sealed_secret: sealedSecret,
+        updated_at: updatedAt,
+      });
       return { meta: { changes: 1 } };
     }
 
