@@ -756,3 +756,80 @@ describe("deriveJoinInputs — operator-mode source precedence", () => {
     expect(res.inputs?.credsPath).toBe("~/.config/nats/metafactory-community.creds");
   });
 });
+
+// =============================================================================
+// C-1224 (ADR-0013 Model B) — leaf shared secret resolution.
+// =============================================================================
+
+describe("C-1224 — leaf-secret (secret-auth pipe) derivation", () => {
+  test("leaf_secret from config → leafSecret + leafUser defaults to principal", () => {
+    const cfg = loaded({
+      principal: { id: "andreas" },
+      stack: {
+        id: "andreas/meta-factory",
+        nkey_seed_path: "~/.config/nats/cortex.nk",
+        nats_infra: {
+          config_path: "~/.config/nats/local.conf",
+          plist_path: "~/Library/LaunchAgents/nats.plist",
+          account: "A" + "B".repeat(55),
+          leaf_secret: "s3cr3t-from-config",
+        },
+      },
+    });
+    const res = deriveJoinInputs("metafactory", {}, "/cfg", reader(cfg), "darwin");
+    expect(res.ok).toBe(true);
+    expect(res.inputs?.leafSecret).toBe("s3cr3t-from-config");
+    // No leaf_user in config → defaults to the principal id.
+    expect(res.inputs?.leafUser).toBe("andreas");
+  });
+
+  test("leaf_user from config overrides the principal-id default", () => {
+    const cfg = loaded({
+      principal: { id: "andreas" },
+      stack: {
+        id: "andreas/meta-factory",
+        nkey_seed_path: "~/.config/nats/cortex.nk",
+        nats_infra: {
+          config_path: "~/.config/nats/local.conf",
+          plist_path: "~/Library/LaunchAgents/nats.plist",
+          leaf_secret: "s3cr3t",
+          leaf_user: "andreas-leaf",
+        },
+      },
+    });
+    const res = deriveJoinInputs("metafactory", {}, "/cfg", reader(cfg), "darwin");
+    expect(res.inputs?.leafUser).toBe("andreas-leaf");
+  });
+
+  test("--leaf-secret / --leaf-user flags win over config", () => {
+    const cfg = loaded({
+      principal: { id: "andreas" },
+      stack: {
+        id: "andreas/meta-factory",
+        nkey_seed_path: "~/.config/nats/cortex.nk",
+        nats_infra: {
+          config_path: "~/.config/nats/local.conf",
+          plist_path: "~/Library/LaunchAgents/nats.plist",
+          leaf_secret: "config-secret",
+          leaf_user: "config-user",
+        },
+      },
+    });
+    const res = deriveJoinInputs(
+      "metafactory",
+      { leafSecret: "flag-secret", leafUser: "flag-user" },
+      "/cfg",
+      reader(cfg),
+      "darwin",
+    );
+    expect(res.inputs?.leafSecret).toBe("flag-secret");
+    expect(res.inputs?.leafUser).toBe("flag-user");
+  });
+
+  test("no leaf_secret anywhere → leafSecret + leafUser both absent (creds path)", () => {
+    const res = deriveJoinInputs("metafactory", {}, "/cfg", reader(FULL), "darwin");
+    expect(res.inputs?.leafSecret).toBeUndefined();
+    // leafUser is meaningless without a secret — never resolved on its own.
+    expect(res.inputs?.leafUser).toBeUndefined();
+  });
+});
