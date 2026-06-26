@@ -50,6 +50,7 @@ import {
   validateSignedAdmissionDecision,
   validateAdmissionDecisionClaim,
   validateSignedAdmissionRead,
+  validateSignedAdmissionMineRead,
   isValidRequestId,
 } from "../validate";
 import { canonicalJSON, verifyEd25519 } from "../signing";
@@ -59,7 +60,7 @@ import {
   retryAfterSeconds,
   TOO_MANY_REQUESTS_BODY,
 } from "../rate-limit";
-import type { AdmissionStatus } from "../types";
+import type { AdmissionMineRow, AdmissionStatus } from "../types";
 
 /** Maximum clock skew for admin decision claims — mirrors the network-create route. */
 const CLOCK_SKEW_MS = 5 * 60 * 1000; // 5 minutes
@@ -295,6 +296,72 @@ export function admissionRequestRoutes(): Hono<{ Bindings: Env }> {
     const store = getIssuanceStore(c.env);
     const requests = await store.listIssuanceRequests(status);
     return c.json(requests, 200);
+  });
+
+  // ---------------------------------------------------------------------------
+  // GET /admission-requests/mine — ADR-0018 Q4 (Gap-C) member PoP-read
+  //
+  // Released to a caller who signs a proof-of-possession claim with their OWN
+  // registered key. The signature IS the authorization (no admin key, no
+  // allowlist): the route verifies the signature against `claim.peer_pubkey`
+  // and returns ONLY the admission rows for that key, across all networks.
+  // Each row carries a `sealed_secret` slot (null in PR5a; PR5b populates the
+  // sealed-to-pubkey leaf-secret blob — ADR-0018 Q1 b′).
+  //
+  // Signed-read so an unauthenticated caller leaks NO metadata about the
+  // onboarding queue. MUST be registered before `/:request_id` so "mine" is
+  // not swallowed by the param route (where it would 400 as invalid_request_id).
+  // ---------------------------------------------------------------------------
+
+  app.get("/admission-requests/mine", async (c) => {
+    // M1 — rate-limit BEFORE the Ed25519 verify (read bucket).
+    const allowed = await checkRateLimit(c.env, "read", clientKey(c.req.raw));
+    if (!allowed) {
+      return c.json(TOO_MANY_REQUESTS_BODY, 429, {
+        "Retry-After": String(retryAfterSeconds("read")),
+      });
+    }
+
+    // Parse + validate the x-pop-signed header.
+    const headerVal = c.req.header("x-pop-signed");
+    if (!headerVal) {
+      return c.json({ error: "x-pop-signed header required" }, 400);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(headerVal);
+    } catch (_err) {
+      return c.json({ error: "x-pop-signed must be valid JSON" }, 400);
+    }
+    const readCheck = validateSignedAdmissionMineRead(parsed);
+    if (!readCheck.ok) {
+      return c.json({ error: "x-pop-signed validation_failed", details: readCheck.errors }, 400);
+    }
+    const { signed } = readCheck;
+
+    // Clock-skew — stop a captured read token being replayed indefinitely.
+    const issued = Date.parse(signed.claim.issued_at);
+    const now = Date.now();
+    if (Math.abs(now - issued) > CLOCK_SKEW_MS) {
+      return c.json({ error: "issued_at out of skew window" }, 400);
+    }
+
+    // Proof-of-possession — the signature over canonicalJSON(claim) MUST verify
+    // against the claimed peer_pubkey. This signature IS the authorization: a
+    // caller who cannot sign for the key gets nothing (401), so the rows for a
+    // key are released only to a holder of that key.
+    const message = new TextEncoder().encode(canonicalJSON(signed.claim)) as Uint8Array<ArrayBuffer>;
+    const valid = await verifyEd25519(signed.claim.peer_pubkey, signed.signature, message);
+    if (!valid) {
+      return c.json({ error: "signature_invalid" }, 401);
+    }
+
+    // Return the caller's OWN admission rows (by the proven pubkey), each with
+    // the (empty-in-PR5a) sealed_secret slot. Never another member's queue.
+    const store = getIssuanceStore(c.env);
+    const rows = await store.listIssuanceRequestsByPeer(signed.claim.peer_pubkey);
+    const mine: AdmissionMineRow[] = rows.map((r) => ({ ...r, sealed_secret: null }));
+    return c.json(mine, 200);
   });
 
   // ---------------------------------------------------------------------------

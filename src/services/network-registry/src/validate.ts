@@ -22,6 +22,7 @@ import type {
   Capability,
   RegistrationClaim,
   SignedAdmissionDecision,
+  SignedAdmissionMineRead,
   SignedAdmissionRead,
   SignedRegistration,
   StackIdentity,
@@ -330,6 +331,21 @@ export function validateRegistrationClaim(
     errors.push({ field: "expected_updated_at", message: "must be a string when present" });
   }
 
+  // ADR-0018 Gap-A — optional target network. Same SIGNED-bytes discipline as
+  // expected_updated_at: it is part of the canonical claim, so it must be
+  // PRESERVED verbatim into the reconstructed claim, or every network-bearing
+  // register would fail signature verification (401). When present it must be a
+  // valid network id (free declaration — the same grammar a network create uses).
+  if (
+    c.network_id !== undefined &&
+    (typeof c.network_id !== "string" || !isValidNetworkId(c.network_id))
+  ) {
+    errors.push({
+      field: "network_id",
+      message: "must be a valid network id (lowercase alphanumeric + hyphen, letter-prefixed) when present",
+    });
+  }
+
   if (errors.length > 0) return { ok: false, errors };
 
   return {
@@ -340,6 +356,7 @@ export function validateRegistrationClaim(
       stacks,
       capabilities,
       ...(typeof c.expected_updated_at === "string" && { expected_updated_at: c.expected_updated_at }),
+      ...(typeof c.network_id === "string" && { network_id: c.network_id }),
       issued_at: c.issued_at as string,
       nonce: c.nonce as string,
     },
@@ -635,6 +652,54 @@ export function validateSignedAdmissionRead(
     ok: true,
     signed: {
       claim: { admin_pubkey: bc.admin_pubkey, issued_at: bc.issued_at },
+      signature: b.signature,
+    },
+  };
+}
+
+/**
+ * ADR-0018 Q4 (Gap-C) — validate the `x-pop-signed` header for the member
+ * PoP-read endpoint `GET /admission-requests/mine`. The header value is JSON:
+ * `{ claim: AdmissionMineReadClaim, signature: string }`. No nonce (reads are
+ * idempotent). Clock-skew applies. The route verifies the signature against
+ * `claim.peer_pubkey` — that signature is the authorization (no admin key).
+ */
+export function validateSignedAdmissionMineRead(
+  body: unknown,
+): { ok: true; signed: SignedAdmissionMineRead } | { ok: false; errors: ValidationError[] } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { ok: false, errors: [{ field: "body", message: "must be an object" }] };
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.signature !== "string" || b.signature.length === 0) {
+    return { ok: false, errors: [{ field: "signature", message: "missing" }] };
+  }
+  if (!BASE64_RE.test(b.signature)) {
+    return { ok: false, errors: [{ field: "signature", message: "must be base64" }] };
+  }
+  if (typeof b.claim !== "object" || b.claim === null || Array.isArray(b.claim)) {
+    return { ok: false, errors: [{ field: "claim", message: "must be a non-array object" }] };
+  }
+  const bc = b.claim as Record<string, unknown>;
+  if (typeof bc.principal_id !== "string" || !isValidPrincipalId(bc.principal_id)) {
+    return {
+      ok: false,
+      errors: [{ field: "claim.principal_id", message: "must be a valid principal id" }],
+    };
+  }
+  if (typeof bc.peer_pubkey !== "string" || !isValidPubkey(bc.peer_pubkey)) {
+    return {
+      ok: false,
+      errors: [{ field: "claim.peer_pubkey", message: "must be a 32-byte Ed25519 pubkey, base64-encoded (44 chars)" }],
+    };
+  }
+  if (typeof bc.issued_at !== "string" || Number.isNaN(Date.parse(bc.issued_at))) {
+    return { ok: false, errors: [{ field: "claim.issued_at", message: "must be an ISO-8601 timestamp" }] };
+  }
+  return {
+    ok: true,
+    signed: {
+      claim: { principal_id: bc.principal_id, peer_pubkey: bc.peer_pubkey, issued_at: bc.issued_at },
       signature: b.signature,
     },
   };

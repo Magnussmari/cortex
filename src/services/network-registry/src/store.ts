@@ -203,6 +203,15 @@ export interface IssuanceRequestStore {
   listIssuanceRequests(status: AdmissionStatus): Promise<AdmissionRequest[]>;
 
   /**
+   * ADR-0018 Q4 (Gap-C) — list the admission requests belonging to a single
+   * member's registered pubkey, across all networks, ordered by created_at
+   * ascending. Backs the member PoP-read endpoint: the caller proves possession
+   * of `peerPubkey` (the signature IS the authorization) and receives ONLY the
+   * rows for that key — never another member's queue.
+   */
+  listIssuanceRequestsByPeer(peerPubkey: string): Promise<AdmissionRequest[]>;
+
+  /**
    * Transition a PENDING request to ADMITTED or REJECTED.
    *
    * The transition is gated on `status = 'PENDING'` (CAS-ish guard): if the
@@ -232,9 +241,21 @@ function generateRequestId(): string {
     .join("");
 }
 
+/**
+ * ADR-0018 Gap-A — the idempotency key for an admission request. Includes the
+ * target `network_id` so a stack can request admission to TWO networks without
+ * the second register colliding with the first. A network-less register (no
+ * `network_id`) normalises to the empty string, preserving the pre-ADR-0018
+ * `(principal_id, peer_pubkey)` idempotency for that path (mirrors the D1
+ * `COALESCE(network_id, '')` unique-index expression).
+ */
+function admissionPeerKey(principalId: string, peerPubkey: string, networkId?: string): string {
+  return `${principalId}\x00${peerPubkey}\x00${networkId ?? ""}`;
+}
+
 export class InMemoryIssuanceRequestStore implements IssuanceRequestStore {
   private readonly requests = new Map<string, AdmissionRequest>();
-  /** (principal_id + "\x00" + peer_pubkey) → request_id */
+  /** (principal_id + "\x00" + peer_pubkey + "\x00" + network_id) → request_id */
   private readonly byPeer = new Map<string, string>();
 
   async upsertPending(
@@ -243,7 +264,7 @@ export class InMemoryIssuanceRequestStore implements IssuanceRequestStore {
     requestedScope: string,
     networkId?: string,
   ): Promise<AdmissionRequest> {
-    const peerKey = `${principalId}\x00${peerPubkey}`;
+    const peerKey = admissionPeerKey(principalId, peerPubkey, networkId);
     const existingId = this.byPeer.get(peerKey);
     if (existingId !== undefined) {
       // Idempotent: return the existing row.
@@ -273,6 +294,12 @@ export class InMemoryIssuanceRequestStore implements IssuanceRequestStore {
   async listIssuanceRequests(status: AdmissionStatus): Promise<AdmissionRequest[]> {
     return [...this.requests.values()]
       .filter((r) => r.status === status)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
+  async listIssuanceRequestsByPeer(peerPubkey: string): Promise<AdmissionRequest[]> {
+    return [...this.requests.values()]
+      .filter((r) => r.peer_pubkey === peerPubkey)
       .sort((a, b) => a.created_at.localeCompare(b.created_at));
   }
 
@@ -317,6 +344,13 @@ export class D1IssuanceRequestStore implements IssuanceRequestStore {
     // Contract: always returns the PENDING (or already-decided) row for this
     // (principal_id, peer_pubkey) pair; never throws on a concurrent insert;
     // never creates a duplicate.
+    // ADR-0018 Gap-A — the idempotency / conflict target is now the TRIPLE
+    // `(principal_id, peer_pubkey, COALESCE(network_id, ''))` (migration 0008).
+    // The `COALESCE(...,'')` makes a network-less register (NULL network_id)
+    // still dedupe — SQLite treats raw NULLs as distinct, which would re-insert
+    // a duplicate PENDING row on every plain re-register; normalising NULL→''
+    // restores the pre-ADR-0018 `(principal_id, peer_pubkey)` idempotency for
+    // that path while keeping two DISTINCT networks as two distinct rows.
     const now = new Date().toISOString();
     const requestId = generateRequestId();
     await this.db
@@ -324,17 +358,20 @@ export class D1IssuanceRequestStore implements IssuanceRequestStore {
         `INSERT INTO admission_requests
            (request_id, principal_id, peer_pubkey, requested_scope, network_id, status, created_at, updated_at, granted_by)
          VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, NULL)
-         ON CONFLICT(principal_id, peer_pubkey) DO NOTHING`,
+         ON CONFLICT(principal_id, peer_pubkey, COALESCE(network_id, '')) DO NOTHING`,
       )
       .bind(requestId, principalId, peerPubkey, requestedScope, networkId ?? null, now, now)
       .run();
 
-    // Unconditional SELECT — retrieves the winner (our insert or the existing row).
+    // Unconditional SELECT — retrieves the winner (our insert or the existing
+    // row) for THIS network. The `COALESCE` mirrors the conflict target so a
+    // NULL network_id matches the empty-string-normalised bind, and two networks
+    // never cross-select each other's row.
     const row = await this.db
       .prepare(
-        "SELECT * FROM admission_requests WHERE principal_id = ? AND peer_pubkey = ?",
+        "SELECT * FROM admission_requests WHERE principal_id = ? AND peer_pubkey = ? AND COALESCE(network_id, '') = COALESCE(?, '')",
       )
-      .bind(principalId, peerPubkey)
+      .bind(principalId, peerPubkey, networkId ?? null)
       .first<AdmissionRequestRow>();
 
     // The row MUST exist at this point: either we inserted it or it pre-existed.
@@ -361,6 +398,16 @@ export class D1IssuanceRequestStore implements IssuanceRequestStore {
         "SELECT * FROM admission_requests WHERE status = ? ORDER BY created_at ASC",
       )
       .bind(status)
+      .all<AdmissionRequestRow>();
+    return (res.results ?? []).map(rowToAdmissionRequest);
+  }
+
+  async listIssuanceRequestsByPeer(peerPubkey: string): Promise<AdmissionRequest[]> {
+    const res = await this.db
+      .prepare(
+        "SELECT * FROM admission_requests WHERE peer_pubkey = ? ORDER BY created_at ASC",
+      )
+      .bind(peerPubkey)
       .all<AdmissionRequestRow>();
     return (res.results ?? []).map(rowToAdmissionRequest);
   }
@@ -941,6 +988,65 @@ export function membersFromPrincipals(
   return rosterFromPrincipals(principals, networkId)
     .members.map((m) => m.principal_id)
     .sort();
+}
+
+/**
+ * ADR-0018 Q3/Gap-B — compute a network's roster from ADMITTED admission rows.
+ *
+ * Admission is the SOURCE OF TRUTH for membership: a principal is "in" network
+ * X iff they hold an ADMITTED admission row for X. Announced capabilities NO
+ * LONGER confer membership — they are an orthogonal facet ("what an admitted
+ * member offers"), joined on top of membership (possibly empty). This is the
+ * resolution of the bug class ADR-0015 warns against (conflating membership
+ * with capability).
+ *
+ * For each distinct ADMITTED principal in the network we join their principal
+ * record for `principal_pubkey` and the capabilities they announced into THIS
+ * network (the facet). An admitted principal with no record (should not happen
+ * — the register hook creates the record before the admission row) is skipped
+ * defensively rather than emitted with an empty pubkey. Sorted by principal_id
+ * for a stable, canonical-friendly response.
+ */
+export function rosterFromAdmissions(
+  admitted: AdmissionRequest[],
+  principals: PrincipalRecord[],
+  networkId: string,
+): NetworkRoster {
+  const byId = new Map(principals.map((p) => [p.principal_id, p]));
+  const seen = new Set<string>();
+  const members: NetworkRoster["members"] = [];
+  for (const row of admitted) {
+    if (row.status !== "ADMITTED" || row.network_id !== networkId) continue;
+    if (seen.has(row.principal_id)) continue;
+    seen.add(row.principal_id);
+    const record = byId.get(row.principal_id);
+    if (!record) continue; // defensive: admitted principal must have registered.
+    const capabilities = record.capabilities
+      .filter((cap) => (cap.networks ?? []).includes(networkId))
+      .map((cap) => cap.id);
+    members.push({
+      principal_id: record.principal_id,
+      principal_pubkey: record.principal_pubkey,
+      capabilities,
+    });
+  }
+  members.sort((a, b) => a.principal_id.localeCompare(b.principal_id));
+  return { network_id: networkId, members };
+}
+
+/**
+ * ADR-0018 Q3/Gap-B — derive a network's lightweight membership list (principal
+ * ids) for the descriptor from ADMITTED admission rows. Mirrors
+ * {@link membersFromPrincipals} (the retired capability-derived view) but is
+ * sourced from admission, so the descriptor's `members[]` can never disagree
+ * with the admission-sourced `/roster`. Unique + sorted for a stable response.
+ */
+export function membersFromAdmissions(
+  admitted: AdmissionRequest[],
+  principals: PrincipalRecord[],
+  networkId: string,
+): string[] {
+  return rosterFromAdmissions(admitted, principals, networkId).members.map((m) => m.principal_id);
 }
 
 /**

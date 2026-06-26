@@ -77,6 +77,8 @@ export async function makeSignedRegistration(
     signWith?: PrincipalKey;
     /** #825 — optimistic-concurrency CAS token signed into the claim. */
     expectedUpdatedAt?: string;
+    /** ADR-0018 Gap-A — target network signed into the claim (pins admission). */
+    networkId?: string;
   } = {},
 ): Promise<{ claim: RegistrationClaim; signature: string }> {
   const claim: RegistrationClaim = {
@@ -85,6 +87,7 @@ export async function makeSignedRegistration(
     stacks: opts.stacks ?? [],
     capabilities: opts.capabilities ?? [],
     ...(opts.expectedUpdatedAt !== undefined && { expected_updated_at: opts.expectedUpdatedAt }),
+    ...(opts.networkId !== undefined && { network_id: opts.networkId }),
     issued_at: opts.issuedAt ?? new Date().toISOString(),
     nonce: opts.nonce ?? randomNonce(),
   };

@@ -88,6 +88,19 @@ export interface RegistrationClaim {
   /** Capabilities the principal wants advertised. */
   capabilities: Capability[];
   /**
+   * ADR-0018 Gap-A — the target network this registration is requesting
+   * admission into. When present, the register hook stamps it onto the PENDING
+   * admission request so the idempotency key becomes
+   * `(principal_id, peer_pubkey, network_id)` — a stack can request admission to
+   * two networks without the second register colliding with the first.
+   *
+   * OPTIONAL: a registration that names no network (a plain identity register,
+   * not a join) creates a network-less PENDING row (`network_id = null`). Part
+   * of the SIGNED canonical claim — a MITM cannot strip or forge the target
+   * network, so admission is always pinned to the network the joiner named.
+   */
+  network_id?: string;
+  /**
    * #825 — optimistic concurrency. The `updated_at` of the record this claim's
    * merge was computed from (captured during the client's verified read). The
    * registry compare-and-sets on it: if the stored row changed since (a
@@ -357,6 +370,62 @@ export interface SignedAdmissionRead {
   claim: AdmissionReadClaim;
   /** Base64 Ed25519 signature over canonical-JSON(claim). */
   signature: string;
+}
+
+/**
+ * ADR-0018 Q4 (Gap-C) — the member proof-of-possession read claim carried by
+ * `GET /admission-requests/mine`.
+ *
+ * Unlike the admin read claim, this is signed by the MEMBER's own registered
+ * key — the signature over `canonicalJSON(claim)` against `peer_pubkey` IS the
+ * authorization (no admin key, no allowlist). A caller learns ONLY the
+ * admission rows belonging to the key they can prove possession of: the route
+ * returns the rows whose `peer_pubkey` equals the (verified) claimed pubkey.
+ *
+ * No nonce (reads are idempotent); clock-skew applies to stop a captured token
+ * being replayed indefinitely. Signed-read so an unauthenticated caller leaks
+ * no metadata about the onboarding queue.
+ */
+export interface AdmissionMineReadClaim {
+  /**
+   * The principal the caller is asking about. Echoed for canonicalisation and
+   * cross-checked against the returned rows; the real authority is the
+   * signature over `peer_pubkey`.
+   */
+  principal_id: string;
+  /**
+   * The member's registered Ed25519 pubkey (base64). The claim is signed with
+   * the matching private key, so verifying the signature against this field
+   * proves possession — the rows for this pubkey are released, nothing else.
+   */
+  peer_pubkey: string;
+  /** ISO-8601 UTC; within the CLOCK_SKEW_MS window. */
+  issued_at: string;
+}
+
+/** On-wire envelope for a member PoP read authorisation. */
+export interface SignedAdmissionMineRead {
+  claim: AdmissionMineReadClaim;
+  /** Base64 Ed25519 signature over canonical-JSON(claim). */
+  signature: string;
+}
+
+/**
+ * ADR-0018 Q4 (Gap-C) — one row of the member PoP-read response. The member's
+ * own admission request, plus the (b′) `sealed_secret` slot.
+ *
+ * `sealed_secret` is included in the shape NOW but always `null` in PR5a: the
+ * sealed-to-pubkey leaf-secret blob is populated by PR5b (ADR-0018 Q1 b′).
+ * Shipping the field now lets the member-read consumer pin the response shape
+ * before the secret-delivery machinery lands.
+ */
+export interface AdmissionMineRow extends AdmissionRequest {
+  /**
+   * ADR-0018 Q1 (b′) — the per-member leaf PSK, sealed to this member's pubkey
+   * (libsodium `crypto_box_seal`). NULL until PR5b populates it; the registry
+   * only ever carries the opaque ciphertext (it cannot read it).
+   */
+  sealed_secret: string | null;
 }
 
 // ---------------------------------------------------------------------------
