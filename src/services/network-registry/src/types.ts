@@ -388,9 +388,12 @@ export interface SignedAdmissionRead {
  */
 export interface AdmissionMineReadClaim {
   /**
-   * The principal the caller is asking about. Echoed for canonicalisation and
-   * cross-checked against the returned rows; the real authority is the
-   * signature over `peer_pubkey`.
+   * The principal the caller is asking about. Echoed into the signed claim for
+   * canonicalisation/audit only — the route does NOT cross-check it against the
+   * returned rows. The sole authority is the signature over `peer_pubkey`: the
+   * route queries by the verified `peer_pubkey` (`listIssuanceRequestsByPeer`),
+   * so the released rows are exactly those owned by the proven key regardless of
+   * this field's value.
    */
   principal_id: string;
   /**
