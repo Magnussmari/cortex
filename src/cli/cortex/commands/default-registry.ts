@@ -79,7 +79,7 @@ export const DEFAULT_REGISTRY: RegistryAnchor = {
 };
 
 /** First non-empty string in the list, or undefined. */
-function firstNonEmpty(...vals: Array<string | undefined>): string | undefined {
+function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
   for (const v of vals) {
     if (v !== undefined && v !== "") return v;
   }

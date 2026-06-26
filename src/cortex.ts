@@ -3379,9 +3379,7 @@ export async function startCortex(
       // window on the default). A custom registry with no pin still falls
       // through to the client's TOFU (pubkey left undefined here).
       const resolvedFederationRegistry = resolveRegistryAnchor({
-        ...(federationRegistryConfig.url !== undefined && {
-          configUrl: federationRegistryConfig.url,
-        }),
+        configUrl: federationRegistryConfig.url,
         ...(federationRegistryConfig.pubkey !== undefined && {
           configPubkey: federationRegistryConfig.pubkey,
         }),
@@ -3537,7 +3535,7 @@ export async function startCortex(
       // is the default registry and config omits the pubkey (no TOFU on the
       // default). Custom registries keep the client's TOFU (pubkey undefined).
       const resolvedRegistry = resolveRegistryAnchor({
-        ...(registryConfig.url !== undefined && { configUrl: registryConfig.url }),
+        configUrl: registryConfig.url,
         ...(registryConfig.pubkey !== undefined && { configPubkey: registryConfig.pubkey }),
       });
       registryClient = new RegistryClient({
