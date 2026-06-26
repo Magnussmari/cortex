@@ -100,17 +100,23 @@ async function ready(): Promise<void> {
 }
 
 /**
- * AEAD associated-data: bind the ciphertext to the already-signed cleartext
- * header fields. Deterministic, canonical, and computed identically on seal +
- * open. Any divergence in `id` / `type` / `classification` between seal-time and
- * open-time → AEAD tag mismatch → fail closed (the lift-onto-another-header
- * defence). These three fields are all in myelin's SIGNABLE_FIELDS.
+ * AEAD associated-data: bind the ciphertext to the cleartext header fields.
+ * Deterministic, canonical, computed identically on seal + open. Any divergence
+ * between seal-time and open-time → AEAD tag mismatch → fail closed (the
+ * lift-onto-another-header defence — a hub cannot move the ciphertext onto a
+ * different envelope header).
+ *
+ * Bound fields: `id`, `type`, `sovereignty.classification` (all in myelin's
+ * SIGNABLE_FIELDS, so doubly protected) plus `correlation_id` (NOT signed —
+ * myelin excludes it — so the AAD is what makes a correlation_id swap under a
+ * sealed body tamper-evident; ADR-0019 receive-path lock).
  */
 function associatedData(envelope: Envelope): Uint8Array {
   const bound = JSON.stringify([
     envelope.id,
     envelope.type,
     envelope.sovereignty.classification,
+    envelope.correlation_id ?? null,
   ]);
   return sodium.from_string(bound);
 }

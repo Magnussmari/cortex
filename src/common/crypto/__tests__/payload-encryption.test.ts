@@ -196,6 +196,21 @@ describe("fail-closed: wrong key, tamper, header-lift", () => {
     ).rejects.toThrow(/failed to open/);
   });
 
+  test("AAD lift: a swapped correlation_id (routing) under a sealed body → open fails", async () => {
+    const k = await key("net1/k1");
+    const env = baseEnvelope({
+      correlation_id: "22222222-2222-4222-8222-222222222222",
+    });
+    const sealed = await sealPayload(env, "net1", k);
+    const lifted: Envelope = {
+      ...sealed,
+      correlation_id: "33333333-3333-4333-8333-333333333333",
+    };
+    await expect(
+      openPayload(lifted, new NetworkKeyring([{ net: "net1", keys: [k] }])),
+    ).rejects.toThrow(/failed to open/);
+  });
+
   test("AAD lift: ciphertext moved onto a different classification → open fails", async () => {
     const k = await key("net1/k1");
     const sealed = await sealPayload(baseEnvelope(), "net1", k);
