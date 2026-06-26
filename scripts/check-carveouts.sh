@@ -197,10 +197,10 @@ ALLOWLIST_PATHS=(
   # account-topology design doc above. Class: NSC.
   # RETIRE: never (NSC operator is the permanent qualified survivor, CONTEXT.md).
   'docs/sop-onboard-peer-principal.md'
-  # Distributed-stacks + managed-execution design — the sovereign-federation / NSC
-  # operator hosting model (own-operator per remote stack, leaf topology, ADR-0013).
-  # Remaining "operator" hits are "NSC operator" / "per-stack operators". Class: NSC.
-  'docs/design-distributed-stacks-and-managed-execution.md'
+  # Isolated-stack-hosting design (Mode B) — the sovereign-federation / NSC operator
+  # hosting model (own-operator per remote stack, leaf topology, ADR-0013). Remaining
+  # "operator" hits are "NSC operator" / "per-stack operators" / "multi-operator". Class: NSC.
+  'docs/design-isolated-stack-hosting.md'
   # HISTORICAL removed-field regression test — describes and guards the
   # v3-REMOVED `config.agent.operatorId` legacy field (cortex#429 PR-C). Its
   # whole purpose is to assert a stray reader of the removed field never creeps
