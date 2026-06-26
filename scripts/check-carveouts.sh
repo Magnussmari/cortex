@@ -174,6 +174,23 @@ ALLOWLIST_PATHS=(
   # "operator" is the NATS account-tree root, never the principal. Class: NSC.
   # RETIRE: never (NSC operator is the permanent qualified survivor, CONTEXT.md).
   'docs/design-g1-account-topology.md'
+  # G1d / T1 (cortex#1139) provision tooling — the arc-shell driver + pure
+  # orchestration + live adapters behind `cortex network provision`. Their entire
+  # subject is the NSC account tree (the principal's own nsc operator + the
+  # federation/agents accounts minted under it via arc). Every "operator" is the
+  # NATS account-tree root, never the principal. Same class as connection.ts /
+  # trust-resolver.ts / design-g1-account-topology.md / ADR-0013. Class: NSC.
+  # RETIRE: never (NSC operator is the permanent qualified survivor, CONTEXT.md).
+  'src/cli/cortex/commands/operator-provisioning.ts'
+  'src/cli/cortex/commands/network-provision-lib.ts'
+  'src/cli/cortex/commands/network-provision-adapters.ts'
+  'src/cli/cortex/commands/__tests__/operator-provisioning.test.ts'
+  'src/cli/cortex/commands/__tests__/network-provision-lib.test.ts'
+  'src/cli/cortex/commands/__tests__/network-provision-cli.test.ts'
+  # G1d own-operator onboarding design doc — its whole subject is standing up the
+  # principal's own NSC account tree (also caught by the `operator-onboarding`
+  # line pattern; path-allowlisted for clarity). Class: NSC.
+  'docs/design-own-operator-onboarding.md'
   # ADR-0013 sovereign federation — its whole subject is the NSC operator/account
   # model (own-operator federation, per-side export/import). Every "operator" is the
   # NATS account-tree root, never the principal. Class: NSC.

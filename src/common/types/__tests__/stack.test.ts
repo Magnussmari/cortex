@@ -251,6 +251,47 @@ describe("StackConfigSchema.nats_infra — platform service descriptor", () => {
     ).toThrow();
   });
 
+  // G1d (cortex#1139) — the dedicated agents account (split from the leaf-bound
+  // federation account) that `cortex network provision` mints per stack.
+  test("G1d — accepts a distinct agents_account (A-prefixed NKey)", () => {
+    const VALID_AGENTS = "A" + "C".repeat(55);
+    const parsed = StackConfigSchema.parse({
+      id: "andreas/research",
+      nats_infra: {
+        account: VALID_ACCOUNT,
+        agents_account: VALID_AGENTS,
+      },
+    });
+    expect(parsed.nats_infra?.account).toBe(VALID_ACCOUNT);
+    expect(parsed.nats_infra?.agents_account).toBe(VALID_AGENTS);
+  });
+
+  test("G1d — agents_account stays optional (omittable)", () => {
+    const parsed = StackConfigSchema.parse({
+      id: "andreas/research",
+      nats_infra: { account: VALID_ACCOUNT },
+    });
+    expect(parsed.nats_infra?.agents_account).toBeUndefined();
+  });
+
+  test("G1d — rejects a U-prefixed (user) key as agents_account", () => {
+    expect(() =>
+      StackConfigSchema.parse({
+        id: "andreas/research",
+        nats_infra: { agents_account: "U" + "B".repeat(55) },
+      }),
+    ).toThrow();
+  });
+
+  test("G1d — rejects a malformed agents_account", () => {
+    expect(() =>
+      StackConfigSchema.parse({
+        id: "andreas/research",
+        nats_infra: { agents_account: "A-too-short" },
+      }),
+    ).toThrow();
+  });
+
   test("rejects an unknown nats_infra key (strict schema)", () => {
     expect(() =>
       StackConfigSchema.parse({
