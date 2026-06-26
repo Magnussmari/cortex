@@ -177,6 +177,33 @@ _Avoid_: reading admission as credential issuance (it isn't — ADR-0015); a "gu
 The Mission Control dashboard's access tier — `viewer` < `operator` < `admin` (`ROLE_HIERARCHY` in `src/surface/mc/worker/src/user-auth/types.ts`, persisted in D1 `users.role`) — governing what a logged-in dashboard session may do (view / operate / administer). Part of the M7 surface's AAA model (`docs/design-auth-aaa.md`), alongside `AgentClass` (pet/cattle) and `GrantScope` (read/review/control). It is **not** the **principal**: principal is the bus identity / trust-root (M3–M6) that scopes subjects and signs envelopes; the authorization role is a surface-only privilege level on a human dashboard user. The two axes are orthogonal — JC is seeded `role: operator` *and* is his own **principal** (runs `jc/…` stacks, signs his own wire); a `viewer` is not "less of a principal," `admin` is not "more of one." The tier name `operator` is **kept** because `viewer | operator | admin` is idiomatic RBAC vocabulary (GCP, k8s, PagerDuty all use "operator" for the operate-level tier); like the NSC operator, it is a second place the word legitimately survives the operator→principal migration — qualified as the *authorization role*, never the identity.
 _Avoid_: reading dashboard `role: operator` as the **principal**; conflating the AAA tier with the bus identity. Say "authorization role" or "MC role" when you mean the dashboard privilege tier.
 
+### Joining a network (sovereign federation — Model B)
+
+> The part of the stack we most often get tripped up on. "Join" is **two acts**: (1) **identity** — self-sovereign, one root, nobody grants it; and (2) **admission** — the network's trust decision, which grants *membership* and mints *nothing*. Authority: `docs/adr/0013-sovereign-federation-model.md` (one-root identity) + `docs/adr/0015-two-tier-onboarding-and-admission-gate.md` (admission).
+
+![How a stack joins a network under sovereign Model-B federation](docs/diagrams/cortex-network-join.png)
+
+**One identity root (why it's simpler than it looks).** A principal holds exactly **one seed** — their **NSC operator** (their *principal key*). From it `cortex` derives everything you'd otherwise manage by hand: the principal's **account** (the **Federation account** the leaf binds to), your **stack signing key** (an `SU` nkey that signs every envelope on the wire via `runtime.publish` — its pubkey is pinned as `stack.nkey_pub` and trusted by peers through the `signed_by[]` chain), and your local bus **connection creds**. These are *distinct* credentials — the wire-signing key is **not** the connection credential — but you never mint or juggle them separately: **one seed in, the rest derived for you.** The only credential from *outside* your root is the network's **leaf shared secret** (the PSK that attaches your leaf to the hub). So it isn't 'one key, two jobs' — it's **one root you hold, every local credential derived from it.**
+
+**Admission is trust, not issuance (the trust half).** A network is a *roster of principals who have been let in* — a **network of trust**. Admission is the **Network-admission gate**: `register (proof-of-possession) → PENDING → an admin (or admin-agent) approves → recognized peer`. It **mints nothing** — it adds your already-sovereign pubkey to the roster and hands you the **leaf shared secret** to attach. Trust is **two-layered**, and the second layer keeps every member sovereign:
+- **Network membership** — the admin curates the roster; peers trust it because they all pinned the same registry anchor.
+- **Per-principal acceptance** — even for an admitted peer, each principal independently chooses whom to accept (accept-policy `network:<id>` = trust the whole roster, or `principals:[…]` = trust only named peers). Nobody is forced to trust an admitted member.
+
+So trust is **granted** (admission) *and* **chosen** (accept-policy), never *minted*.
+
+**Where signing does NOT happen.** The **registry** (`network.meta-factory.ai`) is the *DNS of the federation* — it stores the **one pubkey** a stack publishes + the network descriptor + roster, and **signs nothing**. The hub admin **issues no credential** — you issue your own stack key from your own root (you signing for yourself). The only thing crossing the **principal boundary** is the **leaf shared secret** (a transport PSK, like a Wi-Fi password) — never an identity credential. The one line nobody crosses is **operator-to-operator**: my root never issues your account.
+_Avoid_: "two signing systems" / two signing authorities (there is **one root** — the derived credentials are not a second authority); thinking you mint or manage those derived credentials by hand; reading admission as credential issuance; "the registry/hub mints my creds"; treating the leaf secret as an identity.
+
+**How a stack joins** (one verb; the registry autoconfigures the layers — the "feel like TCP/IP" north star, ADR-0003 §9):
+1. **Provision your own identity** — `cortex provision-stack generate` (you sign; you alone hold the seed).
+2. **Register** — `cortex provision-stack register`: posts your pubkey + capabilities, signed by that key (proof-of-possession); raises a PENDING admission request on a gated network.
+3. **Pin the registry** — `policy.federated.registry.{url,pubkey}`: the single trust anchor; resolve peers from it, never hardcode a peer pubkey.
+4. **Be admitted** — the admin approves your **roster membership** and hands you the **leaf shared secret + which side hosts the hub**. The one two-party trust act; it mints nothing.
+5. **Join** — `cortex network join <network> --apply`: ensures your own operator, renders the secret-auth leaf bound to *your own local account*, wires your half of export/import, restarts.
+6. **Verify** — `cortex network status` → leaf link `established`, peers resolved from the roster.
+
+**TCP/IP mapping**: your NSC operator = you own your keys · the registry = DNS (pin one resolver) · admission = being let onto the network (the trust grant) · the leaf shared secret = the PSK to attach to the medium · `cortex network join` = the DHCP-style plug-in · **scope** `local`/`federated`/`public` = localhost/LAN/internet.
+
 ## Relationships
 
 - A **principal** runs one or more **stacks**, and belongs to one or more **networks**.
