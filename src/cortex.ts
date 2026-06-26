@@ -98,7 +98,7 @@ import {
   provisionReviewStream,
   provisionReviewConsumer,
 } from "./bus/jetstream/provision";
-import { reviewScopePatterns } from "./bus/jetstream/review-subjects";
+import { reviewScopePatterns, REVIEW_OFFER_TASK_SUFFIX } from "./bus/jetstream/review-subjects";
 import {
   verifySignedByChain,
   nkeyToBase64Pubkey,
@@ -1627,7 +1627,11 @@ export async function startCortex(
   // offering layer decides reachability, the existing federation block decides
   // verdict-routing. They compose; CO-2 touches only the Offer binding.
   const reviewOfferingPatterns = offeringSubjectPatterns(
-    "tasks.code-review.>",
+    // cortex#1199 — the shared single-token `*` Offer suffix (owned by
+    // review-subjects.ts). Single-token (not `>`) keeps the offering-derived
+    // federated/public Offer patterns JetStream-disjoint from the 4-token Direct
+    // pattern, so CODE_REVIEW provisions even when code-review is offered federated.
+    REVIEW_OFFER_TASK_SUFFIX,
     reviewPrincipalId,
     derivedStack.stack,
     resolveOffering("code-review", resolvedPolicy?.offerings),
