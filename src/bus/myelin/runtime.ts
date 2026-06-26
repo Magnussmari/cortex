@@ -38,6 +38,16 @@ import {
 // signer. Import discipline matches B.1c: the constrained `/identity`
 // subpath keeps tsc out of myelin's full source tree.
 import { signEnvelope } from "@the-metafactory/myelin/identity";
+// M3 (cortex#1241, ADR-0019) — per-network payload sealing on the OUTBOUND
+// publish path. Encrypt-then-sign: seal `payload` with the network key FIRST,
+// then the existing `signEnvelope` below signs the ciphertext. Dormant unless a
+// `policy.federated.networks[]` entry sets `encryption: enabled|required`.
+import { sealPayload } from "../../common/crypto/payload-encryption";
+import {
+  buildSealPolicyByPrincipal,
+  countEncryptionEnabledNetworks,
+  type NetworkSealPolicy,
+} from "../../common/crypto/network-encryption-policy";
 
 /**
  * Per-envelope handler. Receives validated envelopes from any active
@@ -1073,6 +1083,40 @@ export async function startMyelinRuntime(
     }
   }
 
+  // M3 (cortex#1241, ADR-0019) — per-target-principal OUTBOUND seal policy,
+  // derived once at init from `policy.federated.networks[]`. Maps a target
+  // principal (the SECOND subject segment of `federated.{principal}.{stack}.…`)
+  // to the network it lives on + that network's encryption posture + key. Empty
+  // when no network sets `encryption: enabled|required` — the seal step below is
+  // then a pure no-op and the publish path is byte-identical to pre-M3.
+  //
+  // cortex#1246 BLOCKER fix: also pass the OWN principal id so a SELF-addressed
+  // federated subject (`federated.{ownPrincipal}.…` — how a federated Offer /
+  // probe-echo is published) resolves to its own network's seal policy and seals,
+  // instead of falling through unsealed (segment[1] == own principal is never in
+  // its own `peers[]`). Only the unambiguous single-encryption-network case maps
+  // here; `encryptionEnabledNetworkCount` drives the multi-network warn-once
+  // below.
+  const myPrincipal = principalFromConfig(options?.principal);
+  const sealPolicyByPrincipal = buildSealPolicyByPrincipal(
+    federatedNetworks,
+    myPrincipal,
+  );
+  const encryptionEnabledNetworkCount =
+    countEncryptionEnabledNetworks(federatedNetworks);
+  // Loud-but-not-fatal warning dedup: warn ONCE per network when sealing is
+  // requested (`enabled`/`required`) but the network key is absent (PR5b has
+  // not yet delivered `K`). We publish cleartext in that case — federation
+  // stays up, but "federating in the clear" is visible (ADR-0019 §7).
+  const sealKeyMissingWarned = new Set<string>();
+  // cortex#1246 — warn-once dedup for a self-addressed federated egress
+  // (`federated.{ownPrincipal}.…`, e.g. an Offer) that could NOT be sealed
+  // because the stack is on MULTIPLE encryption-enabled networks and the network
+  // is unresolvable from a self-addressed subject alone. Single-network seals
+  // correctly (own principal is mapped in `sealPolicyByPrincipal`); this defends
+  // the multi-network gap so it is loud, never silent.
+  let selfAddressedAmbiguousSealWarned = false;
+
   // Back-compat alias: every existing reference to the single `link` now
   // targets the primary link's `NatsLink`. The subscribe/pull/jsm helpers
   // below stay bound to `primary` (design §3.5 — `subscribePull` and the
@@ -1284,7 +1328,7 @@ export async function startMyelinRuntime(
   // reconnect attaches the link but re-binding its interest on reconnect is
   // deferred (the leaf comes back publish-capable; inbound re-bind is a TC-2d-
   // adjacent follow-up, noted in the PR).
-  const myPrincipal = principalFromConfig(options?.principal);
+  // `myPrincipal` is resolved once above (seal-policy build site).
   const myStack = options?.stack;
   // `federated.{my-principal}.{my-stack}.>` (stack-aware) or
   // `federated.{my-principal}.>` (stack-less — the `>` multi-segment wildcard
@@ -1490,6 +1534,82 @@ export async function startMyelinRuntime(
   };
 
   /**
+   * M3 (cortex#1241, ADR-0019) — OUTBOUND payload seal, encrypt-then-sign.
+   *
+   * Seals `envelope.payload` with the target network's key so the signer below
+   * signs the ciphertext. Engages ONLY when:
+   *   - the resolved subject is `federated.*` (only federated payloads are sealed
+   *     — `local.*`/`public.*` are never encrypted, ADR-0019 §6), AND
+   *   - the target principal (subject segment[1]) is on a network whose
+   *     `encryption` is `enabled`/`required` (in `sealPolicyByPrincipal`), AND
+   *   - that network holds a key.
+   * ALL federated dispatch modes (Direct/Delegate/Offer) flow through this one
+   * chokepoint, so all three are sealed uniformly with the per-network key.
+   *
+   * When sealing is requested but no key is held, it warns ONCE per network
+   * (loud-but-not-fatal) and returns the cleartext envelope — federation stays
+   * up. Any seal failure also falls back to cleartext + a log (never crash the
+   * publish path). Returns `envelope` unchanged in every non-sealing case.
+   */
+  const maybeSealOutbound = async (
+    envelope: Envelope,
+    subject: string,
+  ): Promise<Envelope> => {
+    if (!subject.startsWith("federated.")) return envelope;
+    const targetPrincipal = subject.split(".")[1];
+    if (targetPrincipal === undefined || targetPrincipal.length === 0) {
+      return envelope;
+    }
+    const policy: NetworkSealPolicy | undefined =
+      sealPolicyByPrincipal.get(targetPrincipal);
+    if (policy === undefined) {
+      // cortex#1246 — no seal policy resolved for this federated subject. For a
+      // peer-addressed subject this is correct (the target's network is not
+      // encryption-enabled → cleartext as today). But a SELF-addressed subject
+      // (`federated.{ownPrincipal}.…`, e.g. an Offer) only lands here when the
+      // stack is on MULTIPLE encryption-enabled networks (single-network maps the
+      // own principal in `sealPolicyByPrincipal`): the network is unresolvable
+      // from a self-addressed subject alone, so we publish cleartext but WARN
+      // ONCE — a federated Offer in the clear must never be silent (ADR-0019 §7).
+      if (
+        targetPrincipal === myPrincipal &&
+        encryptionEnabledNetworkCount > 1 &&
+        !selfAddressedAmbiguousSealWarned
+      ) {
+        selfAddressedAmbiguousSealWarned = true;
+        console.error(
+          `myelin-runtime: self-addressed federated subject "${subject}" (own principal="${myPrincipal}") could NOT be sealed — the stack is on ${encryptionEnabledNetworkCount} encryption-enabled networks and the network is not resolvable from a self-addressed subject alone (cortex#1246 multi-network follow-up). Publishing IN THE CLEAR. This is a loud-but-not-fatal warning.`,
+        );
+      }
+      return envelope; // network not encryption-enabled (or unresolvable self-addr)
+    }
+    if (policy.key === undefined) {
+      // Encryption requested but PR5b has not delivered `K` yet — warn once,
+      // publish cleartext (ADR-0019 §7 loud-but-not-fatal). The federated link
+      // stays up; "federating in the clear" is visible in the log.
+      if (!sealKeyMissingWarned.has(policy.net)) {
+        sealKeyMissingWarned.add(policy.net);
+        console.error(
+          `myelin-runtime: network="${policy.net}" has encryption="${policy.mode}" but NO payload_key — publishing federated payloads to principal="${targetPrincipal}" IN THE CLEAR until the network key is delivered (ADR-0019 §7). This is a loud-but-not-fatal warning.`,
+        );
+      }
+      return envelope;
+    }
+    try {
+      return await sealPayload(envelope, policy.net, policy.key);
+    } catch (err) {
+      // Never crash the publish path on a seal failure — fall back to cleartext
+      // (a `required` network's receiver will reject it, surfacing the problem
+      // without dropping the sender). Log so the failure is visible.
+      console.error(
+        `myelin-runtime: payload seal failed for id=${envelope.id} network="${policy.net}" — publishing cleartext:`,
+        err instanceof Error ? err.message : err,
+      );
+      return envelope;
+    }
+  };
+
+  /**
    * Shared sign + wire-publish core. `publishEnabled` derives the
    * subject from `envelope.type` via `deriveNatsSubject`; the
    * cortex#409 `publishOnSubjectEnabled` path passes an explicit
@@ -1541,6 +1661,14 @@ export async function startMyelinRuntime(
       return;
     }
 
+    // M3 (cortex#1241, ADR-0019) — ENCRYPT-THEN-SIGN. Seal the `payload` with
+    // the target network's key BEFORE the signer runs below, so the existing
+    // `signed_by` signature covers the CIPHERTEXT (the §4 verify-before-decrypt
+    // property). The seal is gated on a `federated.*` subject whose target
+    // principal lives on an encryption-enabled network that holds a key; in
+    // every other case `sealed` === `envelope` and the path is unchanged.
+    const sealed = await maybeSealOutbound(envelope, subject);
+
     // IAW Phase B.3: sign before publish if the runtime was started
     // with a signer. The chain-aware `signEnvelope` appends to any
     // existing `signed_by[]` rather than overwriting — so a multi-hop
@@ -1549,7 +1677,10 @@ export async function startMyelinRuntime(
     // to the original envelope plus a log — we don't want a transient
     // crypto failure (extremely rare; bad seed bytes typically fail
     // at `loadStackSigningKey` time) to crash the publish path.
-    let envelopeToPublish: Envelope = envelope;
+    //
+    // M3: the signer operates on `sealed` (ciphertext-in-`payload` when the
+    // seal engaged), so the chain signs the sealed form — encrypt-then-sign.
+    let envelopeToPublish: Envelope = sealed;
     if (signer !== undefined && signerSeedBase64 !== undefined) {
       try {
         // Normalize signed_by to the array shape myelin's
@@ -1558,13 +1689,13 @@ export async function startMyelinRuntime(
         // back-compat Envelope still allows a single stamp). The
         // signer appends to the existing chain when present.
         const priorChain =
-          envelope.signed_by === undefined
+          sealed.signed_by === undefined
             ? undefined
-            : Array.isArray(envelope.signed_by)
-              ? envelope.signed_by
-              : [envelope.signed_by];
+            : Array.isArray(sealed.signed_by)
+              ? sealed.signed_by
+              : [sealed.signed_by];
         const envelopeForSigner = {
-          ...envelope,
+          ...sealed,
           ...(priorChain !== undefined && { signed_by: priorChain }),
         };
         envelopeToPublish = await signEnvelope(

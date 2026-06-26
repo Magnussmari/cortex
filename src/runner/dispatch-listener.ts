@@ -102,6 +102,10 @@ import type {
 import type { PolicyEngine } from "../common/policy/engine";
 import { extractAgentIdFromDid } from "../common/policy/did";
 import { isUuid } from "../common/types/uuid";
+// M3 (cortex#1241, ADR-0019) — verify-then-decrypt the sealed dispatch payload.
+import { readMarker, NetworkKeyring } from "../common/crypto/payload-encryption";
+import { openInboundEnvelope } from "../common/crypto/inbound-payload";
+import { buildNetworkKeyring } from "../common/crypto/network-encryption-policy";
 import type {
   Intent,
   PolicyDenyReason,
@@ -654,18 +658,30 @@ interface DispatchTraceContext {
  *
  * `correlationId` / `taskId` fall back to `envelope.correlation_id` then
  * `envelope.id` so the trace always carries a non-empty join key.
- * `agentId` is an untrusted peek at `payload.agent_id` — purely for the
- * trace's human-facing detail; the authoritative agent id is resolved by
- * the verified parse downstream.
+ * `agentId` / `taskId` are an untrusted peek at the payload — purely for the
+ * trace's human-facing detail; the authoritative ids are resolved by the
+ * verified parse downstream.
+ *
+ * M3 (cortex#1246 NIT) — this is a PRE-VERIFY peek, so it must honour the
+ * "nothing reads the sealed payload before verify→decrypt" invariant in letter,
+ * not just in spirit. A SEALED body is `{ciphertext,nonce}` (no `task_id` /
+ * `agent_id`), so the peek would read `undefined` and leak nothing today — but
+ * to keep the invariant true regardless of future fields, the payload peek is
+ * skipped entirely when an `extensions.enc` marker is present. A sealed envelope
+ * therefore traces on `correlation_id` / `id` only; the real ids appear once the
+ * verified parse runs post-decrypt. Cleartext (transition-window) envelopes,
+ * whose fields were on the wire anyway, keep the richer trace detail.
  */
 function rawEnvelopeTraceContext(
   envelope: Envelope,
   subject: string | undefined,
 ): DispatchTraceContext {
   const join = envelope.correlation_id ?? envelope.id;
-  const payload = envelope.payload as
-    | Partial<DispatchTaskReceivedPayload>
-    | undefined;
+  // Never peek a sealed payload pre-verify — fall back to the join key only.
+  const sealed = readMarker(envelope) !== undefined;
+  const payload = sealed
+    ? undefined
+    : (envelope.payload as Partial<DispatchTaskReceivedPayload> | undefined);
   const taskId =
     typeof payload?.task_id === "string" ? payload.task_id : join;
   const agentId =
@@ -1063,6 +1079,96 @@ function parsePayload(envelope: Envelope): DispatchTaskReceivedPayload | null {
 }
 
 /**
+ * M3 (cortex#1241, ADR-0019) — the cleartext ROUTING identifiers for the
+ * PRE-verify deny-audit emitters, derived from SIGNED cleartext metadata ONLY
+ * (never the payload, which may be sealed before verify+decrypt). `task_id`
+ * comes from `correlation_id` (the dispatch's join key, also the task id by
+ * convention); `agent_id` from the signed `target_assistant` DID when present
+ * (Offer mode has no named target → `"unknown"`). Used purely to populate the
+ * `dispatch.<agent_id>` capability + correlation on a verify-FAILURE audit
+ * envelope — the request was rejected, so precise content is unavailable and
+ * unnecessary.
+ */
+function routingDescriptorPreVerify(
+  envelope: Envelope,
+  _subject: string | undefined,
+): Pick<DispatchTaskReceivedPayload, "task_id" | "agent_id"> {
+  const targetDid = getTargetAssistant(envelope);
+  const agentId =
+    targetDid !== undefined ? extractAgentIdFromDid(targetDid) : undefined;
+  return {
+    task_id: envelope.correlation_id ?? envelope.id,
+    agent_id: agentId ?? "unknown",
+  };
+}
+
+/**
+ * cortex#1246 NIT — memoise the inbound {@link NetworkKeyring} per networks map.
+ * `decryptInboundDispatch` rebuilt the keyring on EVERY sealed/`required`
+ * inbound; the `federatedNetworksById` map is constructed once in the listener
+ * factory and read-only for its lifetime (`payload_key` is read-only in M3), so
+ * keying a `WeakMap` on the map identity yields the same keyring on every call
+ * without re-deriving it. The `WeakMap` lets the cache entry GC with the map.
+ */
+const inboundKeyringByNetworksMap = new WeakMap<
+  Map<string, PolicyFederatedNetwork>,
+  NetworkKeyring
+>();
+
+function inboundKeyringFor(
+  networksById: Map<string, PolicyFederatedNetwork>,
+): NetworkKeyring {
+  let keyring = inboundKeyringByNetworksMap.get(networksById);
+  if (keyring === undefined) {
+    keyring = buildNetworkKeyring([...networksById.values()]);
+    inboundKeyringByNetworksMap.set(networksById, keyring);
+  }
+  return keyring;
+}
+
+/** Outcome of {@link decryptInboundDispatch}. */
+type InboundDecryptOutcome =
+  | { status: "cleartext"; envelope: Envelope }
+  | { status: "opened"; envelope: Envelope }
+  | { status: "rejected"; reason: string };
+
+/**
+ * M3 (cortex#1241, ADR-0019) — verify-then-DECRYPT step for an inbound
+ * `federated` dispatch. Called AFTER `verifySignedByChain` accepts the sealed
+ * bytes. Resolves the network (the sealed envelope's `extensions.enc.net`
+ * marker, or the source network from the subject for a cleartext inbound) and
+ * its `encryption` posture, then applies the transition window via
+ * {@link openInboundEnvelope}:
+ *   - sealed + key held → decrypt (status "opened");
+ *   - cleartext on an `enabled`/`off` network → accept as-is (status "cleartext");
+ *   - cleartext on a `required` network, or sealed with a missing/failing key →
+ *     "rejected" (the caller drops + logs).
+ * The keyring is derived from the network config the listener already holds
+ * (`federatedNetworksById`) — no extra wiring, PR5b populates `payload_key`.
+ */
+async function decryptInboundDispatch(
+  envelope: Envelope,
+  subject: string | undefined,
+  networksById: Map<string, PolicyFederatedNetwork>,
+): Promise<InboundDecryptOutcome> {
+  const marker = readMarker(envelope);
+  const netId = marker?.net ?? extractSourceNetwork(envelope, subject, networksById);
+  const netCfg = netId !== undefined ? networksById.get(netId) : undefined;
+  const mode = (netCfg?.encryption ?? "off");
+  // Fast path: a cleartext envelope on a non-`required` network needs no work
+  // (and a non-federated network with no marker never sealed anything).
+  if (marker === undefined && mode !== "required") {
+    return { status: "cleartext", envelope };
+  }
+  const keyring = inboundKeyringFor(networksById);
+  const outcome = await openInboundEnvelope(envelope, keyring, { mode });
+  if (outcome.status === "rejected") {
+    return { status: "rejected", reason: outcome.reason };
+  }
+  return { status: outcome.status, envelope: outcome.envelope };
+}
+
+/**
  * Translate a parsed `DispatchTaskReceivedPayload` into the protocol-
  * level `DispatchRequest` the substrate harness consumes.
  *
@@ -1261,72 +1367,21 @@ async function handleDispatchEnvelope(
     bashAllowlist,
     bashGuardDisabled,
   } = ctx;
-  // cortex#492 — pre-parse trace context. Refined to the trusted payload
-  // fields (`task_id`, `agent_id`) once the parse succeeds.
+  // cortex#492 — pre-parse trace context from CLEARTEXT METADATA ONLY. M3
+  // (cortex#1241, ADR-0019) reorder: NOTHING reads the payload before
+  // verify + decrypt — the NATS subject already routed the envelope here, and
+  // only cleartext metadata (id, correlation_id) feeds the trace. The trusted
+  // payload parse (task_id / agent_id / prompt) + canonical-recipient check run
+  // AFTER `verifySignedByChain` and AFTER decrypt, further down. This is a
+  // correctness fix independent of encryption: never parse/process the fields
+  // of an unverified envelope.
   let traceCtx = rawEnvelopeTraceContext(envelope, subject);
-  const payload = parsePayload(envelope);
-  if (!payload) {
-    trace(
-      traceDispatch,
-      runtime,
-      source,
-      "malformed",
-      "fail",
-      traceCtx,
-      "required fields missing or task_id not UUID-shaped",
-    );
-    console.error(
-      `cortex-runner: dispatch-listener: malformed dispatch.task.received envelope id=${envelope.id} — required fields missing`,
-    );
-    return;
-  }
-  // Refine the trace context with the trusted parsed fields.
-  traceCtx = {
-    correlationId: envelope.correlation_id ?? payload.task_id,
-    taskId: payload.task_id,
-    agentId: payload.agent_id,
-    ...(subject !== undefined && { subject }),
-  };
-  trace(traceDispatch, runtime, source, "parsed", "pass", traceCtx);
-
-  const recipientMismatch = validateCanonicalTaskRecipient(
-    envelope,
-    payload,
-    subject,
-  );
-  if (recipientMismatch !== null) {
-    trace(
-      traceDispatch,
-      runtime,
-      source,
-      "recipient-mismatch",
-      "fail",
-      traceCtx,
-      recipientMismatch,
-    );
-    process.stderr.write(
-      `[runner/dispatch-listener] dropped envelope ${envelope.id} ` +
-        `(correlation_id=${envelope.correlation_id ?? "<none>"} ` +
-        `task_id=${payload.task_id} agent=${payload.agent_id}): ` +
-        `${recipientMismatch}\n`,
-    );
-    await emitCanonicalRecipientMismatch(
-      runtime,
-      source,
-      envelope,
-      payload,
-      recipientMismatch,
-    );
-    return;
-  }
-  trace(
-    traceDispatch,
-    runtime,
-    source,
-    "recipient-validated",
-    "pass",
-    traceCtx,
-  );
+  // M3 — routing identifiers for the PRE-verify deny-audit emitters (chain
+  // rejection / receiving-agent guard), derived from cleartext SIGNED metadata
+  // only: `task_id` ← `correlation_id`; `agent_id` ← the signed
+  // `target_assistant` DID when present (else "unknown" — Offer has no named
+  // target). These emitters never touch the sealed payload.
+  const preVerifyRouting = routingDescriptorPreVerify(envelope, subject);
 
   // IAW Phase B wiring (cortex#320, v2.0.2) — verify the envelope's
   // `signed_by[]` chain BEFORE resolving the principal. The runner used
@@ -1376,7 +1431,7 @@ async function handleDispatchEnvelope(
       runtime,
       source,
       envelope,
-      payload,
+      preVerifyRouting,
       subject,
       stack,
     );
@@ -1439,7 +1494,7 @@ async function handleDispatchEnvelope(
         runtime,
         source,
         envelope,
-        payload,
+        preVerifyRouting,
         subject,
         stack,
         { kind: "crypto_verify_failed", myelinReason: detail },
@@ -1460,7 +1515,7 @@ async function handleDispatchEnvelope(
       process.stderr.write(
         `[runner/dispatch-listener] dropped envelope ${envelope.id} ` +
           `(correlation_id=${envelope.correlation_id ?? "<none>"} ` +
-          `task_id=${payload.task_id} agent=${payload.agent_id}): ` +
+          `task_id=${preVerifyRouting.task_id} agent=${preVerifyRouting.agent_id}): ` +
           `${verification.reason.kind} at chain index ` +
           `${verification.rejectedAt}\n`,
       );
@@ -1468,7 +1523,7 @@ async function handleDispatchEnvelope(
         runtime,
         source,
         envelope,
-        payload,
+        preVerifyRouting,
         subject,
         stack,
         verification.reason,
@@ -1560,6 +1615,107 @@ async function handleDispatchEnvelope(
       );
     }
   }
+
+  // M3 (cortex#1241, ADR-0019) — VERIFY-THEN-DECRYPT. The chain verified the
+  // SEALED bytes above (encrypt-then-sign: `signed_by` covers the ciphertext);
+  // now decrypt so the parse/process below reads cleartext. Only `federated`
+  // envelopes are ever sealed — `local`/`public` skip entirely (byte-identical
+  // to pre-M3). The transition window accepts cleartext-but-signed inbound on
+  // an `enabled` network and rejects it on a `required` one. A sealed envelope
+  // whose key is missing / fails to open is dropped (logged) — never processed.
+  if (envelope.sovereignty.classification === "federated") {
+    const decryptOutcome = await decryptInboundDispatch(
+      envelope,
+      subject,
+      federatedNetworksById,
+    );
+    if (decryptOutcome.status === "rejected") {
+      trace(
+        traceDispatch,
+        runtime,
+        source,
+        "payload-decrypt-rejected",
+        "fail",
+        traceCtx,
+        decryptOutcome.reason,
+      );
+      process.stderr.write(
+        `[runner/dispatch-listener] dropped federated envelope ${envelope.id} ` +
+          `(correlation_id=${envelope.correlation_id ?? "<none>"}): ` +
+          `payload decrypt rejected (${decryptOutcome.reason})\n`,
+      );
+      return;
+    }
+    // "opened" → cleartext payload restored; "cleartext" → transition accept.
+    envelope = decryptOutcome.envelope;
+  }
+
+  // M3 reorder — the trusted payload parse + canonical-recipient check NOW run,
+  // AFTER verify + decrypt (cortex#1241). `parsePayload` reads task_id /
+  // agent_id / prompt from the (now-cleartext) payload.
+  const payload = parsePayload(envelope);
+  if (!payload) {
+    trace(
+      traceDispatch,
+      runtime,
+      source,
+      "malformed",
+      "fail",
+      traceCtx,
+      "required fields missing or task_id not UUID-shaped",
+    );
+    console.error(
+      `cortex-runner: dispatch-listener: malformed dispatch.task.received envelope id=${envelope.id} — required fields missing`,
+    );
+    return;
+  }
+  // Refine the trace context with the trusted parsed fields.
+  traceCtx = {
+    correlationId: envelope.correlation_id ?? payload.task_id,
+    taskId: payload.task_id,
+    agentId: payload.agent_id,
+    ...(subject !== undefined && { subject }),
+  };
+  trace(traceDispatch, runtime, source, "parsed", "pass", traceCtx);
+
+  const recipientMismatch = validateCanonicalTaskRecipient(
+    envelope,
+    payload,
+    subject,
+  );
+  if (recipientMismatch !== null) {
+    trace(
+      traceDispatch,
+      runtime,
+      source,
+      "recipient-mismatch",
+      "fail",
+      traceCtx,
+      recipientMismatch,
+    );
+    process.stderr.write(
+      `[runner/dispatch-listener] dropped envelope ${envelope.id} ` +
+        `(correlation_id=${envelope.correlation_id ?? "<none>"} ` +
+        `task_id=${payload.task_id} agent=${payload.agent_id}): ` +
+        `${recipientMismatch}\n`,
+    );
+    await emitCanonicalRecipientMismatch(
+      runtime,
+      source,
+      envelope,
+      payload,
+      recipientMismatch,
+    );
+    return;
+  }
+  trace(
+    traceDispatch,
+    runtime,
+    source,
+    "recipient-validated",
+    "pass",
+    traceCtx,
+  );
 
   // IAW Phase C.3.1 — policy gate. The engine resolves the originating
   // principal from `envelope.signed_by[0]` (the first stamp is the
@@ -2190,7 +2346,12 @@ async function emitChainVerificationDeny(
   runtime: MyelinRuntime,
   source: SystemEventSource,
   envelope: Envelope,
-  payload: DispatchTaskReceivedPayload,
+  // M3 (cortex#1241) — narrowed to the cleartext ROUTING identifiers this deny
+  // audit needs. A chain-verify failure runs BEFORE decrypt, so the sealed
+  // payload is unavailable; the caller passes `routingDescriptorPreVerify(...)`
+  // (task_id ← correlation_id, agent_id ← target_assistant DID). A full
+  // `DispatchTaskReceivedPayload` is still assignable (post-decrypt callers).
+  payload: Pick<DispatchTaskReceivedPayload, "task_id" | "agent_id">,
   subject: string | undefined,
   stack: string | undefined,
   chainReason: ChainRejectionReason,
@@ -2268,7 +2429,9 @@ async function emitReceivingAgentUnconfiguredDeny(
   runtime: MyelinRuntime,
   source: SystemEventSource,
   envelope: Envelope,
-  payload: DispatchTaskReceivedPayload,
+  // M3 (cortex#1241) — narrowed to cleartext ROUTING identifiers (runs
+  // pre-verify, pre-decrypt; the sealed payload is unavailable).
+  payload: Pick<DispatchTaskReceivedPayload, "task_id" | "agent_id">,
   subject: string | undefined,
   stack: string | undefined,
 ): Promise<void> {

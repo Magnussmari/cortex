@@ -37,7 +37,9 @@ import { PolicyEngine } from "../../common/policy/engine";
 import type { Intent } from "../../common/policy/types";
 import { AgentRegistry } from "../../common/agents/registry";
 import { TrustResolver } from "../../common/agents/trust-resolver";
-import type { Agent } from "../../common/types/cortex-config";
+import type { Agent, PolicyFederatedNetwork } from "../../common/types/cortex-config";
+import sodium from "libsodium-wrappers";
+import { sealPayload } from "../../common/crypto/payload-encryption";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -3508,15 +3510,17 @@ describe("dispatch-listener — stage tracing (cortex#492)", () => {
     await settle(() => r.published);
 
     const stages = traceStages(r.published);
-    // chain-verify-start lands immediately before chain-verified, between
-    // recipient-validated and policy-decision.
+    // M3 (cortex#1241) reorder — chain verify+decrypt now run FIRST, BEFORE the
+    // payload is parsed: never parse/process an unverified envelope. So
+    // chain-verify-start/chain-verified bracket precedes `parsed` +
+    // `recipient-validated` (was: after them, pre-reorder).
     expect(stages).toEqual([
       "received",
       "subject-matched",
-      "parsed",
-      "recipient-validated",
       "chain-verify-start",
       "chain-verified",
+      "parsed",
+      "recipient-validated",
       "policy-decision",
       "session-spawning",
       "started",
@@ -3689,3 +3693,294 @@ describe("createDispatchListener — S2 per-agent subject isolation (cortex#1160
   });
 });
 
+
+// ===========================================================================
+// M3 (cortex#1241, ADR-0019) — federated payload encryption: verify → decrypt
+// → process. The whole `payload` is sealed on an encryption-enabled network;
+// the listener verifies the chain on the sealed bytes, decrypts with the
+// network key, THEN parses/processes. Nothing reads the payload pre-verify.
+// ===========================================================================
+describe("dispatch-listener — M3 payload encryption (cortex#1241, ADR-0019)", () => {
+  const FED_NET = "research-collab";
+  const FED_SUBJECT = "federated.research-collab.dispatch.task.received";
+
+  async function freshKey(): Promise<Uint8Array> {
+    await sodium.ready;
+    return sodium.randombytes_buf(32);
+  }
+  const b64 = (k: Uint8Array): string => Buffer.from(k).toString("base64");
+
+  function fedNetwork(
+    o: Partial<PolicyFederatedNetwork> = {},
+  ): PolicyFederatedNetwork {
+    return {
+      id: FED_NET,
+      leaf_node: "leaf-research",
+      peers: [{ principal_id: "metafactory", stack_id: "metafactory/meta-factory" }],
+      accept_subjects: ["federated.>"],
+      deny_subjects: [],
+      announce_capabilities: [],
+      max_hop: 5,
+      ...o,
+    };
+  }
+
+  // Policy engine that admits a federated dispatch from peer `metafactory` on
+  // the research-collab network (mirrors the D.3 `engineWithFederation`).
+  function fedEngine(): PolicyEngine {
+    return new PolicyEngine({
+      principals: [
+        {
+          id: "cortex",
+          home_principal: "andreas",
+          home_stack: "andreas/research",
+          role: ["operator"],
+          trust: [],
+        },
+      ],
+      roles: [{ id: "operator", capabilities: ["dispatch.cortex"] }],
+      federated: {
+        // The acting principal `cortex` (home_stack andreas/research) must be in
+        // the network roster for the federation branch to allow (mirrors D.3).
+        networks: [
+          { id: FED_NET, peers: [{ stack_id: "andreas/research" }] },
+        ],
+      },
+    });
+  }
+
+  function fedReceived(
+    payloadOverrides: Partial<DispatchTaskReceivedPayload> = {},
+    distribution_mode: "direct" | "delegate" | "offer" = "direct",
+  ): Envelope {
+    const payload: DispatchTaskReceivedPayload = {
+      task_id: TASK_ID,
+      agent_id: "cortex",
+      prompt: "say hello",
+      ...payloadOverrides,
+    };
+    return {
+      id: "00000000-0000-4000-8000-000000000000",
+      source: "metafactory.dispatch-handler.local",
+      type: "dispatch.task.received",
+      distribution_mode,
+      target_assistant: `did:mf:${payload.agent_id}`,
+      timestamp: "2026-05-09T12:00:00Z",
+      correlation_id: payload.task_id,
+      sovereignty: {
+        classification: "federated",
+        data_residency: "NZ",
+        max_hop: 5,
+        frontier_ok: true,
+        model_class: "any",
+      },
+      payload: payload as unknown as Record<string, unknown>,
+    };
+  }
+
+  async function seal(env: Envelope, key: Uint8Array): Promise<Envelope> {
+    return sealPayload(env, FED_NET, { kid: `${FED_NET}/k1`, key });
+  }
+
+  test("sealed federated dispatch: prompt is ciphertext-only on the wire, decrypts + processes (direct)", async () => {
+    const key = await freshKey();
+    const sealed = await seal(fedReceived(), key);
+
+    // The sensitive prompt is NEVER present in cleartext on the wire.
+    expect(JSON.stringify(sealed)).not.toContain("say hello");
+    expect(typeof sealed.payload.ciphertext).toBe("string");
+
+    const r = recordingRuntime();
+    const { factory, optsCaptured } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: fedEngine(),
+      subjects: ["federated.>"],
+      federated: {
+        networks: [fedNetwork({ encryption: "enabled", payload_key: b64(key) })],
+      },
+      traceDispatch: true,
+    });
+    await listener.start();
+    r.trigger(sealed, FED_SUBJECT);
+    await settle(() => r.published);
+
+    // Decrypted prompt reached the harness — end-to-end through the listener.
+    expect(optsCaptured[0]?.prompt).toBe("say hello");
+    const stages = traceStages(r.published);
+    expect(stages).toContain("parsed");
+    expect(stages).not.toContain("payload-decrypt-rejected");
+    await listener.stop();
+  });
+
+  test.each(["direct", "delegate", "offer"] as const)(
+    "all federated dispatch modes (%s) decrypt + parse — no carve-out",
+    async (mode) => {
+      const key = await freshKey();
+      const sealed = await seal(fedReceived({}, mode), key);
+      const r = recordingRuntime();
+      const listener = createDispatchListener({
+        runtime: r.runtime,
+        source: SOURCE,
+        ccSessionFactory: fakeFactory(SUCCESS_RESULT).factory,
+        agentTeamFactory: fakeAgentTeamFactory("done").factory,
+        policyEngine: fedEngine(),
+        subjects: ["federated.>"],
+        federated: {
+          networks: [fedNetwork({ encryption: "enabled", payload_key: b64(key) })],
+        },
+        traceDispatch: true,
+      });
+      await listener.start();
+      r.trigger(sealed, FED_SUBJECT);
+      await settle(() => r.published);
+
+      const stages = traceStages(r.published);
+      expect(stages).toContain("parsed");
+      expect(stages).not.toContain("payload-decrypt-rejected");
+      await listener.stop();
+    },
+  );
+
+  test("verify-before-decrypt-before-parse: an unverified (empty-chain, enforce) envelope is rejected BEFORE the payload is decrypted or parsed", async () => {
+    const key = await freshKey();
+    const sealed = await seal(fedReceived(), key);
+    const cortexAgent = agentFixtureForRunner({
+      id: "cortex",
+      trust: ["cortex"],
+      nkey_pub: "U" + "B".repeat(55),
+    });
+    const r = recordingRuntime();
+    const { factory, optsCaptured } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: fedEngine(),
+      subjects: ["federated.>"],
+      federated: {
+        networks: [fedNetwork({ encryption: "enabled", payload_key: b64(key) })],
+      },
+      trustResolver: runnerResolverWith(cortexAgent),
+      receivingAgentId: "cortex",
+      principalId: "andreas",
+      rejectEmpty: true, // enforce — unsigned dispatch is rejected at the chain gate
+      cryptoVerify: false,
+      traceDispatch: true,
+    });
+    await listener.start();
+    r.trigger(sealed, FED_SUBJECT); // unsigned (empty chain) → verify rejects
+    await settle(() => r.published);
+
+    const stages = traceStages(r.published);
+    expect(stages).toContain("chain-rejected");
+    // Dropped at verify — the sealed payload is NEVER decrypted or parsed.
+    expect(stages).not.toContain("payload-decrypt-rejected");
+    expect(stages).not.toContain("parsed");
+    expect(optsCaptured).toHaveLength(0);
+    await listener.stop();
+  });
+
+  test("transition window — `enabled` network ACCEPTS a cleartext-but-signed federated inbound", async () => {
+    const key = await freshKey();
+    const r = recordingRuntime();
+    const { factory, optsCaptured } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: fedEngine(),
+      subjects: ["federated.>"],
+      federated: {
+        networks: [fedNetwork({ encryption: "enabled", payload_key: b64(key) })],
+      },
+      traceDispatch: true,
+    });
+    await listener.start();
+    r.trigger(fedReceived(), FED_SUBJECT); // CLEARTEXT inbound
+    await settle(() => r.published);
+
+    expect(optsCaptured[0]?.prompt).toBe("say hello");
+    expect(traceStages(r.published)).not.toContain("payload-decrypt-rejected");
+    await listener.stop();
+  });
+
+  test("transition window — `required` network REJECTS a cleartext federated inbound (before parse)", async () => {
+    const key = await freshKey();
+    const r = recordingRuntime();
+    const { factory, optsCaptured } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: fedEngine(),
+      subjects: ["federated.>"],
+      federated: {
+        networks: [fedNetwork({ encryption: "required", payload_key: b64(key) })],
+      },
+      traceDispatch: true,
+    });
+    await listener.start();
+    r.trigger(fedReceived(), FED_SUBJECT); // CLEARTEXT on a `required` network
+    await settle(() => r.published);
+
+    const stages = traceStages(r.published);
+    expect(stages).toContain("payload-decrypt-rejected");
+    expect(stages).not.toContain("parsed");
+    expect(optsCaptured).toHaveLength(0);
+    await listener.stop();
+  });
+
+  test("sealed inbound with a MISSING network key is rejected before parse (loud, not processed)", async () => {
+    const sealKey = await freshKey();
+    const sealed = await seal(fedReceived(), sealKey);
+    const r = recordingRuntime();
+    const { factory, optsCaptured } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: fedEngine(),
+      subjects: ["federated.>"],
+      // encryption enabled but NO payload_key delivered yet
+      federated: { networks: [fedNetwork({ encryption: "enabled" })] },
+      traceDispatch: true,
+    });
+    await listener.start();
+    r.trigger(sealed, FED_SUBJECT);
+    await settle(() => r.published);
+
+    const stages = traceStages(r.published);
+    expect(stages).toContain("payload-decrypt-rejected");
+    expect(stages).not.toContain("parsed");
+    expect(optsCaptured).toHaveLength(0);
+    await listener.stop();
+  });
+
+  test("local dispatch is byte-unchanged by encryption (decrypt skipped) even with networks configured", async () => {
+    const key = await freshKey();
+    const r = recordingRuntime();
+    const { factory, optsCaptured } = fakeFactory(SUCCESS_RESULT);
+    const listener = createDispatchListener({
+      runtime: r.runtime,
+      source: SOURCE,
+      ccSessionFactory: factory,
+      policyEngine: engineGranting(["dispatch.cortex"]),
+      // A `required` network is configured — but the local dispatch must never
+      // touch the decrypt path (classification gate).
+      federated: {
+        networks: [fedNetwork({ encryption: "required", payload_key: b64(key) })],
+      },
+      traceDispatch: true,
+    });
+    await listener.start();
+    r.trigger(makeReceivedEnvelope(), CANONICAL_CORTEX_CHAT_SUBJECT); // local
+    await settle(() => r.published);
+
+    expect(optsCaptured[0]?.prompt).toBe("say hello");
+    expect(traceStages(r.published)).not.toContain("payload-decrypt-rejected");
+    await listener.stop();
+  });
+});
