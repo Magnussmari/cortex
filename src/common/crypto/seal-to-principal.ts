@@ -118,7 +118,15 @@ export function ed25519SeedToX25519(ed25519Seed: Uint8Array): Uint8Array {
     );
   }
   const { privateKey } = sodium.crypto_sign_seed_keypair(ed25519Seed);
-  return sodium.crypto_sign_ed25519_sk_to_curve25519(privateKey);
+  try {
+    return sodium.crypto_sign_ed25519_sk_to_curve25519(privateKey);
+  } finally {
+    // Best-effort wipe of the expanded ed25519 secret key once the X25519
+    // secret is derived. JS GC may have copied it, but zeroizing the buffer
+    // we hold is cheap defense-in-depth for a seed-handling module. (The
+    // returned X25519 secret is the caller's to wipe after use.)
+    sodium.memzero(privateKey);
+  }
 }
 
 // ===========================================================================
@@ -182,15 +190,24 @@ export async function openSealed(
     sodium.crypto_sign_seed_keypair(ownEd25519Seed);
   const xPub = sodium.crypto_sign_ed25519_pk_to_curve25519(publicKey);
   const xSec = sodium.crypto_sign_ed25519_sk_to_curve25519(privateKey);
-  const sealed = bytesFromB64(sealedB64, "sealed blob");
   try {
-    return sodium.crypto_box_seal_open(sealed, xPub, xSec);
-  } catch (err) {
-    // Generic on purpose: do not distinguish "wrong recipient" from
-    // "tampered", and never surface key/ciphertext bytes.
-    throw new Error(
-      "seal-to-principal: failed to open sealed box (wrong recipient or tampered ciphertext)",
-      { cause: err },
-    );
+    const sealed = bytesFromB64(sealedB64, "sealed blob");
+    try {
+      return sodium.crypto_box_seal_open(sealed, xPub, xSec);
+    } catch (err) {
+      // Generic on purpose: do not distinguish "wrong recipient" from
+      // "tampered", and never surface key/ciphertext bytes.
+      throw new Error(
+        "seal-to-principal: failed to open sealed box (wrong recipient or tampered ciphertext)",
+        { cause: err },
+      );
+    }
+  } finally {
+    // Best-effort wipe of the derived secret material once the open has run.
+    // The outer try/finally guarantees the wipe even if base64 decode or the
+    // open throws. GC may have copied these, but zeroizing the buffers we
+    // hold is cheap defense-in-depth for a seed-handling module.
+    sodium.memzero(privateKey);
+    sodium.memzero(xSec);
   }
 }

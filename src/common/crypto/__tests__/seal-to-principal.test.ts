@@ -247,6 +247,20 @@ describe("seal-to-principal — input validation (no secret leakage)", () => {
     await expect(sealToPrincipal("x", "!!!not base64!!!")).rejects.toThrow();
   });
 
+  test("a 32-byte but off-curve ed25519 pubkey is rejected (fails closed, no leak)", async () => {
+    // Right length (32 bytes), wrong value: 0xFF×32 is not a valid ed25519
+    // point. libsodium's pk_to_curve25519 must reject non-canonical / off-curve
+    // encodings rather than derive a bogus X25519 key and seal to it. Locks the
+    // fail-closed behavior on the derivation boundary.
+    await sodium.ready;
+    const offCurveB64 = sodium.to_base64(
+      new Uint8Array(32).fill(0xff),
+      sodium.base64_variants.ORIGINAL,
+    );
+
+    await expect(sealToPrincipal("x", offCurveB64)).rejects.toThrow();
+  });
+
   test("a wrong-length seed is rejected by openSealed", async () => {
     const { edPubB64 } = await makeIdentity();
     const sealed = await sealToPrincipal("x", edPubB64);
