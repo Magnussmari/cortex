@@ -274,11 +274,18 @@ export interface CapabilityHit {
 
 /**
  * The lifecycle status of a network admission request.
- * Transitions: PENDING → ADMITTED (on admin admit/grant)
- *              PENDING → REJECTED (on admin reject)
- * Re-transitions are forbidden (409 already_decided).
+ * Transitions: PENDING  → ADMITTED (on registry-admin admit/grant)
+ *              PENDING  → REJECTED (on registry-admin reject)
+ *              ADMITTED → REVOKED  (ADR-0018 Q6 — hub-admin `revoke-member`:
+ *                                   the member's hub `authorization` user is
+ *                                   dropped + the hub reloaded, cutting
+ *                                   transport, and the row is marked REVOKED so
+ *                                   the roster + the member PoP-read both stop
+ *                                   serving it).
+ * Re-transitions out of a decided state are forbidden (409 already_decided);
+ * REVOKED is the one transition OUT of ADMITTED (and is itself terminal).
  */
-export type AdmissionStatus = "PENDING" | "ADMITTED" | "REJECTED";
+export type AdmissionStatus = "PENDING" | "ADMITTED" | "REJECTED" | "REVOKED";
 
 /**
  * A persisted admission request — the metadata record that a verified
@@ -318,6 +325,21 @@ export interface AdmissionRequest {
    * Null while PENDING.
    */
   granted_by: string | null;
+  /**
+   * ADR-0018 Q1 (b′) — the per-member secret(s), sealed to THIS member's
+   * registered ed25519 pubkey (libsodium `crypto_box_seal`, via
+   * {@link sealToPrincipal}). The registry only ever carries the OPAQUE
+   * ciphertext — it cannot read it, so the "registry holds no readable secret"
+   * invariant survives (it holds a blob the way it already holds opaque
+   * pubkeys). NULL until the hub-admin `cortex network secret add-member`
+   * delivers it (sealed mode), and NULL again after `revoke-member`.
+   *
+   * The leaf PSK rides here now (PR5b). The per-network M3 payload key (#1246,
+   * not yet merged) rides the SAME slot later — the seal carries a small JSON
+   * envelope so a second sealed blob (the payload key) can be added without a
+   * schema change. The registry never interprets the bytes either way.
+   */
+  sealed_secret: string | null;
 }
 
 /**
@@ -414,22 +436,83 @@ export interface SignedAdmissionMineRead {
 }
 
 /**
- * ADR-0018 Q4 (Gap-C) — one row of the member PoP-read response. The member's
- * own admission request, plus the (b′) `sealed_secret` slot.
+ * ADR-0018 Q1 (b′) / Q5 — the HUB-ADMIN-signed claim carried by
+ * `POST /admission-requests/{request_id}/sealed-secret`.
  *
- * `sealed_secret` is included in the shape NOW but always `null` in PR5a: the
- * sealed-to-pubkey leaf-secret blob is populated by PR5b (ADR-0018 Q1 b′).
- * Shipping the field now lets the member-read consumer pin the response shape
- * before the secret-delivery machinery lands.
+ * Q5 keeps two authorities distinct: the registry-admin signs the admit
+ * decision (PENDING → ADMITTED) and MINTS NOTHING; the HUB-ADMIN mints the
+ * per-member PSK, writes the hub `authorization` user, and seals the bearer
+ * copy. This claim is the second authority's write of that opaque sealed blob
+ * onto the ADMITTED row — gated on the hub-admin allowlist
+ * (`REGISTRY_HUB_ADMIN_PUBKEYS`, falling back to `REGISTRY_ADMIN_PUBKEYS` when
+ * the two authorities collapse into one principal, e.g. metafactory's Luna).
+ *
+ * The route NEVER mints the secret; it only persists the ciphertext the
+ * hub-admin sealed. The registry cannot read it.
  */
-export interface AdmissionMineRow extends AdmissionRequest {
+export interface SealedSecretWriteClaim {
+  /** Must equal the URL path parameter. Echoed for canonicalisation. */
+  request_id: string;
   /**
-   * ADR-0018 Q1 (b′) — the per-member leaf PSK, sealed to this member's pubkey
-   * (libsodium `crypto_box_seal`). NULL until PR5b populates it; the registry
-   * only ever carries the opaque ciphertext (it cannot read it).
+   * The opaque sealed ciphertext (standard base64, `crypto_box_seal`). The
+   * registry never decodes/interprets it — it is a blob useless to anyone but
+   * the member whose pubkey it was sealed to.
    */
-  sealed_secret: string | null;
+  sealed_secret: string;
+  /** Base64 Ed25519 pubkey of the hub-admin signing this claim. */
+  hub_admin_pubkey: string;
+  /** ISO-8601 UTC timestamp at which the hub-admin signed this claim. */
+  issued_at: string;
+  /** Random nonce to prevent replay (same replay cache as the admit gate). */
+  nonce: string;
 }
+
+/** On-wire envelope for a hub-admin sealed-secret write. */
+export interface SignedSealedSecretWrite {
+  claim: SealedSecretWriteClaim;
+  /** Base64 Ed25519 signature over canonical-JSON(claim). */
+  signature: string;
+}
+
+/**
+ * ADR-0018 Q6 — the HUB-ADMIN-signed claim carried by
+ * `POST /admission-requests/{request_id}/revoke`.
+ *
+ * Revoke cuts transport at the hub (the CLI drops the member's `authorization`
+ * user + reloads the hub) AND marks the admission row REVOKED so the roster and
+ * the member PoP-read both stop serving it. This is the registry-side half of
+ * that operation: an ADMITTED → REVOKED transition that also clears the sealed
+ * blob. Hub-admin authority (Q5), never the registry-admin admit gate.
+ */
+export interface AdmissionRevokeClaim {
+  /** Must equal the URL path parameter. */
+  request_id: string;
+  /** Base64 Ed25519 pubkey of the hub-admin signing this claim. */
+  hub_admin_pubkey: string;
+  /** ISO-8601 UTC timestamp at which the hub-admin signed this claim. */
+  issued_at: string;
+  /** Random nonce to prevent replay. */
+  nonce: string;
+}
+
+/** On-wire envelope for a hub-admin revoke. */
+export interface SignedAdmissionRevoke {
+  claim: AdmissionRevokeClaim;
+  /** Base64 Ed25519 signature over canonical-JSON(claim). */
+  signature: string;
+}
+
+/**
+ * ADR-0018 Q4 (Gap-C) — one row of the member PoP-read response. The member's
+ * own admission request, including the (b′) `sealed_secret` slot.
+ *
+ * As of PR5b the `sealed_secret` slot is POPULATED by the hub-admin
+ * `cortex network secret add-member` (sealed mode) and consumed by
+ * `cortex network join` (auto-fetch + unseal). It is part of the base
+ * {@link AdmissionRequest} now; this alias is retained as the documented
+ * member-read response shape.
+ */
+export type AdmissionMineRow = AdmissionRequest;
 
 // ---------------------------------------------------------------------------
 // Back-compat aliases — store-layer names still reference Issuance* names
