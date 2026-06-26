@@ -1,0 +1,321 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 2200" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2c2a26"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3f7d4a"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2e4d7b"/>
+    </marker>
+    <marker id="arrow-plum" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7a4b86"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b56522"/>
+    </marker>
+  </defs>
+
+  <!-- ============ BACKGROUND ============ -->
+  <rect width="1700" height="2200" fill="#EFE7D5"/>
+
+  <!-- ============ TITLE ============ -->
+  <text x="60" y="80" font-size="50" font-weight="700" fill="#1d1c19" font-style="italic" font-family="Georgia, 'Times New Roman', serif">Joining a Network &#8212; Sovereign &#8220;Model B&#8221; Federation</text>
+  <text x="62" y="118" font-size="23" fill="#3a3833">One signing root per principal, never cross-issued &#8212; and the one-command, plug-and-play join</text>
+  <text x="62" y="146" font-size="15" fill="#6b665d" font-style="italic">Design ref: ADR-0013  &#183;  docs/sop-network-join.md  &#183;  cortex network join  &#183;  2026-06-27</text>
+  <line x1="60" y1="166" x2="1640" y2="166" stroke="#1d1c19" stroke-width="2"/>
+
+  <!-- ============================================================ -->
+  <!-- BAND 1 — THE PARTS -->
+  <!-- ============================================================ -->
+  <text x="60" y="212" font-size="26" font-weight="700" fill="#1d1c19" font-family="Georgia, serif" font-style="italic">1 &#183; The parts</text>
+  <text x="232" y="212" font-size="17" fill="#6b665d">who&#8217;s who in a federation</text>
+
+  <!-- Card: PRINCIPAL -->
+  <g transform="rotate(-0.4 246 390)">
+    <rect x="60" y="240" width="372" height="300" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+    <rect x="60" y="240" width="372" height="46" rx="12" fill="#efe4cf" stroke="#2c2a26" stroke-width="2.5"/>
+    <text x="84" y="271" font-size="22" font-weight="700" fill="#1d1c19" letter-spacing="1">PRINCIPAL</text>
+    <text x="408" y="271" font-size="15" fill="#6b665d" text-anchor="end" font-style="italic">e.g. Andreas</text>
+    <text x="84" y="328" font-size="16.5" fill="#2c2a26">Trust + policy root. Holds their</text>
+    <text x="84" y="352" font-size="16.5" fill="#2c2a26">OWN <tspan font-weight="700">NSC operator</tspan> &#8212; the NATS</text>
+    <text x="84" y="376" font-size="16.5" fill="#2c2a26">signing root &#8212; and every</text>
+    <text x="84" y="400" font-size="16.5" fill="#2c2a26">stack&#8217;s seed.</text>
+    <rect x="84" y="478" width="304" height="40" rx="8" fill="#eaf0e6" stroke="#3f7d4a" stroke-width="1.6"/>
+    <text x="98" y="503" font-size="15.5" fill="#3f7d4a" font-style="italic">&#8627; you own your keys</text>
+  </g>
+
+  <!-- Card: STACK -->
+  <g transform="rotate(0.4 648 390)">
+    <rect x="462" y="240" width="372" height="300" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+    <rect x="462" y="240" width="372" height="46" rx="12" fill="#efe4cf" stroke="#2c2a26" stroke-width="2.5"/>
+    <text x="486" y="271" font-size="22" font-weight="700" fill="#1d1c19" letter-spacing="1">STACK</text>
+    <text x="810" y="271" font-size="15" fill="#6b665d" text-anchor="end" font-style="italic">one cortex runtime</text>
+    <text x="486" y="328" font-size="16.5" fill="#2c2a26">One cortex runtime &#8212; one OS</text>
+    <text x="486" y="352" font-size="16.5" fill="#2c2a26">process. Its own identity,</text>
+    <text x="486" y="376" font-size="16.5" fill="#2c2a26">subjects, policy.</text>
+    <text x="486" y="400" font-size="16.5" fill="#2c2a26">A principal runs many stacks.</text>
+    <rect x="486" y="478" width="304" height="40" rx="8" fill="#eaf0e6" stroke="#3f7d4a" stroke-width="1.6"/>
+    <text x="500" y="503" font-size="15.5" fill="#3f7d4a" font-style="italic">&#8627; a device on the network</text>
+  </g>
+
+  <!-- Card: NETWORK -->
+  <g transform="rotate(-0.3 1050 390)">
+    <rect x="864" y="240" width="372" height="300" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+    <rect x="864" y="240" width="372" height="46" rx="12" fill="#efe4cf" stroke="#2c2a26" stroke-width="2.5"/>
+    <text x="888" y="271" font-size="22" font-weight="700" fill="#1d1c19" letter-spacing="1">NETWORK</text>
+    <text x="1212" y="271" font-size="15" fill="#6b665d" text-anchor="end" font-style="italic">e.g. metafactory</text>
+    <!-- sketchy cloud -->
+    <g stroke="#2e4d7b" stroke-width="2" fill="#e7edf4">
+      <path d="M 1135 322 q -6 -26 22 -28 q 8 -22 34 -14 q 22 -10 30 12 q 24 0 18 24 q 6 18 -16 20 l -74 0 q -22 0 -14 -14 z"/>
+    </g>
+    <text x="888" y="332" font-size="16.5" fill="#2c2a26">A federation of principals&#8217;</text>
+    <text x="888" y="356" font-size="16.5" fill="#2c2a26">stacks, joined at the NATS</text>
+    <text x="888" y="380" font-size="16.5" fill="#2c2a26">leaf-node layer. One principal</text>
+    <text x="888" y="404" font-size="16.5" fill="#2c2a26">may join many networks.</text>
+    <rect x="888" y="478" width="304" height="40" rx="8" fill="#e7edf4" stroke="#2e4d7b" stroke-width="1.6"/>
+    <text x="902" y="503" font-size="15.5" fill="#2e4d7b" font-style="italic">&#8627; a LAN you attach to</text>
+  </g>
+
+  <!-- Card: REGISTRY -->
+  <g transform="rotate(0.35 1452 390)">
+    <rect x="1266" y="240" width="372" height="300" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+    <rect x="1266" y="240" width="372" height="46" rx="12" fill="#e7edf4" stroke="#2c2a26" stroke-width="2.5"/>
+    <text x="1290" y="271" font-size="22" font-weight="700" fill="#1d1c19" letter-spacing="1">REGISTRY</text>
+    <text x="1614" y="271" font-size="14" fill="#6b665d" text-anchor="end" font-style="italic">network.meta-factory.ai</text>
+    <text x="1290" y="328" font-size="16.5" fill="#2c2a26">Identity directory &#8212; the</text>
+    <text x="1290" y="352" font-size="16.5" fill="#2c2a26">network descriptor + roster.</text>
+    <text x="1290" y="376" font-size="16.5" fill="#b56522" font-weight="700">Stores ONE pubkey per stack</text>
+    <text x="1290" y="402" font-size="16.5" fill="#b56522" font-weight="700">&#183; signs nothing.</text>
+    <rect x="1290" y="478" width="304" height="40" rx="8" fill="#e7edf4" stroke="#2e4d7b" stroke-width="1.6"/>
+    <text x="1304" y="503" font-size="15.5" fill="#2e4d7b" font-style="italic">&#8627; the DNS of the federation</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- BAND 2 — WHERE SIGNING HAPPENS -->
+  <!-- ============================================================ -->
+  <text x="60" y="612" font-size="26" font-weight="700" fill="#1d1c19" font-family="Georgia, serif" font-style="italic">2 &#183; Where signing happens &#8212; ONE root per principal</text>
+  <text x="815" y="612" font-size="17" fill="#6b665d">one seed you hold; cortex derives the rest</text>
+
+  <!-- Left card: your sovereign root (a single chain) -->
+  <rect x="60" y="636" width="1160" height="364" rx="12" fill="#FBF7EC" stroke="#7a4b86" stroke-width="2.5"/>
+  <text x="84" y="674" font-size="20" font-weight="700" fill="#7a4b86" letter-spacing="1">YOUR OPERATOR &#8212; the sovereign root</text>
+  <text x="84" y="697" font-size="15.5" fill="#6b665d" font-style="italic">a single chain &#183; one root, used two ways</text>
+
+  <!-- chain box 1: principal key -->
+  <rect x="120" y="710" width="480" height="66" rx="9" fill="#f1eaf3" stroke="#7a4b86" stroke-width="2.5"/>
+  <text x="360" y="736" font-size="17.5" font-weight="700" fill="#1d1c19" text-anchor="middle">Your principal key</text>
+  <text x="360" y="760" font-size="14" fill="#6b665d" text-anchor="middle">= your NSC operator &#8212; the ONE seed you hold</text>
+  <line x1="360" y1="776" x2="360" y2="806" stroke="#7a4b86" stroke-width="2.5" marker-end="url(#arrow-plum)"/>
+  <text x="372" y="797" font-size="13.5" fill="#7a4b86" font-style="italic">issues</text>
+
+  <!-- chain box 2: account -->
+  <rect x="120" y="808" width="480" height="52" rx="9" fill="#f1eaf3" stroke="#7a4b86" stroke-width="2"/>
+  <text x="360" y="841" font-size="17.5" font-weight="700" fill="#1d1c19" text-anchor="middle">your account</text>
+  <line x1="360" y1="860" x2="360" y2="890" stroke="#7a4b86" stroke-width="2.5" marker-end="url(#arrow-plum)"/>
+  <text x="372" y="881" font-size="13.5" fill="#7a4b86" font-style="italic">issues</text>
+
+  <!-- chain box 3: stack key -->
+  <rect x="120" y="892" width="480" height="66" rx="9" fill="#f1eaf3" stroke="#7a4b86" stroke-width="2.5"/>
+  <text x="360" y="918" font-size="17.5" font-weight="700" fill="#1d1c19" text-anchor="middle">your stack key</text>
+  <text x="360" y="941" font-size="14" fill="#6b665d" text-anchor="middle">an SU user nkey</text>
+
+  <!-- fan-out: ONE key, used two ways -->
+  <line x1="600" y1="915" x2="666" y2="889" stroke="#7a4b86" stroke-width="2.5" marker-end="url(#arrow-plum)"/>
+  <line x1="600" y1="935" x2="666" y2="945" stroke="#3f7d4a" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+
+  <rect x="672" y="864" width="508" height="48" rx="9" fill="#f1eaf3" stroke="#7a4b86" stroke-width="2"/>
+  <text x="690" y="894" font-size="16.5" fill="#1d1c19">&#8594; signs every envelope <tspan fill="#6b665d">(the wire)</tspan></text>
+
+  <rect x="672" y="920" width="508" height="48" rx="9" fill="#eaf0e6" stroke="#3f7d4a" stroke-width="2"/>
+  <text x="690" y="950" font-size="16.5" fill="#1d1c19">&#8594; authenticates your bus connection</text>
+
+  <!-- caption -->
+  <text x="120" y="988" font-size="15.5" fill="#2c2a26" font-style="italic">one key, issued from your one root, used two ways &#8212; you hold one seed; cortex generates the rest.</text>
+
+  <!-- barrier: the ONLY wall — BETWEEN principals, not inside one -->
+  <line x1="1255" y1="662" x2="1255" y2="970" stroke="#b56522" stroke-width="2.5" stroke-dasharray="9 7"/>
+  <circle cx="1255" cy="800" r="28" fill="#f6e6d6" stroke="#b56522" stroke-width="2.5"/>
+  <path d="M 1242 787 L 1268 813 M 1268 787 L 1242 813" stroke="#b56522" stroke-width="3.5" stroke-linecap="round"/>
+
+  <!-- faded peer operator -->
+  <g opacity="0.42">
+    <rect x="1300" y="700" width="332" height="158" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+    <text x="1466" y="734" font-size="17" font-weight="700" fill="#1d1c19" text-anchor="middle">PEER OPERATOR</text>
+    <text x="1466" y="757" font-size="13.5" fill="#6b665d" text-anchor="middle" font-style="italic">another principal&#8217;s root</text>
+    <rect x="1324" y="772" width="284" height="34" rx="7" fill="#f1eaf3" stroke="#7a4b86" stroke-width="1.6"/>
+    <text x="1466" y="794" font-size="13.5" fill="#1d1c19" text-anchor="middle">their account</text>
+    <rect x="1324" y="812" width="284" height="34" rx="7" fill="#f1eaf3" stroke="#7a4b86" stroke-width="1.6"/>
+    <text x="1466" y="834" font-size="13.5" fill="#1d1c19" text-anchor="middle">their stack key</text>
+  </g>
+
+  <!-- barrier label -->
+  <text x="1300" y="892" font-size="13.5" font-weight="700" fill="#b56522">no operator ever signs</text>
+  <text x="1300" y="912" font-size="13.5" font-weight="700" fill="#b56522">another&#8217;s account &#8212; the only</text>
+  <text x="1300" y="932" font-size="13.5" font-weight="700" fill="#b56522">barrier <tspan font-weight="400" font-style="italic" fill="#9c4f15">(this is the sovereignty)</tspan></text>
+
+  <!-- Orange callout bar -->
+  <rect x="60" y="1012" width="1580" height="96" rx="12" fill="#f6e6d6" stroke="#b56522" stroke-width="2.5"/>
+  <text x="84" y="1052" font-size="20" font-weight="700" fill="#9c4f15">The registry signs nothing.  The hub admin mints NO creds for you.</text>
+  <text x="84" y="1084" font-size="18" fill="#2c2a26">The only thing handed over is a <tspan font-weight="700" fill="#b56522">leaf shared secret</tspan> &#8212; a transport PSK (like a Wi-Fi password), <tspan font-weight="700">NOT an identity credential.</tspan></text>
+
+  <!-- ============================================================ -->
+  <!-- BAND 3 — HOW TO JOIN -->
+  <!-- ============================================================ -->
+  <text x="60" y="1166" font-size="26" font-weight="700" fill="#1d1c19" font-family="Georgia, serif" font-style="italic">3 &#183; How to join</text>
+  <text x="330" y="1166" font-size="17" fill="#6b665d">mostly self-serve &#8212; with ONE trust gate where someone else must say yes</text>
+  <text x="60" y="1186" font-size="13.5" fill="#3f7d4a" font-style="italic">STEPS 1&#8211;3 &#183; self-sovereign &#8212; you act alone, no one&#8217;s permission needed</text>
+
+  <!-- ROW 1 -->
+  <!-- Step 1 -->
+  <rect x="60" y="1192" width="505" height="208" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+  <circle cx="96" cy="1228" r="20" fill="#2c2a26"/>
+  <text x="96" y="1235" font-size="22" font-weight="700" fill="#f4eddc" text-anchor="middle">1</text>
+  <text x="128" y="1236" font-size="20" font-weight="700" fill="#1d1c19">Provision your identity</text>
+  <rect x="84" y="1262" width="457" height="40" rx="8" fill="#f1eaf3" stroke="#7a4b86" stroke-width="1.6"/>
+  <text x="104" y="1287" font-size="16" fill="#7a4b86" font-family="'Courier New', monospace">cortex provision-stack generate</text>
+  <text x="84" y="1332" font-size="16" fill="#2c2a26">You mint your own Ed25519 key &#8212;</text>
+  <text x="84" y="1356" font-size="16" fill="#2c2a26">you sign, you own the seed.</text>
+
+  <!-- Step 2 -->
+  <rect x="597" y="1192" width="505" height="208" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+  <circle cx="633" cy="1228" r="20" fill="#2c2a26"/>
+  <text x="633" y="1235" font-size="22" font-weight="700" fill="#f4eddc" text-anchor="middle">2</text>
+  <text x="665" y="1236" font-size="20" font-weight="700" fill="#1d1c19">Register at the registry</text>
+  <rect x="621" y="1262" width="457" height="40" rx="8" fill="#e7edf4" stroke="#2e4d7b" stroke-width="1.6"/>
+  <text x="641" y="1287" font-size="16" fill="#2e4d7b" font-family="'Courier New', monospace">cortex provision-stack register</text>
+  <text x="621" y="1332" font-size="16" fill="#2c2a26">Proof-of-possession &#8212; the registry</text>
+  <text x="621" y="1356" font-size="16" fill="#2c2a26">stores your pubkey.</text>
+
+  <!-- Step 3 -->
+  <rect x="1134" y="1192" width="505" height="208" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+  <circle cx="1170" cy="1228" r="20" fill="#2c2a26"/>
+  <text x="1170" y="1235" font-size="22" font-weight="700" fill="#f4eddc" text-anchor="middle">3</text>
+  <text x="1202" y="1236" font-size="20" font-weight="700" fill="#1d1c19">Pin the registry</text>
+  <rect x="1158" y="1262" width="457" height="40" rx="8" fill="#e7edf4" stroke="#2e4d7b" stroke-width="1.6"/>
+  <text x="1178" y="1287" font-size="14.5" fill="#2e4d7b" font-family="'Courier New', monospace">policy.federated.registry.{url,pubkey}</text>
+  <text x="1158" y="1332" font-size="16" fill="#2c2a26">The ONE trust anchor.</text>
+  <text x="1158" y="1356" font-size="16" fill="#b56522" font-weight="700">Never hardcode peers.</text>
+
+  <!-- row1 arrows -->
+  <line x1="567" y1="1296" x2="595" y2="1296" stroke="#2c2a26" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <line x1="1104" y1="1296" x2="1132" y2="1296" stroke="#2c2a26" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- wrap arrow 3 -> GATE (orange: the trust handoff begins) -->
+  <path d="M 1386 1402 C 1386 1432, 340 1430, 340 1412" fill="none" stroke="#b56522" stroke-width="2.5" marker-end="url(#arrow-orange)"/>
+
+  <!-- ===== STEP 4 — ADMISSION: the TRUST GATE (distinct, heavy, orange) ===== -->
+  <rect x="60" y="1412" width="560" height="294" rx="5" fill="#f6e6d6" stroke="#b56522" stroke-width="4"/>
+  <rect x="68" y="1420" width="544" height="262" rx="3" fill="none" stroke="#b56522" stroke-width="1.3" stroke-dasharray="3 4"/>
+  <!-- gate post (left spine) -->
+  <rect x="60" y="1412" width="11" height="294" rx="3" fill="#b56522"/>
+  <!-- shield badge with keyhole -->
+  <path d="M 100 1432 L 122 1440 L 122 1459 Q 122 1476 100 1486 Q 78 1476 78 1459 L 78 1440 Z" fill="#b56522" stroke="#7a3d10" stroke-width="1.5"/>
+  <circle cx="100" cy="1456" r="5.5" fill="#f6e6d6"/>
+  <path d="M 100 1456 L 96 1470 L 104 1470 Z" fill="#f6e6d6"/>
+  <!-- title -->
+  <text x="142" y="1452" font-size="19" font-weight="700" fill="#9c4f15">4 &#183; ADMISSION &#8212; the trust gate</text>
+  <text x="142" y="1474" font-size="14" fill="#9c4f15" font-style="italic">the only place someone else must say yes</text>
+  <!-- description -->
+  <text x="84" y="1506" font-size="15" fill="#2c2a26">The admin (or admin-agent) approves your roster</text>
+  <text x="84" y="1528" font-size="15" fill="#2c2a26">membership &#8594; hands you the <tspan font-weight="700" fill="#b56522">leaf shared secret.</tspan></text>
+  <!-- badge: grants membership / mints nothing -->
+  <rect x="84" y="1542" width="452" height="32" rx="16" fill="#b56522"/>
+  <text x="310" y="1564" font-size="15" font-weight="700" fill="#FBF7EC" text-anchor="middle">grants membership &#183; mints NOTHING</text>
+  <!-- two-layer trust annotation -->
+  <line x1="84" y1="1590" x2="596" y2="1590" stroke="#d8a868" stroke-width="1.3"/>
+  <text x="84" y="1610" font-size="12.5" font-weight="700" fill="#9c4f15" letter-spacing="1.5">TWO-LAYER TRUST &#8212; granted AND chosen</text>
+  <text x="84" y="1632" font-size="13.5" fill="#2c2a26"><tspan font-weight="700" fill="#b56522">&#9312;</tspan> network membership &#8212; admin curates the roster</text>
+  <text x="84" y="1654" font-size="13.5" fill="#2c2a26"><tspan font-weight="700" fill="#b56522">&#9313;</tspan> per-principal accept-policy &#8212; each peer still</text>
+  <text x="104" y="1674" font-size="13.5" fill="#2c2a26">chooses whom to accept &#183; <tspan font-family="'Courier New', monospace" font-size="12.5" fill="#7a4b86">network:&lt;id&gt; | principals:[&#8230;]</tspan></text>
+  <text x="84" y="1697" font-size="13.5" fill="#9c4f15" font-style="italic">trust is granted AND chosen &#8212; never minted.</text>
+
+  <!-- gate -> step 5 (orange: secret in hand, proceed) -->
+  <line x1="620" y1="1500" x2="646" y2="1500" stroke="#b56522" stroke-width="2.5" marker-end="url(#arrow-orange)"/>
+
+  <!-- lane tag for steps 5-6 -->
+  <text x="648" y="1442" font-size="13.5" fill="#3f7d4a" font-style="italic">STEPS 5&#8211;6 &#183; self-serve again &#8212; plug-and-play</text>
+
+  <!-- ===== STEP 5 — Join (self-serve) ===== -->
+  <rect x="648" y="1450" width="470" height="226" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+  <circle cx="684" cy="1486" r="20" fill="#2c2a26"/>
+  <text x="684" y="1493" font-size="22" font-weight="700" fill="#f4eddc" text-anchor="middle">5</text>
+  <text x="716" y="1494" font-size="20" font-weight="700" fill="#1d1c19">Join</text>
+  <rect x="672" y="1512" width="422" height="40" rx="8" fill="#eaf0e6" stroke="#3f7d4a" stroke-width="1.6"/>
+  <text x="688" y="1537" font-size="14" fill="#3f7d4a" font-family="'Courier New', monospace">cortex network join &lt;network&gt; --apply</text>
+  <text x="672" y="1582" font-size="15" fill="#2c2a26">One verb &#8212; ensures your operator,</text>
+  <text x="672" y="1605" font-size="15" fill="#2c2a26">renders the secret-auth leaf bound</text>
+  <text x="672" y="1628" font-size="15" fill="#2c2a26">to YOUR account, wires export/import,</text>
+  <text x="672" y="1651" font-size="15" fill="#2c2a26">then restarts.</text>
+
+  <!-- step 5 -> 6 (neutral self-serve) -->
+  <line x1="1118" y1="1563" x2="1144" y2="1563" stroke="#2c2a26" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- ===== STEP 6 — Verify (self-serve) ===== -->
+  <rect x="1146" y="1450" width="470" height="226" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+  <circle cx="1182" cy="1486" r="20" fill="#2c2a26"/>
+  <text x="1182" y="1493" font-size="22" font-weight="700" fill="#f4eddc" text-anchor="middle">6</text>
+  <text x="1214" y="1494" font-size="20" font-weight="700" fill="#1d1c19">Verify</text>
+  <rect x="1170" y="1512" width="422" height="40" rx="8" fill="#eaf0e6" stroke="#3f7d4a" stroke-width="1.6"/>
+  <text x="1186" y="1537" font-size="16" fill="#3f7d4a" font-family="'Courier New', monospace">cortex network status</text>
+  <text x="1170" y="1582" font-size="16" fill="#2c2a26">Read the leaf link state.</text>
+  <rect x="1170" y="1602" width="422" height="44" rx="8" fill="#eaf0e6" stroke="#3f7d4a" stroke-width="2"/>
+  <text x="1190" y="1630" font-size="17" fill="#3f7d4a" font-weight="700">leaf link &#8594; established  &#10003;</text>
+
+  <!-- ============================================================ -->
+  <!-- BAND 4 — TCP/IP NORTH STAR + SCOPE -->
+  <!-- ============================================================ -->
+  <line x1="60" y1="1716" x2="1640" y2="1716" stroke="#1d1c19" stroke-width="1.5"/>
+  <text x="60" y="1762" font-size="26" font-weight="700" fill="#1d1c19" font-family="Georgia, serif" font-style="italic">4 &#183; The TCP/IP north star</text>
+  <text x="470" y="1762" font-size="17" fill="#6b665d">same interface, different reach</text>
+
+  <!-- north-star mapping lines -->
+  <rect x="60" y="1788" width="980" height="346" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+  <!-- line 1 -->
+  <rect x="84" y="1812" width="20" height="20" rx="4" fill="#3f7d4a"/>
+  <text x="116" y="1829" font-size="18" fill="#1d1c19"><tspan font-weight="700">your NSC operator</tspan>  =  you own your keys (your device&#8217;s identity)</text>
+  <!-- line 2 -->
+  <rect x="84" y="1860" width="20" height="20" rx="4" fill="#2e4d7b"/>
+  <text x="116" y="1877" font-size="18" fill="#1d1c19"><tspan font-weight="700">the registry</tspan>  =  DNS &#8212; resolve names &#8594; pubkeys; pin ONE resolver</text>
+  <!-- line 3 -->
+  <rect x="84" y="1908" width="20" height="20" rx="4" fill="#b56522"/>
+  <text x="116" y="1925" font-size="18" fill="#1d1c19"><tspan font-weight="700">leaf shared secret</tspan>  =  the PSK to attach to the medium (transport, not identity)</text>
+  <!-- line 4 -->
+  <rect x="84" y="1956" width="20" height="20" rx="4" fill="#2c2a26"/>
+  <text x="116" y="1973" font-size="18" fill="#1d1c19"><tspan font-weight="700">cortex network join &lt;network&gt;</tspan>  =  the DHCP-style plug-in</text>
+  <text x="116" y="1999" font-size="16" fill="#6b665d">one verb &#8212; the registry autoconfigures the layers</text>
+  <!-- closing line -->
+  <line x1="84" y1="2026" x2="1016" y2="2026" stroke="#cabfa6" stroke-width="1.5"/>
+  <text x="84" y="2058" font-size="16.5" fill="#2c2a26" font-style="italic">Hand the registry a network name &#8212; it hands back everything the layers need:</text>
+  <text x="84" y="2082" font-size="16.5" fill="#2c2a26" font-style="italic">descriptor + roster + trust anchor. No out-of-band key wrangling.</text>
+  <text x="84" y="2114" font-size="15" fill="#7a4b86" font-style="italic">*one signing root per principal &#183; one registry to resolve them &#183; one PSK to attach*</text>
+
+  <!-- SCOPE legend chip -->
+  <rect x="1064" y="1788" width="576" height="346" rx="12" fill="#FBF7EC" stroke="#2c2a26" stroke-width="2.5"/>
+  <rect x="1064" y="1788" width="576" height="48" rx="12" fill="#efe4cf" stroke="#2c2a26" stroke-width="2.5"/>
+  <text x="1088" y="1820" font-size="20" font-weight="700" fill="#1d1c19" letter-spacing="1">SCOPE LEGEND</text>
+  <text x="1616" y="1820" font-size="14" fill="#6b665d" text-anchor="end" font-style="italic">same wire, different reach</text>
+  <!-- local -->
+  <rect x="1088" y="1864" width="150" height="44" rx="8" fill="#ece8de" stroke="#6b665d" stroke-width="2"/>
+  <text x="1163" y="1892" font-size="18" font-weight="700" fill="#3a3833" text-anchor="middle">local</text>
+  <text x="1262" y="1884" font-size="17" font-weight="700" fill="#1d1c19">= localhost</text>
+  <text x="1262" y="1906" font-size="14.5" fill="#6b665d">home &#183; zero-config</text>
+  <!-- federated -->
+  <rect x="1088" y="1924" width="150" height="44" rx="8" fill="#eaf0e6" stroke="#3f7d4a" stroke-width="2"/>
+  <text x="1163" y="1952" font-size="18" font-weight="700" fill="#3f7d4a" text-anchor="middle">federated</text>
+  <text x="1262" y="1944" font-size="17" font-weight="700" fill="#1d1c19">= LAN</text>
+  <text x="1262" y="1966" font-size="14.5" fill="#6b665d">registry-mediated join</text>
+  <!-- public -->
+  <rect x="1088" y="1984" width="150" height="44" rx="8" fill="#f6e6d6" stroke="#b56522" stroke-width="2"/>
+  <text x="1163" y="2012" font-size="18" font-weight="700" fill="#b56522" text-anchor="middle">public</text>
+  <text x="1262" y="2004" font-size="17" font-weight="700" fill="#1d1c19">= internet</text>
+  <text x="1262" y="2026" font-size="14.5" fill="#6b665d">the open square &#183; opt-in</text>
+  <line x1="1088" y1="2058" x2="1616" y2="2058" stroke="#cabfa6" stroke-width="1.5"/>
+  <text x="1088" y="2086" font-size="15.5" fill="#2c2a26">Same interface end to end &#8212;</text>
+  <text x="1088" y="2110" font-size="15.5" fill="#2c2a26">like localhost / LAN / internet.</text>
+
+  <!-- footer -->
+  <text x="60" y="2170" font-size="14" fill="#6b665d" font-style="italic">metafactory  &#183;  cortex M7 collaboration surface  &#183;  sovereign &#8220;Model B&#8221; federation  &#183;  docs/diagrams/cortex-network-join.png</text>
+</svg>
