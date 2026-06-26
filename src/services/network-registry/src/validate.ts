@@ -19,12 +19,16 @@
 import type {
   AdmissionDecisionClaim,
   AdmissionReadClaim,
+  AdmissionRevokeClaim,
   Capability,
   RegistrationClaim,
+  SealedSecretWriteClaim,
   SignedAdmissionDecision,
   SignedAdmissionMineRead,
   SignedAdmissionRead,
+  SignedAdmissionRevoke,
   SignedRegistration,
+  SignedSealedSecretWrite,
   StackIdentity,
 } from "./types";
 
@@ -701,6 +705,181 @@ export function validateSignedAdmissionMineRead(
     signed: {
       claim: { principal_id: bc.principal_id, peer_pubkey: bc.peer_pubkey, issued_at: bc.issued_at },
       signature: b.signature,
+    },
+  };
+}
+
+// =============================================================================
+// ADR-0018 PR5b — hub-admin sealed-secret write + revoke claim validators
+// =============================================================================
+
+/**
+ * Bound on the opaque sealed ciphertext the registry stores (ADR-0018 b′). It
+ * must be base64 (the registry never decodes it, but a non-base64 value can
+ * only be junk) and bounded so a hostile hub-admin cannot stuff the row with an
+ * unbounded blob. A `crypto_box_seal` of a small secret is ~100 bytes base64;
+ * 8 KiB leaves generous headroom for the future M3 payload-key envelope (#1246)
+ * riding the SAME slot without a hard cliff.
+ */
+export function isValidSealedSecret(b64: string): boolean {
+  return typeof b64 === "string" && b64.length >= 1 && b64.length <= 8192 && BASE64_RE.test(b64);
+}
+
+/**
+ * Validate the `POST /admission-requests/{id}/sealed-secret` envelope
+ * ({ claim: SealedSecretWriteClaim, signature }). Mirrors
+ * `validateSignedAdmissionDecision` so the HUB-admin gate applies the identical
+ * 503/401/403 order.
+ */
+export function validateSignedSealedSecretWrite(
+  body: unknown,
+): { ok: true; signed: SignedSealedSecretWrite } | { ok: false; errors: ValidationError[] } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { ok: false, errors: [{ field: "body", message: "must be an object" }] };
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.signature !== "string" || b.signature.length === 0) {
+    return { ok: false, errors: [{ field: "signature", message: "missing" }] };
+  }
+  if (!BASE64_RE.test(b.signature)) {
+    return { ok: false, errors: [{ field: "signature", message: "must be base64" }] };
+  }
+  if (typeof b.claim !== "object" || b.claim === null || Array.isArray(b.claim)) {
+    return { ok: false, errors: [{ field: "claim", message: "must be a non-array object" }] };
+  }
+  return {
+    ok: true,
+    signed: { claim: b.claim as SealedSecretWriteClaim, signature: b.signature },
+  };
+}
+
+/**
+ * Validate the `SealedSecretWriteClaim` payload before crypto verification.
+ * Cross-field rule: claim.request_id MUST match the URL path parameter
+ * (forged-attribution guard). The opaque `sealed_secret` is shape-checked only
+ * (base64 + bounded) — the registry never reads it.
+ */
+export function validateSealedSecretClaim(
+  claim: unknown,
+  expectedRequestId: string,
+): { ok: true; claim: SealedSecretWriteClaim } | { ok: false; errors: ValidationError[] } {
+  const errors: ValidationError[] = [];
+
+  if (typeof claim !== "object" || claim === null || Array.isArray(claim)) {
+    return { ok: false, errors: [{ field: "claim", message: "must be an object" }] };
+  }
+  const c = claim as Record<string, unknown>;
+
+  if (typeof c.request_id !== "string" || c.request_id.length === 0) {
+    errors.push({ field: "request_id", message: "must be a non-empty string" });
+  } else if (c.request_id !== expectedRequestId) {
+    errors.push({
+      field: "request_id",
+      message: `body request_id "${c.request_id}" does not match path "${expectedRequestId}"`,
+    });
+  }
+
+  if (typeof c.sealed_secret !== "string" || !isValidSealedSecret(c.sealed_secret)) {
+    errors.push({ field: "sealed_secret", message: "must be base64, 1..8192 chars" });
+  }
+
+  if (typeof c.hub_admin_pubkey !== "string" || !isValidPubkey(c.hub_admin_pubkey)) {
+    errors.push({ field: "hub_admin_pubkey", message: "must be a 32-byte Ed25519 pubkey, base64-encoded (44 chars)" });
+  }
+
+  if (typeof c.issued_at !== "string" || Number.isNaN(Date.parse(c.issued_at))) {
+    errors.push({ field: "issued_at", message: "must be an ISO-8601 timestamp" });
+  }
+
+  if (typeof c.nonce !== "string" || c.nonce.length < 8 || c.nonce.length > 128) {
+    errors.push({ field: "nonce", message: "must be a string between 8 and 128 chars" });
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+
+  return {
+    ok: true,
+    claim: {
+      request_id: c.request_id as string,
+      sealed_secret: c.sealed_secret as string,
+      hub_admin_pubkey: c.hub_admin_pubkey as string,
+      issued_at: c.issued_at as string,
+      nonce: c.nonce as string,
+    },
+  };
+}
+
+/**
+ * Validate the `POST /admission-requests/{id}/revoke` envelope
+ * ({ claim: AdmissionRevokeClaim, signature }).
+ */
+export function validateSignedAdmissionRevoke(
+  body: unknown,
+): { ok: true; signed: SignedAdmissionRevoke } | { ok: false; errors: ValidationError[] } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { ok: false, errors: [{ field: "body", message: "must be an object" }] };
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.signature !== "string" || b.signature.length === 0) {
+    return { ok: false, errors: [{ field: "signature", message: "missing" }] };
+  }
+  if (!BASE64_RE.test(b.signature)) {
+    return { ok: false, errors: [{ field: "signature", message: "must be base64" }] };
+  }
+  if (typeof b.claim !== "object" || b.claim === null || Array.isArray(b.claim)) {
+    return { ok: false, errors: [{ field: "claim", message: "must be a non-array object" }] };
+  }
+  return {
+    ok: true,
+    signed: { claim: b.claim as AdmissionRevokeClaim, signature: b.signature },
+  };
+}
+
+/**
+ * Validate the `AdmissionRevokeClaim` payload before crypto verification.
+ * Cross-field rule: claim.request_id MUST match the URL path parameter.
+ */
+export function validateAdmissionRevokeClaim(
+  claim: unknown,
+  expectedRequestId: string,
+): { ok: true; claim: AdmissionRevokeClaim } | { ok: false; errors: ValidationError[] } {
+  const errors: ValidationError[] = [];
+
+  if (typeof claim !== "object" || claim === null || Array.isArray(claim)) {
+    return { ok: false, errors: [{ field: "claim", message: "must be an object" }] };
+  }
+  const c = claim as Record<string, unknown>;
+
+  if (typeof c.request_id !== "string" || c.request_id.length === 0) {
+    errors.push({ field: "request_id", message: "must be a non-empty string" });
+  } else if (c.request_id !== expectedRequestId) {
+    errors.push({
+      field: "request_id",
+      message: `body request_id "${c.request_id}" does not match path "${expectedRequestId}"`,
+    });
+  }
+
+  if (typeof c.hub_admin_pubkey !== "string" || !isValidPubkey(c.hub_admin_pubkey)) {
+    errors.push({ field: "hub_admin_pubkey", message: "must be a 32-byte Ed25519 pubkey, base64-encoded (44 chars)" });
+  }
+
+  if (typeof c.issued_at !== "string" || Number.isNaN(Date.parse(c.issued_at))) {
+    errors.push({ field: "issued_at", message: "must be an ISO-8601 timestamp" });
+  }
+
+  if (typeof c.nonce !== "string" || c.nonce.length < 8 || c.nonce.length > 128) {
+    errors.push({ field: "nonce", message: "must be a string between 8 and 128 chars" });
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+
+  return {
+    ok: true,
+    claim: {
+      request_id: c.request_id as string,
+      hub_admin_pubkey: c.hub_admin_pubkey as string,
+      issued_at: c.issued_at as string,
+      nonce: c.nonce as string,
     },
   };
 }
