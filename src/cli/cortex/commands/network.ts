@@ -1769,7 +1769,7 @@ function shouldAutoProvision(cfg: LoadedConfig): boolean {
   return (
     cfg.principal?.id !== undefined &&
     cfg.stack?.id !== undefined &&
-    cfg.stack?.nats_infra?.account === undefined
+    cfg.stack.nats_infra?.account === undefined
   );
 }
 
@@ -1800,7 +1800,7 @@ async function maybeAutoProvision(
   // now sees the account tree and the join CAN proceed in the same invocation
   // (true plug-and-play). On a dry-run nothing was written, so the stack is
   // still unprovisioned and the join cannot meaningfully continue.
-  let provisionedAfter = false;
+  let provisionedAfter: boolean;
   try {
     provisionedAfter = isStackProvisioned(load(configPath));
   } catch {
