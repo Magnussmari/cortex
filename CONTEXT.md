@@ -192,7 +192,7 @@ _Avoid_: reading dashboard `role: operator` as the **principal**; conflating the
 So trust is **granted** (admission) *and* **chosen** (accept-policy), never *minted*.
 
 **Where signing does NOT happen.** The **registry** (`network.meta-factory.ai`) is the *DNS of the federation* — it stores the **one pubkey** a stack publishes + the network descriptor + roster, and **signs nothing**. The hub admin **issues no credential** — you issue your own stack key from your own root (you signing for yourself). The only thing crossing the **principal boundary** is the **leaf shared secret** (a transport PSK, like a Wi-Fi password) — never an identity credential. The one line nobody crosses is **operator-to-operator**: my root never issues your account.
-_Avoid_: "two signing systems"; treating the wire key and bus key as separate facilities; reading admission as credential issuance; "the registry/hub mints my creds"; treating the leaf secret as an identity.
+_Avoid_: "two signing systems" / two signing authorities (there is **one root** — the derived credentials are not a second authority); thinking you mint or manage those derived credentials by hand; reading admission as credential issuance; "the registry/hub mints my creds"; treating the leaf secret as an identity.
 
 **How a stack joins** (one verb; the registry autoconfigures the layers — the "feel like TCP/IP" north star, ADR-0003 §9):
 1. **Provision your own identity** — `cortex provision-stack generate` (you sign; you alone hold the seed).
