@@ -208,7 +208,7 @@ Federating turns the stack's hard-isolated local bus into a **leaf** of a shared
 
 ### B0.1 — The bus MUST be operator-mode (the #794 lesson)
 
-> **Authority:** [`docs/adr/0013-sovereign-federation-model.md`](./adr/0013-sovereign-federation-model.md) (Model B — own-operator + per-side export/import, accepted). Model A (hub-minted creds / guest accounts) is **retired** — see [`docs/adr/0015-two-tier-onboarding-and-admission-gate.md`](./adr/0015-two-tier-onboarding-and-admission-gate.md).
+> **Authority:** [`docs/adr/0013-sovereign-federation-model.md`](./adr/0013-sovereign-federation-model.md) (Model B — own NSC operator + per-side export/import, accepted). Model A (hub-minted creds / guest accounts) is **retired** — see [`docs/adr/0015-two-tier-onboarding-and-admission-gate.md`](./adr/0015-two-tier-onboarding-and-admission-gate.md).
 
 > ⚠️ **READ THIS BEFORE JOINING.** Part 1 stands the stack up on a **hard-isolated, anonymous** bus (the `halden` / `community` pattern — Step 2: *no* `leafnodes{}` / `cluster{}` / `gateway{}`, no operator-mode account tree at all; the isolation is the absence of all of those). **An anonymous bus cannot federate.**
 
