@@ -104,6 +104,26 @@ export const StackNatsInfraSchema = z.object({
     "stack.nats_infra.account must be an account-class NKey (A-prefixed, 56 chars total)",
   ).optional(),
   /**
+   * G1d (cortex#1139, ADR-0012/0013) — the dedicated AGENTS account (`A…`
+   * nkey), DISTINCT from the leaf-bound federation {@link
+   * StackNatsInfraSchema.shape.account} above. `cortex network provision` mints
+   * ONE agents account per stack (ADR-0012 isolation — never a shared one); the
+   * dispatch-listener subscribes `federated.>` inside it, and the local
+   * `federated.>` export/import is wired federation-account → agents-account.
+   *
+   * Splitting the two accounts is what turns the federation-wiring step from a
+   * same-account no-op (the pre-G1d fallback in `network-federation-wiring.ts`,
+   * which logs a WARN and wires `--from-account == --to-account`) into a real
+   * CROSS-account export/import. Optional: when absent the wiring still falls
+   * back to the same-account no-op, so a stack provisioned before this field
+   * existed keeps working. Same A-prefixed account-class NKey grammar as
+   * `account`; strict prefix discrimination happens in the wiring renderer.
+   */
+  agents_account: z.string().regex(
+    /^A[A-Z0-9]{55}$/,
+    "stack.nats_infra.agents_account must be an account-class NKey (A-prefixed, 56 chars total)",
+  ).optional(),
+  /**
    * Path to the leaf `.creds` file for the network connection. Maps to the
    * `--creds` flag. OPTIONAL even within the block: when omitted, the join
    * derives the convention default `~/.config/nats/<network>.creds`
