@@ -117,6 +117,13 @@ import {
   type PingResult,
 } from "./network-ping-lib";
 import {
+  deriveProvisionNames,
+  provisionStack,
+  type ProvisionInputs,
+  type ProvisionPorts,
+} from "./network-provision-lib";
+import { buildLiveProvisionPorts } from "./network-provision-adapters";
+import {
   createLiveProbeBus,
   type LiveProbeBus,
 } from "./network-ping-adapters";
@@ -129,7 +136,7 @@ export { type ExitResult } from "./_shared/exit-result";
 // Grammar
 // =============================================================================
 
-type NetworkSubcommand = "join" | "leave" | "status" | "create" | "ping" | "admit";
+type NetworkSubcommand = "join" | "leave" | "status" | "create" | "ping" | "admit" | "provision";
 
 /**
  * Default registry URL when neither --registry-url nor config provides one.
@@ -312,6 +319,25 @@ const SPEC: SubcommandSpec<NetworkSubcommand> = {
         "--dry-run": "bool",
       },
     },
+    // G1d / T1 (cortex#1139, ADR-0013) — one-command sovereign account-topology
+    // setup. Mints the principal's OWN nsc operator + a dedicated federation
+    // account + a per-stack agents account (via arc), wires the local
+    // federated.> export/import, ensures the signing seed, and writes
+    // stack.nats_infra back — leaving the stack ready for `cortex network join`.
+    // DRY-RUN by default (prints the plan); --apply mutates. `cortex network
+    // join` auto-calls this when the stack isn't provisioned yet.
+    provision: {
+      positionals: ["stack"],
+      flags: {
+        "--config": "value",
+        "--principal": "value",
+        "--seed-path": "value",
+        "--creds": "value",
+        "--force": "bool",
+        "--apply": "bool",
+        "--dry-run": "bool",
+      },
+    },
   },
   universal: { "--json": "bool", "--help": "bool", "-h": "bool" },
 };
@@ -476,6 +502,7 @@ async function runJoin(
   flags: FlagMap,
   json: boolean,
   load: ConfigReader,
+  provisionPortsFactory: ProvisionPortsFactory,
 ): Promise<ExitResult> {
   // S5 (#739) — `join public` is the open-square opt-in, structurally distinct
   // from a federated join (no leaf, no creds/account, no peers). Route it to
@@ -487,6 +514,27 @@ async function runJoin(
   if (!NETWORK_ID_RE.test(networkId)) {
     return usageError("join", `network "${networkId}" must be lowercase alphanumeric + hyphen, letter-prefixed`, json);
   }
+
+  // cortex#1139 — plug-and-play: if the stack hasn't been provisioned (no
+  // dedicated federation + agents account in config), auto-run `cortex network
+  // provision` first so a single `join` stands the whole substrate up. On an
+  // --apply provision failure we abort (a join with no account tree is doomed);
+  // otherwise we prepend the provision output and continue.
+  const autoProv = await maybeAutoProvision(flags, json, load, provisionPortsFactory);
+  if (autoProv.ran && (!autoProv.provisionedAfter || autoProv.provisionFailed)) {
+    // Provision ran but the stack isn't (yet) provisioned for THIS invocation —
+    // a dry-run (nothing written) or a failed apply. Surface the provision
+    // output + guidance; don't attempt a doomed join in the same run.
+    const guidance = autoProv.provisionFailed
+      ? ""
+      : json
+        ? ""
+        : "\ncortex network join: re-run after `cortex network provision <stack> --apply` to join.\n";
+    return autoProv.provisionFailed
+      ? { exitCode: 1, stdout: "", stderr: autoProv.output }
+      : { exitCode: 0, stdout: autoProv.output + guidance, stderr: "" };
+  }
+  const provPrefix = autoProv.output;
 
   // #753 — derive principal / stack / seed / registry / nats-infra (config +
   // convention), with each flag surviving as an optional override. Config-load
@@ -584,9 +632,14 @@ async function runJoin(
   });
   // cortex#1228 — prepend the custom-registry TOFU warning to stderr (when set)
   // so it is surfaced regardless of the flow's success/JSON mode.
-  return tofuWarning !== undefined
-    ? { ...flow, stderr: tofuWarning + flow.stderr }
-    : flow;
+  const withTofu =
+    tofuWarning !== undefined ? { ...flow, stderr: tofuWarning + flow.stderr } : flow;
+  // cortex#1139 — prepend any auto-provision output so the join transcript shows
+  // the substrate setup that ran first (to stdout on success, stderr on failure).
+  if (provPrefix === "") return withTofu;
+  return withTofu.exitCode === 0
+    ? { ...withTofu, stdout: provPrefix + withTofu.stdout }
+    : { ...withTofu, stderr: provPrefix + withTofu.stderr };
 }
 
 async function runLeave(
@@ -1533,6 +1586,230 @@ async function runAdmit(
 }
 
 // =============================================================================
+// G1d / T1 (cortex#1139) — `cortex network provision <stack>`
+// =============================================================================
+
+/**
+ * Factory for the provision port bundle. Production builds the live adapters
+ * (arc account-tree seam + signing + config write-back) targeting the stack's
+ * config file; tests inject fakes that record calls without touching arc/fs.
+ */
+export type ProvisionPortsFactory = (stackConfigPath: string) => ProvisionPorts;
+
+const DEFAULT_PROVISION_PORTS_FACTORY: ProvisionPortsFactory = (p) => buildLiveProvisionPorts(p);
+
+const STACK_SLUG_RE = /^[a-z][a-z0-9_-]*$/;
+
+/**
+ * Resolve where the `stack.nats_infra` write-back lands, layout-aware (mirrors
+ * `stackConfigPath` in network-adapters): a config-split pointer writes to its
+ * sibling `stacks/<basename>.yaml`; a legacy monolith writes to itself.
+ */
+function resolveStackWriteConfigPath(configPath: string): string {
+  const expanded = expandTilde(configPath);
+  const configDir = expanded.replace(/\/[^/]*$/, "");
+  if (existsSync(join(configDir, "system", "system.yaml"))) {
+    const base = (expanded.split("/").pop() ?? "").replace(/\.ya?ml$/i, "");
+    return join(configDir, "stacks", `${base}.yaml`);
+  }
+  return expanded;
+}
+
+/** Resolve the stack slug for provision: positional `{principal}/{slug}` or a
+ *  bare slug, else the single configured `stack.id`, else `default`. */
+function resolveProvisionSlug(
+  stackArg: string,
+  principal: string,
+  cfg: LoadedConfig,
+): { ok: true; slug: string } | { ok: false; reason: string } {
+  if (stackArg === "") {
+    const id = cfg.stack?.id;
+    const slug = id !== undefined ? id.split("/")[1] ?? "default" : "default";
+    return { ok: true, slug };
+  }
+  if (stackArg.includes("/")) {
+    const parts = stackArg.split("/");
+    if (parts.length !== 2 || parts[0] !== principal) {
+      return { ok: false, reason: `<stack> "${stackArg}" must be {principal}/{slug} with prefix matching principal "${principal}"` };
+    }
+    const slug = parts[1] ?? "";
+    if (!STACK_SLUG_RE.test(slug)) return { ok: false, reason: `<stack> slug "${slug}" must be letter-prefixed lowercase` };
+    return { ok: true, slug };
+  }
+  if (!STACK_SLUG_RE.test(stackArg)) return { ok: false, reason: `<stack> "${stackArg}" must be letter-prefixed lowercase` };
+  return { ok: true, slug: stackArg };
+}
+
+/** Build the {@link ProvisionInputs} from config + flags, or a usage reason. */
+function deriveProvisionInputs(
+  stackArg: string,
+  flags: FlagMap,
+  load: ConfigReader,
+): { ok: true; inputs: ProvisionInputs; stackConfigPath: string } | { ok: false; reason: string; usage: boolean } {
+  const configPath = expandTilde(optionalValueFlag(flags, "--config") ?? DEFAULT_CONFIG_PATH);
+  let cfg: LoadedConfig;
+  try {
+    cfg = load(configPath);
+  } catch (err) {
+    return { ok: false, reason: `config load failed: ${err instanceof Error ? err.message : String(err)}`, usage: false };
+  }
+
+  const principal = optionalValueFlag(flags, "--principal") ?? cfg.principal?.id;
+  if (principal === undefined || principal === "") {
+    return { ok: false, reason: "cannot resolve principal — pass --principal or set `principal.id` in cortex.yaml", usage: true };
+  }
+  if (!PRINCIPAL_ID_RE.test(principal)) {
+    return { ok: false, reason: `principal "${principal}" must be lowercase alphanumeric + hyphen, letter-prefixed`, usage: true };
+  }
+
+  const slugRes = resolveProvisionSlug(stackArg, principal, cfg);
+  if (!slugRes.ok) return { ok: false, reason: slugRes.reason, usage: true };
+  const slug = slugRes.slug;
+
+  const names = deriveProvisionNames(principal, slug);
+  if (!names.ok) return { ok: false, reason: names.reason, usage: true };
+
+  const seedPath = optionalValueFlag(flags, "--seed-path") ?? cfg.stack?.nkey_seed_path ?? `~/.config/nats/${principal}-${slug}.seed`;
+  const credsPath = optionalValueFlag(flags, "--creds") ?? cfg.stack?.nats_infra?.creds_path ?? `~/.config/nats/${slug}.creds`;
+
+  const applyRes = resolveApply(flags);
+  if (!applyRes.ok) return { ok: false, reason: applyRes.reason, usage: true };
+
+  const inputs: ProvisionInputs = {
+    principal,
+    stackSlug: slug,
+    stackId: `${principal}/${slug}`,
+    operatorName: names.operatorName, // nsc operator account name (OP_<PRINCIPAL>)
+    federationAccountName: names.federationAccountName,
+    agentsAccountName: names.agentsAccountName,
+    seedPath,
+    credsPath,
+    force: flags["--force"] === true,
+    apply: applyRes.apply,
+    state: {
+      federationAccount: cfg.stack?.nats_infra?.account,
+      agentsAccount: cfg.stack?.nats_infra?.agents_account,
+      signingSeedExists: existsSync(expandTilde(seedPath)),
+    },
+  };
+  return { ok: true, inputs, stackConfigPath: resolveStackWriteConfigPath(configPath) };
+}
+
+async function runProvision(
+  stackArg: string,
+  flags: FlagMap,
+  json: boolean,
+  load: ConfigReader,
+  portsFactory: ProvisionPortsFactory,
+): Promise<ExitResult> {
+  const derived = deriveProvisionInputs(stackArg, flags, load);
+  if (!derived.ok) {
+    return derived.usage ? usageError("provision", derived.reason, json) : opError("provision", derived.reason, json);
+  }
+  const { inputs, stackConfigPath } = derived;
+
+  const ports = portsFactory(stackConfigPath);
+  const res = await provisionStack(inputs, ports);
+
+  if (json) {
+    const data: Record<string, string> = {
+      stack: inputs.stackId,
+      applied: res.applied ? "true" : "false",
+      operator: inputs.operatorName, // nsc operator account
+      federation_account: inputs.federationAccountName,
+      agents_account: inputs.agentsAccountName,
+    };
+    if (res.resolved !== undefined) {
+      data.account = res.resolved.account;
+      data.agents_account_pubkey = res.resolved.agentsAccount;
+    }
+    const env = res.ok
+      ? envelopeOk([{ stack: inputs.stackId, plan: res.plan }], data)
+      : envelopeError(res.reason ?? "provision failed", data);
+    return res.ok
+      ? ok(renderJson(env))
+      : { exitCode: 1, stdout: "", stderr: renderJson(env) };
+  }
+
+  const header = res.applied
+    ? `cortex network provision ${inputs.stackId}: ${res.ok ? "ok" : "FAILED"}`
+    : `cortex network provision ${inputs.stackId}: dry-run (no mutation; pass --apply)`;
+  const body =
+    `${header}\n` +
+    `  principal: ${inputs.principal}   stack: ${inputs.stackId}\n` +
+    res.steps.map((s) => (s === "" ? "" : `  ${s}`)).join("\n") +
+    (res.ok ? "" : `\n  ✗ ${res.reason ?? "unknown failure"}`) +
+    "\n";
+  return res.ok ? ok(body) : { exitCode: 1, stdout: "", stderr: body };
+}
+
+/**
+ * `cortex network join` plug-and-play (cortex#1139) — when the stack isn't
+ * provisioned yet (no `stack.nats_infra.account` + `agents_account`),
+ * auto-run `cortex network provision` first so a single `join` stands the whole
+ * substrate up. Returns the provision output to PREPEND, and whether join
+ * should abort (an --apply provision that failed).
+ */
+/**
+ * A stack is "provisioned enough to join" once its federation account is in
+ * config (`stack.nats_infra.account`). `agents_account` is the G1d enhancement
+ * (cross-account wiring); its absence does NOT block a legacy join.
+ */
+function isStackProvisioned(cfg: LoadedConfig): boolean {
+  return cfg.stack?.nats_infra?.account !== undefined;
+}
+
+/**
+ * Auto-provision fires ONLY for a config that genuinely describes a cortex
+ * stack (principal.id + stack.id present) that has NOT yet minted its account
+ * tree. This deliberately EXCLUDES the fully-flagged / empty-config legacy join
+ * path (no principal/stack in config) so it never disrupts an explicit join.
+ */
+function shouldAutoProvision(cfg: LoadedConfig): boolean {
+  return (
+    cfg.principal?.id !== undefined &&
+    cfg.stack?.id !== undefined &&
+    cfg.stack?.nats_infra?.account === undefined
+  );
+}
+
+async function maybeAutoProvision(
+  flags: FlagMap,
+  json: boolean,
+  load: ConfigReader,
+  portsFactory: ProvisionPortsFactory,
+): Promise<{ ran: boolean; provisionedAfter: boolean; provisionFailed: boolean; output: string }> {
+  const configPath = expandTilde(optionalValueFlag(flags, "--config") ?? DEFAULT_CONFIG_PATH);
+  let cfg: LoadedConfig;
+  try {
+    cfg = load(configPath);
+  } catch {
+    // A broken config surfaces later in the join's own derive; don't double-fail.
+    return { ran: false, provisionedAfter: true, provisionFailed: false, output: "" };
+  }
+  if (!shouldAutoProvision(cfg)) {
+    return { ran: false, provisionedAfter: true, provisionFailed: false, output: "" };
+  }
+
+  // Auto-provision with the SAME apply posture as the join.
+  const res = await runProvision("", flags, json, load, portsFactory);
+  const out = res.stdout || res.stderr;
+  const banner = json ? "" : "cortex network join: stack not provisioned — auto-running `cortex network provision` first\n";
+
+  // Re-read: on an --apply run the live config write-back lands, so the re-read
+  // now sees the account tree and the join CAN proceed in the same invocation
+  // (true plug-and-play). On a dry-run nothing was written, so the stack is
+  // still unprovisioned and the join cannot meaningfully continue.
+  let provisionedAfter = false;
+  try {
+    provisionedAfter = isStackProvisioned(load(configPath));
+  } catch {
+    provisionedAfter = false;
+  }
+  return { ran: true, provisionedAfter, provisionFailed: res.exitCode !== 0, output: banner + out };
+}
+
+// =============================================================================
 // Dispatcher
 // =============================================================================
 
@@ -1545,6 +1822,10 @@ export async function dispatchNetwork(
   // #56 — injectable probe-bus factory so `ping` CLI tests drive a fake bus
   // without standing up NATS. Production omits it → the live NATS-backed bus.
   pingBusFactory: PingBusFactory = DEFAULT_PING_BUS_FACTORY,
+  // cortex#1139 — injectable provision-ports factory so `provision` / the join
+  // auto-provision CLI tests drive fake arc/fs ports. Production omits it → the
+  // live adapters (arc account-tree seam + signing + config write-back).
+  provisionPortsFactory: ProvisionPortsFactory = DEFAULT_PROVISION_PORTS_FACTORY,
 ): Promise<ExitResult> {
   let parsed;
   try {
@@ -1571,7 +1852,7 @@ export async function dispatchNetwork(
 
   switch (parsed.subcommand) {
     case "join":
-      return runJoin(parsed.positionals.network ?? "", parsed.flags, json, load);
+      return runJoin(parsed.positionals.network ?? "", parsed.flags, json, load, provisionPortsFactory);
     case "leave":
       return runLeave(parsed.positionals.network ?? "", parsed.flags, json, load);
     case "status":
@@ -1582,6 +1863,8 @@ export async function dispatchNetwork(
       return runPing(parsed.positionals.peer ?? "", parsed.flags, json, load, pingBusFactory);
     case "admit":
       return runAdmit(parsed.positionals["request-id"] ?? "", parsed.flags, json);
+    case "provision":
+      return runProvision(parsed.positionals.stack ?? "", parsed.flags, json, load, provisionPortsFactory);
   }
 }
 
@@ -1601,6 +1884,8 @@ Usage:
   cortex network admit  <request-id> --admin-seed <path> [--network <id>] [--registry-url <url>]
                         [--discord-member <id>] [--discord-guild <id>] [--discord-server <profile>]
                         [--discord-role <name>] [--apply] [--dry-run] [--json]
+  cortex network provision <stack> [--config <p>] [--principal <id>] [--seed-path <p>]
+                        [--creds <p>] [--force] [--apply] [--dry-run] [--json]
 
 The one-liner (#753): \`cortex network join <network>\` derives EVERYTHING from
 the loaded cortex.yaml — principal (principal.id), stack (stack.id), signing
@@ -1641,6 +1926,20 @@ Subcommands:
           signed claim it WOULD POST); pass --apply to actually write. The
           registry FAILS CLOSED if its REGISTRY_ADMIN_PUBKEYS allowlist is
           unset, and rejects (403) an admin key not on the allowlist.
+  provision (cortex#1139, ADR-0013) One-command sovereign account-topology setup.
+          Mints the principal's OWN nsc operator (OP_<PRINCIPAL>) + a dedicated
+          federation account + a per-stack agents account (ADR-0012 isolation),
+          wires the local federated.> export/import (federation account → agents
+          account), ensures the chmod-600 signing seed (no-clobber; --force to
+          rotate), and writes stack.nats_infra back — leaving the stack ready for
+          \`cortex network join\`. cortex runs zero nsc itself — it shells to arc
+          for the nsc \`init-operator\` / \`add-account\` / \`add-federation-export\`
+          mutations.
+          DRY-RUN by default (prints the plan); --apply mutates. \`cortex network
+          join\` auto-runs this when the stack isn't provisioned yet. The
+          operator-mode bus conversion + restart are left to \`join\` (this verb is
+          non-disruptive). Remaining two-party steps after provision: the leaf
+          shared secret + hub topology agreement (out-of-band).
   admit   (ADR-0015) One-command admin admission decision. Verifies the admin
           seed (chmod-600 gated), builds a signed admission decision claim
           (decision: "admit"), and POSTs it to /admission-requests/:id/admit
