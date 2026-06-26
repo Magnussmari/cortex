@@ -1,18 +1,28 @@
-# Design — Envelope Encryption Strategy (Federation Payload Confidentiality)
+# Design — Envelope Encryption Strategy (M3 Federation Payload Confidentiality)
 
-**Status:** Draft
-**Feature:** IAW E.7 — federation payload confidentiality
-**Refs:** cortex#369 (this work item), cortex#117 (IAW Phase E umbrella), `docs/design-internet-of-agentic-work.md` (federation model §3.x), `docs/plan-internet-of-agentic-work.md` (Phase D + Phase E)
-**Author:** Architect (design session pending: principal + JC)
-**Type:** Design-only — no implementation. Decision document.
+**Status:** **Accepted** (ratified with Andreas 2026-06-27 — option-3 floor, M3 ships in **this** release)
+**Feature:** M3 federated payload confidentiality · IAW E.7 · TC-3 (folds cortex#369)
+**Refs:** cortex#627 (Trust & Confidentiality umbrella), cortex#369 (TC-3 work item), cortex#1142 (admission gate / leaf-secret — the shared-primitive co-consumer), [ADR-0019](adr/0019-federated-payload-encryption.md) (this decision), [ADR-0018](adr/0018-admission-gate-and-leaf-secret-distribution.md) (leaf-secret distribution — same seal primitive), [ADR-0013](adr/0013-sovereign-federation-model.md) (sovereign federation), `docs/design-trust-confidentiality.md` (Phase 3), `docs/design-internet-of-agentic-work.md` (federation model §3.x)
+**Author:** Architect · ratified with Andreas (2026-06-27)
+**Type:** Design — decision document. No feature code in this PR.
 
 ---
 
 ## §0 — TL;DR
 
-Cortex signs every envelope (stack NKey / ed25519 over the JCS-canonical `SIGNABLE_FIELDS`). That gives **integrity + authenticity**, not **confidentiality** — payloads are plaintext on the NATS bus and at rest in JetStream. That is fine today (single-principal meshes where the bus *is* the principal's own network). It stops being fine in Phase E: multi-network bridges and cross-principal federation push payloads onto subjects a **peer principal** can subscribe to and a network hub can read.
+Cortex signs every envelope (stack NKey / ed25519 over the JCS-canonical `SIGNABLE_FIELDS`). That gives **integrity + authenticity**, not **confidentiality** — payloads are plaintext on the NATS bus and at rest in JetStream. That was fine while the bus *was* the principal's own private mesh. It stops being fine the moment the **community federation tier goes live**: admitting non-pre-trusted members onto a cleartext `federated.>` federation would let **any admitted peer** passively read every `federated.>` payload (the residual flagged in `design-admission-gate-leaf-secret.md` §7 Q7). M3 payload confidentiality is the resolution of that residual, and is therefore being **pulled into this release** rather than deferred (CONTEXT.md §222 deferral is hereby reversed).
 
-This doc recommends:
+### Ratified locks (2026-06-27)
+
+| Lock | Decision |
+|---|---|
+| **L1 — v1 floor = option 3 (§3.3)** | Direct/Delegate dispatch is **sealed-to-recipient**; **Offer-mode payloads stay cleartext-but-signed**. Confidential cross-principal work uses **Direct dispatch**. Per-network Offer key (option 1) is a documented **opt-in upgrade**, not v1. Seal-to-all-candidates (option 2) is **future**. |
+| **L2 — encrypt-then-sign (§4)** | `signed_by` covers the **ciphertext**; the recipient verifies the signature on the sealed form, *then* decrypts. Verify-before-decrypt. |
+| **L3 — no new key material** | The X25519 sealing key is derived from the existing ed25519 stack identity (`crypto_sign_ed25519_*_to_curve25519`). **No certs, no new registry surface, no new distribution channel.** |
+| **L4 — shared seal primitive** | The sealing mechanism (ed25519→X25519 + `crypto_box_seal`) is the **same** primitive the leaf-secret distribution (ADR-0018, option b′) uses. Both MUST consume **one shared `seal-to-principal` module** (§3.4). |
+| **L5 — opt-in per network, transition window** | A per-network `encryption` flag in `policy.federated.networks[]`; during transition a member **accepts both** cleartext-but-signed and sealed payloads; federating without it emits a **loud-but-not-fatal** warning. |
+
+This doc records:
 
 1. **Two layers, two jobs.** Wire-layer confidentiality (`tls://` leaf-nodes) protects bytes in transit; **payload-layer confidentiality** (sealed payload) protects content *from the peer principals and hubs that are legitimately on the bus*. TLS does not solve the federation threat because the peer is an authorized bus participant. Both layers are needed; they are independent.
 2. **Sealed-payload pattern.** Encrypt `payload` (and only `payload`) to the recipient stack's public key with X25519 + an AEAD (NaCl `crypto_box` / libsodium sealed box semantics). Derive the X25519 keypair *deterministically from the existing ed25519 stack identity* — **no new long-term key material, no certs**. All envelope metadata (`sovereignty`, `source`, `type`, `correlation_id`, `target_assistant`, `signed_by[]`, `originator`, `distribution_mode`, `requirements`) stays cleartext so the bus routes and verifies exactly as today.
@@ -140,7 +150,20 @@ Three candidate resolutions, in preference order:
 2. **Seal-to-all-candidates (multi-recipient box).** The publisher seals the payload to the X25519 pubkeys of *every* stack on the network that declares the capability (the registry knows capability→stack from the D.4 capability registration). The sealed container carries N per-recipient wrapped keys (`recipients[]` already plural in §3.1). Pro: no shared key; only declared-capable stacks can read. Con: publisher must enumerate candidates at publish time (registry lookup on the hot path), envelope grows with N, a stack that *joins* the capability after publish can't read a replayed envelope. Viable but heavier.
 3. **Don't encrypt Offer payloads in v1; require Direct/Delegate for confidential cross-principal work.** Simplest, and arguably correct: confidential work usually *has* a known recipient. Offer is for "anyone competent, claim this" — often less sensitive. Document that confidential federated work uses Direct dispatch.
 
-**Recommendation:** ship **option 3 as the v1 floor** (encryption requires a named recipient; Offer payloads stay cleartext-but-signed, gated by the same `federated.` warning), and offer **option 1 (per-network Offer key)** as the opt-in for networks that need confidential fan-out. Option 2 is recorded as a future enhancement if seal-to-all becomes necessary. This keeps v1 small and the strong per-recipient story intact, while giving a clear upgrade path. (Open question Q1/Q4 puts this in front of the principal + JC.)
+**LOCKED (L1, ratified 2026-06-27):** ship **option 3 as the v1 floor** — encryption requires a **named recipient** (Direct/Delegate); **Offer payloads stay cleartext-but-signed**, gated by the same `federated.` warning. **Confidential cross-principal work uses Direct dispatch.** Option 1 (per-network Offer key) is the documented **opt-in** for networks that later need confidential fan-out; option 2 (seal-to-all-candidates) is recorded as a **future** enhancement. Rationale for the floor over richer options at launch: confidential work almost always *has* a known recipient (Direct), so the floor loses nothing the community tier needs on day one; it keeps the strong per-recipient confidentiality story intact (no shared secret to distribute or rotate); and it is the smallest mechanism that closes the §7-Q7 cleartext residual for addressed traffic. This was previously open question Q1/Q4 — now closed.
+
+### §3.4 — The shared `seal-to-principal` primitive (design constraint L4)
+
+The sealing mechanism here is **not** unique to payload confidentiality. The leaf-secret distribution design ([ADR-0018](adr/0018-admission-gate-and-leaf-secret-distribution.md), option **b′**) seals the per-member NATS leaf PSK to the admitted joiner's *already-registered* ed25519 pubkey using the identical construction: **ed25519→X25519 conversion + libsodium `crypto_box_seal` (sealed box / anonymous-sender)**. Two callers, one cryptographic operation:
+
+| Consumer | Seals what | To whom |
+|---|---|---|
+| **M3 payload encryption** (this doc) | the envelope `payload` | the recipient **stack's** registered pubkey |
+| **Leaf-secret distribution** (ADR-0018 b′) | the per-member leaf PSK | the admitted **joiner's** registered pubkey |
+
+**Constraint:** both MUST consume **one shared `seal-to-principal` module** — a single implementation of `sealTo(recipientEd25519Pub, plaintext) → sealedBlob` and `openSealed(ownSeed, sealedBlob) → plaintext`, with the ed25519→X25519 derivation in exactly one place. Two independent implementations of "seal to a registered pubkey" is a security-review and key-derivation-divergence hazard (a subtle difference in the conversion or the AEAD construction between the two call sites is the kind of bug that ships silently and breaks interop or confidentiality). This is the myelin primitive filed in §7(2); ADR-0018's build slice and this doc's TC-3 slice both depend on it landing **once**.
+
+> Difference in *shape*, not *primitive*: M3 carries the sealed blob in `extensions.enc` + ciphertext-in-`payload` (§3.1) with AEAD associated-data binding to the envelope header; ADR-0018 carries an opaque sealed blob in a registry field / PoP-read response. The seal/open core is shared; the envelope-binding wrapper (associated data) is M3-specific and layered on top.
 
 ---
 
@@ -148,7 +171,7 @@ Three candidate resolutions, in preference order:
 
 The existing `signed_by` chain signs the **envelope as it goes on the wire**. The question is *what bytes the wire-going signature covers* once `payload` is sealed: the plaintext payload, or the ciphertext?
 
-**Recommendation: encrypt-then-sign — the stack seals `payload`, then `signEnvelope` signs the SIGNABLE_FIELDS over the *sealed* envelope (ciphertext in `payload`, `extensions.enc` present).** I.e. the wire signature covers the ciphertext, not the plaintext.
+**LOCKED (L2, ratified 2026-06-27): encrypt-then-sign — the stack seals `payload`, then `signEnvelope` signs the SIGNABLE_FIELDS over the *sealed* envelope (ciphertext in `payload`, `extensions.enc` present).** I.e. the wire signature covers the ciphertext, not the plaintext.
 
 Justification:
 
@@ -218,12 +241,42 @@ The decision predicate is mechanical and lives next to the existing alignment ch
 
 Encryption is an **additive Phase E slice (E.7)** layered on top of Phase D federation. It does not block any earlier phase and does not change the wire for non-encrypting deployments.
 
-### Decision (ratified posture, cortex#369)
+### Decision (ratified posture, 2026-06-27 — cortex#627 / #369)
 
-- **Signing-only is the v1 / out-of-box default.** Confirmed.
-- **Encryption is opt-in, per network.** A stack with `policy.federated.networks: []` or no `encryption:` key never touches encryption code.
-- **Sealed-payload (per-recipient, X25519-from-identity) is the v1 mechanism.** Per-network shared key is the documented opt-in for Offer fan-out (§3.3).
+- **Signing-only stays the out-of-box default.** A stack with `policy.federated.networks: []` or no `encryption:` key never touches encryption code. M3 is **opt-in per network**, not an unconditional new requirement.
+- **M3 ships in THIS release** (reversing the CONTEXT.md §222 deferral) because the **community federation tier goes live now** — admitting non-pre-trusted peers onto a cleartext `federated.>` mesh is the threat M3 closes.
+- **Sealed-payload (per-recipient, X25519-from-identity, option-3 floor) is the v1 mechanism** (L1). Per-network shared key is the documented opt-in for Offer fan-out (§3.3).
+- **Encrypt-then-sign** (L2); **no new key material** (L3); **one shared `seal-to-principal` primitive with ADR-0018 b′** (L4); **opt-in per network with a both-accepted transition window + loud warning** (L5).
 - **Key rotation** rides the registry's existing transition-claim mechanism (§5.2).
+
+### What this release ships vs. defers
+
+**Ships (this release — the community-tier floor):**
+
+- Sealed-to-recipient `payload` for **Direct/Delegate** `federated.*` dispatch (option-3 floor, L1).
+- The shared `seal-to-principal` module (ed25519→X25519 + `crypto_box_seal`), consumed by **both** M3 and ADR-0018 leaf-secret sealing (L4).
+- AEAD associated-data binding ciphertext → cleartext header (`id` + `type` + `sovereignty.classification`, §3.1).
+- Recipient pubkey resolution from the registry (derive X25519 from `principal_pubkey`, §5).
+- The per-network `encryption: off|enabled|required` flag + the **both-accepted transition window** + the **loud-but-not-fatal** "federating in the clear" warning (L5, §7 below).
+- Decrypt-on-receive after verify; the multi-hop verify-before-decrypt property (§4).
+- Rotation in lockstep with the signing key (§5.2).
+
+**Defers (post-this-release):**
+
+- **Offer-mode confidentiality** — per-network Offer key (§3.3 option 1, opt-in) and seal-to-all-candidates (option 2, future). Until then, confidential fan-out is done as Direct dispatch.
+- **Registry-attested `principal_encpubkey`** field (§5; client-side derivation suffices for v1).
+- **Public-mesh encryption** (out of scope across IAW phases).
+- **At-rest field encryption** — principal infra (OS-FDE); sealed payload gives incidental at-rest protection on non-recipient stacks (§6).
+
+### Build slices (TC-3 breakdown)
+
+| Slice | Scope | Depends on |
+|---|---|---|
+| **TC-3.0** | Shared `seal-to-principal` myelin primitive: `deriveCurve25519From{Seed,Pubkey}`, `sealTo`, `openSealed`. One module, two consumers (M3 + ADR-0018 b′). | myelin (§7 items 1–2) |
+| **TC-3.1** | `sealPayload(envelope, recipientEncPub) → sealedEnvelope` + `openPayload(sealedEnvelope, ownSeed)` — the §3.1 `extensions.enc` shape + AEAD associated-data binding. | TC-3.0; confirm `extensions` ∈ SIGNABLE_FIELDS (§7 item 3) |
+| **TC-3.2** | Publish path: `seal → signEnvelope(sealed) → publish` for Direct/Delegate `federated.*` when the network has `encryption: enabled|required` and a named recipient. Recipient pubkey resolved from the registry (TC-2a client). | TC-3.1; TC-2a/2b (registry client + multi-principal registry) |
+| **TC-3.3** | Receive path: `verifyChain → checkSovereignty → openPayload → dispatch`; accept both cleartext + sealed in `enabled`; reject cleartext `federated` in `required` (Q6 → see §8). | TC-3.2 |
+| **TC-3.4** | Config + posture: `encryption` flag in `policy.federated.networks[]`; loud-but-not-fatal warning when federating with `encryption: off` or non-TLS; transition-window flip runbook. | TC-3.3 |
 
 ### Config surface (one additive field)
 
@@ -265,8 +318,8 @@ When a stack opens a `federated` leaf-node link with `encryption: off` (or a non
 
 Encryption touches the identity/crypto layer that myelin owns. File as a separate myelin issue once this design lands (per cortex#369 process):
 
-1. **ed25519 → X25519 derivation helper** in `@the-metafactory/myelin/identity` (`deriveCurve25519FromEd25519(seed)` / `…FromPubkey(pub)`) — so cortex and peers derive identically.
-2. **`sealPayload(envelope, recipientEncPubkeys[]) → sealedEnvelope`** and **`openPayload(sealedEnvelope, ownSeed) → envelope`** — AEAD seal/open producing the §3.1 shape, with associated-data binding to envelope header fields.
+1. **Shared `seal-to-principal` module** in `@the-metafactory/myelin/identity` — the ed25519 → X25519 derivation helper (`deriveCurve25519From{Seed,Pubkey}`) **plus** the core `sealTo(recipientEd25519Pub, plaintext) → sealedBlob` / `openSealed(ownSeed, sealedBlob) → plaintext` (`crypto_box_seal`). This is the **one** module both M3 and ADR-0018's leaf-secret sealing (option b′) consume (L4, §3.4). Derivation lives in exactly one place so cortex, peers, and the leaf-secret path derive identically.
+2. **`sealPayload(envelope, recipientEncPubkeys[]) → sealedEnvelope`** and **`openPayload(sealedEnvelope, ownSeed) → envelope`** — the M3-specific wrapper over (1) that produces the §3.1 `extensions.enc` shape, with AEAD associated-data binding to envelope header fields. (Leaf-secret sealing uses (1) directly with no envelope wrapper.)
 3. **Confirm `extensions` is inside SIGNABLE_FIELDS** (so `extensions.enc` is tamper-evident under the existing signature). If not, add it — this is the one change the encrypt-then-sign composition (§4) depends on.
 4. **Registry transition-claim rotation** (already a myelin/registry v2 follow-up) — confirm it covers the derived enc key implicitly (it does, since the enc key derives from the rotated signing key).
 
@@ -274,7 +327,9 @@ Encryption touches the identity/crypto layer that myelin owns. File as a separat
 
 ## §8 — Open questions for the principal (+ JC)
 
-1. **Q1 — Offer-mode confidentiality floor.** Accept §3.3 option 3 as the v1 floor (confidential federated work requires a *named* recipient via Direct/Delegate; Offer payloads stay cleartext-but-signed)? Or is confidential fan-out a v1 requirement, forcing per-network keys (option 1) into v1?
+> **Ratification status (2026-06-27):** **Q1 CLOSED** → option-3 floor (L1). **Q2 CLOSED** → reuse the stack seed for the X25519 key (L3, "no certs out of the box"). **Q4 CLOSED** → per-network key approved strictly as an opt-in for Offer fan-out. **Q3 / Q5 / Q6 / Q7** remain implementation-time tuning, recorded below; **Q8** is satisfied by this ratified design serving as the JC anchor. None block the build.
+
+1. **Q1 — Offer-mode confidentiality floor.** **[CLOSED — option-3 floor, L1.]** Accept §3.3 option 3 as the v1 floor (confidential federated work requires a *named* recipient via Direct/Delegate; Offer payloads stay cleartext-but-signed)? Or is confidential fan-out a v1 requirement, forcing per-network keys (option 1) into v1?
 2. **Q2 — Stack-key reuse for encryption.** Confirm deriving the X25519 encryption key from the existing ed25519 stack seed (no new key material) is acceptable, vs. a separate dedicated encryption keypair. Reuse = zero new ceremony (the cortex#369 priority); a separate key = cleaner key-hygiene separation (signing vs encryption) at the cost of a second registry field + a second rotation. **Recommendation: reuse — it is what makes "no certs out of the box" true.**
 3. **Q3 — Registry enc-key field.** Publish a pre-converted `principal_encpubkey` (X25519) in the registry record (registry-attested, saves a derivation), or derive client-side from `principal_pubkey` (zero registry change)? **Recommendation: derive client-side for v1; add the field later if a non-cortex peer can't do the conversion.**
 4. **Q4 — Per-network key as opt-in.** Approve the per-network shared key strictly as an opt-in for Offer fan-out, never as the default mechanism — confining its weaker confidentiality + heavier rotation to exactly the case that needs it?
@@ -289,13 +344,14 @@ Encryption touches the identity/crypto layer that myelin owns. File as a separat
 
 | # | Decision | Status |
 |---|---|---|
-| D1 | Signing-only is the out-of-box default; encryption opt-in per network | Ratified (cortex#369) |
-| D2 | Sealed-payload, per-recipient, X25519 derived from existing ed25519 stack identity, is the v1 mechanism | **Recommended** |
-| D3 | Encrypt `payload` only; all routing/trust/sovereignty metadata stays cleartext + signed | **Recommended** (firm — required by routing) |
-| D4 | Encrypt-then-sign — wire signature covers ciphertext; verify-before-decrypt | **Recommended** |
-| D5 | Seal to the **stack** key, not per-assistant | **Recommended** |
-| D6 | Encryption gated on `sovereignty.classification === 'federated'` + network `encryption` flag; `local` never encrypts | **Recommended** |
-| D7 | Per-network shared key is opt-in for Offer fan-out only | **Recommended** (Q1/Q4) |
-| D8 | Rotation rides the registry transition-claim mechanism; signing+enc keys rotate in lockstep; grace window for in-flight | **Recommended** (Q5) |
-| D9 | TLS leaf-nodes are a documented mandate + runtime warning, not code-enforced (M1 = principal infra) | **Recommended** |
-| D10 | myelin primitives (derivation, seal/open, SIGNABLE_FIELDS `extensions`) filed upstream as a separate myelin issue | Action (§7) |
+| D1 | Signing-only is the out-of-box default; encryption opt-in per network; **M3 ships THIS release** for the community tier | **Accepted** (2026-06-27, cortex#627) |
+| D2 | Sealed-payload, per-recipient, X25519 derived from existing ed25519 stack identity, is the v1 mechanism (L1/L3) | **Accepted** |
+| D3 | Encrypt `payload` only; all routing/trust/sovereignty metadata stays cleartext + signed | **Accepted** (required by routing) |
+| D4 | Encrypt-then-sign — wire signature covers ciphertext; verify-before-decrypt (L2) | **Accepted** |
+| D5 | Seal to the **stack** key, not per-assistant | **Accepted** |
+| D6 | Encryption gated on `sovereignty.classification === 'federated'` + network `encryption` flag; `local` never encrypts | **Accepted** |
+| D7 | Per-network shared key is opt-in for Offer fan-out only; Direct/Delegate floor is cleartext-but-signed Offer (L1) | **Accepted** (Q1/Q4 closed) |
+| D8 | Rotation rides the registry transition-claim mechanism; signing+enc keys rotate in lockstep; grace window for in-flight | **Accepted** (Q5 tuning) |
+| D9 | TLS leaf-nodes are a documented mandate + runtime warning, not code-enforced (M1 = principal infra) | **Accepted** |
+| D10 | One shared `seal-to-principal` primitive serves both M3 and ADR-0018 leaf-secret sealing (L4) | **Accepted** (§3.4) |
+| D11 | myelin primitives (derivation, seal/open, SIGNABLE_FIELDS `extensions`) filed upstream as a separate myelin issue | Action (§7) |
