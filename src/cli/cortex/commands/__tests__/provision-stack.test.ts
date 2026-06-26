@@ -32,8 +32,13 @@ import registryApp from "../../../../services/network-registry/src/index";
 import type { Env } from "../../../../services/network-registry/src/index";
 import {
   makeRegistryKey,
+  makePrincipalKey,
+  makeSignedAdminRead,
+  makeSignedAdminDecision,
   resetStores,
+  type PrincipalKey,
 } from "../../../../services/network-registry/__tests__/helpers";
+import type { AdmissionRequest } from "../../../../services/network-registry/src/types";
 
 const tmpDirs: string[] = [];
 function freshDir(): string {
@@ -239,15 +244,46 @@ describe("cortex provision-stack register — C-787 add-stack (no data loss)", (
   // the registry pubkey. We keep it alongside the env so each test can pass it
   // via --registry-pubkey.
   let registryPubkey = "";
+  let adminKey: PrincipalKey | undefined;
   async function configuredEnv(): Promise<Env> {
     resetStores();
     const reg = await makeRegistryKey();
     registryPubkey = reg.publicKey;
+    adminKey = await makePrincipalKey();
     return {
       REGISTRY_SIGNING_KEY: reg.signingKey,
       REGISTRY_PUBLIC_KEY: reg.publicKey,
+      REGISTRY_ADMIN_PUBKEYS: adminKey.publicKeyB64,
       ENVIRONMENT: "test",
     };
+  }
+
+  /**
+   * ADR-0018 Gap-B — admit the principal's PENDING request for `networkId` so
+   * they appear on the (admission-sourced) roster. Membership is no longer
+   * capability-derived; an admit is required.
+   */
+  async function admitInto(env: Env, principalId: string, networkId: string): Promise<void> {
+    const read = await makeSignedAdminRead(adminKey!);
+    const listRes = await registryApp.fetch(
+      new Request("http://registry.test/admission-requests?status=PENDING", {
+        headers: { "x-admin-signed": JSON.stringify(read) },
+      }),
+      env,
+    );
+    const list = (await listRes.json()) as AdmissionRequest[];
+    const req = list.find((r) => r.principal_id === principalId && r.network_id === networkId);
+    expect(req).toBeDefined();
+    const decision = await makeSignedAdminDecision(req!.request_id, "admit", adminKey!);
+    const admitRes = await registryApp.fetch(
+      new Request(`http://registry.test/admission-requests/${req!.request_id}/admit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(decision),
+      }),
+      env,
+    );
+    expect(admitRes.status).toBe(200);
   }
 
   /** Route the CLI's global fetch at the in-memory registry app for `env`. */
@@ -328,6 +364,65 @@ describe("cortex provision-stack register — C-787 add-stack (no data loss)", (
     } finally {
       restore();
     }
+  });
+
+  test("ADR-0018 Gap-A — register --network pins the PENDING admission request to the network", async () => {
+    const env = await configuredEnv();
+    const dir = freshDir();
+    const seed = join(dir, "stack.nk");
+    await dispatchProvisionStack(["generate", "andreas", "--seed-path", seed]);
+
+    const restore = routeFetchToRegistry(env);
+    try {
+      const res = await dispatchProvisionStack([
+        "register",
+        "andreas",
+        "--seed-path",
+        seed,
+        "--stack-id",
+        "andreas/meta-factory",
+        "--registry-url",
+        "http://registry.test",
+        "--network",
+        "research-collab",
+      ]);
+      expect(res.exitCode).toBe(0);
+
+      // The admission request created by the register hook carries network_id.
+      const read = await makeSignedAdminRead(adminKey!);
+      const listRes = await registryApp.fetch(
+        new Request("http://registry.test/admission-requests?status=PENDING", {
+          headers: { "x-admin-signed": JSON.stringify(read) },
+        }),
+        env,
+      );
+      const list = (await listRes.json()) as AdmissionRequest[];
+      const andreas = list.filter((r) => r.principal_id === "andreas");
+      expect(andreas.length).toBe(1);
+      expect(andreas[0]!.network_id).toBe("research-collab");
+    } finally {
+      restore();
+    }
+  });
+
+  test("ADR-0018 Gap-A — register rejects a malformed --network (exit 2, no POST)", async () => {
+    const env = await configuredEnv();
+    const dir = freshDir();
+    const seed = join(dir, "stack.nk");
+    await dispatchProvisionStack(["generate", "andreas", "--seed-path", seed]);
+    const res = await dispatchProvisionStack([
+      "register",
+      "andreas",
+      "--seed-path",
+      seed,
+      "--registry-url",
+      "http://registry.test",
+      "--network",
+      "Bad_Net",
+    ]);
+    expect(res.exitCode).toBe(2);
+    expect(res.stderr).toMatch(/--network/);
+    void env;
   });
 
   test("first registration (principal absent) still works — fetch+merge degrades to just the new stack", async () => {
@@ -429,6 +524,8 @@ describe("cortex provision-stack register — C-787 add-stack (no data loss)", (
         capabilities: [
           { id: "tasks.code-review", description: "JC reviews", networks: ["community-net"] },
         ],
+        // ADR-0018 Gap-A — name the target network so admission is pinned to it.
+        networkId: "community-net",
       });
       const seedRes = await registryApp.fetch(
         new Request("http://registry.test/principals/jc/register", {
@@ -439,6 +536,9 @@ describe("cortex provision-stack register — C-787 add-stack (no data loss)", (
         env,
       );
       expect(seedRes.status).toBe(201);
+      // ADR-0018 Gap-B — admit JC into community-net so they appear on the
+      // (admission-sourced) roster.
+      await admitInto(env, "jc", "community-net");
 
       // Precondition: JC is on the community roster.
       const rosterBefore = await registryApp.fetch(
@@ -462,7 +562,11 @@ describe("cortex provision-stack register — C-787 add-stack (no data loss)", (
       ]);
       expect(add.exitCode).toBe(0);
 
-      // 3. JC's caps survived → JC is STILL on the community roster (footgun closed).
+      // 3. JC's admission survived the add-stack re-register → JC is STILL on the
+      //    community roster (ADR-0018 Gap-B: membership is admission-sourced; the
+      //    add-stack register raises a separate network-less PENDING row and does
+      //    not disturb the ADMITTED community-net row). Caps preservation (the
+      //    C-819 footgun) is asserted directly on the principal record below.
       const rosterAfter = await registryApp.fetch(
         new Request("http://registry.test/networks/community-net/roster"),
         env,

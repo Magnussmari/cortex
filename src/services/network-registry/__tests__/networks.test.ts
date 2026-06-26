@@ -9,18 +9,23 @@ import {
   makePrincipalKey,
   makeRegistryKey,
   makeSignedRegistration,
+  makeSignedAdminRead,
+  makeSignedAdminDecision,
   resetStores,
   type PrincipalKey,
 } from "./helpers";
 import { canonicalJSON, verifyEd25519 } from "../src/signing";
 import { getStore } from "../src/store";
 import type {
+  AdmissionRequest,
+  Capability,
   NetworkDescriptor,
   NetworkRoster,
   SignedAssertion,
 } from "../src/types";
 
 let env: Env;
+let admin: PrincipalKey;
 
 async function post(path: string, body: unknown): Promise<Response> {
   return app.fetch(
@@ -33,16 +38,46 @@ async function post(path: string, body: unknown): Promise<Response> {
   );
 }
 
-async function get(path: string): Promise<Response> {
-  return app.fetch(new Request(`http://localhost${path}`), env);
+async function get(path: string, headers: Record<string, string> = {}): Promise<Response> {
+  return app.fetch(new Request(`http://localhost${path}`, { headers }), env);
+}
+
+/**
+ * ADR-0018 Gap-B — register a principal targeting `networkId`, then ADMIT the
+ * resulting PENDING request. After this the principal is a member of the network
+ * (admission is the source of truth). `capabilities` are the optional facet.
+ */
+async function registerAndAdmit(
+  principalId: string,
+  pKey: PrincipalKey,
+  networkId: string,
+  capabilities: Capability[] = [],
+): Promise<void> {
+  const reg = await post(
+    `/principals/${principalId}/register`,
+    await makeSignedRegistration(principalId, pKey, { networkId, capabilities }),
+  );
+  expect(reg.status).toBe(201);
+  const read = await makeSignedAdminRead(admin);
+  const listRes = await get("/admission-requests?status=PENDING", {
+    "x-admin-signed": JSON.stringify(read),
+  });
+  const list = (await listRes.json()) as AdmissionRequest[];
+  const req = list.find((r) => r.principal_id === principalId && r.network_id === networkId);
+  expect(req).toBeDefined();
+  const decision = await makeSignedAdminDecision(req!.request_id, "admit", admin);
+  const admitRes = await post(`/admission-requests/${req!.request_id}/admit`, decision);
+  expect(admitRes.status).toBe(200);
 }
 
 beforeEach(async () => {
   resetStores();
   const reg = await makeRegistryKey();
+  admin = await makePrincipalKey();
   env = {
     REGISTRY_SIGNING_KEY: reg.signingKey,
     REGISTRY_PUBLIC_KEY: reg.publicKey,
+    REGISTRY_ADMIN_PUBKEYS: admin.publicKeyB64,
     ENVIRONMENT: "test",
   };
 });
@@ -61,33 +96,25 @@ describe("GET /networks/:id/roster", () => {
     expect(json.payload.members).toEqual([]);
   });
 
-  test("aggregates principals whose capabilities target the network", async () => {
+  test("aggregates ADMITTED principals for the network, joining capabilities as a facet (ADR-0018 Gap-B)", async () => {
     const pA: PrincipalKey = await makePrincipalKey();
     const pB: PrincipalKey = await makePrincipalKey();
     const pC: PrincipalKey = await makePrincipalKey();
 
-    await post(
-      "/principals/alpha/register",
-      await makeSignedRegistration("alpha", pA, {
-        capabilities: [
-          { id: "tasks.code-review", networks: ["research-collab"] },
-          { id: "tasks.docs-edit", networks: ["docs-net"] },
-        ],
-      }),
-    );
-    await post(
-      "/principals/beta/register",
-      await makeSignedRegistration("beta", pB, {
-        capabilities: [{ id: "tasks.code-review", networks: ["research-collab"] }],
-      }),
-    );
-    // Gamma announces to a different network only — should be excluded.
-    await post(
-      "/principals/gamma/register",
-      await makeSignedRegistration("gamma", pC, {
-        capabilities: [{ id: "tasks.code-review", networks: ["other-net"] }],
-      }),
-    );
+    // alpha + beta are ADMITTED into research-collab — they appear.
+    await registerAndAdmit("alpha", pA, "research-collab", [
+      { id: "tasks.code-review", networks: ["research-collab"] },
+      { id: "tasks.docs-edit", networks: ["docs-net"] },
+    ]);
+    await registerAndAdmit("beta", pB, "research-collab", [
+      { id: "tasks.code-review", networks: ["research-collab"] },
+    ]);
+    // gamma ANNOUNCES a capability targeting research-collab but is NOT admitted
+    // into it (admitted into other-net instead). Capabilities no longer confer
+    // membership — gamma must be EXCLUDED.
+    await registerAndAdmit("gamma", pC, "other-net", [
+      { id: "tasks.code-review", networks: ["research-collab"] },
+    ]);
 
     const res = await get("/networks/research-collab/roster");
     expect(res.status).toBe(200);
@@ -186,32 +213,23 @@ describe("GET /networks/:id — descriptor (DD-12)", () => {
     expect(ok).toBe(true);
   });
 
-  test("members[] is derived from the roster (implicit membership)", async () => {
+  test("members[] is sourced from ADMITTED admission rows (ADR-0018 Gap-B)", async () => {
     await seedNetwork("research-collab", "tls://hub:7422", 7422);
 
     const pA: PrincipalKey = await makePrincipalKey();
     const pB: PrincipalKey = await makePrincipalKey();
     const pC: PrincipalKey = await makePrincipalKey();
 
-    await post(
-      "/principals/alpha/register",
-      await makeSignedRegistration("alpha", pA, {
-        capabilities: [{ id: "tasks.code-review", networks: ["research-collab"] }],
-      }),
-    );
-    await post(
-      "/principals/beta/register",
-      await makeSignedRegistration("beta", pB, {
-        capabilities: [{ id: "tasks.docs-edit", networks: ["research-collab"] }],
-      }),
-    );
-    // Gamma targets a different network — must NOT appear in members.
-    await post(
-      "/principals/gamma/register",
-      await makeSignedRegistration("gamma", pC, {
-        capabilities: [{ id: "tasks.code-review", networks: ["other-net"] }],
-      }),
-    );
+    // alpha + beta ADMITTED into research-collab; beta carries NO matching
+    // capability — an admitted-but-no-capability principal still appears.
+    await registerAndAdmit("alpha", pA, "research-collab", [
+      { id: "tasks.code-review", networks: ["research-collab"] },
+    ]);
+    await registerAndAdmit("beta", pB, "research-collab", []);
+    // gamma admitted into a DIFFERENT network — must NOT appear in members.
+    await registerAndAdmit("gamma", pC, "other-net", [
+      { id: "tasks.code-review", networks: ["other-net"] },
+    ]);
 
     const res = await get("/networks/research-collab");
     const json = (await res.json()) as SignedAssertion<NetworkDescriptor>;

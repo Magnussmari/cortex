@@ -43,8 +43,13 @@ import registryApp from "../../services/network-registry/src/index";
 import type { Env } from "../../services/network-registry/src/index";
 import {
   makeRegistryKey,
+  makePrincipalKey,
+  makeSignedAdminRead,
+  makeSignedAdminDecision,
   resetStores,
+  type PrincipalKey,
 } from "../../services/network-registry/__tests__/helpers";
+import type { AdmissionRequest } from "../../services/network-registry/src/types";
 
 const tmpDirs: string[] = [];
 function freshDir(): string {
@@ -467,30 +472,71 @@ describe("C-787 / C-791 — fetchExistingStacks (verified read side of add-stack
 });
 
 // =============================================================================
-// C-819 — capability merge-preserve (stop silent roster eviction)
+// C-819 — capability merge-preserve across re-register (ADR-0018 Gap-B model)
 // =============================================================================
 //
 // The register route does a FULL-OVERWRITE upsert of the `capabilities` column
 // (store.ts: `capabilities = excluded.capabilities`), identical to the stacks
-// column. Roster membership is IMPLICIT: a principal is "in" network X iff one
-// of its announced capabilities lists X in `capability.networks[]`. So a bare
-// re-register whose claim carries NO capabilities silently zeroes the set and
-// evicts the principal from every roster. `resolveMergedCapabilities` is the
-// capability twin of `resolveMergedStacks`: on the add-stack path it fetches
-// the (verified) existing set and unions the announce in, so an EMPTY announce
-// preserves the existing caps unchanged. These tests pin both the unit merge
-// semantics AND the end-to-end roster-survival behaviour against the real route.
+// column. `resolveMergedCapabilities` is the capability twin of
+// `resolveMergedStacks`: on the add-stack path it fetches the (verified)
+// existing set and unions the announce in, so an EMPTY announce preserves the
+// existing caps unchanged. That cap-merge behaviour is the C-819 concern and is
+// STILL valid — pinned by the unit tests below.
+//
+// What CHANGED (ADR-0018 Gap-B / Q3=ii): roster membership is no longer
+// capability-derived. The served roster `members[]` is now sourced from
+// ADMITTED admission rows, NOT from `capability.networks[]`. So the old
+// coupling "a caps-wipe evicts the principal from every roster" no longer
+// holds — membership and capabilities are independent facets. A principal is
+// "in" network X iff they hold an ADMITTED admission row for X; wiping their
+// caps (e.g. via a bare re-register) cannot evict an admitted member, and a
+// principal with caps-but-no-ADMITTED-row is NOT on the roster. The
+// silent-eviction footgun C-819 worked around is now structurally impossible.
+// These tests pin (a) the cap-merge semantics, and (b) that an ADMITTED
+// member's roster membership survives a bare re-register because it is
+// admission-derived, independent of the cap set.
 describe("C-819 — resolveMergedCapabilities preserves caps across re-register", () => {
   let registryPubkey = "";
+  let adminKey: PrincipalKey | undefined;
   async function configuredEnv(): Promise<Env> {
     resetStores();
     const reg = await makeRegistryKey();
     registryPubkey = reg.publicKey;
+    adminKey = await makePrincipalKey();
     return {
       REGISTRY_SIGNING_KEY: reg.signingKey,
       REGISTRY_PUBLIC_KEY: reg.publicKey,
+      REGISTRY_ADMIN_PUBKEYS: adminKey.publicKeyB64,
       ENVIRONMENT: "test",
     };
+  }
+
+  /**
+   * ADR-0018 Gap-B — admit the principal's PENDING request for `networkId` so
+   * they appear on the (admission-sourced) roster. Membership is no longer
+   * capability-derived; an admit is required.
+   */
+  async function admitInto(env: Env, principalId: string, networkId: string): Promise<void> {
+    const read = await makeSignedAdminRead(adminKey!);
+    const listRes = await registryApp.fetch(
+      new Request("http://registry.test/admission-requests?status=PENDING", {
+        headers: { "x-admin-signed": JSON.stringify(read) },
+      }),
+      env,
+    );
+    const list = (await listRes.json()) as AdmissionRequest[];
+    const req = list.find((r) => r.principal_id === principalId && r.network_id === networkId);
+    expect(req).toBeDefined();
+    const decision = await makeSignedAdminDecision(req!.request_id, "admit", adminKey!);
+    const admitRes = await registryApp.fetch(
+      new Request(`http://registry.test/admission-requests/${req!.request_id}/admit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(decision),
+      }),
+      env,
+    );
+    expect(admitRes.status).toBe(200);
   }
 
   function registryFetch(env: Env): typeof globalThis.fetch {
@@ -524,7 +570,9 @@ describe("C-819 — resolveMergedCapabilities preserves caps across re-register"
 
   /**
    * Seed principal `jc` with a single stack that announces a `community-net`
-   * capability — so JC lands on the `community-net` roster (the live repro:
+   * capability AND targets `community-net` for admission (ADR-0018 Gap-A), then
+   * ADMIT the resulting PENDING request (Gap-B) — so JC lands on the
+   * `community-net` roster via an ADMITTED row (the live repro:
    * `metafactory-community` listed `jc`). Returns the root material so a later
    * re-register can sign as the same root (the rotation gate requires it).
    */
@@ -537,16 +585,22 @@ describe("C-819 — resolveMergedCapabilities preserves caps across re-register"
       capabilities: [
         { id: "tasks.code-review", description: "JC reviews", networks: ["community-net"] },
       ],
+      // ADR-0018 Gap-A — name the target network so a PENDING admission row is
+      // raised for it; Gap-B then sources roster membership from the ADMITTED row.
+      networkId: "community-net",
     });
     await post(env, "/principals/jc/register", body);
+    // ADR-0018 Gap-B — admit JC into community-net so they are on the roster.
+    await admitInto(env, "jc", "community-net");
     return root;
   }
 
-  test("ACCEPTANCE — a bare add-stack register (empty announce) preserves JC's caps + roster membership", async () => {
+  test("ACCEPTANCE — a bare add-stack register (empty announce) preserves JC's caps + admission-derived roster membership", async () => {
     const env = await configuredEnv();
     const root = await seedJcWithCommunityCaps(env);
 
-    // Precondition: JC is on the community roster.
+    // Precondition: JC is on the community roster — via an ADMITTED row
+    // (ADR-0018 Gap-B), not via the announced capability.
     expect(await rosterMembers(env, "community-net")).toEqual(["jc"]);
 
     // Now stand up `jc/clawbox` (the live repro). It is a SECOND stack added by
@@ -579,14 +633,21 @@ describe("C-819 — resolveMergedCapabilities preserves caps across re-register"
     const res = await post(env, "/principals/jc/register", body);
     expect(res.status).toBe(201);
 
-    // The footgun is closed: JC is STILL on the community roster.
+    // JC is STILL on the community roster — the bare re-register left JC's
+    // ADMITTED community-net row untouched (membership is admission-derived,
+    // ADR-0018 Gap-B), and the cap-merge preserved the capability facet too.
     expect(await rosterMembers(env, "community-net")).toEqual(["jc"]);
   });
 
-  test("REGRESSION GUARD — WITHOUT the merge (empty caps claim), the route DOES wipe + evict", async () => {
-    // Proves the merge is load-bearing: the same re-register WITHOUT
-    // resolveMergedCapabilities (empty caps in the claim) zeroes the set and
-    // evicts JC. This is the bug; the test above is the fix.
+  test("REGRESSION GUARD — under Gap-B a caps-wipe does NOT evict an ADMITTED member (silent eviction structurally impossible)", async () => {
+    // Pre-ADR-0018 this same re-register (empty caps claim → full-overwrite to
+    // []) zeroed JC's cap set AND evicted JC from every roster, because
+    // membership was capability-derived. Under ADR-0018 Gap-B membership is
+    // ADMITTED-derived and INDEPENDENT of caps: the cap-overwrite still happens
+    // (the cap facet is wiped), but JC's ADMITTED community-net row is untouched
+    // so JC stays on the roster. The silent-eviction footgun is now structurally
+    // impossible. (The cap-merge in the ACCEPTANCE test remains load-bearing for
+    // preserving the capability FACET — proven here by the caps actually wiping.)
     const env = await configuredEnv();
     const root = await seedJcWithCommunityCaps(env);
     expect(await rosterMembers(env, "community-net")).toEqual(["jc"]);
@@ -601,8 +662,21 @@ describe("C-819 — resolveMergedCapabilities preserves caps across re-register"
     });
     const res = await post(env, "/principals/jc/register", body);
     expect(res.status).toBe(201);
-    // Roster eviction reproduced (jc → empty).
-    expect(await rosterMembers(env, "community-net")).toEqual([]);
+
+    // The cap FACET was wiped (full-overwrite to empty) — this is the behaviour
+    // the ACCEPTANCE test's merge guards against for the capability set.
+    const getRes = await registryApp.fetch(
+      new Request("http://registry.test/principals/jc"),
+      env,
+    );
+    const principal = (await getRes.json()) as {
+      payload: { capabilities: { id: string }[] };
+    };
+    expect(principal.payload.capabilities).toEqual([]);
+
+    // But roster membership is ADMITTED-derived → the caps-wipe did NOT evict
+    // JC. The old "caps-wipe → roster eviction" coupling no longer holds.
+    expect(await rosterMembers(env, "community-net")).toEqual(["jc"]);
   });
 
   test("union — a NEW announce is added, existing unrelated caps are kept (same-id new wins)", async () => {

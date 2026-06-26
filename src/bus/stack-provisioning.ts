@@ -119,6 +119,13 @@ export interface RegistrationClaimShape {
   capabilities: { id: string; description?: string; networks?: string[] }[];
   /** #825 — optimistic-concurrency CAS token (record `updated_at` the merge read). */
   expected_updated_at?: string;
+  /**
+   * ADR-0018 Gap-A — the target network this registration requests admission
+   * into. Stamped onto the PENDING admission row by the register hook so a stack
+   * can request admission to two networks (per-network idempotency). Optional: a
+   * plain identity register (not a join) omits it. Part of the SIGNED claim.
+   */
+  network_id?: string;
   issued_at: string;
   nonce: string;
 }
@@ -402,6 +409,13 @@ export interface BuildRegistrationClaimOptions {
    * register / when no existing record was read.
    */
   readonly expectedUpdatedAt?: string;
+  /**
+   * ADR-0018 Gap-A — the target network this registration requests admission
+   * into. When set, it is signed into the claim as `network_id`; the register
+   * hook stamps it onto the PENDING admission row (per-network idempotency). Omit
+   * for a plain identity register that names no network.
+   */
+  readonly networkId?: string;
 }
 
 /**
@@ -440,6 +454,7 @@ export async function buildRegistrationClaim(
     stacks,
     capabilities: opts.capabilities ?? [],
     ...(opts.expectedUpdatedAt !== undefined && { expected_updated_at: opts.expectedUpdatedAt }),
+    ...(opts.networkId !== undefined && { network_id: opts.networkId }),
     issued_at: opts.issuedAt ?? new Date().toISOString(),
     nonce: opts.nonce ?? randomNonce(),
   };

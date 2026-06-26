@@ -20,6 +20,8 @@ import {
   makePrincipalKey,
   makeRegistryKey,
   makeSignedRegistration,
+  makeSignedAdminRead,
+  makeSignedAdminDecision,
   resetStores,
   type PrincipalKey,
 } from "./helpers";
@@ -27,17 +29,20 @@ import {
   RATE_LIMITS,
   type RateLimitBinding,
 } from "../src/rate-limit";
-import type { SignedAssertion, PrincipalRecord } from "../src/types";
+import type { AdmissionRequest, SignedAssertion, PrincipalRecord } from "../src/types";
 
 let env: Env;
 let pKey: PrincipalKey;
+let admin: PrincipalKey;
 
 beforeEach(async () => {
   resetStores();
   const reg = await makeRegistryKey();
+  admin = await makePrincipalKey();
   env = {
     REGISTRY_SIGNING_KEY: reg.signingKey,
     REGISTRY_PUBLIC_KEY: reg.publicKey,
+    REGISTRY_ADMIN_PUBKEYS: admin.publicKeyB64,
     ENVIRONMENT: "test",
   };
   pKey = await makePrincipalKey();
@@ -311,9 +316,31 @@ describe("#681 enumeration policy (dev = prod)", () => {
     await postRegister(
       "andreas",
       await makeSignedRegistration("andreas", pKey, {
+        networkId: "research-collab",
         capabilities: [{ id: "tasks.code-review", networks: ["research-collab"] }],
       }),
       "198.51.100.21",
+    );
+    // ADR-0018 Gap-B — membership is now admission-sourced; admit andreas into
+    // research-collab so the roster has a member (the shape is unchanged).
+    const read = await makeSignedAdminRead(admin);
+    const pendRes = await fetchApp(
+      reqWith("/admission-requests?status=PENDING", {
+        ip: "198.51.100.22",
+        headers: { "x-admin-signed": JSON.stringify(read) },
+      }),
+    );
+    const pend = (await pendRes.json()) as AdmissionRequest[];
+    const req = pend.find((r) => r.principal_id === "andreas" && r.network_id === "research-collab");
+    expect(req).toBeDefined();
+    const decision = await makeSignedAdminDecision(req!.request_id, "admit", admin);
+    await fetchApp(
+      reqWith(`/admission-requests/${req!.request_id}/admit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(decision),
+        ip: "198.51.100.23",
+      }),
     );
 
     // roster: { network_id, members[] } with principal_id + pubkey + capabilities.

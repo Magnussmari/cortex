@@ -97,7 +97,11 @@ export class MockD1 {
   readonly nonces = new Map<string, number>();
   /** Keyed by request_id */
   readonly issuanceRequests = new Map<string, IssuanceRequestRow>();
-  /** Maps (principal_id + "\x00" + peer_pubkey) → request_id for the unique constraint */
+  /**
+   * Maps (principal_id + "\x00" + peer_pubkey + "\x00" + COALESCE(network_id,''))
+   * → request_id for the ADR-0018 Gap-A per-network unique constraint (mirrors
+   * the `COALESCE(network_id, '')` expression index in migration 0008).
+   */
   private readonly issuancePeerIndex = new Map<string, string>();
 
   /** Count of writes, exposed so tests can assert query activity if needed. */
@@ -198,14 +202,15 @@ export class MockD1 {
       return { meta: { changes: n } };
     }
 
-    // admission_requests: INSERT ... ON CONFLICT(principal_id, peer_pubkey) DO NOTHING
-    // (M3 atomic upsert — D1IssuanceRequestStore.upsertPending, ADR-0015)
+    // admission_requests: INSERT ... ON CONFLICT(principal_id, peer_pubkey,
+    // COALESCE(network_id, '')) DO NOTHING (ADR-0018 Gap-A per-network upsert —
+    // D1IssuanceRequestStore.upsertPending)
     if (sql.startsWith("INSERT INTO admission_requests")) {
       const [requestId, principalId, peerPubkey, requestedScope, networkId, createdAt, updatedAt] = args as [
         string, string, string, string, string | null, string, string,
       ];
-      const peerKey = `${principalId}\x00${peerPubkey}`;
-      // ON CONFLICT(principal_id, peer_pubkey) DO NOTHING — idempotent.
+      const peerKey = `${principalId}\x00${peerPubkey}\x00${networkId ?? ""}`;
+      // ON CONFLICT(principal_id, peer_pubkey, COALESCE(network_id,'')) DO NOTHING.
       if (this.issuancePeerIndex.has(peerKey)) {
         return { meta: { changes: 0 } }; // existing row wins, no-op
       }
@@ -288,14 +293,25 @@ export class MockD1 {
       return row ? [row] : [];
     }
 
-    // admission_requests: SELECT by (principal_id, peer_pubkey)
+    // admission_requests: SELECT by (principal_id, peer_pubkey, COALESCE(network_id,''))
+    // (ADR-0018 Gap-A per-network select after upsert)
     if (sql.includes("FROM admission_requests WHERE principal_id = ? AND peer_pubkey =")) {
-      const [principalId, peerPubkey] = args as [string, string];
-      const key = `${principalId}\x00${peerPubkey}`;
+      const [principalId, peerPubkey, networkId] = args as [string, string, string | null];
+      const key = `${principalId}\x00${peerPubkey}\x00${networkId ?? ""}`;
       const requestId = this.issuancePeerIndex.get(key);
       if (!requestId) return [];
       const row = this.issuanceRequests.get(requestId);
       return row ? [row] : [];
+    }
+
+    // admission_requests: SELECT by peer_pubkey ORDER BY created_at
+    // (ADR-0018 Gap-C member PoP-read — listIssuanceRequestsByPeer). Checked
+    // BEFORE the status branch since both start "FROM admission_requests WHERE".
+    if (sql.includes("FROM admission_requests WHERE peer_pubkey =")) {
+      const peerPubkey = args[0] as string;
+      return [...this.issuanceRequests.values()]
+        .filter((r) => r.peer_pubkey === peerPubkey)
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
     }
 
     // admission_requests: SELECT by status ORDER BY created_at
