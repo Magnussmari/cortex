@@ -15,6 +15,7 @@ import { dirname } from "path";
 
 import { parseDocument } from "yaml";
 
+import { expandTilde } from "../../../common/config/loader";
 import { generateStackIdentity } from "../../../bus/stack-provisioning";
 import { buildFederationWiringAdapter } from "./network-federation-wiring";
 import { buildOperatorProvisioningAdapter } from "./operator-provisioning";
@@ -33,14 +34,18 @@ import type {
  * REFUSES to clobber without `force` (the orchestrator only calls it when the
  * seed is absent OR `--force` is set, so the refusal is belt-and-braces).
  *
- * @param seedPathExpanded - the already-tilde-expanded `stack.nkey_seed_path`.
+ * The orchestrator threads the raw (portable `~`) `stack.nkey_seed_path` through
+ * the port so the config write-back persists the tilde form; the fs boundary
+ * here expands it (`expandTilde`) in BOTH `exists` and `generate` so the
+ * existence probe and the O_EXCL write target the same `$HOME`-rooted path
+ * (a divergence here breaks no-clobber idempotency — cortex#1236).
  */
 export function buildSigningIdentityAdapter(): SigningIdentityPort {
   return {
-    exists: (seedPath) => existsSync(seedPath),
+    exists: (seedPath) => existsSync(expandTilde(seedPath)),
     generate: ({ seedPath, force }) => {
       try {
-        const material = generateStackIdentity({ seedPath, force });
+        const material = generateStackIdentity({ seedPath: expandTilde(seedPath), force });
         return { ok: true, nkeyPub: material.nkeyPub, fingerprint: material.fingerprint };
       } catch (err) {
         return { ok: false, reason: err instanceof Error ? err.message : String(err) };

@@ -275,7 +275,7 @@ export async function provisionStack(
   //    federation account already exists (it cannot exist without its operator).
   if (operatorNeeded) {
     const r = await ports.operator.initOperator({ name: inputs.operatorName, force });
-    if (!r.ok) return fail(plan, planLines, `init-operator failed: ${r.reason}`);
+    if (!r.ok) return fail(plan, steps, `init-operator failed: ${r.reason}`);
     steps.push(`nsc operator ${r.alreadyExisted && !r.created ? "present" : r.created ? "minted" : "ensured"}: ${r.operator}`);
   } else {
     steps.push(`nsc operator present: ${inputs.operatorName}`);
@@ -284,7 +284,7 @@ export async function provisionStack(
   // 2. Federation account (leaf-bound, per stack).
   if (fedNeeded) {
     const r = await ports.operator.addAccount({ name: inputs.federationAccountName });
-    if (!r.ok) return fail(plan, planLines, `add-account (federation) failed: ${r.reason}`);
+    if (!r.ok) return fail(plan, steps, `add-account (federation) failed: ${r.reason}`);
     resolvedAccount = r.pubKey;
     steps.push(`federation account ${r.created ? "minted" : "present"}: ${r.account} (${r.pubKey})`);
   } else {
@@ -294,7 +294,7 @@ export async function provisionStack(
   // 3. Per-stack agents account (ADR-0012 isolation).
   if (agentsNeeded) {
     const r = await ports.operator.addAccount({ name: inputs.agentsAccountName });
-    if (!r.ok) return fail(plan, planLines, `add-account (agents) failed: ${r.reason}`);
+    if (!r.ok) return fail(plan, steps, `add-account (agents) failed: ${r.reason}`);
     resolvedAgents = r.pubKey;
     steps.push(`agents account ${r.created ? "minted" : "present"}: ${r.account} (${r.pubKey})`);
   } else {
@@ -304,7 +304,7 @@ export async function provisionStack(
   // 4. Signing seed (chmod 600, no-clobber unless --force).
   if (signingNeeded) {
     const r = ports.signing.generate({ seedPath: inputs.seedPath, force });
-    if (!r.ok) return fail(plan, planLines, `signing-seed generate failed: ${r.reason}`);
+    if (!r.ok) return fail(plan, steps, `signing-seed generate failed: ${r.reason}`);
     resolvedNkeyPub = r.nkeyPub;
     steps.push(`signing seed ${force ? "rotated" : "generated"}: ${inputs.seedPath} (chmod 600)`);
   } else {
@@ -313,7 +313,7 @@ export async function provisionStack(
 
   // Defensive: both account pubkeys must be resolved before wiring/write-back.
   if (resolvedAccount === undefined || resolvedAgents === undefined) {
-    return fail(plan, planLines, "internal: account pubkeys unresolved after mint (should not happen)");
+    return fail(plan, steps, "internal: account pubkeys unresolved after mint (should not happen)");
   }
 
   // 5. Wire the local-side federated.> export/import (fed-account → agents-account).
@@ -322,7 +322,7 @@ export async function provisionStack(
     agentsAccount: resolvedAgents,
     apply: true,
   });
-  if (!wire.ok) return fail(plan, planLines, `federation wiring failed: ${wire.reason}`);
+  if (!wire.ok) return fail(plan, steps, `federation wiring failed: ${wire.reason}`);
   steps.push(`federated.> export/import: ${wire.note ?? "wired"}`);
 
   // 6. Write the resolved nats_infra fields back to the stack config.
@@ -333,7 +333,7 @@ export async function provisionStack(
     seedPath: inputs.seedPath,
     ...(resolvedNkeyPub !== undefined && { nkeyPub: resolvedNkeyPub }),
   });
-  if (!written.ok) return fail(plan, planLines, `config write-back failed: ${written.reason}`);
+  if (!written.ok) return fail(plan, steps, `config write-back failed: ${written.reason}`);
   steps.push("stack.nats_infra written (account, agents_account, creds_path, nkey_seed_path)");
 
   steps.push("");
@@ -353,6 +353,9 @@ export async function provisionStack(
   };
 }
 
-function fail(plan: PlanItem[], planLines: string[], reason: string): ProvisionResult {
-  return { ok: false, reason, applied: true, plan, steps: planLines };
+function fail(plan: PlanItem[], steps: string[], reason: string): ProvisionResult {
+  // Return the steps accumulated so far (not the original plan) so a
+  // mid-pipeline abort surfaces how far provisioning actually got — e.g.
+  // operator minted, federation account failed (cortex#1236 NIT 2).
+  return { ok: false, reason, applied: true, plan, steps };
 }
