@@ -14,7 +14,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, chmodSync } from "fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, chmodSync, statSync } from "fs";
 import { tmpdir, homedir } from "os";
 import { join } from "path";
 
@@ -1024,6 +1024,34 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
     expect(existsSync(join(dir, "leafnodes-metafactory.conf"))).toBe(false);
     expect(existsSync(conf)).toBe(true); // base config NEVER deleted
     expect(readFileSync(conf, "utf-8")).toBe(original);
+  });
+
+  test("C-1224: the written leaf include file is mode 0600 even under a permissive umask (secret-at-rest)", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, bareLocalConf(), "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    // Force a permissive umask so a bare `writeFileSync(..., mode: 0o600)` would
+    // be masked to 0640/0644 without the explicit chmod-back. The write must
+    // still land 0600 (the secret lives inside the file for Model B).
+    const prevUmask = process.umask(0o022);
+    try {
+      ports.leafFile.write({
+        descriptor: brandVerified(descriptorForLeaf("metafactory")),
+        binding: {
+          credentials: "/Users/andreas/.config/nats/andreas.creds",
+          account: "AADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX",
+        },
+      });
+    } finally {
+      process.umask(prevUmask);
+    }
+
+    const leafPath = join(dir, "leafnodes-metafactory.conf");
+    expect(existsSync(leafPath)).toBe(true);
+    // Mask off the file-type bits; only the permission bits must equal 0600.
+    expect(statSync(leafPath).mode & 0o777).toBe(0o600);
   });
 
   test("restore rewrites a pre-existing include file back to its prior bytes + keeps a pre-existing directive", () => {

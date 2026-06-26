@@ -1756,4 +1756,41 @@ describe("C-1224 — secret-auth leaf join (Model B)", () => {
     expect(res.ok).toBe(true);
     expect(rec.conversions.length).toBe(1);
   });
+
+  test("secret-only leaf on an auto-converted anonymous bus binds the account (NOT a creds error)", async () => {
+    // Regression guard for the post-auto-convert re-resolve (network-lib:310):
+    // a secret-only Model-B leaf (hasCreds === false, hasSecret === true) on an
+    // anonymous bus must auto-convert (O-3) and then RE-RESOLVE on `hasLeafAuth`
+    // — not `hasCreds`. If it re-resolved on `hasCreds` the secret would be
+    // invisible and the join would abort with a misleading "no leaf creds
+    // available" despite a valid secret.
+    const secretWithPkg: JoiningStack = {
+      principalId: "andreas",
+      stackSlug: "community",
+      // Model B — NO creds file; the leaf secret is the only auth method.
+      leafSecret: "s3cr3t-leaf-pipe",
+      leafUser: "andreas",
+      account: LOCAL_PACKAGE.account,
+      operatorModePackage: LOCAL_PACKAGE,
+    };
+    const { ports, rec } = makeFakes({ busType: "anonymous" });
+    const res = await joinNetwork("metafactory-community", secretWithPkg, ports);
+
+    expect(res.ok).toBe(true);
+    // The bus auto-converted exactly once...
+    expect(rec.conversions).toEqual([LOCAL_PACKAGE]);
+    // ...and BOTH bind-mode resolves saw the secret as an auth method
+    // (hasCreds === true here is the modelled `hasLeafAuth`). The pre-fix bug
+    // passed the literal `hasCreds` (false) on the second resolve.
+    expect(rec.bindModeChecks).toEqual([
+      { account: LOCAL_PACKAGE.account, hasCreds: true },
+      { account: LOCAL_PACKAGE.account, hasCreds: true },
+    ]);
+    // The re-resolve bound the OWN account + carried the secret, no creds path.
+    expect(rec.writes.length).toBe(1);
+    const binding = rec.writes[0]!.binding;
+    expect(binding.account).toBe(LOCAL_PACKAGE.account);
+    expect(binding.leafSecret).toBe("s3cr3t-leaf-pipe");
+    expect(binding.credentials).toBeUndefined();
+  });
 });

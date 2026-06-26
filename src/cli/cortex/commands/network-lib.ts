@@ -306,8 +306,12 @@ export async function joinNetwork(
         ? `converted the anonymous bus to operator-mode (rendered the operator/account/resolver blocks — O-3, #1053)`
         : `bus already operator-mode under this operator — no conversion needed (O-3, #1053)`,
     );
-    // Re-resolve against the now-operator-mode bus.
-    bindMode = ports.leafFile.resolveBindMode(stack.account, hasCreds);
+    // Re-resolve against the now-operator-mode bus. Use `hasLeafAuth` (not
+    // `hasCreds`) so a secret-only Model-B leaf (C-1224) that triggered the
+    // auto-convert still passes the "has an auth method" gate — otherwise it
+    // would abort with a misleading "no leaf creds available" despite a valid
+    // secret. Mirrors the first resolve at line 275.
+    bindMode = ports.leafFile.resolveBindMode(stack.account, hasLeafAuth);
   }
 
   if (bindMode.mode === "refuse") {

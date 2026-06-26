@@ -21,6 +21,7 @@
  */
 
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -458,7 +459,15 @@ function buildLeafFilePort(cfg: LivePortsConfig, mutate: boolean): LeafFilePort 
       const content = renderLeafIncludeFile(inputs.descriptor, inputs.binding);
       if (!mutate) return; // dry-run: render to validate, but do not write.
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, leafIncludeFileName(inputs.descriptor.network_id)), content, "utf-8");
+      // C-1224 (ADR-0013 Model B): for a secret-auth leaf the secret bytes live
+      // INSIDE this file (the `user:secret@host` userinfo of the rendered `url`),
+      // so it is a secret-at-rest. Write it 0600 AND re-chmod explicitly — the
+      // create `mode` is masked by the process umask, so a permissive umask
+      // (e.g. 022 → 0644) would otherwise leave it world-readable. 0600 is the
+      // correct floor even for a creds-path-only leaf (defence in depth).
+      const leafPath = join(dir, leafIncludeFileName(inputs.descriptor.network_id));
+      writeFileSync(leafPath, content, { mode: 0o600 });
+      chmodSync(leafPath, 0o600);
     },
     remove(networkId) {
       if (!mutate) return;
