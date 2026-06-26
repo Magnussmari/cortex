@@ -3192,9 +3192,48 @@ export async function startCortex(
         scopeToken === "local"
           ? `cortex-dev-consumer-${principalId}-${consumer.agent.id}`
           : `cortex-dev-consumer-offer-${scopeToken}-${principalId}-${consumer.agent.id}`;
+      // cortex#1203 — provision the DEV_IMPLEMENT durable UP-FRONT, then bind.
+      // The review, brain and release lanes all `provisionReviewConsumer(...)`
+      // (jsm.consumers.add) before `consumer.start()`; the dev lane was the ONLY
+      // one that didn't — and `consumer.start()`/`subscribePull` BINDS an
+      // existing durable rather than creating it. With no `consumers.add`, the
+      // bind fails "consumer not found" and `dev.implement` never reaches ready
+      // (the F-2.1 consumer silently dormant). Mirrors the brain lane: the
+      // per-scope `pattern` is the durable's `filter_subject` (cortex#1186).
+      if (reviewJsm !== null) {
+        try {
+          await provisionReviewConsumer({
+            jsm: reviewJsm,
+            // cortex#1203 review major-1: the config-resolved stream name (NOT a
+            // hardcoded "DEV_IMPLEMENT") — must match the stream as provisioned
+            // AND the `consumer.start({ stream })` below, or a renamed
+            // `bus.devImplement.stream.name` reproduces the very "consumer not
+            // found" this fixes.
+            stream: devImplementStream,
+            durable,
+            filterSubject: pattern,
+            maxDeliver: reviewConsumerMaxDeliver,
+            // cortex#1203 review major-2: a dev implement runs far longer than a
+            // review, but is bounded by the dev session timeout. Size the durable
+            // ack-wait to that (+60s) so a legitimately-long run isn't redelivered
+            // mid-flight (the 20-min review default would → dead-letter → dup
+            // session). Defaults to 30m+ when the timeout is unset.
+            ackWaitNs: (config.claude.asyncTimeoutMs + 60_000) * 1_000_000,
+          });
+        } catch (provisionErr) {
+          // Don't abort — let `consumer.start()` surface the bind failure via
+          // its own dormant/skip path (mirrors the review + brain lanes).
+          process.stderr.write(
+            `cortex: provisionReviewConsumer (dev) failed for "${durable}": ` +
+              `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
+          );
+        }
+      }
       const started = await consumer.start({
         pattern,
-        stream: "DEV_IMPLEMENT",
+        // cortex#1203 review major-1 — config-resolved name, matches the durable
+        // provisioned just above (not a hardcoded literal).
+        stream: devImplementStream,
         durable,
       });
       const scopeTag = scopeToken === "local" ? "" : ` (offer:${scopeToken})`;
