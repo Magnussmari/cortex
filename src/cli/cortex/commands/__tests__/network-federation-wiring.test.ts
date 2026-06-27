@@ -456,7 +456,7 @@ describe("buildFederationWiringAdapter — arc-shell adapter", () => {
   }
 
   const SUCCESS_JSON = JSON.stringify({
-    schema: "arc.nats.v2",
+    schema: "arc.nats.federation.v1",
     ok: true,
     fromAccount: LEAF_ACCOUNT,
     toAccount: AGENTS_ACCOUNT,
@@ -468,7 +468,7 @@ describe("buildFederationWiringAdapter — arc-shell adapter", () => {
   });
 
   const IDEMPOTENT_JSON = JSON.stringify({
-    schema: "arc.nats.v2",
+    schema: "arc.nats.federation.v1",
     ok: true,
     fromAccount: LEAF_ACCOUNT,
     toAccount: AGENTS_ACCOUNT,
@@ -531,7 +531,7 @@ describe("buildFederationWiringAdapter — arc-shell adapter", () => {
 
   test("arc ok=false: returns ok=false with reason from arc", async () => {
     const errorJson = JSON.stringify({
-      schema: "arc.nats.v2",
+      schema: "arc.nats.federation.v1",
       ok: false,
       error: { code: "NSC_COMMAND_FAILED", message: "nsc add export failed" },
     });
@@ -584,7 +584,7 @@ describe("buildFederationWiringAdapter — arc-shell adapter", () => {
     // from==to as a no-op locally). Build a SUCCESS_JSON with toAccount=LEAF_ACCOUNT
     // to match the actual args the adapter will pass.
     const sameAccountSuccessJson = JSON.stringify({
-      schema: "arc.nats.v2",
+      schema: "arc.nats.federation.v1",
       ok: true,
       fromAccount: LEAF_ACCOUNT,
       toAccount: LEAF_ACCOUNT,
@@ -637,5 +637,106 @@ describe("buildFederationWiringAdapter — arc-shell adapter", () => {
 
     expect(calls[0]).toContain("nats");
     expect(calls[0]).toContain("add-federation-export");
+  });
+});
+
+// =============================================================================
+// cortex#1225 regression — accept arc's REAL schema, reject the wrong one
+//
+// The adapter originally required `arc.nats.v2`, a schema arc never shipped
+// (arc#243 namespaces federation results under `arc.nats.federation.v1`). That
+// made `cortex network provision --apply` always fail at the federation-wiring
+// step against real arc, blocking the PR7 live-stack migration. These tests
+// pin the contract to what arc ACTUALLY emits and prove the never-shipped
+// `arc.nats.v2` is rejected, so the regression cannot silently return.
+// =============================================================================
+
+describe("cortex#1225 — federation-wiring schema contract (arc.nats.federation.v1)", () => {
+  function makeRunner(stdout: string): { runner: ArcFederationRunner; calls: string[][] } {
+    const calls: string[][] = [];
+    const runner: ArcFederationRunner = async (argv) => {
+      calls.push([...argv]);
+      return { stdout, stderr: "", exitCode: 0 };
+    };
+    return { runner, calls };
+  }
+
+  // Mirrors arc's REAL AddFederationExportJson on --apply, including the extra
+  // `pushResult` field arc emits (which cortex does not model and must ignore).
+  const REAL_ARC_OUTPUT = JSON.stringify({
+    schema: "arc.nats.federation.v1",
+    ok: true,
+    fromAccount: LEAF_ACCOUNT,
+    toAccount: AGENTS_ACCOUNT,
+    subject: "federated.>",
+    exportAdded: true,
+    importAdded: true,
+    exportAlreadyPresent: false,
+    importAlreadyPresent: false,
+    pushResult: { fromAccount: "ok", toAccount: "ok" },
+  });
+
+  test("accepts the schema arc actually emits (arc.nats.federation.v1, incl. extra pushResult)", async () => {
+    const { runner } = makeRunner(REAL_ARC_OUTPUT);
+    const adapter = buildFederationWiringAdapter(runner);
+
+    const result = await adapter.wireLocalFederation({
+      federationAccount: LEAF_ACCOUNT,
+      agentsAccount: AGENTS_ACCOUNT,
+      apply: true,
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.note).toBeDefined();
+  });
+
+  test("rejects the never-shipped arc.nats.v2 as a schema mismatch (the original bug)", async () => {
+    const wrongSchema = JSON.stringify({
+      schema: "arc.nats.v2",
+      ok: true,
+      fromAccount: LEAF_ACCOUNT,
+      toAccount: AGENTS_ACCOUNT,
+      subject: "federated.>",
+      exportAdded: true,
+      importAdded: true,
+      exportAlreadyPresent: false,
+      importAlreadyPresent: false,
+    });
+    const { runner } = makeRunner(wrongSchema);
+    const adapter = buildFederationWiringAdapter(runner);
+
+    const result = await adapter.wireLocalFederation({
+      federationAccount: LEAF_ACCOUNT,
+      agentsAccount: AGENTS_ACCOUNT,
+      apply: true,
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/schema mismatch/i);
+      // The diagnostic names the schema we DID require + the one arc sent.
+      expect(result.reason).toMatch(/arc\.nats\.federation\.v1/);
+      expect(result.reason).toMatch(/arc\.nats\.v2/);
+    }
+  });
+
+  test("rejects a genuinely-malformed envelope (missing schema field)", async () => {
+    const noSchema = JSON.stringify({
+      ok: true,
+      fromAccount: LEAF_ACCOUNT,
+      toAccount: AGENTS_ACCOUNT,
+      subject: "federated.>",
+    });
+    const { runner } = makeRunner(noSchema);
+    const adapter = buildFederationWiringAdapter(runner);
+
+    const result = await adapter.wireLocalFederation({
+      federationAccount: LEAF_ACCOUNT,
+      agentsAccount: AGENTS_ACCOUNT,
+      apply: true,
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/schema mismatch/i);
   });
 });

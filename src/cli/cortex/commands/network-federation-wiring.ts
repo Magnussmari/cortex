@@ -24,11 +24,21 @@
  *
  * ## Schema
  *
- * arc responds with `arc.nats.v2` (a new schema revision for federation
- * commands, distinct from `arc.nats.v1` used by add-bot/reissue-bot). We
- * guard on the schema string so a future arc that returns `arc.nats.v1` for
- * this subcommand (a contract regression) fails loudly rather than silently
- * misinterpreting the envelope.
+ * arc responds with `arc.nats.federation.v1` (a SEPARATE schema namespace for
+ * federation commands — arc#243 / `ARC_NATS_FEDERATION_SCHEMA` in arc's
+ * `src/lib/json-response.ts` — distinct from `arc.nats.v1` used by
+ * add-bot/reissue-bot and `arc.nats.operator.v1` used by init-operator/
+ * add-account). We guard on the schema string so a future arc that returns a
+ * different schema for this subcommand (a contract regression) fails loudly
+ * rather than silently misinterpreting the envelope.
+ *
+ * NOTE (cortex#1225): this adapter originally required `arc.nats.v2` — a schema
+ * arc never shipped and explicitly chose NOT to (it namespaced federation under
+ * `arc.nats.federation.v1` so consumers guarding on `arc.nats.v1` stay
+ * unaffected). The mismatch made `cortex network provision --apply` ALWAYS fail
+ * at the federation-wiring step against real arc; the unit tests passed because
+ * their fixtures mocked the never-shipped `arc.nats.v2`. Fixed to accept the
+ * schema arc actually emits.
  */
 
 import type { FederationWiringPort } from "./network-ports";
@@ -58,13 +68,19 @@ async function defaultArcFederationRunner(argv: readonly string[]): Promise<ArcF
 }
 
 // =============================================================================
-// arc.nats.v2 envelope types
+// arc.nats.federation.v1 envelope types
+//
+// Mirrors arc's `AddFederationExportJson` (src/lib/json-response.ts). arc may
+// additionally emit a `pushResult` field on success; we intentionally do not
+// model it (cortex does not consume it — extra fields are forward-compatible).
 // =============================================================================
 
-const ARC_NATS_SCHEMA_V2 = "arc.nats.v2";
+/** Schema arc emits for `nats add-federation-export` (arc#243). Must match
+ *  arc's `ARC_NATS_FEDERATION_SCHEMA`; a divergence here breaks provision. */
+const ARC_NATS_FEDERATION_SCHEMA = "arc.nats.federation.v1";
 
 interface ArcFederationOk {
-  schema: typeof ARC_NATS_SCHEMA_V2;
+  schema: typeof ARC_NATS_FEDERATION_SCHEMA;
   ok: true;
   fromAccount: string;
   toAccount: string;
@@ -76,7 +92,7 @@ interface ArcFederationOk {
 }
 
 interface ArcFederationError {
-  schema: typeof ARC_NATS_SCHEMA_V2;
+  schema: typeof ARC_NATS_FEDERATION_SCHEMA;
   ok: false;
   error: { code: string; message: string };
 }
@@ -149,7 +165,7 @@ export function buildFederationWiringAdapter(
         return {
           ok: false,
           reason:
-            `arc returned no valid '${ARC_NATS_SCHEMA_V2}' envelope. ` +
+            `arc returned no valid '${ARC_NATS_FEDERATION_SCHEMA}' envelope. ` +
             `Confirm arc is installed and that 'arc nats add-federation-export' supports --json. ` +
             `arc stderr: ${result.stderr.trim() || "(empty)"}`,
         };
@@ -162,7 +178,7 @@ export function buildFederationWiringAdapter(
         return {
           ok: false,
           reason:
-            `arc returned no valid '${ARC_NATS_SCHEMA_V2}' envelope (JSON parse failed). ` +
+            `arc returned no valid '${ARC_NATS_FEDERATION_SCHEMA}' envelope (JSON parse failed). ` +
             `arc output: ${line.slice(0, 200)}`,
         };
       }
@@ -171,12 +187,12 @@ export function buildFederationWiringAdapter(
       if (
         typeof parsed !== "object" ||
         parsed === null ||
-        (parsed as { schema?: unknown }).schema !== ARC_NATS_SCHEMA_V2
+        (parsed as { schema?: unknown }).schema !== ARC_NATS_FEDERATION_SCHEMA
       ) {
         return {
           ok: false,
           reason:
-            `arc returned no valid '${ARC_NATS_SCHEMA_V2}' envelope (schema mismatch). ` +
+            `arc returned no valid '${ARC_NATS_FEDERATION_SCHEMA}' envelope (schema mismatch). ` +
             `Got: ${JSON.stringify((parsed as { schema?: unknown }).schema ?? "(none)")}. ` +
             `Ensure arc supports the G1b add-federation-export command (arc#243).`,
         };

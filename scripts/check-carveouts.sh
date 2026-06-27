@@ -184,6 +184,13 @@ ALLOWLIST_PATHS=(
   'src/cli/cortex/commands/operator-provisioning.ts'
   'src/cli/cortex/commands/network-provision-lib.ts'
   'src/cli/cortex/commands/network-provision-adapters.ts'
+  # network-federation-wiring.ts is the THIRD arc-shell provision adapter
+  # (FederationWiringPort, sibling to operator-provisioning.ts above). Its
+  # doc-comment names the NSC account-tree schemas (`arc.nats.operator.v1`,
+  # `init-operator`/`add-account`) only to contrast them with the federation
+  # schema it consumes — every "operator" is the NSC account-tree sense, never
+  # the principal (cortex#1225). Class: NSC.
+  'src/cli/cortex/commands/network-federation-wiring.ts'
   'src/cli/cortex/commands/__tests__/operator-provisioning.test.ts'
   'src/cli/cortex/commands/__tests__/network-provision-lib.test.ts'
   'src/cli/cortex/commands/__tests__/network-provision-cli.test.ts'
