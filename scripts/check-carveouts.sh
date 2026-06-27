@@ -213,6 +213,13 @@ ALLOWLIST_PATHS=(
   # faithful arc-CLI contract harness. Every "operator" is the NSC account-tree
   # sense (OperatorProvisioningPort / OP_ANDREAS), never the principal. Class: NSC.
   'src/cli/cortex/commands/__tests__/network-provision-integration.test.ts'
+  # cortex#1265 server-config bridge — the provision JWT-export adapter +
+  # its arc-contract test + the design doc. `operator` throughout = the NSC
+  # account-tree root (export-operator / operator-mode JWTs), never the principal.
+  # Same class as network-provision-lib.ts / network-make-live-lib.ts. Class: NSC.
+  'src/cli/cortex/commands/operator-mode-export.ts'
+  'src/cli/cortex/commands/__tests__/operator-mode-export.test.ts'
+  'docs/design-wrap-server-config-tooling.md'
   # G1d own-operator onboarding design doc — its whole subject is standing up the
   # principal's own NSC account tree (also caught by the `operator-onboarding`
   # line pattern; path-allowlisted for clarity). Class: NSC.

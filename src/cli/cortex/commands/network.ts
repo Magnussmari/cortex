@@ -2093,7 +2093,7 @@ function deriveProvisionInputs(
   if (!applyRes.ok) return { ok: false, reason: applyRes.reason, usage: true };
 
   // cortex#1265 — the SYS (system) account to best-effort export. `--system-account`
-  // overrides the conventional "SYS"; absent on a fresh operator (skipped — optional).
+  // overrides the conventional "SYS"; absent on a fresh nsc operator (skipped — optional).
   const systemAccountName = optionalValueFlag(flags, "--system-account") ?? "SYS";
   // The JWT export is ensure-shaped: it is a no-op once both operator_jwt AND
   // account_jwt already sit in config (the renderer's minimum).
