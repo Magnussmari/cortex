@@ -72,6 +72,11 @@ function fakeFactory(): { factory: ProvisionPortsFactory; calls: string[]; write
       federationWiring,
       signing: { exists: () => false, generate: () => { calls.push("signing"); return { ok: true, nkeyPub: "U" + "Z".repeat(55), fingerprint: "fp" }; } },
       configWrite: { write: () => { calls.push("config-write"); return { ok: true }; } },
+      export: {
+        exportOperator: async ({ name }) => { calls.push(`export-operator:${name}`); return { ok: true, operatorJwt: "eyJ.op.sig", pubKey: "OD4D" }; },
+        exportAccount: async (name) => { calls.push(`export-account:${name}`); return { ok: true, pubKey: FED_PUB, jwt: "eyJ.fed.sig" }; },
+        exportSystem: async ({ name }) => { calls.push(`export-system:${name}`); return { ok: false, reason: "no SYS", notFound: true }; },
+      },
     };
     return ports;
   };
@@ -128,6 +133,10 @@ describe("cortex network provision — apply", () => {
       "add-account:ANDREAS_RESEARCH_AGENTS",
       "signing",
       "wire",
+      // cortex#1265 — the operator-mode JWT export bridges wiring → config write.
+      "export-operator:OP_ANDREAS",
+      "export-account:ANDREAS_RESEARCH_FED",
+      "export-system:SYS",
       "config-write",
     ]);
   });

@@ -1,8 +1,8 @@
 # Design — Wrap the raw `nsc` server-config generation in cortex tooling
 
-**Status:** design — DECISION PENDING SIGN-OFF (2026-06-28) · **Author:** Luna (for Andreas) · **Refs:** cortex#1265 (from #1262) · **Builds on:** [`design-onboarding-tooling-audit.md`](./design-onboarding-tooling-audit.md) (G1–G5), ADR-0013 (sovereign Model B), ADR-0012 (account isolation)
+**Status:** SIGNED OFF + IMPLEMENTED (2026-06-28) — Option A (provision) + A2 (make-live bootstrap) · **Author:** Luna (for Andreas) · **Refs:** cortex#1265 (from #1262), arc server-config-export · **Builds on:** [`design-onboarding-tooling-audit.md`](./design-onboarding-tooling-audit.md) (G1–G5), ADR-0013 (sovereign Model B), ADR-0012 (account isolation)
 
-> **This doc investigates and recommends; it does not implement.** The one decision that needs Andreas's sign-off before any code is written is in §4 — *where the server-config generation lives*. Everything else is supporting analysis.
+> **Decision (§4) is signed off and built.** Andreas approved **Option A** (the server-config JWT-export bridge lives in `cortex network provision`) and the secondary **A2** (the local-only path bootstraps its initial `.conf` via `cortex network make-live`). Implementation: provision now exports operator + federation + (best-effort) SYS JWTs into `stack.nats_infra` (`network-provision-lib.ts` + `operator-mode-export.ts`, backed by new arc verbs `nats export-operator` / `export-system`); make-live bootstraps an initial operator-mode resolver via `renderOperatorModeBlocks` when none exists. **Note on SYS:** `nsc add operator` does not auto-create a SYS account, and the renderer treats `system_account` as optional, so provision exports it *best-effort* (a missing SYS is a clean skip, never a failure) rather than forcing a new account into the tree.
 
 ---
 

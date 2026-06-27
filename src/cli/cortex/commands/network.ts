@@ -129,6 +129,7 @@ import {
   type MakeLivePorts,
 } from "./network-make-live-lib";
 import { buildLiveMakeLivePorts, buildResolverPreloadAdapter } from "./network-make-live-adapters";
+import type { OperatorModeLeafPackage } from "../../../common/nats/leaf-remote-renderer";
 import {
   runNetworkSecret,
   type SecretAction,
@@ -1945,6 +1946,29 @@ function deriveMakeLiveInputs(
     resolverHasAccount: resolverProbe.hasAccount(natsConfigPath, agentsAccountPubkey),
   };
 
+  // cortex#1265 — assemble the operator-mode leaf package from the JWTs provision
+  // wrote into `stack.nats_infra` (same minimum + precedence as network-derive's
+  // O-3 join package). Present ⇒ a bus with no resolver_preload is BOOTSTRAPPED
+  // operator-mode instead of refused (the local-only path).
+  const ni = cfg.stack?.nats_infra;
+  const opJwt = ni?.operator_jwt;
+  const fedAccount = ni?.account;
+  const acctJwt = ni?.account_jwt;
+  const sysAccount = ni?.system_account;
+  const sysJwt = ni?.system_account_jwt;
+  const operatorModePackage: OperatorModeLeafPackage | undefined =
+    opJwt !== undefined && opJwt !== "" &&
+    fedAccount !== undefined && fedAccount !== "" &&
+    acctJwt !== undefined && acctJwt !== ""
+      ? {
+          operatorJwt: opJwt,
+          account: fedAccount,
+          accountJwt: acctJwt,
+          ...(sysAccount !== undefined && sysAccount !== "" && { systemAccount: sysAccount }),
+          ...(sysJwt !== undefined && sysJwt !== "" && { systemAccountJwt: sysJwt }),
+        }
+      : undefined;
+
   const inputs: MakeLiveInputs = {
     principal,
     stackSlug: slug,
@@ -1958,6 +1982,7 @@ function deriveMakeLiveInputs(
     force,
     apply: applyRes.apply,
     state,
+    ...(operatorModePackage !== undefined && { operatorModePackage }),
   };
   return { ok: true, inputs };
 }
@@ -2067,6 +2092,18 @@ function deriveProvisionInputs(
   const applyRes = resolveApply(flags);
   if (!applyRes.ok) return { ok: false, reason: applyRes.reason, usage: true };
 
+  // cortex#1265 — the SYS (system) account to best-effort export. `--system-account`
+  // overrides the conventional "SYS"; absent on a fresh operator (skipped — optional).
+  const systemAccountName = optionalValueFlag(flags, "--system-account") ?? "SYS";
+  // The JWT export is ensure-shaped: it is a no-op once both operator_jwt AND
+  // account_jwt already sit in config (the renderer's minimum).
+  const natsInfra = cfg.stack?.nats_infra;
+  const operatorModeJwtsPresent =
+    natsInfra?.operator_jwt !== undefined &&
+    natsInfra.operator_jwt !== "" &&
+    natsInfra.account_jwt !== undefined &&
+    natsInfra.account_jwt !== "";
+
   const inputs: ProvisionInputs = {
     principal,
     stackSlug: slug,
@@ -2074,6 +2111,7 @@ function deriveProvisionInputs(
     operatorName: names.operatorName, // nsc operator account name (OP_<PRINCIPAL>)
     federationAccountName: names.federationAccountName,
     agentsAccountName: names.agentsAccountName,
+    systemAccountName,
     seedPath,
     credsPath,
     force: flags["--force"] === true,
@@ -2082,6 +2120,7 @@ function deriveProvisionInputs(
       federationAccount: cfg.stack?.nats_infra?.account,
       agentsAccount: cfg.stack?.nats_infra?.agents_account,
       signingSeedExists: existsSync(expandTilde(seedPath)),
+      operatorModeJwtsPresent,
     },
   };
   return { ok: true, inputs, stackConfigPath: resolveStackWriteConfigPath(configPath) };

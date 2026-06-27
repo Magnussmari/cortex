@@ -14,6 +14,7 @@ import { homedir } from "os";
 import { join } from "path";
 
 import { expandTilde } from "../../../common/config/loader";
+import { renderOperatorModeBlocks } from "../../../common/nats/leaf-remote-renderer";
 import {
   selectNatsServiceManager,
   currentServicePlatform,
@@ -223,6 +224,35 @@ export function buildResolverPreloadAdapter(): ResolverPreloadPort {
         // Back up before the in-place edit (timestamped — the rollback artefact).
         copyFileSync(abs, `${abs}.bak-makelive-${Date.now().toString()}`);
         writeFileSync(abs, next, "utf-8");
+        return { ok: true, changed: true };
+      } catch (err) {
+        return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+    },
+    // cortex#1265 — bootstrap an initial operator-mode skeleton (local-only path).
+    // Reuses renderOperatorModeBlocks (the SINGLE source of the §B0.1 grammar) so
+    // the bootstrapped conf is byte-identical to one `cortex network join` would
+    // render. APPENDS the operator-mode blocks to the bus's EXISTING config — it
+    // requires that config to exist (it carries the bus's server_name/listen/http),
+    // never fabricating a server identity.
+    bootstrapOperatorMode: ({ natsConfigPath, package: pkg }) => {
+      try {
+        const abs = expandTilde(natsConfigPath);
+        if (!existsSync(abs)) {
+          return {
+            ok: false,
+            reason:
+              `nats config not found at ${abs} — bootstrap appends operator-mode blocks to an ` +
+              "EXISTING bus config (carrying its server_name/listen/http). Create the base config first.",
+          };
+        }
+        const current = readFileSync(abs, "utf-8");
+        const result = renderOperatorModeBlocks(current, pkg);
+        if (result.status === "refuse") return { ok: false, reason: result.reason };
+        if (result.status === "already") return { ok: true, changed: false };
+        // converted — back up first (the rollback artefact), then write in place.
+        copyFileSync(abs, `${abs}.bak-makelive-${Date.now().toString()}`);
+        writeFileSync(abs, result.conf, "utf-8");
         return { ok: true, changed: true };
       } catch (err) {
         return { ok: false, reason: err instanceof Error ? err.message : String(err) };
