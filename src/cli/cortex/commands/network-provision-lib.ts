@@ -11,13 +11,19 @@
  *   3. ensure the per-stack agents account (arc nats add-account)— ADR-0012 isolation
  *   4. ensure the stack signing seed  (provision-stack generate) — chmod 600, no-clobber
  *   5. wire federated.> export/import (arc nats add-federation-export) — fed → agents
- *   6. write stack.nats_infra back    (account, agents_account, creds_path) + nkey_seed_path
+ *   6. export operator-mode JWTs       (arc nats export-{operator,account,system}) — cortex#1265
+ *   7. write stack.nats_infra back    (account, agents_account, creds_path, nkey_seed_path,
+ *                                       operator_jwt, account_jwt, system_account[_jwt])
  *
  * After this the stack is ready for `cortex network join` — only the two
  * irreducible two-party steps remain (the leaf shared secret + hub topology
- * agreement). The operator-mode `.conf` render + bus restart are LEFT TO JOIN
- * (render-only here; join already performs the O-3 conversion + #821 health
- * probe), so this verb is non-disruptive.
+ * agreement). The operator-mode `.conf` render + bus restart are STILL LEFT TO
+ * JOIN (render-only here; join performs the O-3 conversion + #821 health probe),
+ * so this verb stays NON-DISRUPTIVE. cortex#1265 only adds the config-side JWT
+ * EXPORT that starves the renderer today: provision now populates the four
+ * `stack.nats_infra.{operator_jwt, account_jwt, system_account, system_account_jwt}`
+ * fields the O-3 join (and make-live bootstrap) read, so the operator runs zero
+ * raw `nsc generate config`. It writes ONLY config, never the `.conf`.
  *
  * This module is PURE over injected ports — zero fs / arc / nsc. The live
  * adapters live in `network-provision-adapters.ts`; the arc account-tree seam is
@@ -107,7 +113,43 @@ export interface ProvisionConfigWritePort {
     credsPath: string;
     seedPath: string;
     nkeyPub?: string;
+    /**
+     * cortex#1265 — the operator-mode JWTs that feed the O-3 join /
+     * make-live-bootstrap renderer (`renderOperatorModeBlocks`). Persisted under
+     * `stack.nats_infra.{operator_jwt, account_jwt, system_account,
+     * system_account_jwt}` — the exact fields `network-derive` reads. Omitted
+     * (left untouched) when not exported this run.
+     */
+    operatorJwt?: string;
+    accountJwt?: string;
+    systemAccount?: string;
+    systemAccountJwt?: string;
   }): { ok: true } | { ok: false; reason: string };
+}
+
+/**
+ * cortex#1265 — the export seam that bridges the minted nsc account tree to the
+ * operator-mode `.conf` renderer. Shells `arc nats export-{operator,account,
+ * system}` so cortex NEVER runs nsc (ADR-0013 invariant). Read-only over the nsc
+ * store; NEVER throws (arc failures → `{ ok: false }`).
+ */
+export interface OperatorModeExportPort {
+  /** `arc nats export-operator --name <name> --json` → operator JWT (+ pubkey). */
+  exportOperator(opts: { name: string }): Promise<
+    { ok: true; operatorJwt: string; pubKey: string } | { ok: false; reason: string }
+  >;
+  /** `arc nats export-account <name> --json` → account pubkey + JWT (exists today). */
+  exportAccount(name: string): Promise<
+    { ok: true; pubKey: string; jwt: string } | { ok: false; reason: string }
+  >;
+  /**
+   * `arc nats export-system --name <name> --json` → SYS account pubkey + JWT.
+   * `notFound` distinguishes "no SYS account exists" (a clean skip — SYS is
+   * optional, `nsc add operator` does not mint one) from a real arc failure.
+   */
+  exportSystem(opts: { name: string }): Promise<
+    { ok: true; pubKey: string; jwt: string } | { ok: false; reason: string; notFound: boolean }
+  >;
 }
 
 /** The full port bundle the orchestrator depends on. */
@@ -116,6 +158,7 @@ export interface ProvisionPorts {
   signing: SigningIdentityPort;
   federationWiring: FederationWiringPort;
   configWrite: ProvisionConfigWritePort;
+  export: OperatorModeExportPort;
 }
 
 // =============================================================================
@@ -130,6 +173,12 @@ export interface ProvisionState {
   agentsAccount: string | undefined;
   /** Does the signing seed file exist on disk? */
   signingSeedExists: boolean;
+  /**
+   * cortex#1265 — do `stack.nats_infra.operator_jwt` AND `account_jwt` already
+   * sit in config? Drives the ensure-shape of the JWT export: present ⇒ skip the
+   * export (no-op), absent ⇒ export + write. `--force` re-exports regardless.
+   */
+  operatorModeJwtsPresent: boolean;
 }
 
 export interface ProvisionInputs {
@@ -139,6 +188,8 @@ export interface ProvisionInputs {
   operatorName: string;
   federationAccountName: string;
   agentsAccountName: string;
+  /** cortex#1265 — the SYS (system) account name to best-effort export (default "SYS"). */
+  systemAccountName: string;
   /** `stack.nkey_seed_path` — where the signing seed is / will be written. */
   seedPath: string;
   /** Conventional leaf `.creds` path recorded in config (minted at join). */
@@ -148,7 +199,7 @@ export interface ProvisionInputs {
   state: ProvisionState;
 }
 
-export type PlanStatus = "mint" | "generate" | "wire" | "ok";
+export type PlanStatus = "mint" | "generate" | "wire" | "export" | "ok";
 
 export interface PlanItem {
   step: string;
@@ -184,6 +235,7 @@ export function buildProvisionPlan(inputs: ProvisionInputs): PlanItem[] {
   const fedPresent = !force && state.federationAccount !== undefined;
   const agentsPresent = !force && state.agentsAccount !== undefined;
   const signingPresent = !force && state.signingSeedExists;
+  const jwtsPresent = !force && state.operatorModeJwtsPresent;
 
   return [
     {
@@ -212,9 +264,14 @@ export function buildProvisionPlan(inputs: ProvisionInputs): PlanItem[] {
       detail: `${inputs.federationAccountName} → ${inputs.agentsAccountName}`,
     },
     {
+      step: "operator-mode JWTs export",
+      status: jwtsPresent ? "ok" : "export",
+      detail: `operator + ${inputs.federationAccountName} + ${inputs.systemAccountName} (system, best-effort)`,
+    },
+    {
       step: "stack.nats_infra write-back",
       status: "wire",
-      detail: "account, agents_account, creds_path, nkey_seed_path",
+      detail: "account, agents_account, creds_path, nkey_seed_path, operator_jwt, account_jwt, system_account[_jwt]",
     },
   ];
 }
@@ -325,6 +382,63 @@ export async function provisionStack(
   if (!wire.ok) return fail(plan, steps, `federation wiring failed: ${wire.reason}`);
   steps.push(`federated.> export/import: ${wire.note ?? "wired"}`);
 
+  // 5.5 (cortex#1265) — export the operator-mode JWTs so the O-3 join /
+  // make-live-bootstrap renderer (renderOperatorModeBlocks) materialises the
+  // operator-mode `.conf` with ZERO manual `nsc generate config`. Config-only +
+  // NON-DISRUPTIVE: nothing here touches the live bus (provision's documented
+  // invariant). Ensure-shaped: skipped when the JWTs already sit in config.
+  let operatorJwt: string | undefined;
+  let accountJwt: string | undefined;
+  let systemAccount: string | undefined;
+  let systemAccountJwt: string | undefined;
+  const jwtExportNeeded = force || !state.operatorModeJwtsPresent;
+  if (jwtExportNeeded) {
+    const opRes = await ports.export.exportOperator({ name: inputs.operatorName });
+    if (!opRes.ok) return fail(plan, steps, `export-operator failed: ${opRes.reason}`);
+    operatorJwt = opRes.operatorJwt;
+
+    const acctRes = await ports.export.exportAccount(inputs.federationAccountName);
+    if (!acctRes.ok) return fail(plan, steps, `export-account (federation) failed: ${acctRes.reason}`);
+    // Cross-check the exported account pubkey against the resolved federation
+    // pubkey — a divergence would render a `.conf` binding the leaf to the WRONG
+    // account (mirrors make-live's BLOCK 3 drift guard).
+    if (acctRes.pubKey !== resolvedAccount) {
+      return fail(
+        plan,
+        steps,
+        `account pubkey drift: federation account ${inputs.federationAccountName} resolved to ` +
+          `${resolvedAccount} but \`arc nats export-account\` returned ${acctRes.pubKey}.`,
+      );
+    }
+    accountJwt = acctRes.jwt;
+
+    // SYS is OPTIONAL + best-effort: `nsc add operator` does NOT mint one, and an
+    // operator-mode bus runs without it (the renderer treats system_account as
+    // optional). A missing SYS account is a clean skip, never a provision failure.
+    const sysRes = await ports.export.exportSystem({ name: inputs.systemAccountName });
+    if (sysRes.ok) {
+      systemAccount = sysRes.pubKey;
+      systemAccountJwt = sysRes.jwt;
+      steps.push(
+        `operator-mode JWTs exported: operator + ${inputs.federationAccountName} + ${inputs.systemAccountName} (system)`,
+      );
+    } else if (sysRes.notFound) {
+      steps.push(
+        `operator-mode JWTs exported: operator + ${inputs.federationAccountName} ` +
+          `(no ${inputs.systemAccountName} account — system_account skipped, optional)`,
+      );
+    } else {
+      // A non-"not-found" arc failure on the OPTIONAL system export: soft-skip
+      // with a visible warning rather than aborting the whole provision.
+      steps.push(
+        `operator-mode JWTs exported: operator + ${inputs.federationAccountName} ` +
+          `(WARNING: system export skipped — ${sysRes.reason})`,
+      );
+    }
+  } else {
+    steps.push("operator-mode JWTs present in config (untouched)");
+  }
+
   // 6. Write the resolved nats_infra fields back to the stack config.
   const written = ports.configWrite.write({
     account: resolvedAccount,
@@ -332,9 +446,18 @@ export async function provisionStack(
     credsPath: inputs.credsPath,
     seedPath: inputs.seedPath,
     ...(resolvedNkeyPub !== undefined && { nkeyPub: resolvedNkeyPub }),
+    ...(operatorJwt !== undefined && { operatorJwt }),
+    ...(accountJwt !== undefined && { accountJwt }),
+    ...(systemAccount !== undefined && { systemAccount }),
+    ...(systemAccountJwt !== undefined && { systemAccountJwt }),
   });
   if (!written.ok) return fail(plan, steps, `config write-back failed: ${written.reason}`);
-  steps.push("stack.nats_infra written (account, agents_account, creds_path, nkey_seed_path)");
+  steps.push(
+    "stack.nats_infra written (account, agents_account, creds_path, nkey_seed_path" +
+      (operatorJwt !== undefined ? ", operator_jwt, account_jwt" : "") +
+      (systemAccount !== undefined ? ", system_account, system_account_jwt" : "") +
+      ")",
+  );
 
   steps.push("");
   steps.push("Ready for `cortex network join <network>` — remaining: leaf shared secret + hub topology (two-party, out-of-band).");

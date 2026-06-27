@@ -12,7 +12,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { buildSigningIdentityAdapter } from "../network-provision-adapters";
+import { readFileSync, writeFileSync } from "fs";
+import { parseDocument } from "yaml";
+
+import { buildSigningIdentityAdapter, buildProvisionConfigWriteAdapter } from "../network-provision-adapters";
 
 describe("buildSigningIdentityAdapter — live, tilde expansion (cortex#1236)", () => {
   let home: string;
@@ -66,5 +69,71 @@ describe("buildSigningIdentityAdapter — live, tilde expansion (cortex#1236)", 
     // again → no O_EXCL EEXIST. The divergence this asserts against is the
     // cortex#1236 bug (probe expanded, write literal `~`).
     expect(adapter.exists(RAW_SEED)).toBe(true);
+  });
+});
+
+// cortex#1265 — the config write-back persists the operator-mode JWTs.
+describe("buildProvisionConfigWriteAdapter — operator-mode JWT write-back (cortex#1265)", () => {
+  let dir: string;
+  const FED = "A" + "B".repeat(55);
+  const AGENTS = "A" + "C".repeat(55);
+  const SYS = "A" + "S".repeat(55);
+  const OP_JWT = "eyJ.op.sig";
+  const FED_JWT = "eyJ.fed.sig";
+  const SYS_JWT = "eyJ.sys.sig";
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "cortex-provision-cfg-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("writes operator_jwt/account_jwt/system_account[_jwt] under stack.nats_infra", () => {
+    const path = join(dir, "research.yaml");
+    writeFileSync(path, "stack:\n  id: andreas/research\n", "utf-8");
+    const adapter = buildProvisionConfigWriteAdapter(path);
+
+    const r = adapter.write({
+      account: FED,
+      agentsAccount: AGENTS,
+      credsPath: "~/.config/nats/research.creds",
+      seedPath: "~/.config/nats/andreas-research.seed",
+      operatorJwt: OP_JWT,
+      accountJwt: FED_JWT,
+      systemAccount: SYS,
+      systemAccountJwt: SYS_JWT,
+    });
+    expect(r.ok).toBe(true);
+
+    const doc = parseDocument(readFileSync(path, "utf-8"));
+    expect(doc.getIn(["stack", "nats_infra", "operator_jwt"])).toBe(OP_JWT);
+    expect(doc.getIn(["stack", "nats_infra", "account_jwt"])).toBe(FED_JWT);
+    expect(doc.getIn(["stack", "nats_infra", "system_account"])).toBe(SYS);
+    expect(doc.getIn(["stack", "nats_infra", "system_account_jwt"])).toBe(SYS_JWT);
+    // The pre-existing account-tree fields are written too.
+    expect(doc.getIn(["stack", "nats_infra", "account"])).toBe(FED);
+  });
+
+  test("omitted JWT fields are NOT written (never clobber a hand-tuned value)", () => {
+    const path = join(dir, "research.yaml");
+    writeFileSync(path, "stack:\n  id: andreas/research\n  nats_infra:\n    system_account: AKEEPME\n", "utf-8");
+    const adapter = buildProvisionConfigWriteAdapter(path);
+
+    // No system fields passed (SYS absent) — the existing system_account survives.
+    adapter.write({
+      account: FED,
+      agentsAccount: AGENTS,
+      credsPath: "~/c.creds",
+      seedPath: "~/s.seed",
+      operatorJwt: OP_JWT,
+      accountJwt: FED_JWT,
+    });
+
+    const doc = parseDocument(readFileSync(path, "utf-8"));
+    expect(doc.getIn(["stack", "nats_infra", "operator_jwt"])).toBe(OP_JWT);
+    // The pre-existing system_account was NOT clobbered.
+    expect(doc.getIn(["stack", "nats_infra", "system_account"])).toBe("AKEEPME");
+    expect(doc.getIn(["stack", "nats_infra", "system_account_jwt"])).toBeUndefined();
   });
 });

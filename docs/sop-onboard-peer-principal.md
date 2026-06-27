@@ -46,25 +46,30 @@ This prints your `nkey_pub` (`U…`, 56 chars). Keep the seed chmod 600 — it i
 
 ### Step 3 — Ensure your bus is operator-mode
 
-Your stack's local NATS bus must be **operator-mode** (it must define your NSC operator, the system account, and the resolver preload including the federation account) before it can bind a leaf link to an operator-mode hub. A hard-isolated anonymous bus (no NSC operator, no accounts) cannot federate.
+Your stack's local NATS bus must be **operator-mode** (it must define your NSC operator, optionally the system account, and the resolver preload including the federation account) before it can bind a leaf link to an operator-mode hub. A hard-isolated anonymous bus (no NSC operator, no accounts) cannot federate.
 
-> **What operator-mode means here.** Your bus config must include the NSC operator JWT, `system_account`, `resolver: MEMORY`, and `resolver_preload` containing both your agents account and your system account. Mirror the four blocks from your existing operator-mode bus conf if you have one (e.g. `~/.config/nats/local.conf`). Keep your stack's own `server_name`, `listen` port, `jetstream.domain`, and `http` monitor port — do not copy the meta-factory leaf include, `cortex network join` renders its own leaf include for your stack.
+> **What operator-mode means here.** Your bus config must include the NSC operator JWT, optionally `system_account`, `resolver: MEMORY`, and `resolver_preload` containing your federation account (and, once landed, your agents account). Keep your stack's own `server_name`, `listen` port, `jetstream.domain`, and `http` monitor port — `cortex network join` renders its own leaf include for your stack.
 
-If your stack is already on an operator-mode bus (most established stacks are), skip to step 4.
+**You no longer hand-edit this (cortex#1265).** `cortex network provision` (step 4a) now **exports the operator-mode JWTs** — operator + federation account (+ SYS account, when present) — into `stack.nats_infra.{operator_jwt, account_jwt, system_account, system_account_jwt}`. From there the conversion is automatic and command-only:
 
-> **Converting a hard-isolated stack.** Edit `~/.config/nats/<slug>.conf` to add the operator-mode blocks, restart the bus, then continue. See [`sop-stack-onboarding.md §B0.1`](./sop-stack-onboarding.md#b01--the-bus-must-be-operator-mode-the-794-lesson) for the full procedure.
+- **Federating stack →** `cortex network join` (step 6) reads those fields and **renders the operator-mode `.conf` for you** (O-3 conversion). You run **zero `nsc generate config`**.
+- **Local-only stack (never federates) →** `cortex network make-live <slug> --apply` **bootstraps** the initial operator-mode resolver from the same JWTs (and lands the daemon on its agents account). Again, no raw `nsc`.
 
-### Step 4a — Create your dedicated federation account
+If your stack is already on an operator-mode bus (most established stacks are), nothing to do — both paths are idempotent and never clobber a hand-tuned `.conf`.
 
-Your stack needs a **dedicated federation account** under your NSC operator — separate from your agents account so federation traffic is blast-radius-isolated from internal work. This is the last-mile provisioning step (G1d):
+> **Manual fallback only.** The hand-edit in [`sop-stack-onboarding.md §B0.1`](./sop-stack-onboarding.md#b01--the-bus-must-be-operator-mode-the-794-lesson) is now a last-resort fallback, not the happy path — prefer `cortex network provision` + `join`/`make-live`.
+
+### Step 4a — Mint your account tree (one command)
+
+Stand up your sovereign account tree — your NSC operator, a **dedicated federation account** (separate from your agents account so federation traffic is blast-radius-isolated from internal work), the per-stack agents account, the `federated.>` export/import wiring, and the **operator-mode JWT export** (cortex#1265) — in a single command:
 
 ```bash
-arc nats add-federation-export --account <federation-account-name> --stack <principal>/<slug>
+cortex network provision <principal>/<slug> --apply
 ```
 
-> **Honest status (as of G5).** G1d (the dedicated-account provisioning primitive) emits a WARN no-op today — the `arc nats add-federation-export` command provisions the export/import wiring but the automated account-creation path is still the last-mile. If your NSC operator does not yet have a dedicated federation account, you create it once with `nsc add account <federation-account-name>` before running the arc command. This step becomes fully one-command when G1d ships.
+> **Status (G1d + cortex#1265).** This wraps `arc nats init-operator` + `add-account` (federation + agents) + `add-federation-export` + `export-{operator,account,system}`. It is **non-disruptive** — it writes only config (the account pubkeys AND the operator-mode JWTs into `stack.nats_infra`), never the `.conf` and never restarts the bus. The raw `nsc add account` / `nsc generate config` steps this SOP used to teach are gone; provision now covers account creation and the JWT export wholesale. Dry-run by default; pass `--apply` to mint.
 
-Add the federation account's NKey (`A…`) to your stack config under `stack.nats_infra.account`.
+`cortex network provision` writes the federation account's NKey (`A…`) to `stack.nats_infra.account` and the operator-mode JWTs alongside it — no manual edit required.
 
 ### Step 4b — Register your stack identity with the network registry
 

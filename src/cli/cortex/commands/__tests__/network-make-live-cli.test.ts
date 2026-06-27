@@ -91,6 +91,7 @@ function fakeFactory(): { factory: MakeLivePortsFactory; calls: string[]; mutate
         hasAccount: () => false,
         hasResolverPreload: () => true, // M3 — operator-mode bus (fake)
         appendAccount: () => { calls.push("resolver-append"); return { ok: true, changed: true }; },
+        bootstrapOperatorMode: () => { calls.push("bootstrap"); return { ok: true, changed: true }; },
       },
       restart: {
         resolveTargets: () => ({ natsDescriptor: "/LA/nats.plist", daemonDescriptor: "/LA/cortex.plist" }),

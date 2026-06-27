@@ -10,7 +10,7 @@
  * nats BEFORE the daemon), idempotent re-runs, and that the orchestrator never
  * touches the stack config (so encryption / federated config survives).
  */
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 
 import {
   makeLiveStack,
@@ -19,8 +19,11 @@ import {
   type MakeLivePorts,
   type MakeLiveState,
 } from "../network-make-live-lib";
-import { insertIntoResolverPreload, findNatsServerDescriptor } from "../network-make-live-adapters";
+import { insertIntoResolverPreload, findNatsServerDescriptor, buildResolverPreloadAdapter } from "../network-make-live-adapters";
 import type { DaemonLocatorIO } from "../daemon-locator";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
 const AGENTS_PUB = "A" + "R".repeat(55);
 const AGENTS_JWT = "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJzdWIiOiJBQVJSIn0.sig";
@@ -50,6 +53,10 @@ function makePorts(over?: {
   hasResolverPreload?: boolean;
   /** Whether the append actually mutates (changed). Default true. */
   appendChanged?: boolean;
+  /** cortex#1265 — whether bootstrapOperatorMode reports a change. Default true. */
+  bootstrapChanged?: boolean;
+  /** cortex#1265 — make bootstrapOperatorMode fail (refuse/error). */
+  bootstrapFails?: boolean;
   /** BLOCK 3 — pubkey the export port returns (default the matching AGENTS_PUB). */
   exportPubKey?: string;
   /** BLOCK 2 — descriptors resolveTargets returns. */
@@ -80,6 +87,11 @@ function makePorts(over?: {
       appendAccount: ({ accountPubkey }) => {
         calls.push(`resolver-append:${accountPubkey}`);
         return { ok: true, changed: over?.appendChanged ?? true };
+      },
+      bootstrapOperatorMode: ({ natsConfigPath }) => {
+        calls.push(`bootstrap:${natsConfigPath}`);
+        if (over?.bootstrapFails) return { ok: false, reason: "operator-mode under a different operator" };
+        return { ok: true, changed: over?.bootstrapChanged ?? true };
       },
     },
     restart: {
@@ -204,6 +216,66 @@ describe("makeLiveStack — apply", () => {
     expect(calls).toEqual([]);
   });
 
+  // cortex#1265 — operator-mode bootstrap (local-only path) ─────────────────────
+  const FAKE_PKG = {
+    operatorJwt: "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJzdWIiOiJPQUZBS0UifQ.sig",
+    account: "A" + "F".repeat(55),
+    accountJwt: "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJzdWIiOiJBRkVEIn0.sig",
+  };
+
+  test("bootstrap: no resolver_preload BUT package present → bootstrap → append → restart", async () => {
+    const { ports, calls } = makePorts({ hasResolverPreload: false });
+    const res = await makeLiveStack(
+      makeInputs({ credsFileExists: false, resolverHasAccount: false }, { operatorModePackage: FAKE_PKG }),
+      ports,
+    );
+    expect(res.ok).toBe(true);
+    expect(res.applied).toBe(true);
+    // Bootstrap FIRST (creates the resolver_preload), then the agents append, then
+    // a SINGLE nats restart, then creds mint, then daemon restart.
+    expect(calls).toEqual([
+      `bootstrap:~/.config/nats/local.conf`,
+      `export:ANDREAS_WORK_AGENTS`,
+      `resolver-append:${AGENTS_PUB}`,
+      "restart-nats",
+      `mint:cortex-work@ANDREAS_WORK_AGENTS->~/.config/nats/cortex-work.creds`,
+      "restart-daemon",
+    ]);
+    expect(res.steps.join("\n")).toContain("operator-mode bootstrap");
+  });
+
+  test("bootstrap: a refuse (different operator) aborts before any append/restart", async () => {
+    const { ports, calls } = makePorts({ hasResolverPreload: false, bootstrapFails: true });
+    const res = await makeLiveStack(
+      makeInputs({ credsFileExists: false, resolverHasAccount: false }, { operatorModePackage: FAKE_PKG }),
+      ports,
+    );
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("operator-mode bootstrap failed");
+    expect(calls).toEqual([`bootstrap:~/.config/nats/local.conf`]); // nothing after
+  });
+
+  test("bootstrap: the plan shows the bootstrap step in dry-run", async () => {
+    const { ports, calls } = makePorts({ hasResolverPreload: false });
+    const res = await makeLiveStack(
+      makeInputs({ credsFileExists: false, resolverHasAccount: false }, { apply: false, operatorModePackage: FAKE_PKG }),
+      ports,
+    );
+    expect(res.ok).toBe(true);
+    expect(res.applied).toBe(false);
+    expect(res.steps.join("\n")).toContain("operator-mode bootstrap");
+    expect(calls).toEqual([]); // dry-run mutates nothing
+  });
+
+  test("bootstrap: refuses when NO package AND no resolver_preload (the #794 floor)", async () => {
+    const { ports, calls } = makePorts({ hasResolverPreload: false });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: false, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("no operator-mode JWTs");
+    expect(res.reason).toContain("provision");
+    expect(calls).toEqual([]);
+  });
+
   // BLOCK 3 — pubkey drift cross-check ─────────────────────────────────────────
   test("BLOCK 3: export-account pubkey ≠ config pubkey aborts before resolver write", async () => {
     const driftKey = "A" + "Q".repeat(55);
@@ -289,6 +361,60 @@ describe("insertIntoResolverPreload", () => {
 
   test("returns null when there is no resolver_preload block", () => {
     expect(insertIntoResolverPreload("listen: 127.0.0.1:4222\n", "x")).toBeNull();
+  });
+});
+
+// ── cortex#1265 — bootstrapOperatorMode adapter (real renderOperatorModeBlocks) ─
+
+describe("buildResolverPreloadAdapter — bootstrapOperatorMode (cortex#1265)", () => {
+  const PKG = {
+    operatorJwt: "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJzdWIiOiJPUCJ9.sig",
+    account: "A" + "F".repeat(55),
+    accountJwt: "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJzdWIiOiJBRkVEIn0.sig",
+  };
+  // A plain bus config: server identity, NO operator-mode blocks.
+  const BASE_CONF = ['server_name: "research"', 'listen: "127.0.0.1:4222"', 'http: "127.0.0.1:8222"'].join("\n") + "\n";
+
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cortex-bootstrap-")); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test("renders operator + resolver_preload (federation account), KEEPING server identity", () => {
+    const path = join(dir, "research.conf");
+    writeFileSync(path, BASE_CONF, "utf-8");
+    const adapter = buildResolverPreloadAdapter();
+
+    const r = adapter.bootstrapOperatorMode({ natsConfigPath: path, package: PKG });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.changed).toBe(true);
+
+    const out = readFileSync(path, "utf-8");
+    // operator-mode blocks rendered…
+    expect(out).toContain("operator: " + PKG.operatorJwt);
+    expect(out).toContain("resolver: MEMORY");
+    expect(out).toContain(`${PKG.account}: ${PKG.accountJwt}`);
+    // …and the bus's own identity preserved verbatim.
+    expect(out).toContain('server_name: "research"');
+    expect(out).toContain('listen: "127.0.0.1:4222"');
+    // The probe now reports operator-mode (so the append step finds the block).
+    expect(adapter.hasResolverPreload(path)).toBe(true);
+  });
+
+  test("idempotent: a second bootstrap on the converted bus is a no-op (changed:false)", () => {
+    const path = join(dir, "research.conf");
+    writeFileSync(path, BASE_CONF, "utf-8");
+    const adapter = buildResolverPreloadAdapter();
+    adapter.bootstrapOperatorMode({ natsConfigPath: path, package: PKG });
+    const second = adapter.bootstrapOperatorMode({ natsConfigPath: path, package: PKG });
+    expect(second.ok).toBe(true);
+    if (second.ok) expect(second.changed).toBe(false);
+  });
+
+  test("refuses when the base config file is absent (never fabricate server identity)", () => {
+    const adapter = buildResolverPreloadAdapter();
+    const r = adapter.bootstrapOperatorMode({ natsConfigPath: join(dir, "missing.conf"), package: PKG });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("not found");
   });
 });
 

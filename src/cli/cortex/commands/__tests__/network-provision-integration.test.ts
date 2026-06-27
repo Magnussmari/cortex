@@ -94,9 +94,15 @@ function buildPorts(runner: ArcFederationRunner): { ports: ProvisionPorts; writt
   const configWrite: ProvisionConfigWritePort = {
     write: (fields) => { written.push(fields); return { ok: true }; },
   };
+  // cortex#1265 — a fake export port (the export-arc seam is unit-tested separately).
+  const exportPort = {
+    exportOperator: async () => ({ ok: true as const, operatorJwt: "eyJ.op.sig", pubKey: "OD4D" }),
+    exportAccount: async () => ({ ok: true as const, pubKey: FED_PUB, jwt: "eyJ.fed.sig" }),
+    exportSystem: async () => ({ ok: false as const, reason: "no SYS", notFound: true }),
+  };
   // The REAL wiring adapter — only the arc subprocess runner is swapped.
   const federationWiring = buildFederationWiringAdapter(runner);
-  return { ports: { operator, signing, federationWiring, configWrite }, written };
+  return { ports: { operator, signing, federationWiring, configWrite, export: exportPort }, written };
 }
 
 function inputs(): ProvisionInputs {
@@ -107,11 +113,12 @@ function inputs(): ProvisionInputs {
     operatorName: "OP_ANDREAS",
     federationAccountName: "ANDREAS_WORK_FED",
     agentsAccountName: "ANDREAS_WORK_AGENTS",
+    systemAccountName: "SYS",
     seedPath: "~/.config/nats/cortex-work.nk",
     credsPath: "~/.config/nats/work.creds",
     force: false,
     apply: true,
-    state: { federationAccount: undefined, agentsAccount: undefined, signingSeedExists: false },
+    state: { federationAccount: undefined, agentsAccount: undefined, signingSeedExists: false, operatorModeJwtsPresent: false },
   };
 }
 

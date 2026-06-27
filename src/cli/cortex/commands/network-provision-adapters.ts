@@ -19,6 +19,7 @@ import { expandTilde } from "../../../common/config/loader";
 import { generateStackIdentity } from "../../../bus/stack-provisioning";
 import { buildFederationWiringAdapter } from "./network-federation-wiring";
 import { buildOperatorProvisioningAdapter } from "./operator-provisioning";
+import { buildOperatorModeExportAdapter } from "./operator-mode-export";
 import type {
   ProvisionPorts,
   SigningIdentityPort,
@@ -81,6 +82,21 @@ export function buildProvisionConfigWriteAdapter(stackConfigPath: string): Provi
         if (fields.nkeyPub !== undefined) {
           doc.setIn(["stack", "nkey_pub"], fields.nkeyPub);
         }
+        // cortex#1265 — the operator-mode JWTs the O-3 join / make-live-bootstrap
+        // renderer reads (network-derive). Set only when exported this run (omitted
+        // fields leave any hand-tuned value untouched — never clobbered).
+        if (fields.operatorJwt !== undefined) {
+          doc.setIn(["stack", "nats_infra", "operator_jwt"], fields.operatorJwt);
+        }
+        if (fields.accountJwt !== undefined) {
+          doc.setIn(["stack", "nats_infra", "account_jwt"], fields.accountJwt);
+        }
+        if (fields.systemAccount !== undefined) {
+          doc.setIn(["stack", "nats_infra", "system_account"], fields.systemAccount);
+        }
+        if (fields.systemAccountJwt !== undefined) {
+          doc.setIn(["stack", "nats_infra", "system_account_jwt"], fields.systemAccountJwt);
+        }
         mkdirSync(dirname(stackConfigPath), { recursive: true });
         writeFileSync(stackConfigPath, doc.toString(), "utf-8");
         return { ok: true };
@@ -102,5 +118,6 @@ export function buildLiveProvisionPorts(stackConfigPath: string): ProvisionPorts
     signing: buildSigningIdentityAdapter(),
     federationWiring: buildFederationWiringAdapter(),
     configWrite: buildProvisionConfigWriteAdapter(stackConfigPath),
+    export: buildOperatorModeExportAdapter(),
   };
 }
