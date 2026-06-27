@@ -479,7 +479,7 @@ describe("buildFederationWiringAdapter — arc-shell adapter", () => {
     importAlreadyPresent: true,
   });
 
-  test("dry-run: invokes arc with --dry-run (no --apply) and returns ok", async () => {
+  test("dry-run: invokes arc with NO --apply and NO --dry-run (arc default is dry-run) and returns ok", async () => {
     const { runner, calls } = makeRunner({ stdout: SUCCESS_JSON });
     const adapter = buildFederationWiringAdapter(runner);
 
@@ -491,13 +491,43 @@ describe("buildFederationWiringAdapter — arc-shell adapter", () => {
 
     expect(result.ok).toBe(true);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain("--dry-run");
+    // arc's add-federation-export has NO --dry-run flag: dry-run is the default
+    // and only --apply mutates. The non-apply branch must emit neither flag —
+    // passing --dry-run makes real arc exit 1 with `unknown option '--dry-run'`.
+    expect(calls[0]).not.toContain("--dry-run");
     expect(calls[0]).not.toContain("--apply");
     expect(calls[0]).toContain("--from-account");
     expect(calls[0]).toContain(LEAF_ACCOUNT);
     expect(calls[0]).toContain("--to-account");
     expect(calls[0]).toContain(AGENTS_ACCOUNT);
     expect(calls[0]).toContain("--json");
+  });
+
+  test("dry-run regression: a runner mimicking real arc's --dry-run rejection would surface failure (guards against a non-existent arc flag)", async () => {
+    // Mimic real arc's behaviour if the adapter ever regressed to passing a flag
+    // arc does not know (e.g. --dry-run): commander exits 1 with empty stdout and
+    // an `unknown option` error on stderr. This pins the regression to real-arc
+    // behaviour rather than a permissive mock that returns success for any argv.
+    const realArcLikeRunner: ArcFederationRunner = async (argv) => {
+      const unknown = argv.find(
+        (a) => a.startsWith("--") && a !== "--from-account" && a !== "--to-account"
+          && a !== "--subject" && a !== "--service" && a !== "--apply" && a !== "--json",
+      );
+      if (unknown !== undefined) {
+        return { stdout: "", stderr: `error: unknown option '${unknown}'`, exitCode: 1 };
+      }
+      return { stdout: SUCCESS_JSON, stderr: "", exitCode: 0 };
+    };
+    const adapter = buildFederationWiringAdapter(realArcLikeRunner);
+
+    // The shipping adapter (no --dry-run flag) succeeds against real-arc behaviour.
+    const result = await adapter.wireLocalFederation({
+      federationAccount: LEAF_ACCOUNT,
+      agentsAccount: AGENTS_ACCOUNT,
+      apply: false,
+    });
+
+    expect(result.ok).toBe(true);
   });
 
   test("--apply: invokes arc with --apply (not --dry-run)", async () => {

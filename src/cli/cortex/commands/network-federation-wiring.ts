@@ -142,7 +142,13 @@ export function buildFederationWiringAdapter(
         "--from-account", federationAccount,
         "--to-account", toAccount,
         "--subject", "federated.>",
-        apply ? "--apply" : "--dry-run",
+        // arc's add-federation-export has NO --dry-run flag; dry-run is the
+        // DEFAULT and only --apply mutates (`arc nats add-federation-export
+        // --help`: "--apply … (default: dry-run)"). Passing --dry-run makes arc
+        // exit 1 with `unknown option '--dry-run'` and empty stdout, so the
+        // dry-run join path (network-lib.ts: apply defaults false) always failed
+        // federation-wiring. Emit --apply only when mutating; nothing otherwise.
+        ...(apply ? ["--apply"] : []),
         "--json",
       ];
 
