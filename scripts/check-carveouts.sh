@@ -194,6 +194,11 @@ ALLOWLIST_PATHS=(
   'src/cli/cortex/commands/__tests__/operator-provisioning.test.ts'
   'src/cli/cortex/commands/__tests__/network-provision-lib.test.ts'
   'src/cli/cortex/commands/__tests__/network-provision-cli.test.ts'
+  # provision→arc end-to-end integration test (C-1225 provision-chain hardening):
+  # drives the orchestrator through the real FederationWiringPort against a
+  # faithful arc-CLI contract harness. Every "operator" is the NSC account-tree
+  # sense (OperatorProvisioningPort / OP_ANDREAS), never the principal. Class: NSC.
+  'src/cli/cortex/commands/__tests__/network-provision-integration.test.ts'
   # G1d own-operator onboarding design doc — its whole subject is standing up the
   # principal's own NSC account tree (also caught by the `operator-onboarding`
   # line pattern; path-allowlisted for clarity). Class: NSC.
