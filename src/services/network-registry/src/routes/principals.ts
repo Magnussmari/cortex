@@ -214,15 +214,23 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
     // This is the key that federated envelopes FROM this peer will be verified
     // against (per C-787). The requested_scope is derived from the principal_id.
     //
-    // Errors here are logged but NOT propagated to the caller: a failure to
-    // create the issuance request must not reject a valid registration — the
-    // principal record is already committed, and a retry of the issuance upsert
-    // is always safe (idempotent).
+    // Errors here do NOT reject the registration — a failure to create the
+    // issuance request must not reject a valid registration: the principal
+    // record is already committed, and a retry of the issuance upsert is always
+    // safe (idempotent). But the failure MUST NOT be silent (cortex#1263): a
+    // swallowed upsert leaves a principal in `principals` with NO PENDING
+    // admission row, so the admin sees nothing to admit and the registrant
+    // believes they are queued. We therefore (a) emit a loud, structured
+    // `system.error` log carrying enough context for a monitor / on-call to act,
+    // and (b) surface a non-fatal warning on the register RESPONSE so the
+    // registering cortex can tell its principal "registered, but your admission
+    // request didn't land — re-register to retry."
+    const peerPubkey =
+      stacksWithPubkeys[0]?.stack_pubkey ?? claim.principal_pubkey;
+    const requestedScope = `federated.${principalId}.>`;
+    let admissionRequestFailed = false;
     try {
       const issuanceStore = getIssuanceStore(c.env);
-      const peerPubkey =
-        stacksWithPubkeys[0]?.stack_pubkey ?? claim.principal_pubkey;
-      const requestedScope = `federated.${principalId}.>`;
       // ADR-0018 Gap-A — stamp the target network the joiner named (signed into
       // the claim) onto the PENDING admission row. This makes the idempotency
       // key `(principal_id, peer_pubkey, network_id)`, so the same stack can
@@ -235,15 +243,45 @@ export function principalRoutes(): Hono<{ Bindings: Env }> {
         claim.network_id,
       );
     } catch (err) {
+      admissionRequestFailed = true;
+      // Loud, structured system.error signal — mirrors the registry's other
+      // non-fatal error surfacing (`console.error` with the `[network-registry]`
+      // prefix, picked up by the platform log drain / monitor). The token
+      // `system.error admission_request_upsert_failed` is greppable; the context
+      // (principal_id, peer_pubkey, network_id, scope, error) is everything a
+      // monitor / on-call needs to diagnose and re-raise the PENDING row.
       console.error(
-        `[network-registry] issuance upsert failed for principal ${principalId}: ${err instanceof Error ? err.message : String(err)}`,
+        `[network-registry] system.error admission_request_upsert_failed ` +
+          `principal_id=${principalId} ` +
+          `peer_pubkey=${peerPubkey} ` +
+          `network_id=${claim.network_id ?? "(none)"} ` +
+          `requested_scope=${requestedScope} ` +
+          `error=${err instanceof Error ? err.message : String(err)}`,
       );
-      // Intentionally non-fatal: the principal record is committed.
+      // Intentionally non-fatal: the principal record is committed. The caller
+      // is told via the response warning below.
     }
 
     // Sign + return the canonical view so the principal gets the same
     // signed assertion shape peers will see.
     const assertion = await signAssertion(c.env, record);
+    if (admissionRequestFailed) {
+      // Additive, back-compat: the signed `payload`/`issued_at`/`registry`/
+      // `signature` fields are unchanged (clients that ignore extra fields keep
+      // working). The `admission_request: "failed"` flag + human-readable
+      // `warning` tell the registering cortex that registration succeeded but
+      // the admission request did NOT land — re-registering self-heals because
+      // `upsertPending` is idempotent.
+      return c.json(
+        {
+          ...assertion,
+          admission_request: "failed" as const,
+          warning:
+            "registered, but the PENDING admission request could not be created; re-register to retry (the upsert is idempotent)",
+        },
+        201,
+      );
+    }
     return c.json(assertion, 201);
   });
 
