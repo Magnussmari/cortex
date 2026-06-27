@@ -289,3 +289,125 @@ describe("Pier arc-manifest (arc-manifest-pier.yaml)", () => {
     expect(allSteps.join("\n")).not.toContain("issue-nats-creds");
   });
 });
+
+// ---------------------------------------------------------------------------
+// AIRGAP lock-down (ADR-0015 + ADR-0017, cortex#1142 / #1175)
+//
+// The load-bearing security invariant: Pier is a PUBLIC, zero-authority
+// concierge that SURFACES admission requests but is *structurally incapable*
+// of running them. The privileged acts (`cortex network admit`,
+// `cortex network secret add-member`, the Discord role grant) require Bash /
+// Skill tools Pier does not have. These tests fail-closed: any future edit that
+// hands Pier a privileged tool, an executor role, or "drives the admit gate"
+// language breaks the build before it can ship.
+// ---------------------------------------------------------------------------
+
+describe("Pier AIRGAP — structurally cannot admit or hold a secret", () => {
+  const MANIFEST = join(REPO_ROOT, "arc-manifest-pier.yaml");
+
+  // The public entry channel (#onboard-your-fleet) and the private back-office
+  // (#assistant-fleet-onboarding). Pier greets in the PUBLIC channel.
+  const PUBLIC_ENTRY_CHANNEL = "1517154685595942972";
+  const PRIVATE_BACKOFFICE_CHANNEL = "1514679294553751613";
+
+  // Any of these in a tool allowlist would break the airgap: Bash/Skill let Pier
+  // shell out to the privileged CLI; Write/Edit let it tamper with config.
+  const PRIVILEGED_TOOL = /^(Bash|Skill|Write|Edit|NotebookEdit|mcp__)/;
+
+  function personaBody(): string {
+    const raw = readFileSync(PERSONA, "utf-8");
+    return raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
+  }
+  function loadManifest(): Record<string, unknown> {
+    return parseYaml(readFileSync(MANIFEST, "utf-8")) as Record<string, unknown>;
+  }
+
+  test("persona allowedTools is exactly [Read] — Read-only, no privileged tool", () => {
+    const fm = loadPersonaFrontmatter();
+    expect(fm.allowedTools).toEqual(["Read"]);
+    (fm.allowedTools as string[]).forEach((t) =>
+      expect(t).not.toMatch(PRIVILEGED_TOOL),
+    );
+  });
+
+  test("fragment openOnboardingAllowedTools is exactly [Read] (stranger session is Read-only too)", () => {
+    const f = loadFragment();
+    // Mirrors the persona allowlist — the anon onboarding session must not get
+    // broader tools than a mapped Pier session (cortex#1167).
+    expect(f.openOnboardingAllowedTools).toEqual(["Read"]);
+    (f.openOnboardingAllowedTools as string[]).forEach((t) =>
+      expect(t).not.toMatch(PRIVILEGED_TOOL),
+    );
+  });
+
+  test("no Pier tool allowlist contains Bash/Skill/Write/Edit/mcp__* (cannot shell out to the CLI)", () => {
+    const fm = loadPersonaFrontmatter();
+    const f = loadFragment();
+    const allTools = [
+      ...((fm.allowedTools as string[] | undefined) ?? []),
+      ...((f.openOnboardingAllowedTools as string[] | undefined) ?? []),
+    ];
+    allTools.forEach((t) => expect(t).not.toMatch(PRIVILEGED_TOOL));
+  });
+
+  test("persona declares behavior.issues_nothing = true", () => {
+    const fm = loadPersonaFrontmatter();
+    const behavior = fm.behavior as Record<string, unknown> | undefined;
+    expect(behavior?.issues_nothing).toBe(true);
+  });
+
+  test("fragment carries no privileged-executor role (roles[] retired; airgap is the boundary)", () => {
+    const f = loadFragment();
+    expect(f.roles).toBeUndefined();
+  });
+
+  test("manifest carries no retired/executor `roles` field on identity", () => {
+    const m = loadManifest();
+    const identity = m.identity as Record<string, unknown> | undefined;
+    expect(identity?.roles).toBeUndefined();
+  });
+
+  test("manifest binds the PUBLIC entry channel (not the private back-office) and matches the fragment", () => {
+    const m = loadManifest();
+    const f = loadFragment();
+    const mDiscord = (m.presence as Record<string, unknown>).discord as Record<string, unknown>;
+    const fDiscord = (f.presence as Record<string, unknown>).discord as Record<string, unknown>;
+    // Pier must greet in the channel newcomers can reach BEFORE any role.
+    expect(mDiscord.agentChannelId).toBe(PUBLIC_ENTRY_CHANNEL);
+    expect(mDiscord.agentChannelId).not.toBe(PRIVATE_BACKOFFICE_CHANNEL);
+    // The manifest's public identifiers must not drift from the rendered fragment.
+    expect(mDiscord.agentChannelId).toBe(fDiscord.agentChannelId);
+    expect(mDiscord.guildId).toBe(fDiscord.guildId);
+  });
+
+  test("manifest description frames Pier as surfacing — never as an admit executor", () => {
+    const m = loadManifest();
+    const desc = (m.description as string).toLowerCase();
+    expect(desc).toContain("surface");
+    expect(desc).toContain("issues nothing");
+    // Must NOT claim Pier drives/runs the admit gate itself.
+    expect(desc).not.toMatch(/drives?\s+[^.]*\bnetwork admit\b/);
+  });
+
+  test("persona surfaces admission — explicitly forbids Pier running the gate itself", () => {
+    const body = personaBody().toLowerCase();
+    // Surface-not-execute invariants (cortex#1164 / #1161).
+    expect(body).toContain("you surface; a human admits");
+    expect(body).toContain("you surface; a human grants");
+    // The explicit prohibition on self-invoking the signed admin command.
+    expect(body).toMatch(/do\s+\*\*not\*\*\s+invoke\s+`cortex network admit`/);
+    // Never approve its own request.
+    expect(body).toContain("never approve your own");
+  });
+
+  test("persona never instructs Pier to RUN admit/secret — every privileged command is surfaced, for a human to run", () => {
+    const body = personaBody();
+    // The privileged commands appear ONLY inside "for a principal to review and
+    // run" framing — never as an instruction to Pier. Assert the framing exists
+    // wherever the signed admin command does.
+    expect(body).toMatch(/their admin seed signs; you never hold it/);
+    // The secret command (post-merge sealed flow) is surfaced for the admin.
+    expect(body).toMatch(/cortex network secret add-member/);
+    expect(body).toMatch(/the admin runs it/i);
+  });
+});

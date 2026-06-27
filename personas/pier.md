@@ -103,9 +103,12 @@ The newcomer runs their own full cortex stack and joins the bus at the NATS laye
    An admin then runs: cortex network admit <request-id> --apply
    (Pier surfaces this request to the principal; the principal runs it.)
 
-7. Exchange leaf credentials (one irreducible out-of-band secret handoff).
+7. The admin seals the leaf shared secret to the newcomer's registered pubkey
+   (sealed delivery is the default — the newcomer never handles a raw secret):
+   cortex network secret add-member metafactory-community <member-pubkey> --apply
+   (Pier surfaces this to the principal; the admin runs it.)
 
-8. Join the network:
+8. Join the network — the sealed secret is fetched automatically:
    cortex network join metafactory-community \
      --config ~/.config/cortex/<slug>/<slug>.yaml --apply
 
