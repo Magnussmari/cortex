@@ -341,4 +341,4 @@ Each peer principal (e.g. JC) does their own B0 (a leaf cert on the hub) + B3 on
 
 ### Confidentiality note
 
-Payloads cross `federated.` **cleartext-over-TLS** in v1 (CONTEXT.md §Federation confidentiality) — envelope/payload encryption is designed but deferred. For a public-facing community stack, keep the dispatch scope tight (principal-only, least-privilege allowlist from Part 1) until that lands.
+Payload encryption **ships as of v5.27.0** ([ADR-0019](./adr/0019-federated-payload-encryption.md)): a network is a trust group, and all `federated.>` payloads (Direct/Delegate/Offer) are sealed with one per-network key `K`. It is **opt-in per network** — until you set `policy.federated.networks[].encryption: enabled` + `payload_key` (and the config file is `chmod 600`), payloads still cross `federated.` cleartext-over-TLS. For a public-facing community stack, **go private** (see [`sop-onboard-peer-principal.md` §Step 8 — Go private](./sop-onboard-peer-principal.md)) **and** keep the dispatch scope tight (principal-only, least-privilege allowlist from Part 1).
