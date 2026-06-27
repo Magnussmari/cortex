@@ -13,6 +13,9 @@
  *      `resolver_preload` (MEMORY resolver) in the nats config (default
  *      `~/.config/nats/local.conf`). Keyed on the account pubkey: pure addition,
  *      never disturbs the other stacks' accounts already there (multi-stack safe).
+ *      cortex#1265 — when the bus has NO `resolver_preload` yet (a fresh local-only
+ *      stack that never federates), BOOTSTRAP the operator-mode skeleton first from
+ *      the JWTs provision wrote into `stack.nats_infra` (instead of refusing).
  *   3. restart the NATS server so the MEMORY resolver loads the new account
  *      (a SIGHUP reload does NOT pick up resolver_preload — a hard restart is
  *      required; verified empirically, see docs/design-make-live-daemon-switch.md).
@@ -47,6 +50,8 @@
  * and mutates NOTHING. `--apply` executes mint → resolver → nats restart →
  * daemon restart, fail-fast (any port failure aborts and surfaces how far it got).
  */
+
+import type { OperatorModeLeafPackage } from "../../../common/nats/leaf-remote-renderer";
 
 // =============================================================================
 // Ports
@@ -92,6 +97,22 @@ export interface ResolverPreloadPort {
     accountName: string;
     accountPubkey: string;
     accountJwt: string;
+  }): { ok: true; changed: boolean } | { ok: false; reason: string };
+  /**
+   * cortex#1265 — bootstrap an INITIAL operator-mode skeleton into a config that
+   * has NO `resolver_preload` yet (the local-only path: a never-federates stack
+   * never runs `join`, so nothing else renders the operator-mode blocks). Renders
+   * `operator:` + optional `system_account:` + `resolver: MEMORY` +
+   * `resolver_preload { <federation account> }` via `renderOperatorModeBlocks`,
+   * KEEPING the bus's own `server_name`/`listen`/`http`/`jetstream.domain`, and
+   * backing up the config first. Idempotent: `changed:false` when the bus is
+   * already operator-mode under the SAME operator. Refuses (ok:false) on a
+   * malformed package OR a bus already operator-mode under a DIFFERENT operator
+   * (never clobber). The subsequent `appendAccount` then adds the agents account.
+   */
+  bootstrapOperatorMode(opts: {
+    natsConfigPath: string;
+    package: OperatorModeLeafPackage;
   }): { ok: true; changed: boolean } | { ok: false; reason: string };
 }
 
@@ -146,6 +167,14 @@ export interface MakeLiveInputs {
   credsPath: string;
   /** Path to the cortex config the daemon loads (for daemon-restart discovery). */
   cortexConfigPath: string;
+  /**
+   * cortex#1265 — the operator-mode leaf package assembled from
+   * `stack.nats_infra.{operator_jwt, account, account_jwt, system_account,
+   * system_account_jwt}` (provision populates these). Present ⇒ a bus with no
+   * `resolver_preload` is BOOTSTRAPPED operator-mode (instead of refused). Absent
+   * ⇒ the #794 refusal stands (no JWTs to render with).
+   */
+  operatorModePackage?: OperatorModeLeafPackage;
   /**
    * Path to the nats-server config carrying resolver_preload. BLOCK 1 — derived
    * PER-STACK from `stack.nats_infra.config_path` (or `--nats-config`); there is
@@ -260,29 +289,43 @@ export async function makeLiveStack(
     };
   }
 
-  // M3 — operator-mode guard (the `network join` #794 analogue). make-live teaches
-  // the nats-server a new account by appending to `resolver_preload`; a bus with no
-  // such block (the anonymous / hard-isolated `halden` pattern) is not operator-mode
-  // and make-live does not apply to it. Refuse BEFORE any mint/restart, in BOTH
-  // dry-run and apply, so the operator learns this rather than (under a defaulted
-  // config path) silently editing the wrong file. Runs against the SAME natsConfigPath
-  // the rest of the flow targets (BLOCK 1 derives it per-stack), so a category error
-  // is caught against the stack's own bus.
-  if (!ports.resolver.hasResolverPreload(inputs.natsConfigPath)) {
+  // M3 / cortex#1265 — operator-mode handling. make-live teaches the nats-server a
+  // new account by appending to `resolver_preload`; a bus with no such block (the
+  // anonymous / hard-isolated `halden` pattern, OR a fresh local-only stack) is not
+  // yet operator-mode. Two outcomes, decided BEFORE any mint/restart (so the choice
+  // shows in dry-run too), against the SAME natsConfigPath the rest of the flow
+  // targets (BLOCK 1 derives it per-stack):
+  //   - operator-mode JWTs in config (provision populated them) ⇒ BOOTSTRAP an
+  //     initial operator-mode skeleton (cortex#1265 local-only path).
+  //   - no JWTs ⇒ the #794 refusal stands — nothing to render with.
+  const bootstrapNeeded = !ports.resolver.hasResolverPreload(inputs.natsConfigPath);
+  if (bootstrapNeeded && inputs.operatorModePackage === undefined) {
     return {
       ok: false,
       applied: false,
       plan: [],
       reason:
         `${inputs.natsConfigPath} has no resolver_preload { … } block — this stack's bus is not ` +
-        "operator-mode; make-live does not apply. Convert the bus to operator-mode first " +
-        "(see docs/sop-stack-onboarding.md §B0.1) before landing the daemon on its agents account.",
+        "operator-mode, and stack.nats_infra carries no operator-mode JWTs to bootstrap one. Run " +
+        `\`cortex network provision ${inputs.stackSlug} --apply\` first (it populates ` +
+        "operator_jwt + account_jwt), or convert the bus by hand (docs/sop-stack-onboarding.md §B0.1).",
       steps: [],
     };
   }
 
-  const { credsNeeded, resolverNeeded, natsRestartNeeded, daemonRestartNeeded, plan } =
+  const { credsNeeded, resolverNeeded, natsRestartNeeded, daemonRestartNeeded, plan: corePlan } =
     planMakeLive(inputs);
+  // cortex#1265 — prepend the bootstrap step to the plan when it is needed.
+  const plan: PlanItem[] = bootstrapNeeded
+    ? [
+        {
+          step: "operator-mode bootstrap",
+          status: "wire",
+          detail: `render operator + resolver_preload (federation account) → ${inputs.natsConfigPath}`,
+        },
+        ...corePlan,
+      ]
+    : corePlan;
   const planLines = plan.map(renderPlanLine);
 
   // BLOCK 2 — resolve (read-only) the launchd/systemd descriptors the nats-server +
@@ -336,8 +379,28 @@ export async function makeLiveStack(
   // post-hoc record shows exactly which services were restarted).
   const steps: string[] = [...targetLines];
 
-  // 1. Teach the NATS server the agents account (append to resolver_preload).
+  // 0. (cortex#1265) Bootstrap the operator-mode skeleton when the bus has no
+  //    resolver_preload yet — renders operator + resolver: MEMORY + the federation
+  //    account, KEEPING the bus's own server_name/listen/http. The agents account
+  //    is appended in step 1 below. Done BEFORE the append so the block exists.
   let resolverChanged = false;
+  // bootstrapNeeded ⇒ operatorModePackage is defined (the guard above returns
+  // early otherwise). Re-narrow on the field directly to avoid a non-null `!`.
+  if (bootstrapNeeded && inputs.operatorModePackage !== undefined) {
+    const boot = ports.resolver.bootstrapOperatorMode({
+      natsConfigPath: inputs.natsConfigPath,
+      package: inputs.operatorModePackage,
+    });
+    if (!boot.ok) return fail(plan, steps, `operator-mode bootstrap failed: ${boot.reason}`);
+    resolverChanged = boot.changed;
+    steps.push(
+      boot.changed
+        ? `operator-mode bootstrap: rendered operator + resolver_preload (federation account) into ${inputs.natsConfigPath}`
+        : `operator-mode bootstrap: bus already operator-mode (no-op)`,
+    );
+  }
+
+  // 1. Teach the NATS server the agents account (append to resolver_preload).
   if (resolverNeeded) {
     const exported = await ports.accountExport.exportAccount(inputs.agentsAccountName);
     if (!exported.ok) return fail(plan, steps, `export-account failed: ${exported.reason}`);
@@ -365,7 +428,8 @@ export async function makeLiveStack(
       accountJwt: exported.jwt,
     });
     if (!appended.ok) return fail(plan, steps, `resolver_preload append failed: ${appended.reason}`);
-    resolverChanged = appended.changed;
+    // OR with any bootstrap change (cortex#1265) — a single nats restart covers both.
+    resolverChanged = resolverChanged || appended.changed;
     steps.push(
       appended.changed
         ? `resolver_preload: appended ${inputs.agentsAccountName} (${inputs.agentsAccountPubkey})`
