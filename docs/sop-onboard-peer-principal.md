@@ -18,6 +18,25 @@ The federation model (ADR-0013, Model B) is **sovereign**: every principal runs 
 
 This is the ordered sequence for a **new peer principal** joining an existing network. Both principals go through the same steps on their own side; the two irreducible two-party moments are called out explicitly in section 3.
 
+> **Prerequisites — tool versions (cortex#1265).** This flow requires **BOTH cortex ≥ v5.29.0 AND arc ≥ v0.33.0** installed. The server-config bridge that exports your operator-mode JWTs is `cortex network provision` (Step 4a) calling arc's `nats export-operator` / `nats export-system` verbs — an **older arc silently no-ops the JWT export**, leaving `stack.nats_infra` unpopulated so `join` / `make-live` later have nothing to render the operator-mode `.conf` from (the conversion just produces an empty/anonymous bus and you never find out why). Check both installed versions before you start.
+>
+> **Brand-new operator (nothing set up yet) — the whole chain, in order.** Every command below is run by you on your own side, and **no pre-existing `nsc` state is assumed**: the account tree is minted in Step 4a, and the operator-mode `.conf` is rendered _for_ you in Step 6 — you never run a raw `nsc` command.
+>
+> ```
+> cortex stack create               (1)  scaffold the stack skeleton
+> cortex provision-stack generate   (2)  mint the stack signing identity
+> cortex network provision          (4a) mint the account tree AND export the operator-mode JWTs
+> cortex provision-stack register   (4b/5) register identity + raise a PENDING admission request
+>   └─ confirm the admission request landed  (5a — cortex#1263)
+> cortex network admit              (5)  ADMIN admits the request (mints nothing)
+> cortex network secret add-member  (5b) ADMIN seals the leaf PSK to your pubkey
+> cortex network join               (6)  renders the operator-mode `.conf` from the exported JWTs
+> cortex network status             (7)  verify link: established
+> go private (encryption)           (8)
+> ```
+>
+> A **local-only** stack that never federates substitutes `cortex network make-live <slug> --apply` for the join in Step 6 — it bootstraps the same operator-mode resolver from the Step-4a JWTs (again, no raw `nsc`).
+
 ### Step 1 — Stand up your own stack
 
 If you do not have a cortex stack yet, create one. The command scaffolds a born-aligned config-split skeleton (slug == `stack.id` trailing segment, no drift can form) and sets `stack.nkey_seed_path` to the conventional path:
@@ -112,6 +131,13 @@ cortex provision-stack register <principal> \
   --stack-id <principal>/<slug> \
   --network <network>
 ```
+
+**Step 5a — Confirm your admission request landed (cortex#1263).** A registration that returns `2xx` does **not** by itself prove a PENDING admission row was created. The upsert that creates that row used to fail **silently** — leaving a principal in `principals` with **no PENDING request**, so the admin saw nothing to admit and the registrant believed they were queued (this is the chuvala gap: registered, but invisible to admission). cortex#1263 makes the failure visible — confirm it before proceeding:
+
+- **From the register response** (raw API path — `POST /principals/{id}/register`): inspect the `201` body. A `"admission_request": "failed"` field with a human-readable `warning` (`"registered, but the PENDING admission request could not be created; re-register to retry"`) means the row did **not** land. Its **absence** means the request is queued.
+- **Cross-check at the gate** (works for the CLI path too — the registry also logs a greppable `system.error admission_request_upsert_failed`): your request **must** appear in the admin's `cortex network admit --list-pending` (next block). If it is absent, the upsert failed silently.
+
+**If it failed, just re-register** — the underlying `upsertPending` is idempotent, so re-running the Step-5 register **self-heals** the missing PENDING row. Do not move on to admission until your request is confirmed queued.
 
 **Hub side (the network admin admits the request):**
 
