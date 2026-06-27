@@ -14,9 +14,11 @@
 #     → drops personas/pier.md   → ~/.config/cortex/personas/pier.md
 #     → drops agents.d/pier.yaml → ~/.config/cortex/agents.d/pier.yaml
 #     → signals cortex reload    → cortex hot-reloads; Pier appears in fleet
-#     → (no NATS creds issued — Pier needs no bus identity of its own;
-#        it drives cortex CLI commands and the discord CLI on behalf of
-#        the principal)
+#     → (no NATS creds issued — Pier needs no bus identity of its own.
+#        Pier SURFACES admission requests to the principal; it never runs a
+#        privileged CLI itself. Its session is confined Read-only — no Bash,
+#        no Skill — so it is structurally incapable of running
+#        `cortex network admit` / `cortex network secret` (ADR-0015 airgap).)
 #
 # REQUIRED ENV VAR (set before arc install):
 #   PIER_BOT_TOKEN  — the Discord bot token for the Pier bot application.
@@ -37,10 +39,13 @@ version: 0.1.0
 type: agent                    # arc artifact type for bus-participating agents
 targets: [cortex]              # arc#117 — single-target install into cortex HostAdapter
 description: >
-  Onboarding concierge for the metafactory community guild. Lives in
-  #assistant-fleet-onboarding. Admits newcomers + guides them through
-  the two-tier model (Tier-1 chat / Tier-2 sovereign). Issues nothing.
-  Drives discord role add (O-5) and cortex network admit (ADR-0015 gate).
+  Onboarding concierge for the metafactory community guild. Greets newcomers
+  in the public #onboard-your-fleet entry channel and guides them through the
+  two-tier model (Tier-1 chat / Tier-2 sovereign). Issues nothing, and runs no
+  privileged CLI: it SURFACES admission requests (the O-5 community-fleet role
+  grant and the ADR-0015 `cortex network admit` gate) to the principal in the
+  private #assistant-fleet-onboarding back-office. A principal — never Pier —
+  runs them.
 
 runtime:
   substrate: claude-code       # in-process under cortex's runner (§3.1)
@@ -53,17 +58,27 @@ runtime:
 identity:
   id: pier
   displayName: Pier
-  roles: [agent-restricted]    # per §4 — declared role bundle; cortex resolves capabilities
+  # `roles:` is intentionally absent — AgentSchema.roles[] was retired at the
+  # v2.0.0 cutover (cortex#297); authorization lives on policy.principals[].
+  # Pier's "issues nothing" boundary is the Read-only session airgap, not a role.
   trust: [luna]                # Pier trusts Luna (the principal's primary DA) to delegate tasks
 
 # Discord presence — community guild only.
 # Token is injected at runtime from env; never hardcoded.
-# guildId and agentChannelId are public identifiers (no-secret).
+# guildId and the channel ids are public identifiers (no-secret).
+#
+# Three-channel topology (public-entry / private-back-office split) — MUST match
+# agents.d/pier.yaml:
+#   agentChannelId: #onboard-your-fleet      (PUBLIC entry — newcomers reach Pier
+#                                             here BEFORE they hold any role)
+#   logChannelId:   #assistant-fleet-onboarding (PRIVATE back-office — admission
+#                                             audit trail, principal + Pier only)
 presence:
   discord:
     enabled: true
     guildId: "1505549701674700991"          # The Metafactory community guild
-    agentChannelId: "1514679294553751613"   # #assistant-fleet-onboarding
+    agentChannelId: "1517154685595942972"   # #onboard-your-fleet — public entry
+    logChannelId: "1514679294553751613"     # #assistant-fleet-onboarding — private back-office
     # token is resolved at cortex load from env PIER_BOT_TOKEN
     # (declared in agents.d/pier.yaml as ${PIER_BOT_TOKEN})
 
