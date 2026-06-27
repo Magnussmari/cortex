@@ -124,11 +124,20 @@ cortex network admit <request-id> \
   --apply
 ```
 
-**Step 5b — Exchange leaf credentials (out-of-band secret)**
+**Step 5b — Receive the leaf shared secret (sealed, automatic)**
 
-Once admitted, the admin issues a leaf `.creds` file for your stack from their own NSC operator (using `cortex creds issue` or `arc nats add-bot` locally, in their own account) and shares it with you out-of-band (e.g., encrypted message, secure file share). This is the one irreducible secret handoff — no automation bypasses it.
+Once you are admitted, the admin runs the leaf-secret tooling on the hub. The default delivery is **sealed** — the admin seals a per-member leaf PSK to your already-registered pubkey, so you never handle a raw secret:
 
-Place the received `.creds` at `~/.config/nats/<network>.creds`. Note the federation account NKey (`A…`) — it goes in `stack.nats_infra.account`.
+```bash
+# Hub side (admin) — mint + seal a per-member leaf PSK to the member's registered pubkey:
+cortex network secret add-member <network> <your-stack-pubkey> \
+  --admin-seed ~/.config/nats/admin.nk \
+  --apply
+```
+
+The sealed blob lands in the registry (**ciphertext only** — the registry never sees the PSK). Your `cortex network join` (Step 6) **auto-fetches and unseals it with your own seed** — there is no `.creds` file to place and no secret to copy. (Bootstrap / air-gapped fallback: `--deliver oob` surfaces the PSK on the admin's terminal for a manual handoff; you then pass `--leaf-secret` / `--leaf-user` to `join`.)
+
+This is the same sealed channel that later carries the network **payload key** `K` (Step 8) — one primitive, one pipe ([ADR-0018](./adr/0018-admission-gate-and-leaf-secret-distribution.md) / [ADR-0019](./adr/0019-federated-payload-encryption.md)). Note the federation account NKey (`A…`) — it goes in `stack.nats_infra.account`.
 
 ### Step 6 — Join the network (one command)
 
@@ -164,20 +173,52 @@ curl https://network.meta-factory.ai/api/health              # → { "status": "
 curl https://network.meta-factory.ai/principals/<principal>  # → SignedAssertion with your pubkey
 ```
 
+### Step 8 — Go private (enable confidentiality)
+
+Steps 1–7 give you a working federated link, but payloads still cross `federated.>` **cleartext-over-TLS** until you turn on encryption. A network is a **trust group** ([ADR-0019](./adr/0019-federated-payload-encryption.md)): all federated payloads — **Direct, Delegate, AND Offer** — are sealed with **one per-network symmetric key `K`**, readable only by admitted members and protected from any outsider on the transport (another network, the public, a non-member relay/hub).
+
+**1. Get the network key `K`.** Every admitted member of the network holds the same `K`. It is delivered sealed-to-your-pubkey over the **same admission/seal channel** that carried your leaf secret (no new ceremony). As of **v5.27.0** the *automatic* delivery of `K` through `join` is a follow-up (cortex#1246); today the admin hands you `K` (base64, decoding to exactly 32 bytes) over a secure channel and you stage it in config.
+
+**2. Enable encryption in your stack config** (`stacks/<slug>.yaml`):
+
+```yaml
+policy:
+  federated:
+    networks:
+      - id: <network>
+        encryption: enabled            # transition: SEAL outbound, ACCEPT both inbound
+        payload_key: <K-base64-32-bytes>
+        # payload_key_id: <network>/k1  # optional; defaults to <network>/k1
+```
+
+Restart the daemon. Your outbound `federated.>` payloads are now sealed with `K`, and you accept **both** sealed and cleartext-but-signed inbound (the transition window — it never breaks an in-flight peer).
+
+**3. Flip to `required`** once every member confirms they are sealing. `encryption: required` **rejects** inbound cleartext federated payloads — the network is fully private.
+
+> **Secret at rest — `chmod 600`.** The config layer holding `payload_key` (and any seed) MUST be `0600`. `payload_key` is a 256-bit AEAD key; a group-readable config leaks the whole network's confidentiality.
+>
+> **Posture semantics:** `off` (default) never seals · `enabled` seals outbound + accepts both inbound (the migration window) · `required` seals outbound + rejects cleartext inbound. If `encryption` is `enabled`/`required` but `payload_key` is **absent**, the runtime publishes **cleartext** and emits a loud "federating in the clear" warning — it cannot seal without `K`.
+>
+> **Encrypt-then-sign; metadata stays cleartext.** Only `payload` is sealed; `subject`/`sovereignty`/`signed_by[]`/routing fields stay cleartext-and-signed, so the bus routes + verifies the chain before any decrypt. Signing stays per-author (authenticity); `K` attests membership (confidentiality) — two independent properties.
+>
+> **Revoke / rotate:** dropping a member's leaf PSK cuts *transport* immediately; revoking their *read* access requires a network-key **rotation** — `cortex network secret rotate <network> --admin-seed <seed> --apply` mints `K'` and re-seals to the remaining members. One command, automated; members auto-refresh.
+
 ---
 
 ## 3. The two irreducible two-party steps
 
 Everything in section 2 can be done independently by each side — except two moments that are genuine two-party decisions an agent can orchestrate and prompt for, but not unilaterally perform:
 
-### (a) The admission + leaf secret exchange
+### (a) The admission + leaf-secret (and network-key) seal
 
-The network admin must **consciously admit a peer** (via `cortex network admit <request-id> --apply`) and then issue leaf credentials for the joining stack out-of-band. These are two distinct steps (ADR-0015):
+The network admin must **consciously admit a peer** (via `cortex network admit <request-id> --apply`) and then deliver the leaf secret. These are two distinct steps (ADR-0015 / ADR-0018):
 
-1. **Roster admission** — `cortex network admit` approves the peer onto the network roster. It is admin-signed, mints nothing, and records ADMITTED status in the registry.
-2. **Leaf credential handoff** — the admin separately issues a leaf `.creds` with `cortex creds issue` (or `arc nats add-bot`) from their own NSC operator and delivers it to the peer out-of-band. No automation can bypass this; it is the irreducible secret that bounds who can physically connect a leaf.
+1. **Roster admission** — `cortex network admit` approves the peer onto the network roster. It is admin-signed, mints nothing, and records **ADMITTED** status in the registry (`register → PENDING → ADMITTED`). Existing members are grandfathered — migration 0009 backfills them ADMITTED.
+2. **Leaf-secret seal** — the admin runs `cortex network secret add-member <network> <pubkey> --apply` to mint a per-member leaf PSK and **seal it to the peer's registered pubkey** (default `--deliver sealed`). The joiner's `cortex network join` auto-fetches and unseals it — the peer never handles a raw secret, and the registry stores only ciphertext. (`--deliver oob` is the bootstrap fallback: the PSK is surfaced on the admin's terminal for a manual handoff.)
 
-**What crosses out-of-band:** the leaf `.creds` file and the leaf endpoint URL.
+The **network payload key `K`** (the confidentiality key, Step 8 / ADR-0019) rides the **same seal-to-pubkey primitive on the same channel** — one pipe carries both the leaf secret and `K`.
+
+**What crosses out-of-band:** the leaf endpoint URL (the hub `tls://…`) and — until cortex#1246 automates `K` delivery through `join` — the network key `K` itself, handed over a secure channel.
 
 ### (b) The hub topology agreement
 
@@ -215,6 +256,32 @@ The federation onboarding has three independent layers. Understanding which is m
 - Your NSC operator's accounts or JWTs — each principal's account tree stays in their own store
 - Your internal agents account — the federation account is the only one bridged to the leaf
 - Session interiors — `local.` scope never crosses the principal boundary; only `federated.` lifecycle metadata is visible to peers (ADR-0005)
+
+---
+
+## 4b. Community onboarding — the two-channel airgap (Process B)
+
+When the joining principal is a **newcomer in the metafactory-community server** (not a peer you are already coordinating with directly), admission runs across a deliberate **two-channel airgap** ([ADR-0015](./adr/0015-two-tier-onboarding-and-admission-gate.md) two tiers · [ADR-0017](./adr/0017-surface-tooling-arc-bundles.md) surface tooling · the cortex#1250 airgap):
+
+**PUBLIC channel → Pier (zero-authority concierge).** `#onboard-your-fleet` is the public entry anyone can reach before holding any role. **Pier** ([`personas/pier.md`](../personas/pier.md) — `allowedTools: [Read]`, `issues_nothing: true`) greets the newcomer, explains the two tiers, walks them through sovereign setup (Steps 1–7 above), and — once they have registered and raised a PENDING request — **surfaces** the request-id + pubkey to the private back-office. Pier **cannot admit, issues nothing, holds no admin seed, and touches no key.** A prompt-injected Pier still cannot mint an admission.
+
+**PRIVATE channel → admin + privileged assistants.** `#assistant-fleet-onboarding` is where the principal (Andreas) and privileged assistants (Ivy, Luna) act on Pier's surfaced request. These are the Tier-2 `fleet-admit` privileged acts, run with the admin seed that never leaves the private side:
+
+```bash
+# 1. Admit to the roster (mints nothing):
+cortex network admit <request-id> --network <network> \
+  --admin-seed ~/.config/nats/admin.nk --apply
+
+# 2. Seal the leaf PSK (and, per ADR-0019, the network key K) to their pubkey:
+cortex network secret add-member <network> <their-pubkey> \
+  --admin-seed ~/.config/nats/admin.nk --apply
+```
+
+**The newcomer's cortex runs `cortex network join <network> --apply`** → auto-fetches + unseals → leaf connects. They then go private (Step 8).
+
+The airgap **is** the security property: the **public** surface can only *surface*; the **private** surface holds the only authority that admits or seals. See [`personas/pier.md`](../personas/pier.md) for Pier's exact surfacing protocol.
+
+> **Tier 1 (chat-only)** is the lighter path: the newcomer brings their own Discord bot, Pier surfaces a `community-fleet` role request, and the principal grants the role — no bus, no NATS, no keys. See [`sop-community-fleet-admission.md`](./sop-community-fleet-admission.md). Tier 2 (above) is the sovereign bus path.
 
 ---
 

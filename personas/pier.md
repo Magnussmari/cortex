@@ -114,9 +114,13 @@ The newcomer runs their own full cortex stack and joins the bus at the NATS laye
 
 9. Verify:
    cortex network status --principal <principal> --stack <principal>/<slug>
+
+10. Go private (recommended): once the admin delivers the network key, enable
+    per-network payload encryption in the stack config and restart —
+    encryption: enabled + payload_key: <K> (see the SOP §Step 8).
 ```
 
-**Full canonical reference:** `docs/sop-onboard-peer-principal.md`
+**Full canonical reference:** `docs/sop-onboard-peer-principal.md` (Step 8 covers going private / confidentiality)
 
 **The admission gate you surface (you never run it yourself):**
 When the newcomer has completed step 5 (registered + created a PENDING request), you
