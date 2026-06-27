@@ -46,6 +46,15 @@ function makeInputs(state: MakeLiveState, over?: Partial<MakeLiveInputs>): MakeL
 /** Spy ports recording every effectful call in order. */
 function makePorts(over?: {
   resolverHas?: boolean;
+  /** M3 — resolver_preload block present (operator-mode bus). Default true. */
+  hasResolverPreload?: boolean;
+  /** Whether the append actually mutates (changed). Default true. */
+  appendChanged?: boolean;
+  /** BLOCK 3 — pubkey the export port returns (default the matching AGENTS_PUB). */
+  exportPubKey?: string;
+  /** BLOCK 2 — descriptors resolveTargets returns. */
+  natsDescriptor?: string | undefined;
+  daemonDescriptor?: string | undefined;
   exportFails?: boolean;
   mintFails?: boolean;
 }): { ports: MakeLivePorts; calls: string[] } {
@@ -62,17 +71,22 @@ function makePorts(over?: {
       exportAccount: async (account) => {
         calls.push(`export:${account}`);
         if (over?.exportFails) return { ok: false, reason: "export boom" };
-        return { ok: true, pubKey: AGENTS_PUB, jwt: AGENTS_JWT, seedPath: null };
+        return { ok: true, pubKey: over?.exportPubKey ?? AGENTS_PUB, jwt: AGENTS_JWT, seedPath: null };
       },
     },
     resolver: {
       hasAccount: () => over?.resolverHas ?? false,
+      hasResolverPreload: () => over?.hasResolverPreload ?? true,
       appendAccount: ({ accountPubkey }) => {
         calls.push(`resolver-append:${accountPubkey}`);
-        return { ok: true, changed: true };
+        return { ok: true, changed: over?.appendChanged ?? true };
       },
     },
     restart: {
+      resolveTargets: () => ({
+        natsDescriptor: "natsDescriptor" in (over ?? {}) ? over?.natsDescriptor : "/LA/nats.plist",
+        daemonDescriptor: "daemonDescriptor" in (over ?? {}) ? over?.daemonDescriptor : "/LA/cortex.plist",
+      }),
       restartNats: async () => {
         calls.push("restart-nats");
         return { ok: true };
@@ -166,6 +180,79 @@ describe("makeLiveStack — apply", () => {
     expect(res.ok).toBe(true);
     expect(res.applied).toBe(false);
     expect(calls).toEqual([]);
+  });
+
+  // M3 — operator-mode guard ──────────────────────────────────────────────────
+  test("M3: refuses a bus with no resolver_preload block (halden pattern)", async () => {
+    const { ports, calls } = makePorts({ hasResolverPreload: false });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: false, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(false);
+    expect(res.applied).toBe(false);
+    expect(res.reason).toContain("not");
+    expect(res.reason).toContain("operator-mode");
+    expect(res.reason).toContain("resolver_preload");
+    expect(calls).toEqual([]); // nothing minted/restarted
+  });
+
+  test("M3: refuses even in dry-run (preview catches the category error)", async () => {
+    const { ports, calls } = makePorts({ hasResolverPreload: false });
+    const res = await makeLiveStack(
+      makeInputs({ credsFileExists: false, resolverHasAccount: false }, { apply: false }),
+      ports,
+    );
+    expect(res.ok).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  // BLOCK 3 — pubkey drift cross-check ─────────────────────────────────────────
+  test("BLOCK 3: export-account pubkey ≠ config pubkey aborts before resolver write", async () => {
+    const driftKey = "A" + "Q".repeat(55);
+    const { ports, calls } = makePorts({ exportPubKey: driftKey });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: true, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("pubkey drift");
+    expect(res.reason).toContain(driftKey);
+    // exported, then aborted — NO resolver append, NO restart, NO mint.
+    expect(calls).toEqual([`export:ANDREAS_WORK_AGENTS`]);
+  });
+
+  // M2 — --force must not no-op-restart a shared nats-server ────────────────────
+  test("M2: --force with the account already present re-mints but does NOT restart nats", async () => {
+    // resolver already has the account ⇒ append no-ops (changed:false); --force
+    // still re-mints creds + restarts the daemon, but the shared nats-server must
+    // NOT be hard-restarted for a no-op resolver.
+    const { ports, calls } = makePorts({ resolverHas: true, appendChanged: false });
+    const res = await makeLiveStack(
+      makeInputs({ credsFileExists: true, resolverHasAccount: true }, { force: true }),
+      ports,
+    );
+    expect(res.ok).toBe(true);
+    expect(calls).toContain(`export:ANDREAS_WORK_AGENTS`);
+    expect(calls).toContain(`resolver-append:${AGENTS_PUB}`);
+    expect(calls).not.toContain("restart-nats"); // ← the M2 guarantee
+    expect(calls).toContain(`mint:cortex-work@ANDREAS_WORK_AGENTS->~/.config/nats/cortex-work.creds`);
+    expect(calls).toContain("restart-daemon");
+  });
+
+  // BLOCK 2 — dry-run resolves + prints the restart targets ─────────────────────
+  test("BLOCK 2: dry-run prints the resolved nats-server + daemon restart targets", async () => {
+    const { ports } = makePorts({ natsDescriptor: "/LA/homebrew.nats.plist", daemonDescriptor: "/LA/cortex.work.plist" });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: false, resolverHasAccount: false }, { apply: false }), ports);
+    expect(res.ok).toBe(true);
+    const txt = res.steps.join("\n");
+    expect(txt).toContain("nats-server restart target");
+    expect(txt).toContain("/LA/homebrew.nats.plist");
+    expect(txt).toContain("cortex daemon restart target");
+    expect(txt).toContain("/LA/cortex.work.plist");
+  });
+
+  test("BLOCK 2: dry-run warns when a NEEDED restart has no discoverable service", async () => {
+    const { ports } = makePorts({ natsDescriptor: undefined });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: false, resolverHasAccount: false }, { apply: false }), ports);
+    expect(res.ok).toBe(true);
+    const txt = res.steps.join("\n");
+    expect(txt).toContain("WARNING");
+    expect(txt).toContain("NOT FOUND");
   });
 });
 

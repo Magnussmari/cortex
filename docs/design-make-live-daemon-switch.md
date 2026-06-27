@@ -76,20 +76,38 @@ Ensure-shaped, idempotent, dry-run by default (`--apply` mutates). Inputs derive
 from config (`nats.credsPath`, `nats.name`, `stack.nats_infra.agents_account`,
 principal/slug → `ANDREAS_<STACK>_AGENTS`) + flags:
 
+0. **Resolve the target nats-server PER STACK.** The nats config make-live edits +
+   hard-restarts is derived from `stack.nats_infra.config_path` (or `--nats-config`),
+   the same field `network join` derives from — there is **NO** hardcoded default.
+   `metafactory` + `work` legitimately resolve to the shared `~/.config/nats/local.conf`
+   from their own config; a co-located stack on its OWN nats-server (`community.conf`,
+   `halden.conf`) carries its own `config_path`. When neither flag nor config supplies
+   it, make-live **fails fast** rather than guessing — a silent `local.conf` default
+   would edit the wrong file and hard-restart the wrong (shared) server for a
+   community/halden stack. **Operator-mode guard:** a bus with no `resolver_preload`
+   block (the anonymous/hard-isolated `halden` pattern) is refused early — make-live
+   does not apply to it.
 1. **Mint creds under the agents account.** `arc nats add-bot <nats.name>
    --account <AGENTS> --output <nats.credsPath> --force`. The existing creds is
-   backed up to `<creds>.bak-makelive` first. Idempotent: skipped when the bot
-   user already exists under the agents account AND the creds file is present.
+   backed up to a **timestamped** `<creds>.bak-makelive-<ts>` first (so a second
+   `--apply`/`--force` never clobbers the FIRST migration's original-account
+   backup — the rollback artefact). Idempotent: skipped when the bot user already
+   exists under the agents account AND the creds file is present.
 2. **Teach the NATS server the new account.** Append the agents account JWT to
-   `resolver_preload` in the nats config (default `~/.config/nats/local.conf`).
-   Keyed on the account pubkey — present ⇒ no-op; absent ⇒ append a labelled
-   block. **Never touches other accounts** (multi-stack safety, §3.5). The account
-   JWT comes from `arc nats export-account <AGENTS>` (new read-only verb, arc#).
+   `resolver_preload` in the **resolved** nats config (§0). Keyed on the account
+   pubkey — present ⇒ no-op; absent ⇒ append a labelled block. **Never touches
+   other accounts** (multi-stack safety, §3.5). The account JWT comes from
+   `arc nats export-account <AGENTS>` (read-only verb). **Pubkey cross-check:** the
+   exported account pubkey is asserted equal to the config `agents_account` pubkey
+   (the resolver map key) before the write — a drift (slug rename / re-mint / stale
+   `nats_infra`) would write `<configPubkey>: <jwt-for-another-account>`, which nats
+   keys under `jwt.sub` → auth failure. Mismatch ⇒ fail-fast (re-run provision).
 3. **Restart the NATS server.** A MEMORY resolver does **NOT** pick up
    `resolver_preload` changes on `SIGHUP` (empirically verified — the appended
    account did not load after `kill -HUP`). A hard restart is required
-   (`launchctl kickstart -k <nats-service-label>`). Skipped when the resolver was
-   unchanged.
+   (`launchctl kickstart -k <nats-service-label>`). Gated on the resolver having
+   **actually changed** — a `--force` re-mint over an already-present account does
+   NOT hard-restart the (shared) server for a no-op resolver.
 4. **Restart the cortex daemon** so it reconnects with the new creds
    (`launchctl kickstart -k <cortex-daemon-label>`, descriptor discovered by the
    #800 `findCortexDaemonDescriptor` config-arg matcher). Skipped when nothing
@@ -97,7 +115,10 @@ principal/slug → `ANDREAS_<STACK>_AGENTS`) + flags:
 
 Service descriptors are discovered, never guessed: the cortex daemon by the #800
 `--config` matcher; the nats-server by a sibling matcher that finds the launchd
-plist / systemd unit running `nats-server -c <natsConfigPath>`.
+plist / systemd unit running `nats-server -c <natsConfigPath>`. **The dry-run
+resolves and PRINTS both restart targets** (the matched plist/unit paths) so the
+operator verifies the — possibly shared-server — blast radius before `--apply`; a
+needed-but-undiscoverable service surfaces as a dry-run WARNING.
 
 ### 3.3 Mechanics — FEDERATED stack
 
@@ -118,8 +139,9 @@ confidentiality setup is untouched by the account swap.
 
 - **Re-runnable.** Each step is ensure-shaped; a converged re-run mints nothing,
   edits nothing, and restarts nothing.
-- **Rollback** (documented, manual): restore `<creds>.bak-makelive` over
-  `nats.credsPath`, remove the agents-account block from `resolver_preload`
+- **Rollback** (documented, manual): restore the FIRST-migration
+  `<creds>.bak-makelive-<ts>` (the earliest timestamp — the original-account creds)
+  over `nats.credsPath`, remove the agents-account block from `resolver_preload`
   (restore `local.conf` from the timestamped backup make-live writes), restart the
   nats-server + the cortex daemon. The daemon returns to `ANDREAS_AGENTS`.
 

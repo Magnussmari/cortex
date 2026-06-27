@@ -1868,9 +1868,6 @@ const DEFAULT_MAKE_LIVE_PORTS_FACTORY: MakeLivePortsFactory = (mutate) => buildL
 
 const STACK_SLUG_RE = /^[a-z][a-z0-9_-]*$/;
 
-/** Default nats-server config (resolver_preload host) for a LOCAL stack. */
-const DEFAULT_NATS_CONFIG_PATH = "~/.config/nats/local.conf";
-
 /** Build the {@link MakeLiveInputs} from config + flags, or a usage reason. */
 function deriveMakeLiveInputs(
   stackArg: string,
@@ -1916,7 +1913,26 @@ function deriveMakeLiveInputs(
     return { ok: false, reason: "cannot resolve nats.credsPath — pass --creds or set `nats.credsPath` in config", usage: true };
   }
   const botName = cfg.config.nats?.name ?? "cortex";
-  const natsConfigPath = optionalValueFlag(flags, "--nats-config") ?? DEFAULT_NATS_CONFIG_PATH;
+  // BLOCK 1 — derive the nats-server config PER STACK from the stack's OWN config
+  // (`stack.nats_infra.config_path`, the same field `network join` derives from),
+  // NEVER a hardcoded shared default. make-live edits the resolver_preload of, and
+  // HARD-RESTARTS, this exact nats-server; a `local.conf` default would silently
+  // target the shared metafactory server for a `community`/`halden` stack (wrong
+  // file + wrong server → blips metafactory + an own-auth Authorization Violation on
+  // the WRONG bus). Fail-fast when it can't be derived rather than guessing — the
+  // metafactory + work stacks legitimately carry `local.conf` in their own config.
+  const natsConfigPath =
+    optionalValueFlag(flags, "--nats-config") ?? cfg.stack?.nats_infra?.config_path;
+  if (natsConfigPath === undefined || natsConfigPath === "") {
+    return {
+      ok: false,
+      usage: true,
+      reason:
+        `cannot resolve the nats-server config for ${principal}/${slug} — pass --nats-config or set ` +
+        "`stack.nats_infra.config_path` in the stack config. make-live edits + hard-restarts THIS " +
+        "stack's nats-server; it must never default to the shared metafactory ~/.config/nats/local.conf.",
+    };
+  }
 
   const applyRes = resolveApply(flags);
   if (!applyRes.ok) return { ok: false, reason: applyRes.reason, usage: true };
@@ -2348,6 +2364,15 @@ Subcommands:
           runs zero nsc — it shells arc \`add-bot\` / \`export-account\`.
           Network-agnostic (local OR federated; for federated, run \`join\` after
           to render the leaf). NEVER touches encryption/payload_key config.
+          The nats-server config it edits + hard-restarts is derived PER-STACK
+          from stack.nats_infra.config_path (or --nats-config) — there is NO
+          shared default, so a co-located stack on its OWN nats-server
+          (community.conf / halden.conf) must carry config_path (or pass
+          --nats-config); it NEVER silently targets the shared metafactory
+          local.conf. Refuses a bus with no resolver_preload block (not
+          operator-mode). The dry-run prints the resolved nats-server + daemon
+          restart targets so the (possibly shared-server) blast radius is
+          verifiable before --apply.
           Idempotent + dry-run by default; --apply mutates; --force re-mints.
           Run AFTER \`cortex network provision <stack> --apply\`.
   admit   (ADR-0015) One-command admin admission decision. Verifies the admin

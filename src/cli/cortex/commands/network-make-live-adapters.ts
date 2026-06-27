@@ -86,8 +86,8 @@ function arcEnvelopeError(value: unknown): string | undefined {
 
 /**
  * Live {@link CredsMintPort}. Backs up any existing creds to
- * `<credsPath>.bak-makelive` (the documented rollback artefact) BEFORE the mint,
- * then shells `arc nats add-bot <bot> --account <agents> --output <creds>
+ * `<credsPath>.bak-makelive-<ts>` (the documented rollback artefact) BEFORE the
+ * mint, then shells `arc nats add-bot <bot> --account <agents> --output <creds>
  * --force`. The creds land `chmod 600` (arc's `writeCredsFile`).
  */
 export function buildCredsMintAdapter(runner: ArcRunner = defaultArcRunner): CredsMintPort {
@@ -97,9 +97,13 @@ export function buildCredsMintAdapter(runner: ArcRunner = defaultArcRunner): Cre
       // Back up the existing (old-account) creds before overwriting — the
       // rollback artefact. chmod 600 so the backup is no more readable than the
       // live creds it copies (#130 leaked-backup discipline).
+      // M1 — TIMESTAMPED filename (mirrors the resolver backup below): a second
+      // `--apply`/`--force` must not clobber the FIRST migration's backup, which
+      // holds the original shared-account creds the rollback (§3.4) restores. A
+      // fixed `.bak-makelive` would copy the NEW agents creds over the original.
       if (existsSync(abs)) {
         try {
-          const bak = `${abs}.bak-makelive`;
+          const bak = `${abs}.bak-makelive-${Date.now().toString()}`;
           copyFileSync(abs, bak);
           chmodSync(bak, 0o600);
         } catch (err) {
@@ -198,6 +202,13 @@ export function buildResolverPreloadAdapter(): ResolverPreloadPort {
       if (!existsSync(abs)) return false;
       return readFileSync(abs, "utf-8").includes(accountPubkey);
     },
+    // M3 — operator-mode probe: does the config carry a resolver_preload block?
+    // Same brace-anchored pattern insertIntoResolverPreload uses to find the block.
+    hasResolverPreload: (natsConfigPath) => {
+      const abs = expandTilde(natsConfigPath);
+      if (!existsSync(abs)) return false;
+      return /resolver_preload\s*[:=]?\s*\{/.test(readFileSync(abs, "utf-8"));
+    },
     appendAccount: ({ natsConfigPath, accountName, accountPubkey, accountJwt }) => {
       try {
         const abs = expandTilde(natsConfigPath);
@@ -282,6 +293,29 @@ export function findNatsServerDescriptor(opts: {
 export function buildServiceRestartAdapter(mutate: boolean): ServiceRestartPort {
   const platform = currentServicePlatform();
   return {
+    // BLOCK 2 — read-only descriptor resolution for the dry-run preview. Reuses
+    // the SAME finders the restarts use, so the previewed target is exactly the
+    // one --apply would kickstart. Never mutates.
+    resolveTargets: ({ natsConfigPath, cortexConfigPath }) => {
+      const natsDescriptor = findNatsServerDescriptor({
+        platform,
+        natsConfigPath,
+        launchAgentsDir: LAUNCH_AGENTS_DIR,
+        systemdUserDir: SYSTEMD_USER_DIR,
+        io: realLocatorIO,
+      });
+      const daemonDescriptor = findCortexDaemonDescriptor({
+        platform,
+        cortexConfigPath,
+        launchAgentsDir: LAUNCH_AGENTS_DIR,
+        systemdUserDir: SYSTEMD_USER_DIR,
+        io: realLocatorIO,
+      });
+      return {
+        ...(natsDescriptor !== undefined && { natsDescriptor }),
+        ...(daemonDescriptor !== undefined && { daemonDescriptor }),
+      };
+    },
     restartNats: async (natsConfigPath) => {
       const descriptor = findNatsServerDescriptor({
         platform,
