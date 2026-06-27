@@ -1271,7 +1271,10 @@ describe("DispatchHandler — prompt-filter trust scope (cortex#723)", () => {
     const texts = adapter.sentMessages.map((m) => m.text);
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain("I can't process that message");
-    expect(texts[0]).toContain("Content filter blocked");
+    // cortex#1264 — the reply is now the deterministic, category-rendered
+    // text (injection/exfiltration → "...matched a ... safety pattern"),
+    // not the raw "Content filter blocked (matched: ...)" string.
+    expect(texts[0]).toContain("safety pattern");
 
     await handler.shutdown();
   });
@@ -1362,7 +1365,10 @@ describe("DispatchHandler — prompt-filter trust scope (cortex#723)", () => {
     const texts = adapter.sentMessages.map((m) => m.text);
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain("I can't process that message");
-    expect(texts[0]).toContain("Content filter blocked");
+    // cortex#1264 — the reply is now the deterministic, category-rendered
+    // text (injection/exfiltration → "...matched a ... safety pattern"),
+    // not the raw "Content filter blocked (matched: ...)" string.
+    expect(texts[0]).toContain("safety pattern");
 
     await handler.shutdown();
   });
@@ -1491,7 +1497,10 @@ describe("DispatchHandler — prompt-filter trust scope, channel @mentions (cort
     const texts = adapter.sentMessages.map((m) => m.text);
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain("I can't process that message");
-    expect(texts[0]).toContain("Content filter blocked");
+    // cortex#1264 — the reply is now the deterministic, category-rendered
+    // text (injection/exfiltration → "...matched a ... safety pattern"),
+    // not the raw "Content filter blocked (matched: ...)" string.
+    expect(texts[0]).toContain("safety pattern");
 
     await handler.shutdown();
   });

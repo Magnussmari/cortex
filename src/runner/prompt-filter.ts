@@ -39,10 +39,78 @@ try {
   );
 }
 
+/**
+ * cortex#1264 — a STABLE, structured reason category for a BLOCKED match.
+ *
+ * This is the control-plane half of the separation-of-concerns split: the
+ * filter (control plane) emits a category — *structure* — and a deterministic
+ * surface message-builder (`src/adapters/filter-rejection.ts`, presentation)
+ * renders the human-facing text from it. The category is a small closed enum
+ * so the surface text is a pure function of it (never an LLM token, never an
+ * inline control-flow string). New categories are an additive change here +
+ * one new branch in the renderer.
+ *
+ *  - `encoded-content`   — the message carried encoded bytes (base64, hex,
+ *                          unicode-escape, url-encoded, html-entity, split
+ *                          across files). The filter can't read inside it, so
+ *                          it's blocked. This is the onboarding-stall case:
+ *                          a base64 pubkey pasted into a request to Pier.
+ *  - `injection-pattern` — matched a prompt-injection pattern.
+ *  - `exfiltration-pattern` — matched a data-exfiltration pattern.
+ *  - `tool-invocation`   — matched a direct tool/command-invocation pattern.
+ *  - `pii`               — matched a PII pattern.
+ *  - `unspecified`       — blocked, but no category could be derived.
+ */
+export type FilterReasonCategory =
+  | "encoded-content"
+  | "injection-pattern"
+  | "exfiltration-pattern"
+  | "tool-invocation"
+  | "pii"
+  | "unspecified";
+
 export interface PromptFilterResult {
   allowed: boolean;
   reason?: string;
+  /**
+   * Structured reason category for a BLOCKED match (cortex#1264). Present only
+   * when `allowed` is false. The deterministic surface renderer maps this to
+   * actionable human text; downstream code should branch on `category`, not
+   * parse the free-text `reason`.
+   */
+  category?: FilterReasonCategory;
   score?: number;
+}
+
+/**
+ * cortex#1264 — derive the stable {@link FilterReasonCategory} from the raw
+ * filter signals. Pure + deterministic: same inputs → same category.
+ *
+ * Inputs are taken from the TOP-LEVEL (raw-text) match signals only:
+ *   - `matchCategories` — `PatternMatch.category` values found in the raw text
+ *     (`injection` | `exfiltration` | `tool_invocation` | `pii`).
+ *   - `hasEncoding` — whether any encoding rule fired (`result.encodings`).
+ *
+ * Encoded content is reported AS `encoded-content` regardless of what it
+ * decodes to: decoded-pattern matches (`result.decoded_matches`) are
+ * deliberately NOT consulted here, because to the user the actionable fact is
+ * "I can't read encoded content" — the same guidance whether the blob decodes
+ * to a pubkey or to an injection string. A genuine plaintext attack (no
+ * encoding) still surfaces its true pattern category.
+ *
+ * Precedence: explicit plaintext pattern categories first (most specific +
+ * security-relevant), then encoded-content, then the `unspecified` fallback.
+ */
+export function deriveReasonCategory(
+  matchCategories: readonly string[],
+  hasEncoding: boolean,
+): FilterReasonCategory {
+  if (matchCategories.includes("injection")) return "injection-pattern";
+  if (matchCategories.includes("exfiltration")) return "exfiltration-pattern";
+  if (matchCategories.includes("tool_invocation")) return "tool-invocation";
+  if (matchCategories.includes("pii")) return "pii";
+  if (hasEncoding) return "encoded-content";
+  return "unspecified";
 }
 
 /**
@@ -110,6 +178,18 @@ export function scanPrompt(
       const reasons = [...patternIds, ...encodingTypes];
       const reasonStr = reasons.length > 0 ? reasons.join(", ") : "unspecified";
 
+      // cortex#1264 — derive the STRUCTURED reason category (control plane).
+      // The surface renderer turns this into actionable human text; the
+      // free-text `reason` above stays for logs/audit. Encoding hits map to
+      // `encoded-content` (the onboarding-stall case: a base64 pubkey).
+      const matchCategories = result.matches
+        .map((m) => m.category)
+        .filter(Boolean);
+      const category = deriveReasonCategory(
+        matchCategories,
+        result.encodings.length > 0,
+      );
+
       // cortex#741 — TRUSTED senders (the home principal) are not hard-blocked,
       // but the match is ALWAYS audited so it stays observable. This is a
       // downgrade, not a silent bypass — keep the log line loud.
@@ -127,6 +207,7 @@ export function scanPrompt(
       return {
         allowed: false,
         reason: `Content filter blocked this message (matched: ${reasonStr})`,
+        category,
         score: result.overall_confidence,
       };
     }
