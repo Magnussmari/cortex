@@ -26,6 +26,7 @@ import type { AttachmentInfo } from "../adapters/discord/attachment-types";
 import { parseMessageKeywords } from "../runner/message-parser";
 import { buildPrompt } from "../runner/prompt-builder";
 import { scanPrompt } from "../runner/prompt-filter";
+import { renderFilterRejection } from "../adapters/filter-rejection";
 import { CCSession, type CCSessionOpts, type CCSessionResult } from "../runner/cc-session";
 import type {
   CCSessionFactory,
@@ -876,7 +877,14 @@ export class DispatchHandler extends EventEmitter {
       });
       if (!filterResult.allowed) {
         const target = this.targetFromMsg(adapter, msg);
-        await adapter.postResponse(target, `I can't process that message. ${filterResult.reason ?? ""}`);
+        // cortex#1264 — render the human reply DETERMINISTICALLY from the
+        // filter's structured `category` (presentation lives in the adapter
+        // layer, not inline here). The block is unchanged; only the message
+        // is now descriptive + actionable instead of "matched: base64".
+        await adapter.postResponse(
+          target,
+          renderFilterRejection(filterResult.category ?? "unspecified"),
+        );
         return;
       }
 
