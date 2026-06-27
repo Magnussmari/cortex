@@ -210,9 +210,11 @@ In cortex.yaml the link is named by `policy.federated.networks[].leaf_node` and 
 
 Per ADR-0001 §Consequences: *"nothing is live on the federated path yet (no consumer existed), so there is no production traffic to migrate."*
 
-**Signing and encryption are OFF (IoAW end-to-end first).** Per `docs/design-trust-confidentiality.md` §Phase 0, the out-of-box default posture is `security.signing: off` — "get it working off, ramp later." The cross-principal verify seam (TC-2d) only engages under `security.signing: enforce`; under `off`/`permissive` there is **zero registry I/O** and federated envelopes verify local-only. Payload encryption is designed (`docs/design-envelope-encryption.md`) but **deferred** — `federated.` payloads cross cleartext-over-TLS in v1 (`CONTEXT.md` §"Federation confidentiality (v1)": "you + JC + a trusted hub"). The strategy is to get the Internet-of-Agentic-Work path working end-to-end first, then ramp the security posture `off → permissive → enforce`.
+**The federated dispatch path is now LIVE, and confidentiality ships.** The federated review-consumer landed (the F-6 reflex bridge, cortex#1185), so cross-principal dispatch reaches a peer assistant today. **Payload encryption ships as of v5.27.0** ([ADR-0019](./adr/0019-federated-payload-encryption.md)): a network is a **trust group**, and all federated payloads (**Direct/Delegate/Offer**) are sealed with **one per-network key `K`** — readable by every admitted member, opaque to any outsider on the transport. It is **opt-in per network** (`policy.federated.networks[].encryption: enabled` + `payload_key`), with a both-accepted transition window before you flip to `required`. The signing posture still ramps **independently** `off → permissive → enforce` (DD-7) — encryption and signing are separate axes. The end-to-end go-private procedure is [`sop-onboard-peer-principal.md` §Step 8 — Go private](./sop-onboard-peer-principal.md).
 
-**Net:** onboarding config can be **staged now** (identity provisioned, registry pinned, network entry written) so the moment #691/#686 land the path is ready — but a real dispatch to a peer assistant won't reach it until those merge. Don't promise JC a working dispatch today; promise a staged onboarding and a path that lights up when the consumer ships.
+> **Historic note.** This section previously read "signing and encryption are OFF / payload encryption deferred / cleartext-over-TLS in v1." That was accurate **before** the community federation tier shipped — M3 was deferred while the bus was a single principal's private mesh. The community tier admits parties beyond a trusted pair, so M3 now ships **with** the tier it protects (ADR-0019 reverses the CONTEXT.md §222 deferral).
+
+**Net:** onboarding config is staged the same way (identity provisioned, registry pinned, network entry written), and the dispatch path is live — register, wire the leaf link, and go private with one `encryption:` block on each side.
 
 ---
 
@@ -281,12 +283,12 @@ cortex.yaml. That's the whole point of the registry: you register once,
 and I resolve your pubkey from the directory at dispatch time. Add a peer
 to the federation = that peer registers; nobody else touches config.
 
-Honest status: nothing is live on the federated dispatch path yet —
-the subject-grammar rework (#691) and the federated review consumer
-(#686) are still in flight, and signing/encryption are deliberately OFF
-for now (we're getting the Internet-of-Agentic-Work path working
-end-to-end first, then ramping security). So we can stage all the
-onboarding config now and it'll light up the moment #686 ships.
+Honest status: the federated dispatch path is live now (the review
+consumer landed, cortex#1185), and payload confidentiality ships — a
+network is a trust group and all federated payloads are sealed with one
+per-network key, opt-in per network. Signing still ramps separately
+(off -> permissive -> enforce). So we wire the leaf link, register, and
+then go private with one config block on each side.
 
 Send me your {principal}/{stack} and your preference on the leaf hub and
 I'll get the link side ready.
