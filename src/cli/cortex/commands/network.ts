@@ -124,6 +124,12 @@ import {
 } from "./network-provision-lib";
 import { buildLiveProvisionPorts } from "./network-provision-adapters";
 import {
+  makeLiveStack,
+  type MakeLiveInputs,
+  type MakeLivePorts,
+} from "./network-make-live-lib";
+import { buildLiveMakeLivePorts, buildResolverPreloadAdapter } from "./network-make-live-adapters";
+import {
   runNetworkSecret,
   type SecretAction,
   type DeliveryMode,
@@ -148,7 +154,7 @@ export { type ExitResult } from "./_shared/exit-result";
 // Grammar
 // =============================================================================
 
-type NetworkSubcommand = "join" | "leave" | "status" | "create" | "ping" | "admit" | "provision" | "secret";
+type NetworkSubcommand = "join" | "leave" | "status" | "create" | "ping" | "admit" | "provision" | "make-live" | "secret";
 
 /**
  * Default registry URL when neither --registry-url nor config provides one.
@@ -352,6 +358,24 @@ const SPEC: SubcommandSpec<NetworkSubcommand> = {
         "--config": "value",
         "--principal": "value",
         "--seed-path": "value",
+        "--creds": "value",
+        "--force": "bool",
+        "--apply": "bool",
+        "--dry-run": "bool",
+      },
+    },
+    // C-1257 (PR7/#1225, ADR-0013 Model B) — the daemon-switch step. Lands a
+    // provisioned stack's daemon onto its own agents account: mints the bus
+    // creds under ANDREAS_<STACK>_AGENTS at nats.credsPath, teaches the local
+    // NATS server the account (resolver_preload), restarts the nats-server +
+    // the cortex daemon. DRY-RUN by default; --apply mutates. Run AFTER
+    // `cortex network provision <stack> --apply`.
+    "make-live": {
+      positionals: ["stack"],
+      flags: {
+        "--config": "value",
+        "--principal": "value",
+        "--nats-config": "value",
         "--creds": "value",
         "--force": "bool",
         "--apply": "bool",
@@ -1832,7 +1856,141 @@ export type ProvisionPortsFactory = (stackConfigPath: string) => ProvisionPorts;
 
 const DEFAULT_PROVISION_PORTS_FACTORY: ProvisionPortsFactory = (p) => buildLiveProvisionPorts(p);
 
+/**
+ * Factory for the make-live port bundle. Production builds the live adapters
+ * (arc add-bot/export-account + resolver_preload editor + launchctl restarts);
+ * `mutate` is the apply flag (false ⇒ the restart adapter no-ops, mirroring the
+ * service-manager dry-run). Tests inject fakes that record calls without arc/fs.
+ */
+export type MakeLivePortsFactory = (mutate: boolean) => MakeLivePorts;
+
+const DEFAULT_MAKE_LIVE_PORTS_FACTORY: MakeLivePortsFactory = (mutate) => buildLiveMakeLivePorts(mutate);
+
 const STACK_SLUG_RE = /^[a-z][a-z0-9_-]*$/;
+
+/** Build the {@link MakeLiveInputs} from config + flags, or a usage reason. */
+function deriveMakeLiveInputs(
+  stackArg: string,
+  flags: FlagMap,
+  load: ConfigReader,
+): { ok: true; inputs: MakeLiveInputs } | { ok: false; reason: string; usage: boolean } {
+  const configPath = expandTilde(optionalValueFlag(flags, "--config") ?? DEFAULT_CONFIG_PATH);
+  let cfg: LoadedConfig;
+  try {
+    cfg = load(configPath);
+  } catch (err) {
+    return { ok: false, reason: `config load failed: ${err instanceof Error ? err.message : String(err)}`, usage: false };
+  }
+
+  const principal = optionalValueFlag(flags, "--principal") ?? cfg.principal?.id;
+  if (principal === undefined || principal === "") {
+    return { ok: false, reason: "cannot resolve principal — pass --principal or set `principal.id` in cortex.yaml", usage: true };
+  }
+  if (!PRINCIPAL_ID_RE.test(principal)) {
+    return { ok: false, reason: `principal "${principal}" must be lowercase alphanumeric + hyphen, letter-prefixed`, usage: true };
+  }
+
+  const slugRes = resolveProvisionSlug(stackArg, principal, cfg);
+  if (!slugRes.ok) return { ok: false, reason: slugRes.reason, usage: true };
+  const slug = slugRes.slug;
+
+  const names = deriveProvisionNames(principal, slug);
+  if (!names.ok) return { ok: false, reason: names.reason, usage: true };
+
+  const agentsAccountPubkey = cfg.stack?.nats_infra?.agents_account;
+  if (agentsAccountPubkey === undefined || agentsAccountPubkey === "") {
+    return {
+      ok: false,
+      usage: true,
+      reason:
+        `stack.nats_infra.agents_account is not set for ${principal}/${slug} — ` +
+        `run \`cortex network provision ${slug} --apply\` first to mint the account tree.`,
+    };
+  }
+
+  const credsPath = optionalValueFlag(flags, "--creds") ?? cfg.config.nats?.credsPath;
+  if (credsPath === undefined || credsPath === "") {
+    return { ok: false, reason: "cannot resolve nats.credsPath — pass --creds or set `nats.credsPath` in config", usage: true };
+  }
+  const botName = cfg.config.nats?.name ?? "cortex";
+  // BLOCK 1 — derive the nats-server config PER STACK from the stack's OWN config
+  // (`stack.nats_infra.config_path`, the same field `network join` derives from),
+  // NEVER a hardcoded shared default. make-live edits the resolver_preload of, and
+  // HARD-RESTARTS, this exact nats-server; a `local.conf` default would silently
+  // target the shared metafactory server for a `community`/`halden` stack (wrong
+  // file + wrong server → blips metafactory + an own-auth Authorization Violation on
+  // the WRONG bus). Fail-fast when it can't be derived rather than guessing — the
+  // metafactory + work stacks legitimately carry `local.conf` in their own config.
+  const natsConfigPath =
+    optionalValueFlag(flags, "--nats-config") ?? cfg.stack?.nats_infra?.config_path;
+  if (natsConfigPath === undefined || natsConfigPath === "") {
+    return {
+      ok: false,
+      usage: true,
+      reason:
+        `cannot resolve the nats-server config for ${principal}/${slug} — pass --nats-config or set ` +
+        "`stack.nats_infra.config_path` in the stack config. make-live edits + hard-restarts THIS " +
+        "stack's nats-server; it must never default to the shared metafactory ~/.config/nats/local.conf.",
+    };
+  }
+
+  const applyRes = resolveApply(flags);
+  if (!applyRes.ok) return { ok: false, reason: applyRes.reason, usage: true };
+  const force = flags["--force"] === true;
+
+  // Read-only state probes (cheap fs reads via the resolver adapter).
+  const resolverProbe = buildResolverPreloadAdapter();
+  const state = {
+    credsFileExists: existsSync(expandTilde(credsPath)),
+    resolverHasAccount: resolverProbe.hasAccount(natsConfigPath, agentsAccountPubkey),
+  };
+
+  const inputs: MakeLiveInputs = {
+    principal,
+    stackSlug: slug,
+    stackId: `${principal}/${slug}`,
+    agentsAccountName: names.agentsAccountName,
+    agentsAccountPubkey,
+    botName,
+    credsPath,
+    cortexConfigPath: configPath,
+    natsConfigPath,
+    force,
+    apply: applyRes.apply,
+    state,
+  };
+  return { ok: true, inputs };
+}
+
+async function runMakeLive(
+  stackArg: string,
+  flags: FlagMap,
+  json: boolean,
+  load: ConfigReader,
+  portsFactory: MakeLivePortsFactory,
+): Promise<ExitResult> {
+  const derived = deriveMakeLiveInputs(stackArg, flags, load);
+  if (!derived.ok) {
+    return derived.usage ? usageError("make-live", derived.reason, json) : opError("make-live", derived.reason, json);
+  }
+  const { inputs } = derived;
+
+  // Build live ports only on --apply; dry-run uses them too but the restart
+  // adapter no-ops when mutate=false (mirrors the service-manager contract).
+  const ports = portsFactory(inputs.apply);
+  const res = await makeLiveStack(inputs, ports);
+
+  return renderFlowResult(
+    "make-live",
+    inputs.stackId,
+    res.ok,
+    res.reason,
+    res.steps,
+    inputs.apply,
+    json,
+    { agents_account: inputs.agentsAccountName },
+  );
+}
 
 /**
  * Resolve where the `stack.nats_infra` write-back lands, layout-aware (mirrors
@@ -2063,6 +2221,9 @@ export async function dispatchNetwork(
   // ADR-0018 PR5b — injectable secret-ports factory so the `secret` CLI tests
   // drive fake hub/registry/crypto ports. Production omits → the live adapters.
   secretPortsFactory: SecretPortsFactory = DEFAULT_SECRET_PORTS_FACTORY,
+  // C-1257 — injectable make-live ports factory so the make-live CLI tests drive
+  // fake arc/fs/restart ports. Production omits → the live adapters.
+  makeLivePortsFactory: MakeLivePortsFactory = DEFAULT_MAKE_LIVE_PORTS_FACTORY,
 ): Promise<ExitResult> {
   let parsed;
   try {
@@ -2102,6 +2263,8 @@ export async function dispatchNetwork(
       return runAdmit(parsed.positionals["request-id"] ?? "", parsed.flags, json);
     case "provision":
       return runProvision(parsed.positionals.stack ?? "", parsed.flags, json, load, provisionPortsFactory);
+    case "make-live":
+      return runMakeLive(parsed.positionals.stack ?? "", parsed.flags, json, load, makeLivePortsFactory);
     case "secret":
       return runSecret(
         parsed.positionals.action ?? "",
@@ -2131,6 +2294,8 @@ Usage:
                         [--discord-member <id>] [--discord-guild <id>] [--discord-server <profile>]
                         [--discord-role <name>] [--apply] [--dry-run] [--json]
   cortex network provision <stack> [--config <p>] [--principal <id>] [--seed-path <p>]
+                        [--creds <p>] [--force] [--apply] [--dry-run] [--json]
+  cortex network make-live <stack> [--config <p>] [--principal <id>] [--nats-config <p>]
                         [--creds <p>] [--force] [--apply] [--dry-run] [--json]
   cortex network secret <add-member|revoke-member|rotate> <network> <member-pubkey>
                         --admin-seed <hub-admin-seed> [--registry-url <url>] [--hub-config <p>]
@@ -2189,6 +2354,27 @@ Subcommands:
           operator-mode bus conversion + restart are left to \`join\` (this verb is
           non-disruptive). Remaining two-party steps after provision: the leaf
           shared secret + hub topology agreement (out-of-band).
+  make-live (C-1257, ADR-0013 Model B) The daemon-switch — lands a PROVISIONED
+          stack's daemon onto its OWN agents account (ANDREAS_<STACK>_AGENTS).
+          Mints the bus creds under the agents account at nats.credsPath (the
+          file the daemon authenticates with), teaches the local NATS server the
+          account (resolver_preload, MEMORY resolver), then HARD-restarts the
+          nats-server (a SIGHUP reload does NOT load a new preloaded account) +
+          the cortex daemon so it reconnects under the agents account. cortex
+          runs zero nsc — it shells arc \`add-bot\` / \`export-account\`.
+          Network-agnostic (local OR federated; for federated, run \`join\` after
+          to render the leaf). NEVER touches encryption/payload_key config.
+          The nats-server config it edits + hard-restarts is derived PER-STACK
+          from stack.nats_infra.config_path (or --nats-config) — there is NO
+          shared default, so a co-located stack on its OWN nats-server
+          (community.conf / halden.conf) must carry config_path (or pass
+          --nats-config); it NEVER silently targets the shared metafactory
+          local.conf. Refuses a bus with no resolver_preload block (not
+          operator-mode). The dry-run prints the resolved nats-server + daemon
+          restart targets so the (possibly shared-server) blast radius is
+          verifiable before --apply.
+          Idempotent + dry-run by default; --apply mutates; --force re-mints.
+          Run AFTER \`cortex network provision <stack> --apply\`.
   admit   (ADR-0015) One-command admin admission decision. Verifies the admin
           seed (chmod-600 gated), builds a signed admission decision claim
           (decision: "admit"), and POSTs it to /admission-requests/:id/admit

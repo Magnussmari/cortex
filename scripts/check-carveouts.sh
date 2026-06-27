@@ -191,6 +191,20 @@ ALLOWLIST_PATHS=(
   # schema it consumes — every "operator" is the NSC account-tree sense, never
   # the principal (cortex#1225). Class: NSC.
   'src/cli/cortex/commands/network-federation-wiring.ts'
+  # C-1257 (#1225/#1258, ADR-0013 Model B) make-live daemon-switch tooling — the
+  # pure orchestration + live arc-shell adapters + CLI wiring + design doc behind
+  # `cortex network make-live`. Their whole subject is the NSC account tree: the
+  # operator-mode bus, `arc nats export-account`/`add-bot`, the `resolver_preload`
+  # MEMORY resolver, and the per-stack agents account the daemon lands on. Every
+  # "operator" is the NATS account-tree / operator-mode sense (or the human running
+  # the daemon-switch), never the principal vocabulary. Same class as
+  # network-provision-lib.ts / network-federation-wiring.ts above. Class: NSC.
+  # RETIRE: never (NSC operator is the permanent qualified survivor, CONTEXT.md).
+  'src/cli/cortex/commands/network-make-live-lib.ts'
+  'src/cli/cortex/commands/network-make-live-adapters.ts'
+  'src/cli/cortex/commands/__tests__/network-make-live.test.ts'
+  'src/cli/cortex/commands/__tests__/network-make-live-cli.test.ts'
+  'docs/design-make-live-daemon-switch.md'
   'src/cli/cortex/commands/__tests__/operator-provisioning.test.ts'
   'src/cli/cortex/commands/__tests__/network-provision-lib.test.ts'
   'src/cli/cortex/commands/__tests__/network-provision-cli.test.ts'
