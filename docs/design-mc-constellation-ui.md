@@ -54,6 +54,23 @@ The posture pill in the command bar + the posture conditional (admin/member) dri
 
 The skin **renders the A-wave's truth** — it never invents liveness (vision north-star: *truth, not theater*).
 
+## Visibility scope — local vs federated (privacy boundary, load-bearing)
+
+**Session-level granularity is local-only.** The altitude model's two deepest levels — **SESSION and ENVELOPE** — apply only to the principal's **own (local) stacks**. Across the **federation boundary**, a peer principal's stacks expose **aggregated metadata at best**: presence, capability catalog, health, and counts (e.g. "N active sessions") — **never** individual session rows, and never the envelope/interior drill. This extends **ADR-0005** ("session interiors are local-scope, never federate") *up a level*: not only the interior (prompts/tools/diffs) stays home — the **session granularity itself** stays home.
+
+Consequences for the skin:
+
+| Altitude level | LOCAL (own stacks) | FEDERATED (peer principal) |
+|---|---|---|
+| Networks / Network / Stack / Assistant | full | full (presence + capabilities + health) |
+| **Session** | full drill (lifecycle, child sessions) | **aggregate only** — counts/health, no individual sessions |
+| **Envelope** | full ("reach the packet") | **not reachable** |
+
+- **D2 (altitude rail):** the SESSION level is reachable only in a local/own-stack context; for a federated peer the deepest reachable level is STACK/ASSISTANT (aggregate). Don't imply a drill that privacy forbids.
+- **D3/D4:** a federated peer node is **not** drillable into sessions; render the aggregate and make the boundary **visible** — it is a feature (sovereignty), not a missing view.
+- The hosted feed (ADR-0006) is metadata-only by the same logic (a non-member relay holds no per-network key K).
+- Same-principal *local* cross-stack aggregation (a principal's own stacks, e.g. the session-grid #1295) is fine — that's all the principal's own work, not across the federation boundary.
+
 ## Build slices (D-series — sequence AFTER the A-wave to avoid re-skinning churn)
 
 - **D1 — Design system / tokens.** New additive token + motion layer (`styles/tokens.css` or a tokens module): the OKLCH palette, JetBrains Mono + Inter, the keyframes, glow primitives, reduced-motion guard. *Conflict-free (new file) — can land in parallel with the A-wave.*
