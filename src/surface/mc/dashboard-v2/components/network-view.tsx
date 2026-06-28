@@ -73,6 +73,8 @@ import { NetworkFilterBar } from "./network-filter-bar";
 import { NetworkSpotlight } from "./network-spotlight";
 import { NetworkRosterPanel } from "./network-roster-panel";
 import { PierQueue } from "./pier-queue";
+import { McShell } from "./mc-shell";
+import { ROOT_SELECTION, type AltitudeSelection } from "../lib/mc-shell-model";
 import type { NetworkMembershipDTO } from "../hooks/use-networks";
 
 // Lazy: the xyflow + elk engine chunk loads only when this resolves (first
@@ -362,7 +364,30 @@ export function NetworkView({
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedKey, spotlightOpen, closePanel]);
 
+  // MC-D2 (#1289) — the constellation shell-chrome selection (you-are-here).
+  // Owned here so BOTH the command-bar breadcrumb and the altitude rail read one
+  // source. D2 wires networks↔network; deeper levels are scaffolding (D3+).
+  const [shellSelection, setShellSelection] =
+    useState<AltitudeSelection>(ROOT_SELECTION);
+  // If the drilled-into network drops out of the live `/api/networks` snapshot,
+  // ascend back to the 10k-ft root rather than holding a stale selection (the
+  // breadcrumb/posture would otherwise point at a network that no longer exists).
+  useEffect(() => {
+    if (
+      shellSelection.networkId !== null &&
+      !networks.some((n) => n.network_id === shellSelection.networkId)
+    ) {
+      setShellSelection(ROOT_SELECTION);
+    }
+  }, [networks, shellSelection.networkId]);
+
   return (
+    <McShell
+      principal={servingPrincipal}
+      networks={networks}
+      selection={shellSelection}
+      onSelectionChange={setShellSelection}
+    >
     <section className="scaffold-section network-view" aria-label="Network (agent topology)">
       <h2>Network</h2>
       <p className="dim network-view-subtitle">
@@ -453,5 +478,6 @@ export function NetworkView({
         </>
       )}
     </section>
+    </McShell>
   );
 }
