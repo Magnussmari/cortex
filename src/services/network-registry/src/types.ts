@@ -436,6 +436,46 @@ export interface SignedAdmissionMineRead {
 }
 
 /**
+ * C-1282 (ADR-0018 Q4) — the member proof-of-possession read claim carried by
+ * `GET /networks/{network_id}/roster/member`.
+ *
+ * Where {@link AdmissionMineReadClaim} releases a caller's OWN admission rows,
+ * this claim releases a NETWORK's ADMITTED peer-roster — but only to a caller
+ * who is themselves an ADMITTED member of that network. The signature over
+ * `canonicalJSON(claim)` against `peer_pubkey` IS the authorization (no admin
+ * key, no allowlist); the route then applies a fail-closed membership gate:
+ * the proven pubkey MUST hold an ADMITTED row for `network_id`, else 403. The
+ * admitted-peer list is not sensitive to a fellow admitted member (ADR-0018
+ * Q4), but a non-member learns nothing.
+ *
+ * `network_id` is bound INTO the signed claim (not just the path) so the
+ * signature is scoped to one network — a token captured for network A cannot
+ * be replayed against network B's path. The route rejects a claim whose
+ * `network_id` disagrees with the path parameter (400). No nonce (reads are
+ * idempotent); clock-skew applies to bound a captured token's lifetime.
+ */
+export interface NetworkRosterMemberReadClaim {
+  /** The network whose ADMITTED roster the caller is requesting. */
+  network_id: string;
+  /**
+   * The caller's registered Ed25519 pubkey (base64). The claim is signed with
+   * the matching private key, so verifying the signature against this field
+   * proves possession — and the membership gate then checks this pubkey is
+   * ADMITTED to `network_id`.
+   */
+  peer_pubkey: string;
+  /** ISO-8601 UTC; within the CLOCK_SKEW_MS window. */
+  issued_at: string;
+}
+
+/** On-wire envelope for a member network-roster PoP read authorisation. */
+export interface SignedNetworkRosterMemberRead {
+  claim: NetworkRosterMemberReadClaim;
+  /** Base64 Ed25519 signature over canonical-JSON(claim). */
+  signature: string;
+}
+
+/**
  * ADR-0018 Q1 (b′) / Q5 — the HUB-ADMIN-signed claim carried by
  * `POST /admission-requests/{request_id}/sealed-secret`.
  *
