@@ -124,6 +124,7 @@ export default tseslint.config(
     ignores: [
       "dist/",
       "node_modules/",
+      "docs/mockups/",
       "src/bus/myelin/vendor/",
       "src/worker/",
       "src/webhook-proxy/",
