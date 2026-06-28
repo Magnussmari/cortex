@@ -1004,6 +1004,104 @@ export function renderOperatorModeBlocks(
 }
 
 /**
+ * cortex#1265 (PR8) — the minimal per-stack nats-server **base** identity used to
+ * synthesise a hard-isolated bus config when none exists yet, so make-live can
+ * bootstrap the operator-mode blocks onto it (see {@link renderBaseIsolatedConfig}).
+ *
+ * Every field is DERIVED from the stack's own config (never fabricated): `listen`
+ * is the host:port the stack's own daemon already dials (`nats.url`), and the
+ * names are the canonical `<slug>-<principal>` identity. This is the distinction
+ * the make-live adapter holds onto — it synthesises a base from the stack's OWN
+ * declared truth, it does NOT invent an arbitrary (collision-prone) server.
+ */
+export interface NatsBaseIdentity {
+  /** `server_name` + jetstream `domain` — canonically `<slug>-<principal>`. */
+  serverName: string;
+  /** `listen` host:port — the stack's own `nats.url` minus the scheme. */
+  listen: string;
+  /** jetstream `store_dir` — canonically `~/.config/nats/<slug>-jetstream`. */
+  jetstreamStoreDir: string;
+}
+
+/**
+ * Parse a stack's own `nats.url` into a SAFE loopback `host:port` for a
+ * synthesised hard-isolated base `listen` (cortex#1265). Returns `undefined` when
+ * the URL is absent, malformed, carries userinfo/a path, names a non-numeric or
+ * out-of-range port, or resolves to a NON-loopback host — so the make-live caller
+ * DECLINES to synthesise and falls back to its refuse-floor (you supply
+ * `--nats-config` or fix `nats.url`) instead of binding an over-exposed
+ * (`0.0.0.0`) or unbindable address that would only fail at nats-server start.
+ *
+ * Security (review #1302): a from-scratch isolated bus MUST bind loopback only —
+ * the whole point is a private, process-local bus (cortex#692). Allowlist
+ * `127.0.0.1` / `localhost` / `::1`; reject everything else (incl. `0.0.0.0`,
+ * `::`, any routable host). Stricter than the old "strip the scheme" derivation,
+ * which would have passed a non-loopback `nats.url` straight through.
+ */
+export function parseLoopbackListen(natsUrl: string | undefined): string | undefined {
+  if (natsUrl === undefined) return undefined;
+  const stripped = natsUrl.replace(/^(?:nats|tls):\/\//, "").trim();
+  // userinfo (`user:pass@`) or a path/query are not valid in a bare `host:port`.
+  if (stripped === "" || stripped.includes("@") || stripped.includes("/")) return undefined;
+
+  let host: string;
+  let port: string;
+  const v6 = /^\[([0-9a-fA-F:]+)\]:(\d+)$/.exec(stripped);
+  if (v6 !== null) {
+    host = v6[1] ?? "";
+    port = v6[2] ?? "";
+  } else {
+    const idx = stripped.lastIndexOf(":");
+    if (idx <= 0) return undefined; // need a `host:port`
+    host = stripped.slice(0, idx);
+    port = stripped.slice(idx + 1);
+  }
+  if (!/^\d+$/.test(port)) return undefined;
+  const portNum = Number(port);
+  if (portNum < 1 || portNum > 65535) return undefined;
+
+  const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
+  if (!LOOPBACK.has(host)) return undefined;
+  return host === "::1" ? `[::1]:${portNum}` : `${host}:${portNum}`;
+}
+
+/**
+ * Render the SOP §B0.1 **hard-isolated base** nats-server config from a stack's
+ * own derived identity. PURE (data in, text out). Emits exactly the isolation-wall
+ * base — `server_name` / `listen` / `jetstream { store_dir, domain }` — and
+ * DELIBERATELY no `leafnodes` / `cluster` / `gateway` block (that absence IS the
+ * isolation wall, cortex#692; a spoke stack needs no accept block — `cortex
+ * network join` renders its own per-network leaf REMOTE include later). No `http`
+ * monitor either: it is optional for nats-server and has no collision-safe source
+ * to derive (you pick a non-colliding `82xx` by hand if you want one).
+ *
+ * The result is a complete, nats-server-loadable anonymous bus; make-live then
+ * appends the operator-mode blocks via {@link renderOperatorModeBlocks} to make
+ * it operator-mode. `listen` is HOCON-quoted; it is derived from the stack's own
+ * `nats.url`, never attacker-controlled, but quoting keeps a stray space/`#` from
+ * breaking the line.
+ */
+export function renderBaseIsolatedConfig(identity: NatsBaseIdentity): string {
+  const serverName = identity.serverName.trim();
+  const listen = identity.listen.trim();
+  const storeDir = identity.jetstreamStoreDir.trim();
+  return [
+    "// --- hard-isolated base config rendered by cortex network make-live (cortex#1265) ---",
+    `server_name: "${serverName}"`,
+    `listen: "${listen}"`,
+    "jetstream {",
+    `  store_dir: "${storeDir}"`,
+    "  max_mem: 64mb",
+    "  max_file: 1gb",
+    `  domain: "${serverName}"`,
+    "}",
+    "// NO leafnodes{} / cluster{} / gateway{} — that absence IS the isolation wall (cortex#692).",
+    "// `cortex network join` renders this stack's per-network leaf REMOTE include itself.",
+    "",
+  ].join("\n");
+}
+
+/**
  * A JWT shape guard for the operator JWT + account JWTs emitted bare into the config.
  * NSC JWTs are `eyJ…` (a base64url-encoded `{"alg":…}` header) — EXACTLY three
  * base64url segments joined by `.` (header.payload.signature). We require the
