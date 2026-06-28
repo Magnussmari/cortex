@@ -133,9 +133,11 @@ export default function NetworkElkEdge(props: EdgeProps) {
   // #1068 — the hub→agent connector strokes in its stack's deterministic color.
   const stackColor = edgeData?.["stackColor"] as string | undefined;
   // MC-D3 (#1290) — a CROSS-PRINCIPAL federated peer's edge: drawn dashed +
-  // flowing (the live bus-traffic "admitted peer" treatment) and labelled. The
+  // flowing to mark the "admitted peer" relationship, and labelled. The
   // constellation skin's `.edge-live--fed` class supplies the dash geometry +
-  // `dashFlowFed` animation (reduced-motion-guarded in constellation.css).
+  // `dashFlowFed` animation (reduced-motion-guarded in constellation.css). The
+  // flow here is the relationship treatment, not REAL bus traffic — binding the
+  // dash-flow to live envelope flow is D5 (#1292).
   const federated = edgeData?.["federated"] === true;
   const layoutSourceX = edgeData?.["layoutSourceX"] as number | undefined;
   const layoutSourceY = edgeData?.["layoutSourceY"] as number | undefined;
@@ -213,11 +215,19 @@ export default function NetworkElkEdge(props: EdgeProps) {
     }
   }
 
-  // MC-D3 — the federated edge midpoint, where the `federated · admitted peer`
-  // label sits. The label is a presence-level provenance marker (this is an
-  // admitted cross-principal peer relationship) — never a session affordance.
-  const labelX = (sourceX + targetX) / 2;
-  const labelY = (sourceY + targetY) / 2;
+  // MC-D3 — anchor the `federated · admitted peer` label ON the route, not on
+  // the straight chord: use the middle vertex of ELK's orthogonal polyline when
+  // present (so the pill sits on the connector, not floating off it), falling
+  // back to the chord midpoint only when ELK didn't route the edge. The label is
+  // a presence-level provenance marker (an admitted cross-principal peer
+  // relationship) — never a session affordance.
+  const { labelX, labelY } = useMemo(() => {
+    if (elkPoints && elkPoints.length >= 2) {
+      const mid = elkPoints[Math.floor(elkPoints.length / 2)]!;
+      return { labelX: mid.x, labelY: mid.y };
+    }
+    return { labelX: (sourceX + targetX) / 2, labelY: (sourceY + targetY) / 2 };
+  }, [elkPoints, sourceX, sourceY, targetX, targetY]);
 
   return (
     <>
