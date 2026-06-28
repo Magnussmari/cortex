@@ -13,6 +13,7 @@ import type {
   MembershipVerdict,
   NetworkConfidentialityDTO,
   NetworkMembershipDTO,
+  PeerAcceptance,
   RosterStatus,
   RosterScope,
 } from "../../api/networks";
@@ -59,6 +60,71 @@ export function verdictBadge(verdict: MembershipVerdict): VerdictBadge {
         label: "pending",
         tone: "pending",
         title: "Admission request pending — not yet admitted",
+      };
+  }
+}
+
+// --- MC-A2: per-principal acceptance (the second trust layer) ---------------
+
+/**
+ * Stable, non-localized acceptance token — for `data-*` attributes, automation,
+ * and tests. Distinct from the human `label`.
+ */
+export type AcceptanceToken =
+  | "self"
+  | "accepted-network"
+  | "accepted-named"
+  | "not-accepted";
+
+/** A render-ready acceptance badge. */
+export interface AcceptanceBadge {
+  label: string;
+  tone: VerdictTone;
+  /** Stable token (data-* / tests); never localized. */
+  token: AcceptanceToken;
+  title: string;
+}
+
+/**
+ * Map a member's {@link PeerAcceptance} → a badge. Acceptance is the SECOND
+ * trust layer (CONTEXT.md §"Joining a network"): admission grants membership,
+ * accept-policy CHOOSES whom this principal trusts. `self` and the two accepted
+ * variants render quietly (ok/dim); `not-accepted` is surfaced (warn) so a peer
+ * that is admitted-but-not-accepted is VISIBLE — you dispatch it no federated
+ * work despite it being on the roster. Total over the union (compiler-enforced).
+ */
+export function acceptanceBadge(accepts: PeerAcceptance): AcceptanceBadge {
+  switch (accepts) {
+    case "self":
+      return {
+        label: "you",
+        tone: "ok",
+        token: "self",
+        title: "The serving principal — itself an admitted member",
+      };
+    case "accepted-network":
+      return {
+        label: "accepted",
+        tone: "ok",
+        token: "accepted-network",
+        title:
+          "Accepted: a federated offering trusts this network's whole roster (accept-policy network:<id>)",
+      };
+    case "accepted-named":
+      return {
+        label: "accepted",
+        tone: "ok",
+        token: "accepted-named",
+        title:
+          "Accepted: this principal is named in a federated offering's accept-policy (principals:[…])",
+      };
+    case "not-accepted":
+      return {
+        label: "not accepted",
+        tone: "warn",
+        token: "not-accepted",
+        title:
+          "Admitted to the roster but NOT accepted by this principal — no federated offering admits it (default-deny). You dispatch it no federated work.",
       };
   }
 }

@@ -20,6 +20,10 @@ import type {
   AgentPresenceView,
 } from "../api/agents";
 import type { ResolveAdmittedRosterResult } from "../../../bus/agent-network/admission-read";
+import {
+  summarizeAcceptancePolicy,
+  resolvePeerAcceptance,
+} from "../../../bus/agent-network/peer-acceptance";
 
 function presenceView(
   records: AgentPresenceSnapshotRecord[],
@@ -103,7 +107,12 @@ describe("handleListNetworks — graceful states", () => {
     const net = (await body(res)).networks[0]!;
     expect(net.roster_status).toBe("unreachable");
     expect(net.members).toEqual([
-      { principal: "andreas", verdict: "admitted-present", present_stacks: ["main"] },
+      {
+        principal: "andreas",
+        verdict: "admitted-present",
+        present_stacks: ["main"],
+        accepts: "self",
+      },
     ]);
   });
 
@@ -125,7 +134,12 @@ describe("handleListNetworks — graceful states", () => {
     expect(net.roster_scope).toBeNull();
     // Self is still a member (joined stack) + present.
     expect(net.members).toEqual([
-      { principal: "andreas", verdict: "admitted-present", present_stacks: ["main"] },
+      {
+        principal: "andreas",
+        verdict: "admitted-present",
+        present_stacks: ["main"],
+        accepts: "self",
+      },
     ]);
   });
 });
@@ -178,6 +192,7 @@ describe("handleListNetworks — authoritative reconciliation", () => {
       principal: "mallory",
       verdict: "present-but-unadmitted",
       present_stacks: ["s"],
+      accepts: "not-accepted",
     });
   });
 
@@ -196,6 +211,7 @@ describe("handleListNetworks — authoritative reconciliation", () => {
       principal: "newcomer",
       verdict: "pending",
       present_stacks: [],
+      accepts: "not-accepted",
     });
   });
 });
@@ -299,5 +315,62 @@ describe("handleListNetworks — self-scoped read suppresses anomalies (registry
     // jc is present but must NOT be flagged unadmitted — we can't prove it.
     expect(net.members.some((m) => m.verdict === "present-but-unadmitted")).toBe(false);
     expect(net.members.map((m) => m.principal)).toEqual(["andreas"]);
+  });
+});
+
+describe("handleListNetworks — per-principal acceptance (MC-A2, the second trust layer)", () => {
+  it("defaults to self/not-accepted when the view supplies no acceptsPeer resolver", async () => {
+    const res = await handleListNetworks(
+      view({
+        "research-collab": {
+          ok: true,
+          roster: { admitted: ["jc"], pending: [], authoritative: true },
+        },
+      }),
+      presenceView([rec({ agentId: "luna" })]),
+    );
+    const net = (await body(res)).networks[0]!;
+    const accepts = Object.fromEntries(net.members.map((m) => [m.principal, m.accepts]));
+    expect(accepts).toEqual({ andreas: "self", jc: "not-accepted" });
+  });
+
+  it("carries the live acceptance verdict per member (network-wide vs named vs deny)", async () => {
+    const summary = summarizeAcceptancePolicy([
+      {
+        capability: "a.b",
+        scopes: ["federated"],
+        accept: { kind: "network", network: "research-collab" },
+      },
+      {
+        capability: "c.d",
+        scopes: ["federated"],
+        accept: { kind: "principals", principals: ["zeta"] },
+      },
+    ]);
+    const v: NetworksView = {
+      localPrincipal: "andreas",
+      networks: () => [
+        { networkId: "research-collab", leafNode: "rc-leaf", confidentiality: CLEARTEXT },
+        { networkId: "other-net", leafNode: "on-leaf", confidentiality: CLEARTEXT },
+      ],
+      resolveAdmittedRoster: (networkId) =>
+        Promise.resolve(
+          networkId === "research-collab"
+            ? { ok: true, roster: { admitted: ["jc"], pending: [], authoritative: true } }
+            : { ok: true, roster: { admitted: ["zeta"], pending: [], authoritative: true } },
+        ),
+      acceptsPeer: (networkId, member) =>
+        resolvePeerAcceptance(summary, networkId, member, "andreas"),
+    };
+    const out = await handleListNetworks(v, presenceView([rec({ agentId: "luna" })]));
+    const nets = (await body(out)).networks;
+    const rc = nets.find((n) => n.network_id === "research-collab")!;
+    const other = nets.find((n) => n.network_id === "other-net")!;
+    const rcAccepts = Object.fromEntries(rc.members.map((m) => [m.principal, m.accepts]));
+    const otherAccepts = Object.fromEntries(other.members.map((m) => [m.principal, m.accepts]));
+    // research-collab is offered whole-roster → every peer accepted-network.
+    expect(rcAccepts).toEqual({ andreas: "self", jc: "accepted-network" });
+    // other-net is NOT whole-roster, but zeta is named → accepted-named.
+    expect(otherAccepts).toEqual({ andreas: "self", zeta: "accepted-named" });
   });
 });
