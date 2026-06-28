@@ -71,6 +71,8 @@ import { isSpotlightOpenChord } from "../lib/network-spotlight";
 import { NetworkDetailPanel } from "./network-detail-panel";
 import { NetworkFilterBar } from "./network-filter-bar";
 import { NetworkSpotlight } from "./network-spotlight";
+import { NetworkRosterPanel } from "./network-roster-panel";
+import type { NetworkMembershipDTO } from "../hooks/use-networks";
 
 // Lazy: the xyflow + elk engine chunk loads only when this resolves (first
 // entry into the Network tab). Keep this the ONLY dynamic import in the view —
@@ -120,6 +122,13 @@ export interface NetworkViewProps {
    * emitting yet). SOURCED FROM SIGNAL — the view never re-derives substrate health.
    */
   transportRoster?: readonly TransportRosterEventRow[];
+  /**
+   * MC-A1 (cortex#1275) — joined networks + their admitted roster ⋈ presence →
+   * membership verdict, from `/api/networks` (via `useNetworks`). Rendered as
+   * first-class trust groups ABOVE the agent-topology canvas. Empty default → the
+   * roster panel renders nothing (a non-federated stack is unchanged).
+   */
+  networks?: readonly NetworkMembershipDTO[];
 }
 
 export function NetworkView({
@@ -130,6 +139,7 @@ export function NetworkView({
   dispatchingAgentKeys,
   matchTasks = [],
   transportRoster = [],
+  networks = [],
 }: NetworkViewProps) {
   const mode = pickAgentsPanelMode(state);
 
@@ -359,6 +369,10 @@ export function NetworkView({
         federated peers, their declared capabilities, and their liveness, laid
         out around each stack&rsquo;s hub. Filter by scope to focus on this stack.
       </p>
+
+      {/* MC-A1 — networks as first-class trust groups (admitted roster ⋈
+          presence → membership verdict). Renders nothing when none are joined. */}
+      <NetworkRosterPanel networks={networks} localPrincipal={servingPrincipal} />
 
       {mode === "error" && (
         <div className="network-view-error">⚠ {state.error}</div>

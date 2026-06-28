@@ -40,6 +40,7 @@ import {
 } from "./api/handlers";
 import { handleListGitLinks } from "./api/git-links";
 import { handleListAgents, type AgentPresenceView } from "./api/agents";
+import { handleListNetworks, type NetworksView } from "./api/networks";
 import type {
   LocalAggregationContext,
   LocalAggregationProvider,
@@ -182,6 +183,15 @@ export interface StartServerOptions {
    */
   localAggregation?: LocalAggregationProvider;
   /**
+   * MC-A1 (cortex#1275) — lazy accessor for the networks view (serves
+   * `GET /api/networks`: joined networks + their admitted roster ⋈ presence →
+   * membership verdict). A GETTER like `agentPresence` because the registry
+   * client + presence registry boot AFTER the embed in `cortex.ts`; resolved per
+   * request. Returns `null` ⇒ no federation/registry configured → the route
+   * serves an empty `{networks:[]}`.
+   */
+  networks?: () => NetworksView | null;
+  /**
    * P-14 U0.1 — Tier-3 sideband base URL (`mc.sideband`). When present, the
    * `/api/observability/*` routes proxy to it server-side. Loopback-enforced
    * at config-parse time; the proxy re-checks at the request boundary.
@@ -271,7 +281,18 @@ export function startServer(
         // #1008 — resolve the DB-read aggregation context lazily too; null ⇒
         // single-db feeds (the pre-#1008 path).
         const localAggregation = options.localAggregation?.() ?? null;
-        return handleApi(req, url, db, apiDeps, agentPresence, localAggregation);
+        // MC-A1 — resolve the networks view lazily too (registry/presence boot
+        // after the server). null ⇒ the route serves an empty list.
+        const networks = options.networks?.() ?? null;
+        return handleApi(
+          req,
+          url,
+          db,
+          apiDeps,
+          agentPresence,
+          localAggregation,
+          networks,
+        );
       }
 
       // --- Dashboard static ---
@@ -426,7 +447,8 @@ async function handleApi(
   db: Database,
   deps: ApiDeps | null,
   agentPresence: AgentPresenceView | null,
-  localAggregation: LocalAggregationContext | null
+  localAggregation: LocalAggregationContext | null,
+  networks: NetworksView | null = null
 ): Promise<Response> {
   const { pathname } = url;
 
@@ -634,6 +656,17 @@ async function handleApi(
       return methodNotAllowed(["GET"]);
     }
     return handleListAgents(db, agentPresence, localAggregation);
+  }
+
+  // MC-A1 (cortex#1275) — GET /api/networks — joined networks as first-class
+  // trust groups + their admitted roster (admission rows = source of truth,
+  // ADR-0018 Q3) reconciled ⋈ presence into a membership verdict. `networks ===
+  // null` (no federation/registry) → empty list. Read-only.
+  if (pathname === "/api/networks") {
+    if (req.method !== "GET") {
+      return methodNotAllowed(["GET"]);
+    }
+    return handleListNetworks(networks, agentPresence);
   }
 
   // F-17 — principal-driven GitHub iteration import.
