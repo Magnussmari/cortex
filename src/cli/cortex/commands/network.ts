@@ -1910,10 +1910,26 @@ function deriveMakeLiveInputs(
     };
   }
 
-  const credsPath = optionalValueFlag(flags, "--creds") ?? cfg.config.nats?.credsPath;
-  if (credsPath === undefined || credsPath === "") {
-    return { ok: false, reason: "cannot resolve nats.credsPath — pass --creds or set `nats.credsPath` in config", usage: true };
-  }
+  // `nats.credsPath` is the daemon's OWN BUS/BOT creds — the user minted under
+  // the `agents` account by make-live's own `add-bot` (network-make-live-lib.ts:179,
+  // network-make-live-adapters.ts:96). It is DISTINCT from
+  // `stack.nats_infra.creds_path`, the FEDERATION creds minted under a DIFFERENT
+  // account at `network join`. The two must NEVER be conflated: a fallback to
+  // `nats_infra.creds_path` here would mint the bus user under the wrong account
+  // and collide with the federation user at join time (a tester proposed exactly
+  // that — it is wrong). When neither --creds nor config supplies a path, default
+  // to `~/.config/nats/<slug>-bot.creds` — the `-bot` suffix is LOAD-BEARING: it
+  // keeps this BUS/BOT-user path DISTINCT from provision's FEDERATION-user default
+  // `~/.config/nats/<slug>.creds` (deriveProvisionInputs, below). Two different
+  // NATS accounts MUST be two different files; a bare `<slug>.creds` here would
+  // resolve to the SAME path provision uses, so make-live (bus user, agents
+  // account) and `network join` (federation user) would clobber each other. A
+  // from-scratch `cortex stack create` stack now also seeds this key explicitly in
+  // system.yaml, so this runtime default is the belt to that brace: a pre-existing,
+  // unseeded stack needs NO --creds flag for from-scratch make-live.
+  const credsPathRaw = optionalValueFlag(flags, "--creds") ?? cfg.config.nats?.credsPath;
+  const credsPathExplicit = credsPathRaw !== undefined && credsPathRaw !== "";
+  const credsPath = credsPathExplicit ? credsPathRaw : `~/.config/nats/${slug}-bot.creds`;
   const botName = cfg.config.nats?.name ?? "cortex";
   // BLOCK 1 — derive the nats-server config PER STACK from the stack's OWN config
   // (`stack.nats_infra.config_path`, the same field `network join` derives from),
@@ -1999,6 +2015,12 @@ function deriveMakeLiveInputs(
     botName,
     credsPath,
     cortexConfigPath: configPath,
+    // cortex#1265 (v5.30.2) — when credsPath was DEFAULTED, make-live persists the
+    // resolved path into the SYSTEM-layer config so the daemon connects with it
+    // (runtime.ts only passes credsPath when set). An explicit --creds/config value
+    // is never overwritten (credsPathDefaulted stays false).
+    credsPathDefaulted: !credsPathExplicit,
+    systemConfigWritePath: resolveSystemWriteConfigPath(configPath),
     natsConfigPath,
     force,
     apply: applyRes.apply,
@@ -2051,6 +2073,23 @@ function resolveStackWriteConfigPath(configPath: string): string {
     const base = (expanded.split("/").pop() ?? "").replace(/\.ya?ml$/i, "");
     return join(configDir, "stacks", `${base}.yaml`);
   }
+  return expanded;
+}
+
+/**
+ * Resolve where a DEFAULTED `nats.credsPath` write-back lands (cortex#1265,
+ * v5.30.2). `nats` is the SYSTEM/bus layer: in a config-split layout it lives in
+ * `<configDir>/system/system.yaml`; a legacy monolith carries it in the single
+ * file. Sibling of {@link resolveStackWriteConfigPath} but targeting the SYSTEM
+ * layer — the stack-layer file owns `nats_infra`, NOT `config.nats`. Writing
+ * `nats.credsPath` to the stack file would split-brain it away from the
+ * stack-create seed (which writes system.yaml) and from the config-table owner.
+ */
+function resolveSystemWriteConfigPath(configPath: string): string {
+  const expanded = expandTilde(configPath);
+  const configDir = expanded.replace(/\/[^/]*$/, "");
+  const systemYaml = join(configDir, "system", "system.yaml");
+  if (existsSync(systemYaml)) return systemYaml;
   return expanded;
 }
 
@@ -2109,6 +2148,10 @@ function deriveProvisionInputs(
   if (!names.ok) return { ok: false, reason: names.reason, usage: true };
 
   const seedPath = optionalValueFlag(flags, "--seed-path") ?? cfg.stack?.nkey_seed_path ?? `~/.config/nats/${principal}-${slug}.seed`;
+  // FEDERATION-user creds default. DELIBERATELY DISTINCT from make-live's BUS/BOT
+  // creds default `~/.config/nats/<slug>-bot.creds` (deriveMakeLiveInputs, above):
+  // these are two different NATS accounts (federation vs `agents`), so they MUST
+  // be two different files — a shared path would clobber on the second mint.
   const credsPath = optionalValueFlag(flags, "--creds") ?? cfg.stack?.nats_infra?.creds_path ?? `~/.config/nats/${slug}.creds`;
   // cortex#1265 (PR8) — the per-stack nats-server config path make-live + join
   // derive their `--nats-config` from. Preserve a value already in config (the
