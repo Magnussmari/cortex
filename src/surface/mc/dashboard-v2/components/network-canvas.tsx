@@ -134,6 +134,10 @@ function FlowCanvas({
         data: {
           ...(e.layout as unknown as Record<string, unknown>),
           stackColor: e.data?.stackColor,
+          // MC-D3 (#1290) — carry the federation provenance so the constellation
+          // edge draws a federated (cross-principal admitted-peer) connector
+          // dashed + flowing, and labels it. Local/sibling edges stay solid.
+          federated: e.data?.federated ?? false,
         } as Record<string, unknown>,
       })),
     [laidOutEdges],

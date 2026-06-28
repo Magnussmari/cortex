@@ -86,6 +86,13 @@ export function StackHubCard({
   // hub with the local visual, identical to your own stack's treatment.
   const category = classifyOrigin(data.origin, data.servingPrincipal);
   const foreign = !isLocalCategory(category);
+  // MC-D3 (#1290) — the SELF stack (the serving stack, `origin === "local"`) is
+  // the constellation's "● YOU ARE HERE" anchor. Only the serving stack — NOT a
+  // same-principal sibling (DB-read aggregation) — earns the anchor, so it gates
+  // on the literal local origin, not `isLocalCategory` (which also covers
+  // siblings). Presence-level marker; renders in any context, styled as the
+  // glowing anchor only under `.mc-skin`.
+  const isSelfStack = data.origin === "local";
   // U2.3 — signal's intent⋈reality verdict for this stack (present only when the
   // transport overlay is on AND signal observed it). Taken verbatim from signal.
   const badge =
@@ -162,6 +169,11 @@ export function StackHubCard({
       <span className="network-hub-eyebrow dim">
         {foreign ? "federated stack" : "stack"}
       </span>
+      {isSelfStack && (
+        <span className="network-hub-you-are-here" data-you-are-here="true">
+          <span aria-hidden="true">●</span> YOU ARE HERE
+        </span>
+      )}
       <span className="network-hub-label">{label}</span>
       {badge && (
         <span

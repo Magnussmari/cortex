@@ -17,6 +17,7 @@
 import { useMemo, type CSSProperties } from "react";
 import {
   BaseEdge,
+  EdgeLabelRenderer,
   getSmoothStepPath,
   Position,
   type EdgeProps,
@@ -131,6 +132,11 @@ export default function NetworkElkEdge(props: EdgeProps) {
   const elkPoints = edgeData?.["elkPoints"] as Point[] | undefined;
   // #1068 — the hub→agent connector strokes in its stack's deterministic color.
   const stackColor = edgeData?.["stackColor"] as string | undefined;
+  // MC-D3 (#1290) — a CROSS-PRINCIPAL federated peer's edge: drawn dashed +
+  // flowing (the live bus-traffic "admitted peer" treatment) and labelled. The
+  // constellation skin's `.edge-live--fed` class supplies the dash geometry +
+  // `dashFlowFed` animation (reduced-motion-guarded in constellation.css).
+  const federated = edgeData?.["federated"] === true;
   const layoutSourceX = edgeData?.["layoutSourceX"] as number | undefined;
   const layoutSourceY = edgeData?.["layoutSourceY"] as number | undefined;
   const layoutTargetX = edgeData?.["layoutTargetX"] as number | undefined;
@@ -207,12 +213,39 @@ export default function NetworkElkEdge(props: EdgeProps) {
     }
   }
 
+  // MC-D3 — the federated edge midpoint, where the `federated · admitted peer`
+  // label sits. The label is a presence-level provenance marker (this is an
+  // admitted cross-principal peer relationship) — never a session affordance.
+  const labelX = (sourceX + targetX) / 2;
+  const labelY = (sourceY + targetY) / 2;
+
   return (
-    <BaseEdge
-      id={id}
-      path={path}
-      style={baseStyle as CSSProperties}
-      markerEnd={markerEnd}
-    />
+    <>
+      <BaseEdge
+        id={id}
+        path={path}
+        style={baseStyle as CSSProperties}
+        markerEnd={markerEnd}
+        // The constellation skin keys the dashed-flow treatment off this class
+        // (scoped under `.mc-skin`; inert in the un-skinned legacy render).
+        className={federated ? "edge-live--fed" : undefined}
+      />
+      {federated && (
+        <EdgeLabelRenderer>
+          <div
+            className="mc-edge-fed-label"
+            data-edge-federated="true"
+            style={{
+              position: "absolute",
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+              pointerEvents: "none",
+            }}
+            title="Federated bus relationship — an admitted cross-principal peer"
+          >
+            <span aria-hidden="true">●</span> federated · admitted peer
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
   );
 }
