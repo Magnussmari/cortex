@@ -971,9 +971,16 @@ html, body {
 .network-roster-member { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .network-roster-principal { font-family: var(--mono); }
 .network-roster-stacks { font-size: 11px; margin-left: auto; }
-.network-roster-badge, .network-roster-status {
+.network-roster-badge, .network-roster-status, .network-roster-confidentiality {
   font-size: 10px; padding: 1px 7px; border-radius: 999px;
   border: 1px solid currentColor; white-space: nowrap;
+}
+/* MC-A3 (cortex#1277) — confidentiality posture chip (ADR-0019/0018).
+   Tone carries the colour (ok/warn/danger); the degraded "no key" posture also
+   gets a subtle fill so it reads as a real anomaly, not just another chip. */
+.network-roster-confidentiality[data-posture="degraded"] {
+  background: color-mix(in srgb, var(--bad) 14%, transparent);
+  font-weight: 600;
 }
 .tone-ok { color: var(--ok); }
 .tone-warn { color: var(--warn); }

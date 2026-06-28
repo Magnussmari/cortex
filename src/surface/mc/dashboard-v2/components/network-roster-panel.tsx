@@ -16,6 +16,7 @@
 
 import type { NetworkMembershipDTO } from "../hooks/use-networks";
 import {
+  confidentialityBadge,
   verdictBadge,
   rosterStatusBadge,
   summarizeMembership,
@@ -51,6 +52,7 @@ export function NetworkRosterPanel({
       <ul className="network-roster-list">
         {networks.map((net) => {
           const status = rosterStatusBadge(net.roster_status, net.roster_scope);
+          const confidentiality = confidentialityBadge(net.confidentiality);
           const summary = summarizeMembership(net);
           return (
             <li key={net.network_id} className="network-roster-group">
@@ -64,6 +66,16 @@ export function NetworkRosterPanel({
                   title={status.title}
                 >
                   {status.label}
+                </span>
+                {/* MC-A3 (cortex#1277) — per-network confidentiality posture
+                    (ADR-0019/0018). Read-only honesty: never "encrypted" without
+                    a key. `data-posture` is the stable token for automation/tests. */}
+                <span
+                  className={`network-roster-confidentiality tone-${confidentiality.tone}`}
+                  data-posture={confidentiality.posture}
+                  title={confidentiality.title}
+                >
+                  {confidentiality.label}
                 </span>
                 <span className="dim network-roster-summary">
                   {summary.present} present · {summary.absent} absent
