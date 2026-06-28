@@ -177,6 +177,9 @@ import {
   type AdmissionRowsProvider,
   type AdmissionRowsResult,
 } from "./bus/agent-network/admission-read";
+// MC-A3 (cortex#1277, ADR-0019/0018) — derive each joined network's read-only
+// confidentiality posture from config for the `/api/networks` view.
+import { confidentialityPosture } from "./common/crypto/network-encryption-policy";
 // MC-I1.S4 (ADR-0005 §4) — bus→MC dispatch-lifecycle projection renderer.
 import { createDispatchProjectionRenderer } from "./surface/mc/projection/dispatch-lifecycle-renderer";
 // P-14 U2.1 (#934) — bus→MC observability projection renderer (signal's four
@@ -5627,7 +5630,15 @@ export async function startCortex(
         networksViewForApi = {
           localPrincipal: principalId,
           networks: () =>
-            networksList.map((n) => ({ networkId: n.id, leafNode: n.leaf_node })),
+            networksList.map((n) => ({
+              networkId: n.id,
+              leafNode: n.leaf_node,
+              // MC-A3 — config-derived confidentiality posture (ADR-0019/0018).
+              // Read-only honesty: surfaces `enabled`/`required` WITH key as
+              // sealed, but a configured-without-key network as degraded, never
+              // faked "encrypted".
+              confidentiality: confidentialityPosture(n),
+            })),
           resolveAdmittedRoster: (networkId) =>
             resolveAdmittedRoster(networkId, admissionProvider),
         };
