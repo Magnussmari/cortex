@@ -9,7 +9,7 @@
 
 The vision (the fly bridge / Internet of Agentic Work) now has a **concrete visual language**. This doc is the build spec to re-skin the MC Network view to it. The skin sits **on top of the A-wave data model** (#1274 networks-first-class + ADMITTED roster ⋈ presence + encryption posture + Pier queue) — the A-wave is the *truth*; this is the *presentation*.
 
-It is a dark, glowing **constellation / star-map** of the agentic network, with an **altitude rail**, a **you-are-here breadcrumb**, **posture-awareness** (operator vs member), and **live bus traffic** animated on the edges.
+It is a dark, glowing **constellation / star-map** of the agentic network, with an **altitude rail**, a **you-are-here breadcrumb**, **posture-awareness** (admin vs member), and **live bus traffic** animated on the edges.
 
 ## Design tokens (from the mockup — OKLCH, dark)
 
@@ -38,7 +38,7 @@ Background is a radial-gradient "atmosphere"; nodes are radial-gradient glows; p
 
 - **OPERATOR** (a network you own): the network header reads `YOU OPERATE`; admin affordances present (roster, Pier queue, grant, rotate). 
 - **MEMBER** (a network you joined): your slice + admitted peers; no admin affordances.
-The posture pill in the command bar + the `postureOperator` conditional drive which chrome appears.
+The posture pill in the command bar + the posture conditional (admin/member) drive which chrome appears.
 
 ## How it maps to the A-wave data (skin ⟷ truth)
 
@@ -46,7 +46,7 @@ The posture pill in the command bar + the `postureOperator` conditional drive wh
 |---|---|
 | Network header + roster | A1 `/api/networks` (networks-first-class + ADMITTED roster ⋈ presence) |
 | Node state (present / absent / pending / `present-but-unadmitted`) | A1 membership verdict |
-| `YOU OPERATE` / posture pill | A1 posture (operator vs member) |
+| `YOU OPERATE` / posture pill | A1 posture (admin vs member) |
 | `K7` / encryption-key + sealed badge | A3 (#1277) encryption posture |
 | Pier queue (pending requests) | B1 (#1278) |
 | Live peer roster (member posture) | Q3 (#1282) registry ADMITTED read |
@@ -59,7 +59,7 @@ The skin **renders the A-wave's truth** — it never invents liveness (vision no
 - **D1 — Design system / tokens.** New additive token + motion layer (`styles/tokens.css` or a tokens module): the OKLCH palette, JetBrains Mono + Inter, the keyframes, glow primitives, reduced-motion guard. *Conflict-free (new file) — can land in parallel with the A-wave.*
 - **D2 — Shell chrome.** Command bar (logo · principal · ALT breadcrumb · posture pill) + the left **altitude rail**. Mostly new components.
 - **D3 — Constellation canvas.** Re-skin the network graph to the glowing star-map (radial-glow nodes, capability + state labels, you-are-here, dashed federated edges). The centerpiece; **re-skins the A-wave's network-view/canvas/nodes → lands after the A-wave settles.**
-- **D4 — Posture + trust indicators.** Operator/member chrome, `YOU OPERATE`, the `K7` encryption indicator, `federated · admitted peer` edge labels. Consumes A1 + A3 + Q3.
+- **D4 — Posture + trust indicators.** Admin/member chrome, `YOU OPERATE`, the `K7` encryption indicator, `federated · admitted peer` edge labels. Consumes A1 + A3 + Q3.
 - **D5 — Live traffic + atmosphere.** Animated bus-comm edges (`dashFlow` driven by real envelope flow) + the atmosphere glow + the `liveTraffic`/`atmosphere` toggles + reduced-motion.
 
 **Sequencing:** D1 ∥ A-wave (additive). D2 next. D3→D4→D5 after the A-wave data lands (they re-skin the same components A1/A3/B1 build). Deploy the skin as one coherent wave so the pane doesn't ship half-reskinned.
