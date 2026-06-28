@@ -27,6 +27,7 @@ import type {
   SignedAdmissionMineRead,
   SignedAdmissionRead,
   SignedAdmissionRevoke,
+  SignedNetworkRosterMemberRead,
   SignedRegistration,
   SignedSealedSecretWrite,
   StackIdentity,
@@ -704,6 +705,59 @@ export function validateSignedAdmissionMineRead(
     ok: true,
     signed: {
       claim: { principal_id: bc.principal_id, peer_pubkey: bc.peer_pubkey, issued_at: bc.issued_at },
+      signature: b.signature,
+    },
+  };
+}
+
+/**
+ * C-1282 (ADR-0018 Q4) — validate the `x-pop-signed` header for the member
+ * network-roster read `GET /networks/{network_id}/roster/member`. The header
+ * value is JSON: `{ claim: NetworkRosterMemberReadClaim, signature: string }`.
+ *
+ * Like the `/mine` PoP read: no nonce (reads are idempotent), clock-skew
+ * applies, and the route verifies the signature against `claim.peer_pubkey`
+ * (that signature is the authorization). Unlike `/mine`, the claim binds a
+ * `network_id` so the signature is scoped to one network — the route additionally
+ * checks `claim.network_id` matches the path and that the proven pubkey is an
+ * ADMITTED member of it (the fail-closed gate lives in the route, not here).
+ */
+export function validateSignedNetworkRosterMemberRead(
+  body: unknown,
+): { ok: true; signed: SignedNetworkRosterMemberRead } | { ok: false; errors: ValidationError[] } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { ok: false, errors: [{ field: "body", message: "must be an object" }] };
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.signature !== "string" || b.signature.length === 0) {
+    return { ok: false, errors: [{ field: "signature", message: "missing" }] };
+  }
+  if (!BASE64_RE.test(b.signature)) {
+    return { ok: false, errors: [{ field: "signature", message: "must be base64" }] };
+  }
+  if (typeof b.claim !== "object" || b.claim === null || Array.isArray(b.claim)) {
+    return { ok: false, errors: [{ field: "claim", message: "must be a non-array object" }] };
+  }
+  const bc = b.claim as Record<string, unknown>;
+  if (typeof bc.network_id !== "string" || !isValidNetworkId(bc.network_id)) {
+    return {
+      ok: false,
+      errors: [{ field: "claim.network_id", message: "must be a valid network id" }],
+    };
+  }
+  if (typeof bc.peer_pubkey !== "string" || !isValidPubkey(bc.peer_pubkey)) {
+    return {
+      ok: false,
+      errors: [{ field: "claim.peer_pubkey", message: "must be a 32-byte Ed25519 pubkey, base64-encoded (44 chars)" }],
+    };
+  }
+  if (typeof bc.issued_at !== "string" || Number.isNaN(Date.parse(bc.issued_at))) {
+    return { ok: false, errors: [{ field: "claim.issued_at", message: "must be an ISO-8601 timestamp" }] };
+  }
+  return {
+    ok: true,
+    signed: {
+      claim: { network_id: bc.network_id, peer_pubkey: bc.peer_pubkey, issued_at: bc.issued_at },
       signature: b.signature,
     },
   };
