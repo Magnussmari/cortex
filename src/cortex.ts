@@ -171,6 +171,12 @@ import { startCockpitRefreshLoop, type CockpitRefreshLoop } from "./surface/mc/r
 // MC-I1.S1 (ADR-0005) — in-process Mission Control embed (supersedes api.*).
 import { startMissionControl, type MissionControlHandle } from "./surface/mc/embed";
 import type { AgentPresenceView } from "./surface/mc/api/agents";
+import type { NetworksView } from "./surface/mc/api/networks";
+import {
+  resolveAdmittedRoster,
+  type AdmissionRowsProvider,
+  type AdmissionRowsResult,
+} from "./bus/agent-network/admission-read";
 // MC-I1.S4 (ADR-0005 §4) — bus→MC dispatch-lifecycle projection renderer.
 import { createDispatchProjectionRenderer } from "./surface/mc/projection/dispatch-lifecycle-renderer";
 // P-14 U2.1 (#934) — bus→MC observability projection renderer (signal's four
@@ -5127,6 +5133,12 @@ export async function startCortex(
   // registry boots AFTER this embed (below), so the getter returns `null` until
   // we assign it post-registry-start. The MC server resolves it per request.
   let presenceViewForApi: AgentPresenceView | null = null;
+  // MC-A1 (cortex#1275) — mutable holder threaded into the MC server as a lazy
+  // getter so `GET /api/networks` can read the joined networks + their admitted
+  // roster ⋈ presence. Assigned in the federation block below (after
+  // `resolvedPolicy` is known); `null` until then ⇒ the route serves an empty
+  // list. The MC server resolves it per request.
+  let networksViewForApi: NetworksView | null = null;
   // #1008/#989 — discovered LOCAL sibling stacks, used by BOTH the DB-read
   // pane-of-glass aggregation (the embed's `localAggregation` getter, below, for
   // session trees) AND the #989 bus sibling-presence aggregator (later, for
@@ -5201,6 +5213,9 @@ export async function startCortex(
         port: config.mc.port,
         ...(mcHeadless ? { headless: true } : {}),
         agentPresence: () => presenceViewForApi,
+        // MC-A1 (cortex#1275) — networks view (lazy; assigned in the federation
+        // block once `resolvedPolicy` is known). null ⇒ empty `/api/networks`.
+        networks: () => networksViewForApi,
         // #1008 — DB-read pane-of-glass aggregation. The getter returns a context
         // only when discovery produced a resolve-opts (dbRead on); otherwise null
         // ⇒ single-db feeds. Lazy so the roster can be (re)read consistently.
@@ -5575,6 +5590,51 @@ export async function startCortex(
             "cortex: federation roster reconciler started — continuously admitting roster-named peers (opt-in per network; registry-authoritative; chain-verify unchanged)",
           );
         }
+      }
+
+      // MC-A1 (cortex#1275) — wire the `/api/networks` view: surface the joined
+      // networks as first-class trust groups with their admitted roster ⋈
+      // presence → membership verdict. Membership is sourced from the ADMISSION
+      // ROWS (ADR-0018 Q3), NOT the capability-derived `GET /networks/{id}/roster`
+      // (`resolveNetworkRoster`) — conflating capability with membership is the
+      // bug Q3 forbids.
+      //
+      // ESCALATION / FOLLOW-UP (A2 #1276): the LIVE admission-rows provider is
+      // not wired here. A non-admin member can read only its OWN admission rows
+      // today (signed PoP `GET /admission-requests/mine`, scope `self`); the FULL
+      // admitted roster is admin-gated, and a Q3-correct member-accessible PEER
+      // roster read is a registry-side prerequisite (registry `members[]` is
+      // still capability-derived — see `NetworkRoster` in the registry's
+      // types.ts). So A1 wires the seam + a `not_configured` provider: the view
+      // surfaces each joined network + the serving principal's own membership,
+      // with `roster_status: "not_configured"` until A2 drops in the real
+      // admission-rows provider. The model, reconciliation, endpoint, and
+      // frontend are all in place behind this single seam.
+      const networksList = resolvedPolicy?.federated?.networks;
+      if (networksList !== undefined && networksList.length > 0) {
+        // A1 seam — replaced by the self-PoP / admin-list admission-rows provider
+        // in A2. Returns `not_configured` so the endpoint degrades to self-only
+        // membership rather than building on the capability roster.
+        const admissionProvider: AdmissionRowsProvider = {
+          readAdmissionRows: (): Promise<AdmissionRowsResult> =>
+            Promise.resolve({
+              ok: false,
+              reason: "not_configured",
+              detail:
+                "live admission-rows read not wired (A1 seam) — pending A2 (#1276) + registry ADR-0018 Q3 roster fix",
+            }),
+        };
+        networksViewForApi = {
+          localPrincipal: principalId,
+          networks: () =>
+            networksList.map((n) => ({ networkId: n.id, leafNode: n.leaf_node })),
+          resolveAdmittedRoster: (networkId) =>
+            resolveAdmittedRoster(networkId, admissionProvider),
+        };
+        console.log(
+          `cortex: MC /api/networks view wired — ${networksList.length.toString()} joined network(s) ` +
+            "as first-class trust groups (admission-rows roster source pending A2 #1276)",
+        );
       }
 
       // P-14 U3.3 (#937) — the trust-verified federated OBSERVABILITY fold, the
