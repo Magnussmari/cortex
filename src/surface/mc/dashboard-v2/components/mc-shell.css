@@ -1,0 +1,357 @@
+/*
+ * MC-D2 (cortex#1289) — constellation skin shell chrome: command bar + altitude
+ * rail. Consumes D1's tokens (constellation.css) — every custom property below
+ * (--mer, --tide, --fg, --dim, --faint, --line, --panel, --panel2, --lsoft,
+ * --ok, --mono, --sans) is inherited from the `.mc-skin` wrapper this chrome
+ * renders inside. Nothing here is declared on `:root`, so it has zero blast
+ * radius on the panes that haven't adopted the skin.
+ *
+ * Motion is minimal (a single logo-glow breathe) and gated behind
+ * prefers-reduced-motion at the foot of this file (mirrors D1's guard).
+ */
+
+/* ── Shell layout ────────────────────────────────────────────────────────── */
+.mc-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.mc-shell-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.mc-shell-content {
+  flex: 1;
+  min-width: 0;
+  padding: 18px 22px;
+  overflow: auto;
+}
+
+/* ── Command bar (64px top chrome) ───────────────────────────────────────── */
+.mc-command-bar {
+  display: flex;
+  align-items: center;
+  height: 64px;
+  padding: 0 26px;
+  gap: 22px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, oklch(0.2 0.013 252), var(--panel));
+  position: relative;
+  z-index: 20;
+}
+
+.mc-cb-divider {
+  width: 1px;
+  height: 26px;
+  background: var(--line);
+  flex-shrink: 0;
+}
+
+.mc-cb-spacer {
+  flex: 1;
+}
+
+/* shared mono "key" caption (PRINCIPAL / ALT / NETWORKS) */
+.mc-cb-key {
+  font: 500 11px var(--mono);
+  color: var(--faint);
+  letter-spacing: 0.1em;
+}
+
+/* Logo */
+.mc-logo {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.mc-logo-mark {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid var(--mer);
+  box-shadow: 0 0 14px color-mix(in oklch, var(--mer) 50%, transparent);
+  animation: mcLogoBreathe 4s ease-in-out infinite;
+}
+.mc-logo-ring {
+  position: absolute;
+  inset: 5px;
+  border-radius: 50%;
+  border: 1.5px solid var(--mer);
+  opacity: 0.55;
+}
+.mc-logo-core {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--mer);
+  transform: translate(-50%, -50%);
+}
+.mc-logo-text {
+  font: 700 15px var(--mono);
+  letter-spacing: 0.16em;
+  color: var(--fg);
+}
+
+@keyframes mcLogoBreathe {
+  0%, 100% { box-shadow: 0 0 14px color-mix(in oklch, var(--mer) 50%, transparent); }
+  50%      { box-shadow: 0 0 20px color-mix(in oklch, var(--mer) 70%, transparent); }
+}
+
+/* Principal */
+.mc-cb-principal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mc-cb-principal-name {
+  font: 500 11px var(--mono);
+  color: var(--fg);
+}
+
+/* Breadcrumb */
+.mc-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.mc-breadcrumb-seg-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.mc-breadcrumb-sep {
+  color: var(--faint);
+  font: 500 11px var(--mono);
+}
+.mc-breadcrumb-seg {
+  font: 500 11px var(--mono);
+  color: var(--dim);
+  background: none;
+  border: none;
+  padding: 2px 3px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.mc-breadcrumb-seg:hover {
+  color: var(--fg);
+  background: color-mix(in oklch, var(--fg) 8%, transparent);
+}
+.mc-breadcrumb-seg--root {
+  color: var(--mer);
+  font-weight: 600;
+}
+
+/* Posture pill */
+.mc-posture-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border-radius: 6px;
+  font: 600 11px var(--mono);
+  letter-spacing: 0.12em;
+}
+.mc-posture-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.mc-posture-pill--admin {
+  border: 1px solid var(--mer);
+  background: color-mix(in oklch, var(--mer) 12%, transparent);
+  color: var(--mer);
+}
+.mc-posture-pill--admin .mc-posture-dot {
+  background: var(--mer);
+  box-shadow: 0 0 8px var(--mer);
+}
+.mc-posture-pill--member {
+  border: 1px solid var(--tide);
+  background: color-mix(in oklch, var(--tide) 12%, transparent);
+  color: var(--tide);
+}
+.mc-posture-pill--member .mc-posture-dot {
+  background: var(--tide);
+  box-shadow: 0 0 8px var(--tide);
+}
+
+/* Network count */
+.mc-cb-netcount {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mc-cb-netcount-n {
+  font: 600 11px var(--mono);
+  color: var(--fg);
+}
+
+/* ── Altitude rail (left chrome) ─────────────────────────────────────────── */
+.mc-altitude-rail {
+  width: 172px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 0 20px;
+}
+.mc-rail-title {
+  font: 600 9px var(--mono);
+  color: var(--faint);
+  letter-spacing: 0.18em;
+  text-align: center;
+  margin-bottom: 18px;
+}
+.mc-rail-stops {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 24px;
+  position: relative;
+  flex: 1;
+}
+/* the vertical spine behind the stops */
+.mc-rail-stops::before {
+  content: "";
+  position: absolute;
+  left: 31px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: linear-gradient(180deg, var(--mer), var(--lsoft) 22%, var(--lsoft));
+}
+.mc-rail-stop {
+  position: relative;
+  margin-bottom: 22px;
+}
+.mc-rail-stop-btn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.mc-rail-stop-btn:disabled {
+  cursor: default;
+}
+.mc-rail-dot {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1.5px solid var(--faint);
+  background: var(--panel);
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+.mc-rail-stop-labels {
+  display: flex;
+  flex-direction: column;
+}
+.mc-rail-stop-label {
+  font: 600 9px var(--mono);
+  color: var(--dim);
+  letter-spacing: 0.04em;
+}
+.mc-rail-stop-alt {
+  font: 500 8px var(--mono);
+  color: var(--faint);
+}
+
+/* current level — lit */
+.mc-rail-stop--current > .mc-rail-stop-btn .mc-rail-dot {
+  width: 16px;
+  height: 16px;
+  background: var(--mer);
+  border-color: var(--mer);
+  box-shadow: 0 0 12px var(--mer);
+}
+.mc-rail-stop--current > .mc-rail-stop-btn .mc-rail-stop-label {
+  color: var(--mer);
+  font-weight: 700;
+}
+
+/* future stub — dimmed, inert */
+.mc-rail-stop--future > .mc-rail-stop-btn .mc-rail-stop-label {
+  color: var(--faint);
+}
+.mc-rail-stop--future > .mc-rail-stop-btn .mc-rail-dot {
+  opacity: 0.5;
+}
+
+/* drill targets under the NETWORK stop */
+.mc-rail-networks {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0 0 0 22px;
+}
+.mc-rail-network {
+  margin-bottom: 4px;
+}
+.mc-rail-network-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.mc-rail-network-btn:hover {
+  background: color-mix(in oklch, var(--fg) 6%, transparent);
+}
+.mc-rail-network-btn--active {
+  border-color: color-mix(in oklch, var(--mer) 45%, transparent);
+  background: color-mix(in oklch, var(--mer) 10%, transparent);
+}
+.mc-rail-network-name {
+  font: 500 10px var(--mono);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-rail-network-btn--active .mc-rail-network-name {
+  color: var(--fg);
+}
+.mc-rail-network-posture {
+  font: 600 8px var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.mc-rail-network-posture--admin {
+  color: var(--mer);
+}
+.mc-rail-network-posture--member {
+  color: var(--tide);
+}
+
+.mc-rail-dive {
+  text-align: center;
+  font: 600 8px var(--mono);
+  color: var(--faint);
+  letter-spacing: 0.1em;
+  line-height: 1.5;
+  margin-top: 12px;
+}
+
+/* ── Reduced-motion guard (mirrors D1) ───────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .mc-logo-mark {
+    animation: none !important;
+  }
+}
