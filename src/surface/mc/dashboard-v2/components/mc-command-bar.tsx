@@ -77,7 +77,7 @@ export function McCommandBar({
               className={
                 "mc-breadcrumb-seg" + (i === 0 ? " mc-breadcrumb-seg--root" : "")
               }
-              aria-current={i === breadcrumb.length - 1 ? "true" : undefined}
+              aria-current={i === breadcrumb.length - 1 ? "page" : undefined}
               data-network-id={seg.networkId ?? undefined}
               onClick={() => onNavigate(seg)}
             >

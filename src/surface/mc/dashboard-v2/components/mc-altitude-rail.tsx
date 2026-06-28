@@ -76,6 +76,14 @@ export function McAltitudeRail({
                 className="mc-rail-stop-btn"
                 disabled={onClick === undefined}
                 onClick={onClick}
+                // A disabled future stub is removed from the tab order, so its
+                // explanatory `title` is unreachable to AT — carry the same
+                // information on an always-announced `aria-label` instead.
+                aria-label={
+                  isFuture
+                    ? `${meta.label} — future level, arrives with the canvas re-skin`
+                    : undefined
+                }
                 title={
                   isFuture
                     ? `${meta.label} — drill arrives with the canvas re-skin`
