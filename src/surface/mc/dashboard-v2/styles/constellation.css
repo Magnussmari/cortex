@@ -1,0 +1,175 @@
+/*
+ * Constellation skin — design-system token + motion layer (MC-D1, cortex#1288).
+ *
+ * Foundational, ADDITIVE slice of the MC-UX constellation-skin epic
+ * (cortex#1287, under #1274). This file defines ONLY the vocabulary the
+ * skin's view slices (D2–D5) consume: the OKLCH palette, typography vars,
+ * glow primitives, and keyframes. It styles no existing component and
+ * removes nothing — the current dashboard keeps rendering unchanged.
+ *
+ * ── Scope decision: `.mc-skin` wrapper, NOT `:root` ──────────────────────
+ * The approved mockup reuses several token NAMES that the live dashboard
+ * already binds on `:root` via `tokens.css` (--bg, --panel, --fg, --dim/--faint,
+ * --d/--a/--h, --ok/--warn/--bad). Re-declaring those on `:root` here would
+ * silently override the running dashboard's palette — a flag-day restyle,
+ * which this slice explicitly must NOT do.
+ *
+ * Instead every token and primitive is scoped under a `.mc-skin` wrapper
+ * class. The constellation tokens therefore exist only inside whatever
+ * subtree opts in by carrying `class="mc-skin"`. D2–D5 adopt the skin
+ * incrementally — pane by pane — by wrapping their root element in
+ * `.mc-skin`, with zero blast radius on the panes that haven't migrated.
+ * When the whole dashboard has moved over, the wrapper can be hoisted to a
+ * top-level container (or, as a deliberate later step, promoted to `:root`).
+ *
+ * Fonts (JetBrains Mono + Inter) are already loaded once by the shell at
+ * `index.html` (Google Fonts <link>, the repo's established pattern), so this
+ * file declares the family vars only — it adds no new font request.
+ *
+ * Token-presence is guarded by
+ * `__tests__/constellation-tokens.test.ts` (fails if a required token,
+ * keyframe, the `.mc-skin` scope, or the reduced-motion guard is dropped).
+ */
+
+/* ── Palette + typography (scoped to the opt-in subtree) ─────────────────── */
+.mc-skin {
+  /* surfaces */
+  --bg: oklch(0.13 0.012 250);
+  --panel: oklch(0.175 0.012 252);
+  --panel2: oklch(0.215 0.013 252);
+  --line: oklch(0.33 0.013 252);
+  --lsoft: oklch(0.255 0.012 252);
+
+  /* text */
+  --fg: oklch(0.94 0.006 250);
+  --dim: oklch(0.66 0.012 250);
+  --faint: oklch(0.50 0.012 250);
+
+  /* network accents — meridian / tide */
+  --mer: oklch(0.76 0.13 224);
+  --tide: oklch(0.72 0.13 288);
+
+  /* status */
+  --ok: oklch(0.80 0.13 162);
+  --warn: oklch(0.82 0.13 78);
+  --bad: oklch(0.66 0.20 22);
+
+  /* attention coding — Deterministic / Agentic / Human */
+  --d: oklch(0.80 0.14 158);
+  --a: oklch(0.82 0.13 80);
+  --h: oklch(0.76 0.15 8);
+
+  /* typography */
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  /* ── derived glow primitives (compose these in D2–D5) ───────────────── */
+  /* node radial-glow fill: a soft core bloom keyed off any accent var.
+     Usage: background: var(--glow-core); with --glow-tint set per node. */
+  --glow-tint: var(--mer);
+  --glow-core: radial-gradient(
+    circle at 50% 50%,
+    color-mix(in oklch, var(--glow-tint) 85%, transparent) 0%,
+    color-mix(in oklch, var(--glow-tint) 35%, transparent) 45%,
+    transparent 72%
+  );
+  /* node halo ring shadow — breathes via .halo */
+  --glow-halo: 0 0 0 1px color-mix(in oklch, var(--glow-tint) 55%, transparent),
+               0 0 14px 2px color-mix(in oklch, var(--glow-tint) 30%, transparent);
+  /* edge dash geometry — the live bus-traffic flow primitive */
+  --edge-dash: 6 10;        /* stroke-dasharray */
+  --edge-dash-fed: 4 8;     /* federated edges run a tighter dash */
+
+  /* atmosphere — background ellipse behind the constellation */
+  background:
+    radial-gradient(
+      ellipse 120% 90% at 50% 0%,
+      color-mix(in oklch, var(--mer) 8%, transparent) 0%,
+      transparent 60%
+    ),
+    var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+}
+
+/* ── Keyframes (the motion contract D2–D5 reference by name) ─────────────── */
+/* Node liveness: a steady core pulse, a slower variant, and a halo breathe. */
+@keyframes corePulse {
+  0%, 100% { opacity: 1;    transform: scale(1); }
+  50%      { opacity: 0.72; transform: scale(0.88); }
+}
+@keyframes coreSlow {
+  0%, 100% { opacity: 0.95; transform: scale(1); }
+  50%      { opacity: 0.60; transform: scale(0.92); }
+}
+@keyframes haloBreathe {
+  0%, 100% { opacity: 0.85; transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(1.18); }
+}
+
+/* Live bus-traffic flow along edges — marching-ants on stroke-dashoffset. */
+@keyframes dashFlow    { to { stroke-dashoffset: -160; } }
+@keyframes dashFlowFed { to { stroke-dashoffset: -220; } }
+
+/* Attention blink (needs-a-human markers). */
+@keyframes attnBlink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.3; }
+}
+
+/* Status ticker scroll. */
+@keyframes ticker { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+/* Metric bar sweep-in. */
+@keyframes barSweep { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+/* Generic spinner. */
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Reusable glow primitive classes (opt-in, scoped) ────────────────────── */
+/* Node core: a radial bloom that pulses. Set --glow-tint to recolour. */
+.mc-skin .core {
+  background: var(--glow-core);
+  border-radius: 50%;
+  animation: corePulse 2.4s ease-in-out infinite;
+}
+.mc-skin .core--slow { animation-name: coreSlow; animation-duration: 3.6s; }
+
+/* Node halo: a breathing ring around a node. */
+.mc-skin .halo {
+  box-shadow: var(--glow-halo);
+  border-radius: 50%;
+  animation: haloBreathe 3s ease-in-out infinite;
+}
+
+/* Live edge: dashed path animating its offset to show flow direction. */
+.mc-skin .edge-live {
+  stroke-dasharray: var(--edge-dash);
+  animation: dashFlow 2.2s linear infinite;
+}
+.mc-skin .edge-live--fed {
+  stroke-dasharray: var(--edge-dash-fed);
+  animation: dashFlowFed 1.8s linear infinite;
+}
+
+/* Attention marker. */
+.mc-skin .attn { animation: attnBlink 1.1s ease-in-out infinite; }
+
+/* Spinner primitive. */
+.mc-skin .spin { animation: spin 0.9s linear infinite; }
+
+/* ── Reduced-motion guard ────────────────────────────────────────────────
+ * Honour the OS "reduce motion" preference: hold every constellation
+ * animation on its resting frame. Tokens, colours, and the static glow
+ * shapes remain — only the motion stops. */
+@media (prefers-reduced-motion: reduce) {
+  .mc-skin .core,
+  .mc-skin .core--slow,
+  .mc-skin .halo,
+  .mc-skin .edge-live,
+  .mc-skin .edge-live--fed,
+  .mc-skin .attn,
+  .mc-skin .spin {
+    animation: none !important;
+  }
+}

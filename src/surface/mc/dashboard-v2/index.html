@@ -31,6 +31,13 @@
         href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" />
   <link rel="stylesheet" href="./styles/tokens.css" />
   <link rel="stylesheet" href="./styles/global.css" />
+  <!--
+    Constellation skin (MC-D1, cortex#1288) — additive token + motion layer.
+    Every rule is scoped under `.mc-skin`, so this has zero effect until a
+    pane opts in by carrying that class (D2–D5). Loaded last so the skin's
+    scoped vars win inside an opted-in subtree without touching `:root`.
+  -->
+  <link rel="stylesheet" href="./styles/constellation.css" />
 </head>
 <body>
   <div id="root"></div>
