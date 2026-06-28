@@ -99,6 +99,16 @@ describe("confidentialityBadge (MC-A3, ADR-0019/0018)", () => {
     expect(b.label).not.toContain("encrypted");
   });
 
+  it("an unrecognized mode degrades to unknown at runtime, never 'encrypted'", () => {
+    // Defensive: a server sending a mode outside the union (forward-compat / bug)
+    // must hit the exhaustiveness default's runtime fallback, not over-claim.
+    const bogus = { mode: "weird", key_present: true, key_id: "n/k1" } as unknown as
+      NetworkConfidentialityDTO;
+    const b = confidentialityBadge(bogus);
+    expect(b.posture).toBe("unknown");
+    expect(b.label).not.toContain("encrypted");
+  });
+
   it("every posture has a non-empty label + title", () => {
     const cases: (NetworkConfidentialityDTO | undefined)[] = [
       c({ mode: "off" }),

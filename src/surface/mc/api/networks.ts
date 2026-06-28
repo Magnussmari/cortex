@@ -115,6 +115,12 @@ export type { EncryptionMode };
  * a network configured `enabled`/`required` with `key_present: false` is NOT
  * actually sealing (cleartext-with-warning, ADR-0019 §5) and must never be badged
  * "encrypted". The wire-side mirror of {@link NetworkConfidentialityPosture}.
+ *
+ * **Consumer contract:** a consumer MUST combine `mode` AND `key_present` to
+ * judge whether traffic is actually sealed — `mode` alone over-claims (a
+ * keyless `enabled`/`required` network publishes cleartext). The canonical
+ * derivation is `confidentialityBadge` in `network-membership-adapter.ts`; new
+ * consumers should reuse it rather than re-deriving from `mode`.
  */
 export interface NetworkConfidentialityDTO {
   /** Configured mode (default `off`). */

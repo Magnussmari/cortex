@@ -148,8 +148,10 @@ function keyIdSuffix(c: NetworkConfidentialityDTO): string {
  *     cleartext-with-warning, ADR-0019 §5) — flagged `danger`, never "encrypted".
  *   - posture absent (older/stale server) → `unknown` — never assumed encrypted.
  *
- * Total over the `EncryptionMode` union (compiler-enforced; a new mode won't
- * silently fall through).
+ * Total over the `EncryptionMode` union: the `default` branch assigns `c.mode` to
+ * `never`, so adding a mode without a case is a COMPILE error (the project does
+ * not set `noImplicitReturns`, so this `never` assignment — not the switch shape —
+ * is what enforces totality). The runtime fallback is "unknown", never "encrypted".
  */
 export function confidentialityBadge(
   c: NetworkConfidentialityDTO | undefined,
@@ -201,6 +203,18 @@ export function confidentialityBadge(
         title:
           "Federated payloads cross in cleartext (signed, not sealed) — encryption is off (ADR-0019).",
       };
+    default: {
+      // Exhaustiveness guard: a new EncryptionMode must add a case above, or this
+      // assignment fails to compile. Runtime fallback degrades to "unknown" — it
+      // NEVER claims "encrypted" for an unrecognized mode (the honesty invariant).
+      const _exhaustive: never = c.mode;
+      return {
+        label: "encryption: unknown",
+        tone: "warn",
+        posture: "unknown",
+        title: `Unrecognized encryption mode '${String(_exhaustive)}' — not assumed encrypted (ADR-0019).`,
+      };
+    }
   }
 }
 
