@@ -5,12 +5,13 @@
 
 import { describe, it, expect } from "bun:test";
 import {
+  acceptanceBadge,
   confidentialityBadge,
   verdictBadge,
   rosterStatusBadge,
   summarizeMembership,
 } from "../lib/network-membership-adapter";
-import type { NetworkConfidentialityDTO } from "../../api/networks";
+import type { NetworkConfidentialityDTO, PeerAcceptance } from "../../api/networks";
 
 describe("verdictBadge", () => {
   it("maps each verdict to a distinct tone", () => {
@@ -125,15 +126,55 @@ describe("confidentialityBadge (MC-A3, ADR-0019/0018)", () => {
   });
 });
 
+describe("acceptanceBadge (MC-A2 — the second trust layer)", () => {
+  it("self renders as 'you' (ok)", () => {
+    const b = acceptanceBadge("self");
+    expect(b.token).toBe("self");
+    expect(b.tone).toBe("ok");
+    expect(b.label).toBe("you");
+  });
+
+  it("both accepted variants read as 'accepted' (ok) with distinct tokens", () => {
+    const net = acceptanceBadge("accepted-network");
+    const named = acceptanceBadge("accepted-named");
+    expect(net.tone).toBe("ok");
+    expect(named.tone).toBe("ok");
+    expect(net.label).toBe("accepted");
+    expect(named.label).toBe("accepted");
+    expect(net.token).toBe("accepted-network");
+    expect(named.token).toBe("accepted-named");
+  });
+
+  it("not-accepted is surfaced (warn) — admitted-but-not-accepted is visible", () => {
+    const b = acceptanceBadge("not-accepted");
+    expect(b.token).toBe("not-accepted");
+    expect(b.tone).toBe("warn");
+    expect(b.title).toContain("default-deny");
+  });
+
+  it("every acceptance value has a non-empty label + title", () => {
+    for (const a of [
+      "self",
+      "accepted-network",
+      "accepted-named",
+      "not-accepted",
+    ] as PeerAcceptance[]) {
+      const b = acceptanceBadge(a);
+      expect(b.label.length).toBeGreaterThan(0);
+      expect(b.title.length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe("summarizeMembership", () => {
   it("tallies members by verdict", () => {
     const summary = summarizeMembership({
       members: [
-        { principal: "a", verdict: "admitted-present", present_stacks: ["s"] },
-        { principal: "b", verdict: "admitted-absent", present_stacks: [] },
-        { principal: "c", verdict: "admitted-present", present_stacks: ["s"] },
-        { principal: "d", verdict: "present-but-unadmitted", present_stacks: ["x"] },
-        { principal: "e", verdict: "pending", present_stacks: [] },
+        { principal: "a", verdict: "admitted-present", present_stacks: ["s"], accepts: "accepted-network" },
+        { principal: "b", verdict: "admitted-absent", present_stacks: [], accepts: "not-accepted" },
+        { principal: "c", verdict: "admitted-present", present_stacks: ["s"], accepts: "accepted-named" },
+        { principal: "d", verdict: "present-but-unadmitted", present_stacks: ["x"], accepts: "not-accepted" },
+        { principal: "e", verdict: "pending", present_stacks: [], accepts: "not-accepted" },
       ],
     });
     expect(summary).toEqual({

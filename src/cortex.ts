@@ -177,6 +177,14 @@ import {
   type AdmissionRowsProvider,
   type AdmissionRowsResult,
 } from "./bus/agent-network/admission-read";
+// MC-A2 (cortex#1276) — the LIVE member-posture admission-rows provider +
+// per-principal acceptance resolution (the second trust layer).
+import { createMemberRosterAdmissionProvider } from "./bus/agent-network/admission-rows-member-provider";
+import {
+  summarizeAcceptancePolicy,
+  resolvePeerAcceptance,
+} from "./bus/agent-network/peer-acceptance";
+import { materialFromSeedString } from "./bus/stack-provisioning";
 // MC-A3 (cortex#1277, ADR-0019/0018) — derive each joined network's read-only
 // confidentiality posture from config for the `/api/networks` view.
 import { confidentialityPosture } from "./common/crypto/network-encryption-policy";
@@ -5595,38 +5603,83 @@ export async function startCortex(
         }
       }
 
-      // MC-A1 (cortex#1275) — wire the `/api/networks` view: surface the joined
-      // networks as first-class trust groups with their admitted roster ⋈
-      // presence → membership verdict. Membership is sourced from the ADMISSION
-      // ROWS (ADR-0018 Q3), NOT the capability-derived `GET /networks/{id}/roster`
-      // (`resolveNetworkRoster`) — conflating capability with membership is the
-      // bug Q3 forbids.
+      // MC-A1 (cortex#1275) / MC-A2 (cortex#1276) — wire the `/api/networks`
+      // view: surface the joined networks as first-class trust groups with their
+      // admitted roster ⋈ presence → membership verdict, PLUS each member's
+      // per-principal acceptance (the second trust layer). Membership is sourced
+      // from the ADMISSION ROWS (ADR-0018 Q3), NOT the capability-derived
+      // `GET /networks/{id}/roster` (`resolveNetworkRoster`) — conflating
+      // capability with membership is the bug Q3 forbids.
       //
-      // ESCALATION / FOLLOW-UP (A2 #1276): the LIVE admission-rows provider is
-      // not wired here. A non-admin member can read only its OWN admission rows
-      // today (signed PoP `GET /admission-requests/mine`, scope `self`); the FULL
-      // admitted roster is admin-gated, and a Q3-correct member-accessible PEER
-      // roster read is a registry-side prerequisite (registry `members[]` is
-      // still capability-derived — see `NetworkRoster` in the registry's
-      // types.ts). So A1 wires the seam + a `not_configured` provider: the view
-      // surfaces each joined network + the serving principal's own membership,
-      // with `roster_status: "not_configured"` until A2 drops in the real
-      // admission-rows provider. The model, reconciliation, endpoint, and
-      // frontend are all in place behind this single seam.
+      // A2 drops in the LIVE admission-rows provider: the PoP-signed member
+      // roster read `GET /networks/:id/roster/member` (C-1282 / ADR-0018 Q4,
+      // DEPLOYED #1284), signed with this stack's OWN registered key (the seed
+      // it already holds — mint nothing) and DD-9-verified against the pinned
+      // registry pubkey. It returns the COMPLETE admitted roster (scope
+      // `complete`), so membership verdicts are authoritative.
+      //
+      // POSTURE NOTE: the member read returns ADMITTED peers only — a member
+      // never sees a network's PENDING onboarding queue. PENDING enrichment for
+      // a network THIS stack ADMINS is the admin-list path (the SAME
+      // `AdmissionRowsProvider` seam, fed by the admin-gated list); it composes
+      // in once the daemon carries admin credentials (no admin-seed config in
+      // the stack today, so it would be dead code now — deliberately not built).
+      // The Pier queue (B1) already surfaces PENDING for admin-posture networks.
       const networksList = resolvedPolicy?.federated?.networks;
       if (networksList !== undefined && networksList.length > 0) {
-        // A1 seam — replaced by the self-PoP / admin-list admission-rows provider
-        // in A2. Returns `not_configured` so the endpoint degrades to self-only
-        // membership rather than building on the capability roster.
-        const admissionProvider: AdmissionRowsProvider = {
-          readAdmissionRows: (): Promise<AdmissionRowsResult> =>
-            Promise.resolve({
-              ok: false,
-              reason: "not_configured",
-              detail:
-                "live admission-rows read not wired (A1 seam) — pending A2 (#1276) + registry ADR-0018 Q3 roster fix",
-            }),
-        };
+        const registry = resolvedPolicy?.federated?.registry;
+
+        // Load this stack's registered identity material (pubkey + seed) to
+        // PoP-sign the member read. Reuses the chmod-600-gated signing-key
+        // loader; never mints a key. Non-fatal: a stack with no seed (or a load
+        // failure) leaves `material` undefined → the provider stays
+        // `not_configured` (honest self-only), never crashes the embed boot.
+        let stackMaterial: ReturnType<typeof materialFromSeedString> | undefined;
+        if (options.stack?.nkey_seed_path) {
+          try {
+            const kp = await loadStackSigningKey(
+              expandTilde(options.stack.nkey_seed_path),
+            );
+            stackMaterial = materialFromSeedString(
+              new TextDecoder().decode(kp.getSeed()),
+            );
+          } catch (err) {
+            console.error(
+              "cortex: MC /api/networks — could not load stack identity for the member roster read (non-fatal, self-only membership):",
+              err instanceof Error ? err.message : String(err),
+            );
+          }
+        }
+
+        // The LIVE provider — or a `not_configured` provider when we lack the
+        // registry URL or the signing material to read + verify a roster.
+        const admissionProvider: AdmissionRowsProvider =
+          registry !== undefined && stackMaterial !== undefined
+            ? createMemberRosterAdmissionProvider({
+                registryUrl: registry.url,
+                ...(registry.pubkey !== undefined && {
+                  registryPubkey: registry.pubkey,
+                }),
+                material: stackMaterial,
+              })
+            : {
+                readAdmissionRows: (): Promise<AdmissionRowsResult> =>
+                  Promise.resolve({
+                    ok: false,
+                    reason: "not_configured",
+                    detail:
+                      registry === undefined
+                        ? "no federated registry configured (policy.federated.registry) — cannot read the admitted roster"
+                        : "no stack signing identity (stack.nkey_seed_path) — cannot PoP-sign the member roster read",
+                  }),
+              };
+
+        // The accept-policy summary (the second trust layer), distilled ONCE
+        // from this stack's offerings and queried per member.
+        const acceptanceSummary = summarizeAcceptancePolicy(
+          resolvedPolicy?.offerings,
+        );
+
         networksViewForApi = {
           localPrincipal: principalId,
           networks: () =>
@@ -5641,10 +5694,19 @@ export async function startCortex(
             })),
           resolveAdmittedRoster: (networkId) =>
             resolveAdmittedRoster(networkId, admissionProvider),
+          acceptsPeer: (networkId, memberPrincipal) =>
+            resolvePeerAcceptance(
+              acceptanceSummary,
+              networkId,
+              memberPrincipal,
+              principalId,
+            ),
         };
+        const live = registry !== undefined && stackMaterial !== undefined;
         console.log(
           `cortex: MC /api/networks view wired — ${networksList.length.toString()} joined network(s) ` +
-            "as first-class trust groups (admission-rows roster source pending A2 #1276)",
+            `as first-class trust groups (admission roster: ${live ? "LIVE member-read (A2)" : "not_configured — self-only"}; ` +
+            "per-principal acceptance from offerings)",
         );
       }
 

@@ -971,9 +971,16 @@ html, body {
 .network-roster-member { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .network-roster-principal { font-family: var(--mono); }
 .network-roster-stacks { font-size: 11px; margin-left: auto; }
-.network-roster-badge, .network-roster-status, .network-roster-confidentiality {
+.network-roster-badge, .network-roster-status, .network-roster-confidentiality,
+.network-roster-acceptance {
   font-size: 10px; padding: 1px 7px; border-radius: 999px;
   border: 1px solid currentColor; white-space: nowrap;
+}
+/* MC-A2 (cortex#1276) — per-principal acceptance chip (the SECOND trust layer).
+   Accepted variants read quietly; "not accepted" gets a subtle fill so an
+   admitted-but-not-accepted peer is visible, not just another chip. */
+.network-roster-acceptance[data-acceptance="not-accepted"] {
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
 }
 /* MC-A3 (cortex#1277) — confidentiality posture chip (ADR-0019/0018).
    Tone carries the colour (ok/warn/danger); the degraded "no key" posture also

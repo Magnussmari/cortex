@@ -20,6 +20,7 @@ function member(
   return {
     verdict: "pending",
     present_stacks: [],
+    accepts: "not-accepted",
     ...over,
   };
 }

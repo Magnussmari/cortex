@@ -20,7 +20,7 @@ import type { NetworkMembershipDTO, MembershipMemberDTO } from "../hooks/use-net
 function member(
   over: Partial<MembershipMemberDTO> & { principal: string },
 ): MembershipMemberDTO {
-  return { verdict: "pending", present_stacks: [], ...over };
+  return { verdict: "pending", present_stacks: [], accepts: "not-accepted", ...over };
 }
 
 function net(over: Partial<NetworkMembershipDTO> & { network_id: string }): NetworkMembershipDTO {

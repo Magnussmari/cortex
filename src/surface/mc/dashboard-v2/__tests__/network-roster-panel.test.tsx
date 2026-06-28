@@ -27,7 +27,7 @@ function net(
     roster_scope: "complete",
     confidentiality,
     members: [
-      { principal: "andreas", verdict: "admitted-present", present_stacks: ["main"] },
+      { principal: "andreas", verdict: "admitted-present", present_stacks: ["main"], accepts: "self" },
     ],
   };
 }
@@ -75,5 +75,47 @@ describe("NetworkRosterPanel — confidentiality chip", () => {
     ]);
     expect(html).toContain('data-posture="cleartext"');
     expect(html).toContain("cleartext");
+  });
+});
+
+describe("NetworkRosterPanel — per-principal acceptance chip (MC-A2)", () => {
+  const CLEARTEXT: NetworkConfidentialityDTO = {
+    mode: "off",
+    key_present: false,
+    key_id: null,
+  };
+
+  function netWithMembers(members: NetworkMembershipDTO["members"]): NetworkMembershipDTO {
+    return {
+      network_id: "research",
+      leaf_node: "research-leaf",
+      roster_status: "ok",
+      roster_scope: "complete",
+      confidentiality: CLEARTEXT,
+      members,
+    };
+  }
+
+  it("renders the acceptance chip for peers (accepted vs not-accepted)", () => {
+    const html = render([
+      netWithMembers([
+        { principal: "andreas", verdict: "admitted-present", present_stacks: ["main"], accepts: "self" },
+        { principal: "jc", verdict: "admitted-present", present_stacks: ["research"], accepts: "accepted-network" },
+        { principal: "mallory", verdict: "admitted-absent", present_stacks: [], accepts: "not-accepted" },
+      ]),
+    ]);
+    expect(html).toContain('data-acceptance="accepted-network"');
+    expect(html).toContain('data-acceptance="not-accepted"');
+    expect(html).toContain("not accepted");
+  });
+
+  it("does NOT render an acceptance chip for the serving principal (self is marked '(you)')", () => {
+    const html = render([
+      netWithMembers([
+        { principal: "andreas", verdict: "admitted-present", present_stacks: ["main"], accepts: "self" },
+      ]),
+    ]);
+    expect(html).toContain("(you)");
+    expect(html).not.toContain('data-acceptance="self"');
   });
 });

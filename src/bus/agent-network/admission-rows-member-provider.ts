@@ -147,7 +147,7 @@ export function createMemberRosterAdmissionProvider(
   const url = options.registryUrl.replace(/\/+$/, "");
   const pinnedPubkey = options.registryPubkey;
   const material = options.material;
-  const fetchImpl: FetchLike = options.fetchImpl ?? (globalThis.fetch as FetchLike);
+  const fetchImpl: FetchLike = options.fetchImpl ?? globalThis.fetch;
   const now = options.now ?? (() => new Date());
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const logError =
