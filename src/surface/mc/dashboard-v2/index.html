@@ -33,9 +33,10 @@
   <link rel="stylesheet" href="./styles/global.css" />
   <!--
     Constellation skin (MC-D1, cortex#1288) — additive token + motion layer.
-    Every rule is scoped under `.mc-skin`, so this has zero effect until a
-    pane opts in by carrying that class (D2–D5). Loaded last so the skin's
-    scoped vars win inside an opted-in subtree without touching `:root`.
+    Every selector rule is scoped under `.mc-skin`, so this has zero effect
+    until a pane opts in by carrying that class (D2–D5). Inside an opted-in
+    subtree the skin's vars win by proximity (nearest-defining-ancestor), not
+    load order; loaded last simply to keep it after the base token sheets.
   -->
   <link rel="stylesheet" href="./styles/constellation.css" />
 </head>

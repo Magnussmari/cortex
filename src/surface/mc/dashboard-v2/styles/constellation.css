@@ -14,13 +14,27 @@
  * silently override the running dashboard's palette — a flag-day restyle,
  * which this slice explicitly must NOT do.
  *
- * Instead every token and primitive is scoped under a `.mc-skin` wrapper
- * class. The constellation tokens therefore exist only inside whatever
- * subtree opts in by carrying `class="mc-skin"`. D2–D5 adopt the skin
- * incrementally — pane by pane — by wrapping their root element in
- * `.mc-skin`, with zero blast radius on the panes that haven't migrated.
- * When the whole dashboard has moved over, the wrapper can be hoisted to a
- * top-level container (or, as a deliberate later step, promoted to `:root`).
+ * Instead every SELECTOR rule is scoped under a `.mc-skin` wrapper class.
+ * The constellation tokens therefore exist only inside whatever subtree opts
+ * in by carrying `class="mc-skin"`. D2–D5 adopt the skin incrementally — pane
+ * by pane — by wrapping their root element in `.mc-skin`, with zero blast
+ * radius on the panes that haven't migrated. When the whole dashboard has
+ * moved over, the wrapper can be hoisted to a top-level container (or, as a
+ * deliberate later step, promoted to `:root`).
+ *
+ * Caveat — `@keyframes` identifiers are NOT scopable: CSS keeps animation
+ * names in one document-global namespace, so the names below are global by
+ * construction (the `.mc-skin` wrapper confines the selectors that *apply*
+ * them, not the names themselves). There is no collision today (existing
+ * keyframes are toast-in / add-task-spin / focus-heartbeat / xyflow dashdraw),
+ * and the contract test asserts each name is defined exactly once here so a
+ * future duplicate turns into a red test rather than a silent override.
+ *
+ * Note for D2–D5 — the reduced-motion guard at the foot of this file lists
+ * the animated classes by name. `ticker` and `barSweep` keyframes ship here
+ * with no consuming class yet; when you add classes that use them, ALSO add
+ * those classes to the `prefers-reduced-motion` block or you reintroduce an
+ * accessibility regression.
  *
  * Fonts (JetBrains Mono + Inter) are already loaded once by the shell at
  * `index.html` (Google Fonts <link>, the repo's established pattern), so this
