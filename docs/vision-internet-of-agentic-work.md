@@ -57,6 +57,8 @@ Mechanically: every **Envelope** is signed by the **Stack** that emitted it, and
 
 ## Terms
 
+> A reader's glossary for this doc — **consistent with, but not authoritative over,** the canonical bounded-context glossary in **[CONTEXT.md](../CONTEXT.md)**. The domain language is changed there (via a `grill-with-docs` session), never redefined here.
+
 - **Principal** — a human who owns and runs Stacks; the accountable party. (The everyday word "operator" survives only as a low-level account concept.)
 - **Assistant** — an agent identity a person brings; a tool in their swarm.
 - **Stack** — a Principal's deployment that hosts Assistants and signs Envelopes.
