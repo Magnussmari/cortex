@@ -256,7 +256,15 @@ export function networkRoutes(): Hono<{ Bindings: Env }> {
     }
 
     // Rate-limit BEFORE the Ed25519 verify (read bucket — idempotent GET).
-    const allowed = await checkRateLimit(c.env, "read", clientKey(c.req.raw, networkId));
+    // Key by IP ONLY — exactly as the `/admission-requests/mine` sibling does.
+    // `network_id` is an attacker-controlled, format-only-validated path segment
+    // (existence is not checked until the membership gate), so keying on it would
+    // let one IP mint unbounded fresh read budgets by rotating the path, and the
+    // "shed before the expensive verify + D1 read" guard this line exists for
+    // would be bypassable. (The POST /networks mutation keys by (IP, network_id)
+    // for per-network fairness, but that is a 5/60s admin-gated write — the wrong
+    // precedent for a non-sensitive idempotent read whose gate sheds crypto.)
+    const allowed = await checkRateLimit(c.env, "read", clientKey(c.req.raw));
     if (!allowed) {
       return c.json(TOO_MANY_REQUESTS_BODY, 429, {
         "Retry-After": String(retryAfterSeconds("read")),
