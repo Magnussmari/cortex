@@ -30,6 +30,7 @@ function net(over: Partial<NetworkMembershipDTO> & { network_id: string }): Netw
     roster_status: "ok",
     roster_scope: "complete",
     members: [],
+    confidentiality: { mode: "off", key_present: false, key_id: null },
     ...over,
   };
 }
