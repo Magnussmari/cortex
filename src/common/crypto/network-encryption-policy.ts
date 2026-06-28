@@ -16,6 +16,9 @@ import {
   type NetworkKey,
 } from "./payload-encryption";
 
+/** Re-export so surface DTOs can name the mode without reaching into the crypto core. */
+export type { EncryptionMode } from "./payload-encryption";
+
 /** Default key id when a network sets `payload_key` but no `payload_key_id`. */
 export function defaultKeyId(networkId: string): string {
   return `${networkId}/k1`;
@@ -49,6 +52,49 @@ export function buildNetworkKeyring(
     if (k !== undefined) entries.push({ net: network.id, keys: [k] });
   }
   return new NetworkKeyring(entries);
+}
+
+/**
+ * MC-A3 (cortex#1277, ADR-0019/0018) — a network's TRUTHFUL confidentiality
+ * posture, derived from config alone, for read-only surfacing in Mission Control.
+ *
+ * `mode` and `keyPresent` are reported INDEPENDENTLY because they can disagree:
+ * a network with `encryption: enabled|required` but NO `payload_key` does NOT
+ * actually seal — the runtime publishes cleartext-with-a-loud-warning
+ * (ADR-0019 §5). That is the honesty hinge: such a network must NEVER be badged
+ * "encrypted" by the surface.
+ */
+export interface NetworkConfidentialityPosture {
+  /** Configured mode (`policy.federated.networks[].encryption`, default `off`). */
+  readonly mode: EncryptionMode;
+  /** Whether the per-network key `K` (`payload_key`) is actually held locally. */
+  readonly keyPresent: boolean;
+  /**
+   * Active key-id / rotation epoch when a key is held — the `extensions.enc.kid`
+   * the runtime stamps (`payload_key_id`, defaulting to `<network-id>/k1`,
+   * ADR-0019 §K-id). `null` when no key is present. Surfaces the rotation
+   * generation honestly without exposing `K` itself.
+   */
+  readonly keyId: string | null;
+}
+
+/**
+ * Derive a network's read-only confidentiality posture from its config. Pure +
+ * never-throws. Reports `mode` and `keyPresent` SEPARATELY so the surface can
+ * distinguish a truly-sealed network from one configured-to-seal that holds no
+ * key (publishing cleartext-with-warning, ADR-0019 §5) — the latter must not be
+ * badged "encrypted". Reuses {@link networkKeyFromConfig} (so the `keyId` is the
+ * exact `extensions.enc.kid` the runtime would stamp).
+ */
+export function confidentialityPosture(
+  network: PolicyFederatedNetwork,
+): NetworkConfidentialityPosture {
+  const key = networkKeyFromConfig(network);
+  return {
+    mode: network.encryption ?? "off",
+    keyPresent: key !== undefined,
+    keyId: key?.kid ?? null,
+  };
 }
 
 /** The seal decision for an outbound federated envelope to a given target. */

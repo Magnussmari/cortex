@@ -14,6 +14,7 @@ import {
   type NetworksView,
   type ListNetworksResponse,
 } from "../api/networks";
+import type { NetworkConfidentialityPosture } from "../../../common/crypto/network-encryption-policy";
 import type {
   AgentPresenceSnapshotRecord,
   AgentPresenceView,
@@ -44,9 +45,17 @@ function rec(
   };
 }
 
+/** Default posture for the stubs that don't exercise confidentiality (off, no key). */
+const CLEARTEXT: NetworkConfidentialityPosture = {
+  mode: "off",
+  keyPresent: false,
+  keyId: null,
+};
+
 function view(
   rosters: Record<string, ResolveAdmittedRosterResult>,
   localPrincipal = "andreas",
+  confidentiality: Record<string, NetworkConfidentialityPosture> = {},
 ): NetworksView {
   return {
     localPrincipal,
@@ -54,6 +63,7 @@ function view(
       Object.keys(rosters).map((networkId) => ({
         networkId,
         leafNode: `${networkId}-leaf`,
+        confidentiality: confidentiality[networkId] ?? CLEARTEXT,
       })),
     resolveAdmittedRoster: (networkId) =>
       Promise.resolve(
@@ -80,7 +90,9 @@ describe("handleListNetworks — graceful states", () => {
   it("a throwing admission provider degrades to unreachable, never 5xx", async () => {
     const throwingView: NetworksView = {
       localPrincipal: "andreas",
-      networks: () => [{ networkId: "research-collab", leafNode: "rc-leaf" }],
+      networks: () => [
+        { networkId: "research-collab", leafNode: "rc-leaf", confidentiality: CLEARTEXT },
+      ],
       resolveAdmittedRoster: () => Promise.reject(new Error("transport boom")),
     };
     const res = await handleListNetworks(
@@ -184,6 +196,82 @@ describe("handleListNetworks — authoritative reconciliation", () => {
       principal: "newcomer",
       verdict: "pending",
       present_stacks: [],
+    });
+  });
+});
+
+describe("handleListNetworks — confidentiality posture carry-through (MC-A3, ADR-0019/0018)", () => {
+  it("carries the per-network posture through to the wire DTO (camelCase → snake_case)", async () => {
+    const res = await handleListNetworks(
+      view(
+        {
+          "research-collab": {
+            ok: true,
+            roster: { admitted: [], pending: [], authoritative: true },
+          },
+        },
+        "andreas",
+        {
+          "research-collab": {
+            mode: "required",
+            keyPresent: true,
+            keyId: "research-collab/k1",
+          },
+        },
+      ),
+      presenceView([rec({ agentId: "luna" })]),
+    );
+    const net = (await body(res)).networks[0]!;
+    expect(net.confidentiality).toEqual({
+      mode: "required",
+      key_present: true,
+      key_id: "research-collab/k1",
+    });
+  });
+
+  it("defaults to a cleartext posture when none is configured", async () => {
+    const res = await handleListNetworks(
+      view({
+        "research-collab": {
+          ok: true,
+          roster: { admitted: [], pending: [], authoritative: true },
+        },
+      }),
+      presenceView([rec({ agentId: "luna" })]),
+    );
+    const net = (await body(res)).networks[0]!;
+    expect(net.confidentiality).toEqual({
+      mode: "off",
+      key_present: false,
+      key_id: null,
+    });
+  });
+
+  it("posture is independent of a degraded roster read (still carried on a self-only read)", async () => {
+    const res = await handleListNetworks(
+      view(
+        {
+          "research-collab": {
+            ok: false,
+            reason: "unreachable",
+            detail: "registry down",
+          },
+        },
+        "andreas",
+        {
+          "research-collab": { mode: "enabled", keyPresent: false, keyId: null },
+        },
+      ),
+      presenceView([rec({ agentId: "luna" })]),
+    );
+    const net = (await body(res)).networks[0]!;
+    // Roster read failed, but the config-derived posture is still honestly carried
+    // (configured-to-seal, NO key — a degraded/cleartext posture, never "encrypted").
+    expect(net.roster_status).toBe("unreachable");
+    expect(net.confidentiality).toEqual({
+      mode: "enabled",
+      key_present: false,
+      key_id: null,
     });
   });
 });
