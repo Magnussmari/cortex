@@ -77,6 +77,24 @@ describe("handleListNetworks — graceful states", () => {
     expect(await body(res)).toEqual({ networks: [] });
   });
 
+  it("a throwing admission provider degrades to unreachable, never 5xx", async () => {
+    const throwingView: NetworksView = {
+      localPrincipal: "andreas",
+      networks: () => [{ networkId: "research-collab", leafNode: "rc-leaf" }],
+      resolveAdmittedRoster: () => Promise.reject(new Error("transport boom")),
+    };
+    const res = await handleListNetworks(
+      throwingView,
+      presenceView([rec({ agentId: "luna" })]),
+    );
+    expect(res.status).toBe(200);
+    const net = (await body(res)).networks[0]!;
+    expect(net.roster_status).toBe("unreachable");
+    expect(net.members).toEqual([
+      { principal: "andreas", verdict: "admitted-present", present_stacks: ["main"] },
+    ]);
+  });
+
   it("read failure degrades to a self-only membership, never 5xx", async () => {
     const res = await handleListNetworks(
       view({

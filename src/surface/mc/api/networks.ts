@@ -166,7 +166,18 @@ export async function handleListNetworks(
     const resolved = await Promise.all(
       joined.map(async (n) => ({
         info: n,
-        result: await view.resolveAdmittedRoster(n.networkId),
+        // The `resolveAdmittedRoster` contract is never-throw, but A2's live
+        // provider carries transport + crypto: enforce the never-5xx guarantee
+        // STRUCTURALLY here so a stray rejection degrades to "unreachable"
+        // (the network still renders self-only) rather than rejecting the
+        // Promise.all and falling through to the 500 path.
+        result: await view.resolveAdmittedRoster(n.networkId).catch(
+          (err: unknown): ResolveAdmittedRosterResult => ({
+            ok: false,
+            reason: "unreachable",
+            detail: `admission read threw: ${err instanceof Error ? err.message : String(err)}`,
+          }),
+        ),
       })),
     );
 
