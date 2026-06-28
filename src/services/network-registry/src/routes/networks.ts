@@ -39,6 +39,7 @@ import {
   isValidNetworkId,
   validateNetworkCreateClaim,
   validateSignedNetworkCreate,
+  validateSignedNetworkRosterMemberRead,
 } from "../validate";
 import { canonicalJSON, verifyEd25519 } from "../signing";
 import {
@@ -223,6 +224,103 @@ export function networkRoutes(): Hono<{ Bindings: Env }> {
     // each admitted principal's pubkey + this-network capabilities (the facet).
     const principals = await store.listPrincipals();
     const admitted = await getIssuanceStore(c.env).listIssuanceRequests("ADMITTED");
+    const roster = rosterFromAdmissions(admitted, principals, networkId);
+    const assertion = await signAssertion(c.env, roster);
+    return c.json(assertion);
+  });
+
+  // ---------------------------------------------------------------------------
+  // GET /networks/:network_id/roster/member — C-1282 (ADR-0018 Q4) member read
+  //
+  // The MEMBER-ACCESSIBLE read of a network's ADMITTED peer-roster. Released to
+  // a caller who proves possession of an ADMITTED member key for THIS network —
+  // the PoP signature IS the authorization (no admin key, no allowlist), mirror
+  // of `/admission-requests/mine`. FAIL-CLOSED at the membership gate: the
+  // proven pubkey MUST hold an ADMITTED row for `network_id`, else 403. A
+  // non-member (never-registered, PENDING, REVOKED, or admitted to a DIFFERENT
+  // network) learns nothing. The admitted-peer list is not sensitive to a
+  // fellow admitted member (ADR-0018 Q4), so an admitted member sees the full
+  // roster — the SAME payload the public `/roster` serves, minus no secrets
+  // (the roster carries none; sealed blobs stay on the per-member `/mine`).
+  //
+  // This is a SEPARATE surface from the public `/networks/:id/roster` (which the
+  // federation-transport resolve path consumes unauthenticated and is left
+  // unchanged). It exists for the MC member posture (#1275/#1276) + hosted feed
+  // (#1280), which authorize off the running stack's own registered key.
+  // ---------------------------------------------------------------------------
+
+  app.get("/networks/:network_id/roster/member", async (c) => {
+    const networkId = c.req.param("network_id");
+    if (!isValidNetworkId(networkId)) {
+      return c.json({ error: "invalid network_id in path" }, 400);
+    }
+
+    // Rate-limit BEFORE the Ed25519 verify (read bucket — idempotent GET).
+    const allowed = await checkRateLimit(c.env, "read", clientKey(c.req.raw, networkId));
+    if (!allowed) {
+      return c.json(TOO_MANY_REQUESTS_BODY, 429, {
+        "Retry-After": String(retryAfterSeconds("read")),
+      });
+    }
+
+    // Parse + validate the x-pop-signed header (signed-read so an
+    // unauthenticated caller leaks NO roster metadata).
+    const headerVal = c.req.header("x-pop-signed");
+    if (!headerVal) {
+      return c.json({ error: "x-pop-signed header required" }, 400);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(headerVal);
+    } catch (_err) {
+      return c.json({ error: "x-pop-signed must be valid JSON" }, 400);
+    }
+    const readCheck = validateSignedNetworkRosterMemberRead(parsed);
+    if (!readCheck.ok) {
+      return c.json({ error: "x-pop-signed validation_failed", details: readCheck.errors }, 400);
+    }
+    const { signed } = readCheck;
+
+    // The signed claim binds the network — reject a token minted for a DIFFERENT
+    // network than the path (a captured network-A token can't read network B).
+    if (signed.claim.network_id !== networkId) {
+      return c.json({ error: "network_id_mismatch" }, 400);
+    }
+
+    // Clock-skew — bound a captured read token's replay lifetime.
+    const issued = Date.parse(signed.claim.issued_at);
+    const now = Date.now();
+    if (Math.abs(now - issued) > CLOCK_SKEW_MS) {
+      return c.json({ error: "issued_at out of skew window" }, 400);
+    }
+
+    // Proof-of-possession — the signature over canonicalJSON(claim) MUST verify
+    // against the claimed peer_pubkey. This signature IS the authorization: a
+    // caller who cannot sign for the key gets nothing (401).
+    const message = new TextEncoder().encode(canonicalJSON(signed.claim)) as Uint8Array<ArrayBuffer>;
+    const valid = await verifyEd25519(signed.claim.peer_pubkey, signed.signature, message);
+    if (!valid) {
+      return c.json({ error: "signature_invalid" }, 401);
+    }
+
+    // FAIL-CLOSED membership gate — the proven pubkey MUST hold an ADMITTED row
+    // for THIS network. A registered-but-PENDING key, a REVOKED key, or a key
+    // admitted only to another network is NOT a member and gets 403 (no roster).
+    const issuanceStore = getIssuanceStore(c.env);
+    const myRows = await issuanceStore.listIssuanceRequestsByPeer(signed.claim.peer_pubkey);
+    const isMember = myRows.some(
+      (r) => r.status === "ADMITTED" && r.network_id === networkId,
+    );
+    if (!isMember) {
+      return c.json({ error: "not_a_member" }, 403);
+    }
+
+    // Authorised — serve the network's ADMITTED roster (the same admission-sourced
+    // shape the public `/roster` returns), wrapped in a registry-signed assertion
+    // the member pins + verifies (DD-9).
+    const store = getStore(c.env);
+    const principals = await store.listPrincipals();
+    const admitted = await issuanceStore.listIssuanceRequests("ADMITTED");
     const roster = rosterFromAdmissions(admitted, principals, networkId);
     const assertion = await signAssertion(c.env, roster);
     return c.json(assertion);
