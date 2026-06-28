@@ -17,6 +17,7 @@
 import { useMemo, type CSSProperties } from "react";
 import {
   BaseEdge,
+  EdgeLabelRenderer,
   getSmoothStepPath,
   Position,
   type EdgeProps,
@@ -131,6 +132,13 @@ export default function NetworkElkEdge(props: EdgeProps) {
   const elkPoints = edgeData?.["elkPoints"] as Point[] | undefined;
   // #1068 — the hub→agent connector strokes in its stack's deterministic color.
   const stackColor = edgeData?.["stackColor"] as string | undefined;
+  // MC-D3 (#1290) — a CROSS-PRINCIPAL federated peer's edge: drawn dashed +
+  // flowing to mark the "admitted peer" relationship, and labelled. The
+  // constellation skin's `.edge-live--fed` class supplies the dash geometry +
+  // `dashFlowFed` animation (reduced-motion-guarded in constellation.css). The
+  // flow here is the relationship treatment, not REAL bus traffic — binding the
+  // dash-flow to live envelope flow is D5 (#1292).
+  const federated = edgeData?.["federated"] === true;
   const layoutSourceX = edgeData?.["layoutSourceX"] as number | undefined;
   const layoutSourceY = edgeData?.["layoutSourceY"] as number | undefined;
   const layoutTargetX = edgeData?.["layoutTargetX"] as number | undefined;
@@ -207,12 +215,47 @@ export default function NetworkElkEdge(props: EdgeProps) {
     }
   }
 
+  // MC-D3 — anchor the `federated · admitted peer` label ON the route, not on
+  // the straight chord: use the middle vertex of ELK's orthogonal polyline when
+  // present (so the pill sits on the connector, not floating off it), falling
+  // back to the chord midpoint only when ELK didn't route the edge. The label is
+  // a presence-level provenance marker (an admitted cross-principal peer
+  // relationship) — never a session affordance.
+  const { labelX, labelY } = useMemo(() => {
+    if (elkPoints && elkPoints.length >= 2) {
+      const mid = elkPoints[Math.floor(elkPoints.length / 2)]!;
+      return { labelX: mid.x, labelY: mid.y };
+    }
+    return { labelX: (sourceX + targetX) / 2, labelY: (sourceY + targetY) / 2 };
+  }, [elkPoints, sourceX, sourceY, targetX, targetY]);
+
   return (
-    <BaseEdge
-      id={id}
-      path={path}
-      style={baseStyle as CSSProperties}
-      markerEnd={markerEnd}
-    />
+    <>
+      <BaseEdge
+        id={id}
+        path={path}
+        style={baseStyle as CSSProperties}
+        markerEnd={markerEnd}
+        // The constellation skin keys the dashed-flow treatment off this class
+        // (scoped under `.mc-skin`; inert in the un-skinned legacy render).
+        className={federated ? "edge-live--fed" : undefined}
+      />
+      {federated && (
+        <EdgeLabelRenderer>
+          <div
+            className="mc-edge-fed-label"
+            data-edge-federated="true"
+            style={{
+              position: "absolute",
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+              pointerEvents: "none",
+            }}
+            title="Federated bus relationship — an admitted cross-principal peer"
+          >
+            <span aria-hidden="true">●</span> federated · admitted peer
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
   );
 }

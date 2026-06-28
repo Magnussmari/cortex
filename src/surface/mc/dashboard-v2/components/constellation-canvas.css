@@ -1,0 +1,282 @@
+/*
+ * MC-D3 (cortex#1290) — the constellation CANVAS skin.
+ *
+ * Re-skins the EXISTING network graph (ELK + React Flow) into the glowing
+ * star-map from the mockup — radial-glow orb nodes keyed to each stack's hue, a
+ * "you are here" anchor on the serving stack, dashed + flowing federated edges,
+ * and an atmospheric background. It restyles the canvas's DOM; it does NOT
+ * rebuild the engine (the lazy `network-canvas-*` chunk + the ELK/React-Flow
+ * pipeline are untouched).
+ *
+ * ── Scope: every rule is under `.mc-skin` ────────────────────────────────────
+ * The MC-D2 `McShell` wraps the whole Network view in a single `.mc-skin`
+ * container, so D1's OKLCH tokens (--bg/--panel/--stack-color/--mer/--ok/--warn/
+ * --bad) resolve here. Scoping under `.mc-skin` keeps every other dashboard tab
+ * (which never carries the class) byte-identical — additive, zero blast radius.
+ *
+ * ── Truth, never theater ─────────────────────────────────────────────────────
+ * Glow + motion reflect REAL state only: the liveness pulse is gated on the
+ * agent's observed `online` state, the federated dash-flow on the verified
+ * `federated` (cross-principal) edge flag. Nothing fakes liveness. A federated
+ * peer renders in AGGREGATE (presence, capabilities, state) and carries a
+ * visible "federated · admitted peer" boundary — it is NEVER drillable into
+ * sessions (ADR-0007 / the sovereignty boundary); that boundary is enforced in
+ * the components, and made legible here.
+ *
+ * ── Motion ───────────────────────────────────────────────────────────────────
+ * All animation is held on its resting frame under `prefers-reduced-motion`
+ * (the guard at the foot of this file mirrors D1's). The federated edge reuses
+ * D1's `.edge-live--fed` (dashFlowFed) class, already guarded in constellation.css.
+ */
+
+/* ── Atmosphere ─────────────────────────────────────────────────────────────
+ * The canvas is a dark radial "atmosphere" rather than the flat panel. The
+ * per-stack hues bloom against near-black-blue. */
+.mc-skin .network-canvas-wrap {
+  background:
+    radial-gradient(
+      ellipse 120% 80% at 50% -10%,
+      color-mix(in oklch, var(--mer) 14%, transparent) 0%,
+      transparent 55%
+    ),
+    radial-gradient(
+      ellipse 90% 70% at 80% 110%,
+      color-mix(in oklch, var(--tide) 10%, transparent) 0%,
+      transparent 60%
+    ),
+    var(--bg);
+  border-color: color-mix(in oklch, var(--mer) 22%, var(--line));
+}
+.mc-skin .network-canvas-wrap .react-flow,
+.mc-skin .network-canvas-wrap .react-flow__renderer {
+  background: transparent;
+}
+/* Mute React Flow's default dotted background grid against the atmosphere. */
+.mc-skin .react-flow__background {
+  opacity: 0.35;
+}
+
+/* ── Agent orbs ─────────────────────────────────────────────────────────────
+ * The agent card becomes a glowing orb-card keyed to its stack hue. The glow
+ * tint is the inline `--stack-color` each node already carries. */
+.mc-skin .network-node-agent {
+  position: relative;
+  border: 1px solid color-mix(in oklch, var(--stack-color, var(--mer)) 45%, var(--line));
+  border-left-width: 3px;
+  border-left-color: var(--stack-color, var(--mer));
+  border-radius: 12px;
+  background:
+    radial-gradient(
+      circle at 18% 0%,
+      color-mix(in oklch, var(--stack-color, var(--mer)) 22%, transparent) 0%,
+      transparent 60%
+    ),
+    color-mix(in oklch, var(--panel) 86%, var(--bg));
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, var(--stack-color, var(--mer)) 22%, transparent),
+    0 0 18px -2px color-mix(in oklch, var(--stack-color, var(--mer)) 30%, transparent);
+}
+
+/* Liveness glow — ONLY when the agent is actually online (truth, not theater).
+ * Breathes the orb's halo; offline orbs are dimmed + static. */
+.mc-skin .network-node-agent.network-node-online {
+  animation: mcOrbBreathe 3.4s ease-in-out infinite;
+}
+.mc-skin .network-node-agent.network-node-offline {
+  opacity: 0.55;
+  filter: saturate(0.6);
+  box-shadow: none;
+}
+@keyframes mcOrbBreathe {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--stack-color, var(--mer)) 22%, transparent),
+      0 0 16px -3px color-mix(in oklch, var(--stack-color, var(--mer)) 26%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--stack-color, var(--mer)) 38%, transparent),
+      0 0 26px 0 color-mix(in oklch, var(--stack-color, var(--mer)) 42%, transparent);
+  }
+}
+
+/* TTL-lapse (silent drop) reads as a warn-tinted orb. */
+.mc-skin .network-node-agent.network-node-ttl-lapse {
+  border-color: color-mix(in oklch, var(--warn) 55%, var(--line));
+}
+
+/* ── Stack hubs (the cluster cores) ─────────────────────────────────────────
+ * The hub is a brighter core glowing in its stack hue. */
+.mc-skin .network-node-hub {
+  border-radius: 14px;
+  border-color: var(--stack-color, var(--mer));
+  background:
+    radial-gradient(
+      circle at 50% 35%,
+      color-mix(in oklch, var(--stack-color, var(--mer)) 30%, transparent) 0%,
+      transparent 70%
+    ),
+    color-mix(in oklch, var(--panel) 80%, var(--bg));
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, var(--stack-color, var(--mer)) 40%, transparent),
+    0 0 28px -2px color-mix(in oklch, var(--stack-color, var(--mer)) 45%, transparent);
+}
+.mc-skin .network-hub-label {
+  color: var(--fg);
+  text-shadow: 0 0 10px color-mix(in oklch, var(--stack-color, var(--mer)) 50%, transparent);
+}
+
+/* ● YOU ARE HERE — the serving (local) stack anchor. A glowing pill. */
+.mc-skin .network-hub-you-are-here {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 1px 0 2px 0;
+  padding: 1px 8px;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bg);
+  background: var(--ok);
+  border-radius: 999px;
+  box-shadow: 0 0 14px -1px color-mix(in oklch, var(--ok) 70%, transparent);
+  animation: mcAnchorPulse 2.6s ease-in-out infinite;
+}
+@keyframes mcAnchorPulse {
+  0%, 100% { box-shadow: 0 0 12px -2px color-mix(in oklch, var(--ok) 60%, transparent); }
+  50%      { box-shadow: 0 0 20px 1px  color-mix(in oklch, var(--ok) 85%, transparent); }
+}
+
+/* ── Federated peers (aggregate-only, visible boundary) ──────────────────────
+ * A cross-principal foreign hub/agent is dashed + cool-tinted; the provenance
+ * badge reads its admitted `{principal}/{stack}`. This is the sovereignty
+ * boundary made legible — these orbs show aggregate presence only and are not
+ * drillable into sessions. */
+.mc-skin .network-node-foreign,
+.mc-skin .network-node-hub-foreign {
+  border-style: dashed;
+  border-color: color-mix(in oklch, var(--tide) 55%, var(--line));
+}
+.mc-skin .network-node-provenance {
+  color: color-mix(in oklch, var(--tide) 75%, var(--fg));
+}
+
+/* ── Capability + state chips ───────────────────────────────────────────────*/
+.mc-skin .network-node-cap {
+  font-family: var(--mono);
+  border-color: color-mix(in oklch, var(--stack-color, var(--mer)) 35%, var(--line));
+  color: color-mix(in oklch, var(--fg) 80%, var(--stack-color, var(--mer)));
+  background: color-mix(in oklch, var(--stack-color, var(--mer)) 8%, transparent);
+}
+.mc-skin .network-node-cap.network-node-cap-highlighted {
+  border-color: var(--stack-color, var(--mer));
+  box-shadow: 0 0 10px -2px color-mix(in oklch, var(--stack-color, var(--mer)) 60%, transparent);
+}
+.mc-skin .network-node-state.state-online { color: var(--ok); }
+.mc-skin .network-node-state.state-offline { color: var(--warn); }
+.mc-skin .network-node-reason-ttl-lapse { color: var(--warn); }
+
+/* ── Edges — glowing connectors; federated = dashed + flowing + labelled ─────*/
+.mc-skin .react-flow__edge-path {
+  filter: drop-shadow(0 0 3px color-mix(in oklch, var(--mer) 30%, transparent));
+}
+/* The federated edge label — `● federated · admitted peer`. */
+.mc-skin .mc-edge-fed-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  padding: 1px 7px;
+  color: color-mix(in oklch, var(--tide) 80%, var(--fg));
+  background: color-mix(in oklch, var(--panel) 86%, var(--bg));
+  border: 1px solid color-mix(in oklch, var(--tide) 50%, var(--line));
+  border-radius: 999px;
+  box-shadow: 0 0 12px -3px color-mix(in oklch, var(--tide) 50%, transparent);
+}
+.mc-skin .mc-edge-fed-label span[aria-hidden="true"] {
+  color: var(--tide);
+}
+
+/* ── On-canvas network header — `<NETWORK> · admin|member · N stacks` ─────────
+ * Overlays the top of the star-map (the mockup's network header strip). */
+.mc-skin .mc-constellation-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 4;
+  padding: 8px 12px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in oklch, var(--bg) 78%, transparent) 0%,
+    transparent 100%
+  );
+}
+.mc-skin .mc-constellation-header-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mc-skin .mc-constellation-header-net {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  pointer-events: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklch, var(--mer) 30%, var(--line));
+  background: color-mix(in oklch, var(--panel) 80%, var(--bg));
+}
+.mc-skin .mc-ch-name {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.mc-skin .mc-ch-sep { color: var(--faint); }
+.mc-skin .mc-ch-posture {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  font-size: 9.5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+}
+/* admin = you govern it (warm/authoritative); member = admitted peer (cool). */
+.mc-skin .mc-ch-posture-admin {
+  color: var(--bg);
+  background: var(--warn);
+}
+.mc-skin .mc-ch-posture-member {
+  color: color-mix(in oklch, var(--fg) 85%, var(--mer));
+  background: color-mix(in oklch, var(--mer) 18%, transparent);
+  border: 1px solid color-mix(in oklch, var(--mer) 45%, transparent);
+}
+.mc-skin .mc-ch-stacks { color: var(--dim); }
+.mc-skin .mc-ch-conf {
+  margin-left: 2px;
+  font-size: 9.5px;
+  color: var(--dim);
+}
+.mc-skin .mc-ch-conf[data-confidentiality="degraded"] { color: var(--bad); }
+.mc-skin .mc-ch-conf[data-confidentiality="encrypted-required"],
+.mc-skin .mc-ch-conf[data-confidentiality="encrypted"] { color: var(--ok); }
+
+/* ── Reduced-motion guard ───────────────────────────────────────────────────
+ * Hold every constellation-canvas animation on its resting frame; the static
+ * glow shapes + tokens remain. Mirrors D1's guard for this slice's own keyframes
+ * (D1 already guards `.edge-live--fed`). */
+@media (prefers-reduced-motion: reduce) {
+  .mc-skin .network-node-agent.network-node-online,
+  .mc-skin .network-hub-you-are-here {
+    animation: none !important;
+  }
+}

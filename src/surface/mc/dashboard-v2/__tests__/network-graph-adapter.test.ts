@@ -565,3 +565,42 @@ describe("collectLegendStacks (#1068)", () => {
     expect(new Set(rows.map((r) => r.color)).size).toBe(3);
   });
 });
+
+describe("buildNetworkGraph — federated edge flag (MC-D3 #1290)", () => {
+  it("flags a CROSS-PRINCIPAL foreign peer's hub→agent edges federated=true", () => {
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna" }),
+      foreignTile({ agent_id: "sage", principal: "jc", stack: "research" }),
+    ]);
+    const foreignEdge = g.edges.find((e) => e.target === "jc/research/sage");
+    expect(foreignEdge?.data?.federated).toBe(true);
+  });
+
+  it("leaves a LOCAL stack's hub→agent edges federated=false (solid)", () => {
+    const g = buildNetworkGraph([tile({ agent_id: "luna" })]);
+    const localEdge = g.edges.find((e) => e.target === "andreas/research/luna");
+    expect(localEdge?.data?.federated).toBe(false);
+  });
+
+  it("leaves a SAME-PRINCIPAL sibling's edges federated=false (local, not federation)", () => {
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna" }),
+      siblingTile({ agent_id: "echo", stack: "work" }),
+    ]);
+    const siblingEdge = g.edges.find((e) => e.target === "andreas/work/echo");
+    expect(siblingEdge?.data?.federated).toBe(false);
+  });
+
+  it("the edge flag agrees with the node classifier for the same origin", () => {
+    const g = buildNetworkGraph([
+      tile({ agent_id: "luna" }),
+      foreignTile({ agent_id: "sage", principal: "jc", stack: "research" }),
+    ]);
+    const foreignEdge = g.edges.find((e) => e.target === "jc/research/sage");
+    // The classifier says foreign for jc (a cross-principal peer vs serving andreas).
+    expect(classifyOrigin({ principal: "jc", stack: "research" }, "andreas")).toBe(
+      "foreign",
+    );
+    expect(foreignEdge?.data?.federated).toBe(true);
+  });
+});

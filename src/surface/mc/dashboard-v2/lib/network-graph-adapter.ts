@@ -44,6 +44,7 @@ import type {
 } from "./network-transport-overlay";
 import { overlayForStack } from "./network-transport-overlay";
 import { stackColor } from "./stack-color";
+import { classifyOrigin, isLocalCategory } from "./agents-display";
 
 /** Reserved id for the synthetic LOCAL stack-root hub node (never a valid agent key). */
 export const STACK_HUB_NODE_ID = "__stack__";
@@ -196,10 +197,20 @@ export interface NetworkGraphEdge {
    * Edge `data` payload.
    *   - `stackColor` (#1068) — the hub's stack color, so the hub→agent connector
    *     strokes in the stack's hue (set at build time for every edge).
+   *   - `federated` (MC-D3 #1290) — true when this edge wires a CROSS-PRINCIPAL
+   *     federated peer's hub→agent (`classifyOrigin` → `foreign`). The
+   *     constellation skin draws a federated edge dashed + flowing
+   *     (`.edge-live--fed`) and labels it `federated · admitted peer`; a local or
+   *     same-principal-sibling edge is `false`/absent (solid). Presence-level
+   *     provenance, never a session field.
    *   - `transport` (U2.3) — optional health/lag overlay payload, sourced from
    *     signal (present only when the transport overlay is on).
    */
-  data?: { stackColor?: string; transport?: NetworkEdgeTransportData };
+  data?: {
+    stackColor?: string;
+    federated?: boolean;
+    transport?: NetworkEdgeTransportData;
+  };
 }
 
 /** The adapter's output: nodes + edges, pre-layout. */
@@ -320,6 +331,14 @@ export function buildNetworkGraph(
     // it, so a stack reads as one colored cluster. ADDITIVE over the shape/label
     // treatments — never the only signal.
     const color = stackColor(bucket.origin);
+    // MC-D3 (#1290) — federation provenance for this stack's edges. A
+    // CROSS-PRINCIPAL `foreign` peer's hub→agent edges draw dashed + flowing
+    // (admitted-peer bus relationship); the LOCAL hub and a same-principal
+    // SIBLING (DB-read aggregation) draw solid. Same `classifyOrigin` the node
+    // cards use, so edge + node agree on what "federated" means.
+    const federated = !isLocalCategory(
+      classifyOrigin(bucket.origin, servingPrincipal),
+    );
     nodes.push({
       id: bucket.hubId,
       type: "stackHub",
@@ -357,7 +376,7 @@ export function buildNetworkGraph(
         id: `hub-${a.key}`,
         source: bucket.hubId,
         target: a.key,
-        data: { stackColor: color },
+        data: { stackColor: color, federated },
       });
     }
   }
