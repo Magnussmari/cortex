@@ -69,7 +69,12 @@ import {
 } from "../lib/network-graph-filter";
 import { isSpotlightOpenChord } from "../lib/network-spotlight";
 import { NetworkDetailPanel } from "./network-detail-panel";
+import { ConstellationHeader } from "./constellation-header";
 import { NetworkFilterBar } from "./network-filter-bar";
+// MC-D3 (#1290) — the constellation canvas skin. Scoped under `.mc-skin` (the
+// McShell wrapper), so importing it here loads the skin with the Network view
+// while staying inert on every other dashboard tab.
+import "./constellation-canvas.css";
 import { NetworkSpotlight } from "./network-spotlight";
 import { NetworkRosterPanel } from "./network-roster-panel";
 import { PierQueue } from "./pier-queue";
@@ -427,6 +432,10 @@ export function NetworkView({
             onOpenSpotlight={openSpotlight}
           />
           <div className="network-canvas-wrap">
+            {/* MC-D3 — on-canvas network header (<NETWORK> · admin|member · N
+                stacks), overlaying the top of the star-map. Renders nothing for a
+                non-federated stack. admin/member vocab (deprecated label gated). */}
+            <ConstellationHeader networks={networks} />
             {filteredAgents.length === 0 ? (
               // The snapshot has agents but the active filter excludes them all.
               // Keep the filter bar above so the principal can clear/relax it.
