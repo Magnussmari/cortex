@@ -226,6 +226,32 @@ describe("createMemberRosterAdmissionProvider — failure mapping (never throws)
     expect(res.reason).toBe("unreachable");
   });
 
+  it("a hung read aborts on the timeout signal → unreachable (never stalls /api/networks)", async () => {
+    const reg = await registryKeypair();
+    // A fetch that rejects with an AbortError when the wired signal fires.
+    const hangingFetch: FetchLike = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
+    const provider = createMemberRosterAdmissionProvider({
+      registryUrl: "https://registry.example",
+      registryPubkey: reg.publicKeyB64,
+      material: stackMaterial(),
+      fetchImpl: hangingFetch,
+      requestTimeoutMs: 10,
+      logError: () => {},
+    });
+    const res = await provider.readAdmissionRows("research-collab");
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toBe("unreachable");
+    expect(res.detail).toContain("timed out");
+  });
+
   it("assertion signed by the WRONG registry key → unreachable (DD-9 reject, payload NOT trusted)", async () => {
     const realReg = await registryKeypair();
     const attacker = await registryKeypair();

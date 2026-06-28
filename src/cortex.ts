@@ -5651,15 +5651,31 @@ export async function startCortex(
           }
         }
 
-        // The LIVE provider — or a `not_configured` provider when we lack the
-        // registry URL or the signing material to read + verify a roster.
-        const admissionProvider: AdmissionRowsProvider =
-          registry !== undefined && stackMaterial !== undefined
-            ? createMemberRosterAdmissionProvider({
-                registryUrl: registry.url,
+        // Resolve the registry pubkey through the SHARED anchor — exactly as the
+        // federated-verify seam (line ~3398) + the join path do. This is what
+        // pins the DEFAULT metafactory registry's compiled-in pubkey when config
+        // carries no explicit `registry.pubkey`; without it the live read would
+        // ship DARK (no pin ⇒ DD-9 fail-closed ⇒ not_configured) on the common
+        // production posture. A custom registry with no pin resolves to TOFU
+        // (no pubkey) — the provider then honestly stays not_configured (it does
+        // not TOFU a roster it cannot verify).
+        const resolvedRegistry =
+          registry !== undefined
+            ? resolveRegistryAnchor({
+                configUrl: registry.url,
                 ...(registry.pubkey !== undefined && {
-                  registryPubkey: registry.pubkey,
+                  configPubkey: registry.pubkey,
                 }),
+              })
+            : undefined;
+
+        // The LIVE provider — or a `not_configured` provider when we lack a
+        // pinned registry pubkey or the signing material to read + verify.
+        const admissionProvider: AdmissionRowsProvider =
+          resolvedRegistry?.pubkey !== undefined && stackMaterial !== undefined
+            ? createMemberRosterAdmissionProvider({
+                registryUrl: resolvedRegistry.url,
+                registryPubkey: resolvedRegistry.pubkey,
                 material: stackMaterial,
               })
             : {
@@ -5670,7 +5686,9 @@ export async function startCortex(
                     detail:
                       registry === undefined
                         ? "no federated registry configured (policy.federated.registry) — cannot read the admitted roster"
-                        : "no stack signing identity (stack.nkey_seed_path) — cannot PoP-sign the member roster read",
+                        : resolvedRegistry?.pubkey === undefined
+                          ? "no pinned registry pubkey (config pin / default-registry anchor / TOFU unavailable) — cannot DD-9-verify the member roster"
+                          : "no stack signing identity (stack.nkey_seed_path) — cannot PoP-sign the member roster read",
                   }),
               };
 
@@ -5702,7 +5720,8 @@ export async function startCortex(
               principalId,
             ),
         };
-        const live = registry !== undefined && stackMaterial !== undefined;
+        const live =
+          resolvedRegistry?.pubkey !== undefined && stackMaterial !== undefined;
         console.log(
           `cortex: MC /api/networks view wired — ${networksList.length.toString()} joined network(s) ` +
             `as first-class trust groups (admission roster: ${live ? "LIVE member-read (A2)" : "not_configured — self-only"}; ` +

@@ -67,7 +67,11 @@ import type {
  */
 export type FetchLike = (
   url: string,
-  init?: { method?: string; headers?: Record<string, string> },
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    signal?: AbortSignal;
+  },
 ) => Promise<{
   ok: boolean;
   status: number;
@@ -204,6 +208,7 @@ export function createMemberRosterAdmissionProvider(
       resp = await fetchImpl(endpoint, {
         method: "GET",
         headers: { "Content-Type": "application/json", "x-pop-signed": header },
+        signal: controller.signal,
       });
     } catch (err) {
       const reason =
