@@ -7,6 +7,7 @@ import type { PolicyFederatedNetwork } from "../../types/cortex-config";
 import {
   buildNetworkKeyring,
   buildSealPolicyByPrincipal,
+  confidentialityPosture,
   countEncryptionEnabledNetworks,
   defaultKeyId,
   networkKeyFromConfig,
@@ -187,5 +188,48 @@ describe("countEncryptionEnabledNetworks", () => {
         network({ id: "d" }), // unset
       ]),
     ).toBe(2);
+  });
+});
+
+describe("confidentialityPosture (MC-A3, ADR-0019/0018)", () => {
+  test("unset encryption ⇒ mode off, no key", () => {
+    expect(confidentialityPosture(network({ id: "research" }))).toEqual({
+      mode: "off",
+      keyPresent: false,
+      keyId: null,
+    });
+  });
+
+  test("enabled + key present ⇒ mode enabled, key present, default kid", () => {
+    expect(
+      confidentialityPosture(
+        network({ id: "research", encryption: "enabled", payload_key: K32_A }),
+      ),
+    ).toEqual({ mode: "enabled", keyPresent: true, keyId: "research/k1" });
+  });
+
+  test("required + explicit key id ⇒ surfaces the rotation epoch as keyId", () => {
+    expect(
+      confidentialityPosture(
+        network({
+          id: "research",
+          encryption: "required",
+          payload_key: K32_A,
+          payload_key_id: "research/epoch-7",
+        }),
+      ),
+    ).toEqual({ mode: "required", keyPresent: true, keyId: "research/epoch-7" });
+  });
+
+  test("HONESTY HINGE: enabled but NO key ⇒ mode enabled, keyPresent false (not actually sealing)", () => {
+    expect(
+      confidentialityPosture(network({ id: "research", encryption: "enabled" })),
+    ).toEqual({ mode: "enabled", keyPresent: false, keyId: null });
+  });
+
+  test("required but NO key ⇒ mode required, keyPresent false", () => {
+    expect(
+      confidentialityPosture(network({ id: "research", encryption: "required" })),
+    ).toEqual({ mode: "required", keyPresent: false, keyId: null });
   });
 });

@@ -50,6 +50,10 @@
 
 import type { AgentPresenceView } from "./agents";
 import type { ResolveAdmittedRosterResult } from "../../../bus/agent-network/admission-read";
+import type {
+  EncryptionMode,
+  NetworkConfidentialityPosture,
+} from "../../../common/crypto/network-encryption-policy";
 import {
   reconcileNetworkMembership,
   derivePresentStacksByPrincipal,
@@ -65,6 +69,13 @@ export interface JoinedNetworkInfo {
   networkId: string;
   /** The network's leaf-node connection id (`.leaf_node`). */
   leafNode: string;
+  /**
+   * MC-A3 (cortex#1277, ADR-0019/0018) — the network's TRUTHFUL confidentiality
+   * posture, derived from config (`encryption` mode + `payload_key` presence +
+   * `payload_key_id`). `cortex.ts` supplies it via `confidentialityPosture(n)`;
+   * tests supply a stub. The handler maps it to the snake_case wire DTO.
+   */
+  confidentiality: NetworkConfidentialityPosture;
 }
 
 /**
@@ -95,6 +106,25 @@ export type RosterStatus =
 /** Whether the roster reflects the COMPLETE network or only the serving stack's row. */
 export type RosterScope = "complete" | "self";
 
+/** ADR-0019 per-network encryption mode, mirrored from config (wire DTO). */
+export type { EncryptionMode };
+
+/**
+ * MC-A3 (cortex#1277) — a network's confidentiality posture, snake_case for the
+ * `/api/networks` wire DTO. `mode` and `key_present` are reported INDEPENDENTLY:
+ * a network configured `enabled`/`required` with `key_present: false` is NOT
+ * actually sealing (cleartext-with-warning, ADR-0019 §5) and must never be badged
+ * "encrypted". The wire-side mirror of {@link NetworkConfidentialityPosture}.
+ */
+export interface NetworkConfidentialityDTO {
+  /** Configured mode (default `off`). */
+  mode: EncryptionMode;
+  /** Whether the per-network key `K` is actually held (the honesty hinge). */
+  key_present: boolean;
+  /** Active key-id / rotation epoch when a key is held; else `null`. */
+  key_id: string | null;
+}
+
 /** One reconciled roster member, snake_case for the DTO. */
 export interface MembershipMemberDTO {
   principal: string;
@@ -114,6 +144,12 @@ export interface NetworkMembershipDTO {
    * detection suppressed). `null` when the read failed.
    */
   roster_scope: RosterScope | null;
+  /**
+   * MC-A3 (cortex#1277, ADR-0019/0018) — the network's read-only confidentiality
+   * posture. Always present; the surface badges it honestly (never fakes
+   * "encrypted" for a configured-but-keyless network).
+   */
+  confidentiality: NetworkConfidentialityDTO;
   /** Admitted roster reconciled ⋈ presence into per-member verdicts. */
   members: MembershipMemberDTO[];
 }
@@ -231,6 +267,14 @@ export async function handleListNetworks(
         leaf_node: info.leafNode,
         roster_status: rosterStatus,
         roster_scope: rosterScope,
+        // MC-A3 — carry the config-derived confidentiality posture through to the
+        // wire DTO (camelCase posture → snake_case DTO). Read-only; the surface
+        // badges it honestly. Independent of the roster read above.
+        confidentiality: {
+          mode: info.confidentiality.mode,
+          key_present: info.confidentiality.keyPresent,
+          key_id: info.confidentiality.keyId,
+        },
         members: members.map((m) => ({
           principal: m.principal,
           verdict: m.verdict,

@@ -11,6 +11,7 @@
 
 import type {
   MembershipVerdict,
+  NetworkConfidentialityDTO,
   NetworkMembershipDTO,
   RosterStatus,
   RosterScope,
@@ -106,6 +107,99 @@ export function rosterStatusBadge(
         tone: "warn",
         title:
           "Live admission-rows read not wired (A1) — pending A2 + registry ADR-0018 Q3 roster fix",
+      };
+  }
+}
+
+// --- MC-A3: per-network confidentiality posture (ADR-0019/0018) -------------
+
+/**
+ * Stable, non-localized posture token — for `data-*` attributes, automation, and
+ * tests. Distinct from the human `label`.
+ */
+export type ConfidentialityPostureToken =
+  | "encrypted" // enabled + key held — sealed, transition window (cleartext-in still accepted)
+  | "encrypted-required" // required + key held — sealed, cleartext-in REJECTED
+  | "cleartext" // mode off — signed, not sealed
+  | "degraded" // enabled/required but NO key — publishing cleartext-with-warning (the honesty hinge)
+  | "unknown"; // posture not reported (older/stale server) — never assume encrypted
+
+/** A render-ready confidentiality badge. */
+export interface ConfidentialityBadge {
+  label: string;
+  tone: VerdictTone;
+  /** Stable posture token (data-* / tests); never localized. */
+  posture: ConfidentialityPostureToken;
+  /** Tooltip / aria description. */
+  title: string;
+}
+
+/** `(key <kid>)` suffix for a title when a key-id is known; else empty. */
+function keyIdSuffix(c: NetworkConfidentialityDTO): string {
+  return c.key_id ? ` (key ${c.key_id})` : "";
+}
+
+/**
+ * Map a network's confidentiality posture → a badge. READ-ONLY HONESTY: it
+ * NEVER badges "encrypted" unless a key is actually held. The two load-bearing
+ * cases the surface must not blur (ADR-0019):
+ *
+ *   - `enabled`/`required` but NO key → `degraded` (the runtime publishes
+ *     cleartext-with-warning, ADR-0019 §5) — flagged `danger`, never "encrypted".
+ *   - posture absent (older/stale server) → `unknown` — never assumed encrypted.
+ *
+ * Total over the `EncryptionMode` union (compiler-enforced; a new mode won't
+ * silently fall through).
+ */
+export function confidentialityBadge(
+  c: NetworkConfidentialityDTO | undefined,
+): ConfidentialityBadge {
+  if (c === undefined) {
+    return {
+      label: "encryption: unknown",
+      tone: "warn",
+      posture: "unknown",
+      title:
+        "Confidentiality posture not reported by the server — not assumed encrypted (ADR-0019).",
+    };
+  }
+  // Honesty hinge: configured-to-seal but no key ⇒ NOT actually sealing.
+  if ((c.mode === "enabled" || c.mode === "required") && !c.key_present) {
+    return {
+      label: "encryption: no key",
+      tone: "danger",
+      posture: "degraded",
+      title:
+        `Network is configured 'encryption: ${c.mode}' but no payload key (K) is present — ` +
+        "federated payloads publish in CLEARTEXT with a warning (ADR-0019 §5). Not sealed.",
+    };
+  }
+  switch (c.mode) {
+    case "required":
+      return {
+        label: "encrypted (required)",
+        tone: "ok",
+        posture: "encrypted-required",
+        title:
+          `Federated payloads sealed with the per-network key${keyIdSuffix(c)} (ADR-0019); ` +
+          "cleartext inbound is REJECTED.",
+      };
+    case "enabled":
+      return {
+        label: "encrypted",
+        tone: "ok",
+        posture: "encrypted",
+        title:
+          `Federated payloads sealed with the per-network key${keyIdSuffix(c)} (ADR-0019); ` +
+          "cleartext-but-signed inbound still accepted (transition window).",
+      };
+    case "off":
+      return {
+        label: "cleartext",
+        tone: "warn",
+        posture: "cleartext",
+        title:
+          "Federated payloads cross in cleartext (signed, not sealed) — encryption is off (ADR-0019).",
       };
   }
 }

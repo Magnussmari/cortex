@@ -76,7 +76,13 @@ describe("GET /api/networks (HTTP)", () => {
   it("serves the reconciled membership through the wired view", async () => {
     const view: NetworksView = {
       localPrincipal: "andreas",
-      networks: () => [{ networkId: "research-collab", leafNode: "rc-leaf" }],
+      networks: () => [
+        {
+          networkId: "research-collab",
+          leafNode: "rc-leaf",
+          confidentiality: { mode: "off", keyPresent: false, keyId: null },
+        },
+      ],
       resolveAdmittedRoster: () =>
         Promise.resolve({
           ok: true,
