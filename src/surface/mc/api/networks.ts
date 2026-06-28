@@ -50,6 +50,7 @@
 
 import type { AgentPresenceView } from "./agents";
 import type { ResolveAdmittedRosterResult } from "../../../bus/agent-network/admission-read";
+import type { PeerAcceptance } from "../../../bus/agent-network/peer-acceptance";
 import type {
   EncryptionMode,
   NetworkConfidentialityPosture,
@@ -62,6 +63,7 @@ import {
 } from "./networks-membership";
 
 export type { MembershipVerdict } from "./networks-membership";
+export type { PeerAcceptance } from "../../../bus/agent-network/peer-acceptance";
 
 /** One joined network's static identity (from `policy.federated.networks[]`). */
 export interface JoinedNetworkInfo {
@@ -94,6 +96,16 @@ export interface NetworksView {
    * (ADR-0018 Q3). Wraps `resolveAdmittedRoster` — never throws.
    */
   resolveAdmittedRoster(networkId: string): Promise<ResolveAdmittedRosterResult>;
+  /**
+   * MC-A2 (cortex#1276) — the SECOND trust layer: does THIS principal *accept*
+   * `memberPrincipal` on `networkId`? Derived from `policy.offerings[]`
+   * accept-policy (`network:<id>` = whole roster, `principals:[…]` = named).
+   * Synchronous + pure (a distilled summary queried per member). OPTIONAL: a
+   * view that omits it (older wiring / a test stub) leaves acceptance at the
+   * handler default — `self` for the serving principal, `not-accepted`
+   * otherwise (default-deny). `cortex.ts` supplies the live resolver.
+   */
+  acceptsPeer?(networkId: string, memberPrincipal: string): PeerAcceptance;
 }
 
 /** Provenance/availability of a network's admission-rows read. */
@@ -136,6 +148,14 @@ export interface MembershipMemberDTO {
   principal: string;
   verdict: MembershipVerdict;
   present_stacks: string[];
+  /**
+   * MC-A2 (cortex#1276) — the SECOND trust layer: does THIS principal accept
+   * this member? `self` for the serving principal; `accepted-network` (whole
+   * roster trusted) / `accepted-named` (named in an offering) when accepted;
+   * `not-accepted` under default-deny. Membership (`verdict`) is admission;
+   * acceptance is THIS stack's independent accept-policy choice — orthogonal.
+   */
+  accepts: PeerAcceptance;
 }
 
 /** One network's membership view in the `GET /api/networks` response. */
@@ -285,6 +305,16 @@ export async function handleListNetworks(
           principal: m.principal,
           verdict: m.verdict,
           present_stacks: m.presentStacks,
+          // MC-A2 — the SECOND trust layer (acceptance), orthogonal to the
+          // membership verdict above. The view supplies the live resolver; when
+          // it's absent (older wiring / test stub) we default-deny honestly
+          // (self for the serving principal, not-accepted otherwise).
+          accepts:
+            view.acceptsPeer !== undefined
+              ? view.acceptsPeer(info.networkId, m.principal)
+              : m.principal === view.localPrincipal
+                ? "self"
+                : "not-accepted",
         })),
       };
     });

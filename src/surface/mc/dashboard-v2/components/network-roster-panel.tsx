@@ -16,6 +16,7 @@
 
 import type { NetworkMembershipDTO } from "../hooks/use-networks";
 import {
+  acceptanceBadge,
   confidentialityBadge,
   verdictBadge,
   rosterStatusBadge,
@@ -93,6 +94,7 @@ export function NetworkRosterPanel({
                 <ul className="network-roster-members">
                   {net.members.map((m) => {
                     const badge = verdictBadge(m.verdict);
+                    const acceptance = acceptanceBadge(m.accepts);
                     const isYou = localPrincipal !== null && m.principal === localPrincipal;
                     return (
                       <li
@@ -111,6 +113,19 @@ export function NetworkRosterPanel({
                         >
                           {badge.label}
                         </span>
+                        {/* MC-A2 — the SECOND trust layer (acceptance), shown
+                            alongside the membership verdict. Self is already
+                            marked "(you)" above, so its acceptance badge is
+                            redundant — render it only for peers. */}
+                        {m.accepts !== "self" ? (
+                          <span
+                            className={`network-roster-acceptance tone-${acceptance.tone}`}
+                            data-acceptance={acceptance.token}
+                            title={acceptance.title}
+                          >
+                            {acceptance.label}
+                          </span>
+                        ) : null}
                         {m.present_stacks.length > 0 ? (
                           <span className="dim network-roster-stacks">
                             {m.present_stacks.join(", ")}

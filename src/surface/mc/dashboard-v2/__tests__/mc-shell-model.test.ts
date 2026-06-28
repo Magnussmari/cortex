@@ -33,7 +33,7 @@ import {
 function member(
   over: Partial<MembershipMemberDTO> & { principal: string },
 ): MembershipMemberDTO {
-  return { verdict: "admitted-present", present_stacks: [], ...over };
+  return { verdict: "admitted-present", present_stacks: [], accepts: "not-accepted", ...over };
 }
 
 function net(

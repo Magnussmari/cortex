@@ -28,7 +28,7 @@ function net(over: Partial<NetworkMembershipDTO>): NetworkMembershipDTO {
     roster_scope: "complete",
     confidentiality: { mode: "off", key_present: false, key_id: null },
     members: [
-      { principal: "andreas", verdict: "admitted-present", present_stacks: ["research"] },
+      { principal: "andreas", verdict: "admitted-present", present_stacks: ["research"], accepts: "self" },
     ],
     ...over,
   };
@@ -82,7 +82,7 @@ describe("ConstellationHeader (MC-D3 on-canvas network header)", () => {
             network_id: "tide",
             roster_scope: "self",
             members: [
-              { principal: "jc", verdict: "admitted-present", present_stacks: ["research"] },
+              { principal: "jc", verdict: "admitted-present", present_stacks: ["research"], accepts: "accepted-network" },
             ],
           }),
         ],
