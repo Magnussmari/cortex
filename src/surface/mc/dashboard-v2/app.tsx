@@ -39,6 +39,7 @@ import { usePlans } from "./hooks/use-plans";
 import { usePhaseDetail } from "./hooks/use-phase-detail";
 import { useAttention } from "./hooks/use-attention";
 import { useAgents } from "./hooks/use-agents";
+import { useNetworks } from "./hooks/use-networks";
 import { useGovernance } from "./hooks/use-governance";
 import { useObservability } from "./hooks/use-observability";
 import { useObsMetrics } from "./hooks/use-obs-metrics";
@@ -129,6 +130,10 @@ export function App() {
   // G-1114.B.4 — stack-local agent-presence data (fetched only when on the
   // Network tab); live-refreshed off the `agent.presence` WS frame.
   const agents = useAgents(ws, view === "network");
+  // MC-A1 (cortex#1275) — joined networks + admitted roster ⋈ presence, for the
+  // Network view's first-class trust-group panel. Fetched only when the tab is
+  // visible; refreshes off the same `agent.presence` signal as `useAgents`.
+  const networks = useNetworks(ws, view === "network");
   // G-1115 — governance verdicts, fetched only when the tab is visible.
   const governance = useGovernance(ws, view === "governance");
   // P-14 U2.1 (#934) — observability events (signal's four system.* families),
@@ -602,6 +607,10 @@ export function App() {
             // the Network view's transport overlay. Empty until the obs fetch
             // lands / on a non-hub stack; the overlay paints nothing then.
             transportRoster={observability.data?.transportRoster ?? []}
+            // MC-A1 — joined networks as first-class trust groups (admitted
+            // roster ⋈ presence → membership verdict). Empty until the fetch
+            // lands / on a non-federated stack; the panel renders nothing then.
+            networks={networks.networks}
             onViewInWorkingGrid={() => setView("default")}
             // G-1114.F.3 — dispatch-direct to a LOCAL agent, REUSING the
             // existing dispatch path (`POST /api/sessions` with `agentId`). The

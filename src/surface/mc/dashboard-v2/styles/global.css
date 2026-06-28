@@ -940,3 +940,42 @@ html, body {
   padding: 4px 10px; border-radius: 6px; cursor: pointer;
 }
 .theme-btn:hover { border-color: var(--accent); }
+
+/* MC-A1 (cortex#1275) — networks-as-first-class roster panel.
+   Additive section above the agent-topology canvas in the Network view. */
+.network-roster-panel {
+  margin: 8px 0 16px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.network-roster-title { margin: 0 0 2px; font-size: 14px; }
+.network-roster-subtitle { margin: 0 0 10px; font-size: 12px; }
+.network-roster-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.network-roster-group {
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+}
+.network-roster-group-header {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px;
+  margin-bottom: 6px;
+}
+.network-roster-id { font-weight: 600; font-family: var(--mono); }
+.network-roster-leaf { font-size: 11px; }
+.network-roster-summary { font-size: 11px; margin-left: auto; }
+.network-roster-empty { font-size: 12px; padding: 4px 0; }
+.network-roster-members { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.network-roster-member { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.network-roster-principal { font-family: var(--mono); }
+.network-roster-stacks { font-size: 11px; margin-left: auto; }
+.network-roster-badge, .network-roster-status {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid currentColor; white-space: nowrap;
+}
+.tone-ok { color: var(--ok); }
+.tone-warn { color: var(--warn); }
+.tone-danger { color: var(--bad); }
+.tone-pending { color: var(--accent); }

@@ -23,6 +23,7 @@ import { HookStreamPoller } from "./hooks/poller";
 import type { Config } from "./types";
 import type { WsClientRegistry } from "./ws/client-registry";
 import type { AgentPresenceView } from "./api/agents";
+import type { NetworksView } from "./api/networks";
 import type { LocalAggregationProvider } from "./local-aggregation/sibling-db-reader";
 
 export interface MissionControlHandle {
@@ -87,6 +88,13 @@ export interface StartMissionControlOptions {
    * AFTER the embed starts.
    */
   localAggregation?: LocalAggregationProvider;
+  /**
+   * MC-A1 (cortex#1275) — lazy accessor for the networks view. Forwarded verbatim
+   * to `startServer` so `/api/networks` surfaces joined networks + their admitted
+   * roster ⋈ presence. A GETTER (like `agentPresence`) because the registry
+   * client + presence registry boot AFTER the embed. Omitted → empty list.
+   */
+  networks?: () => NetworksView | null;
   /**
    * P-14 U0.1 — Tier-3 sideband base URL (`config.mc.sideband`). Loopback-
    * enforced at config-parse time; forwarded verbatim to `startServer`, which
@@ -170,6 +178,7 @@ export async function startMissionControl(
     serverCtx = startServer(config, db, {
       processManager,
       ...(opts.agentPresence ? { agentPresence: opts.agentPresence } : {}),
+      ...(opts.networks ? { networks: opts.networks } : {}),
       ...(opts.localAggregation ? { localAggregation: opts.localAggregation } : {}),
       ...(opts.sidebandUrl ? { sidebandUrl: opts.sidebandUrl } : {}),
     });
