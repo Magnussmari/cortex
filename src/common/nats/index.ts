@@ -34,6 +34,16 @@ export {
 } from "./systemd-unit-loader";
 
 export {
+  readPidFileDirective,
+  resolveHubReloadTarget,
+} from "./hub-reload-target";
+export type {
+  HubReloadTarget,
+  HubReloadTargetResult,
+  NatsProcess,
+} from "./hub-reload-target";
+
+export {
   bunExecRunner,
   currentServicePlatform,
   detectDescriptorKind,

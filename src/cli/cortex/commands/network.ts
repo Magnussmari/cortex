@@ -1829,7 +1829,10 @@ async function runSecret(
     return report.ok ? ok(renderJson(env)) : { exitCode: 1, stdout: "", stderr: renderJson(env) };
   }
 
-  const header = report.applied
+  // #1317 — key the header off whether --apply was PASSED, not report.applied.
+  // A failed apply has applied=false yet still mutated (and the failure is the
+  // point) — printing "dry-run (no mutation)" there was misleading.
+  const header = applyRes.apply
     ? `cortex network secret ${action} ${networkId}: ${report.ok ? "ok" : "FAILED"}`
     : `cortex network secret ${action} ${networkId}: dry-run (no mutation; pass --apply)`;
   const lines = [header, ...report.steps.map((s) => `  ${s}`)];

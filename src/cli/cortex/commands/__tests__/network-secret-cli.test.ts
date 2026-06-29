@@ -134,6 +134,30 @@ describe("cortex network secret add-member", () => {
     const res = await dispatchNetwork(argv("secret", "add-member", "metafactory", MEMBER, "--apply", "--admin-seed", seedPath), undefined, undefined, undefined, factory);
     expect(res.exitCode).toBe(1);
   });
+
+  test("#1317 — a FAILED --apply prints 'FAILED', never 'dry-run'", async () => {
+    // A factory whose reload throws — the apply mutates (writes) then fails.
+    const conf = { text: "leafnodes {}\n" };
+    const ports: NetworkSecretPorts = {
+      hub: {
+        confPath: "/fake/hub.conf",
+        readConf: async () => conf.text,
+        writeConf: async (t: string) => { conf.text = t; },
+        reload: async () => { throw new Error("multiple nats-server processes running"); },
+      },
+      admission: { findAdmittedRow: async () => ({ request_id: "req1", principal_id: "alice" }) },
+      delivery: { postSealedSecret: async () => {}, revoke: async () => {} },
+      crypto: { mintPsk: () => "PSK-1", seal: async () => "SEALED" },
+    };
+    const res = await dispatchNetwork(
+      argv("secret", "add-member", "metafactory", MEMBER, "--apply", "--admin-seed", seedPath),
+      undefined, undefined, undefined, () => ports,
+    );
+    expect(res.exitCode).toBe(1);
+    const out = res.stdout + res.stderr;
+    expect(out).toContain("FAILED");
+    expect(out).not.toContain("dry-run");
+  });
 });
 
 describe("cortex network secret revoke-member", () => {

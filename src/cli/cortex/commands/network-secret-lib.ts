@@ -142,11 +142,9 @@ async function addOrRotate(
     }
     return fail(action, inputs, steps, data, `failed to render hub authorization: ${errText(err)}`);
   }
-  try {
-    await ports.hub.writeConf(nextConf);
-    await ports.hub.reload();
-  } catch (err) {
-    return fail(action, inputs, steps, data, `failed to write/reload hub config: ${errText(err)}`);
+  const writeRes = await writeThenReload(ports, conf, nextConf, steps);
+  if (!writeRes.ok) {
+    return fail(action, inputs, steps, data, writeRes.reason);
   }
   steps.push(`hub:        ${rotate ? "replaced" : "added"} authorization user "${leafUser}" + reloaded (psk ${fp})`);
 
@@ -214,12 +212,15 @@ async function revokeMember(
   } catch (err) {
     return fail(action, inputs, steps, data, `failed to read hub config: ${errText(err)}`);
   }
+  let nextConf: string;
   try {
-    const nextConf = removeHubLeafUser(conf, leafUser);
-    await ports.hub.writeConf(nextConf);
-    await ports.hub.reload();
+    nextConf = removeHubLeafUser(conf, leafUser);
   } catch (err) {
-    return fail(action, inputs, steps, data, `failed to drop hub authorization user / reload: ${errText(err)}`);
+    return fail(action, inputs, steps, data, `failed to render hub authorization removal: ${errText(err)}`);
+  }
+  const writeRes = await writeThenReload(ports, conf, nextConf, steps);
+  if (!writeRes.ok) {
+    return fail(action, inputs, steps, data, writeRes.reason);
   }
   steps.push(`hub:        dropped authorization user "${leafUser}" + reloaded (transport CUT)`);
 
@@ -234,6 +235,64 @@ async function revokeMember(
   const report = plan(action, inputs, steps, data);
   report.applied = true;
   return report;
+}
+
+// ---------------------------------------------------------------------------
+// Hub write + reload (atomic — roll back the write if the reload fails)
+// ---------------------------------------------------------------------------
+
+/**
+ * #1317 — write the next hub config, then reload the running hub. If the reload
+ * FAILS we must NOT leave the on-disk config ahead of the running process (the
+ * silent partial state the bug report flagged): roll the write back to
+ * `priorConf` so disk and the live server stay in lockstep. A re-run is then
+ * idempotent (the hub upsert/remove is idempotent against the rolled-back conf).
+ *
+ * If the ROLLBACK itself fails the config is genuinely stranded ahead of the
+ * server — that we cannot silently swallow: surface it LOUDLY in the failure
+ * reason (and on stderr) naming the config so the principal can reconcile by
+ * hand. The write succeeded but the reload didn't either way ⇒ ok:false.
+ */
+async function writeThenReload(
+  ports: NetworkSecretPorts,
+  priorConf: string,
+  nextConf: string,
+  steps: string[],
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  try {
+    await ports.hub.writeConf(nextConf);
+  } catch (err) {
+    return { ok: false, reason: `failed to write hub config: ${errText(err)}` };
+  }
+  try {
+    await ports.hub.reload();
+    return { ok: true };
+  } catch (reloadErr) {
+    // Reload failed — undo the write so disk matches the still-running server.
+    try {
+      await ports.hub.writeConf(priorConf);
+      steps.push(`hub:        reload failed — rolled the hub config (${ports.hub.confPath}) back to its pre-write state`);
+      return {
+        ok: false,
+        reason: `hub reload failed (write rolled back, no partial state): ${errText(reloadErr)}`,
+      };
+    } catch (rollbackErr) {
+      // Both the reload AND the rollback failed — the config is stranded ahead
+      // of the running server. This is the one case we must shout about.
+      const warning =
+        `cortex network secret: DANGER — hub reload failed AND the rollback of ${ports.hub.confPath} ` +
+        `also failed. The on-disk config is now AHEAD of the running nats-server (partial state). ` +
+        `Reconcile by hand: restore ${ports.hub.confPath} and reload the hub.\n`;
+      process.stderr.write(warning);
+      steps.push(`hub:        ✗ reload AND rollback failed — ${ports.hub.confPath} is ahead of the running server (manual reconcile required)`);
+      return {
+        ok: false,
+        reason:
+          `hub reload failed (${errText(reloadErr)}) AND rollback failed (${errText(rollbackErr)}) — ` +
+          `${ports.hub.confPath} is ahead of the running server; manual reconcile required`,
+      };
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

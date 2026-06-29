@@ -195,3 +195,63 @@ describe("dry-run (default) + guards", () => {
     expect(r.posted.length).toBe(0);
   });
 });
+
+describe("#1317 — reload-failure does not leave silent partial state", () => {
+  /** A ports bundle whose reload() always throws, recording every conf written. */
+  function reloadFailingPorts(opts: { rollbackFails?: boolean }) {
+    const startConf = "leafnodes {\n  listen: 0.0.0.0:7422\n}\n";
+    const conf = { text: startConf };
+    const written: string[] = [];
+    let reloadCalls = 0;
+    const ports: NetworkSecretPorts = {
+      hub: {
+        confPath: "/fake/local.conf",
+        readConf: async () => conf.text,
+        writeConf: async (text: string) => {
+          written.push(text);
+          // Simulate a rollback write that itself fails, on the 2nd write.
+          if (opts.rollbackFails && written.length === 2) {
+            throw new Error("disk full on rollback");
+          }
+          conf.text = text;
+        },
+        reload: async () => {
+          reloadCalls += 1;
+          throw new Error("nats-server SIGHUP: no such process");
+        },
+      },
+      admission: { findAdmittedRow: async () => ({ request_id: "req1", principal_id: "alice" }) },
+      delivery: {
+        postSealedSecret: async () => {
+          throw new Error("delivery must NOT be reached when the reload failed");
+        },
+        revoke: async () => {},
+      },
+      crypto: { mintPsk: () => "PSK-X", seal: async () => "SEALED" },
+    };
+    return { ports, conf, written, startConf, get reloadCalls() { return reloadCalls; } };
+  }
+
+  test("reload failure rolls the hub config back to its pre-write state; delivery not reached", async () => {
+    const r = reloadFailingPorts({});
+    const report = await runNetworkSecret(inputs({ apply: true }), r.ports);
+
+    expect(report.ok).toBe(false);
+    expect(report.reason).toContain("write rolled back");
+    // Two writes: the new conf, then the rollback to the original.
+    expect(r.written.length).toBe(2);
+    expect(r.conf.text).toBe(r.startConf); // on disk == running server state
+    expect(r.reloadCalls).toBe(1);
+  });
+
+  test("reload AND rollback failing surfaces a LOUD manual-reconcile reason", async () => {
+    const r = reloadFailingPorts({ rollbackFails: true });
+    const report = await runNetworkSecret(inputs({ apply: true }), r.ports);
+
+    expect(report.ok).toBe(false);
+    expect(report.reason).toContain("manual reconcile required");
+    expect(report.reason).toContain("/fake/local.conf");
+    // The rollback write was attempted (2nd write) but threw → conf stays ahead.
+    expect(r.written.length).toBe(2);
+  });
+});
