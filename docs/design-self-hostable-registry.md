@@ -150,14 +150,31 @@ rather than "no global admin configured". The trust anchor is the pinned
 per-network admin DID set, not a registry-wide allowlist. Carry this into the
 manifest-verifier + any self-host registry mode.
 
-## Open questions for JC
+## Decisions (resolved with JC, 2026-06-29)
 
-1. **DID method** for `admin_dids` / `trust_anchors` — `did:key` (zero infra, no
-   rotation) for stacks vs `did:web` (rotatable, domain-anchored) for principals?
-   (#1321 currently stores raw base64 pubkeys; a DID wrapper is a small adapter.)
-2. **Primary alternate manifest source** to support first — git, plain HTTPS file,
-   or NATS object store? (Drives which fetcher to build first.)
-3. **Manifest lifetime** (`expires_at`) default — hours? a day? — balancing
-   staleness against re-fetch cost and revocation latency.
-4. Is per-principal `.well-known`/DNS endpoint publication wanted now, or deferred
-   until a principal actually needs to relocate a stack endpoint?
+1. **DID method — `did:web` for principals, `did:key` for stacks.** Principals get
+   rotatable, domain-anchored `did:web:meta-factory.ai:andreas`; ephemeral
+   stacks/agents get zero-infra `did:key:z6Mk…`. Rationale: principals are durable
+   (need rotation), stacks are disposable. #1321 stores raw base64 pubkeys today;
+   a thin DID wrapper/adapter maps a stack pubkey ↔ `did:key` and a principal ↔
+   `did:web` without changing the stored bytes.
+2. **First alternate manifest source — git / HTTPS file.** A signed manifest JSON
+   served from a git repo or any HTTPS host: simplest to stand up + audit (free
+   version history). NATS object store + others come later. The hosted registry
+   stays a default source throughout (back-compat).
+3. **Manifest lifetime (`expires_at`)** — default I'll use unless told otherwise:
+   **24h** (short enough to bound revocation latency, long enough to avoid churn);
+   tunable per network. Revisit alongside the capability-based-admission follow-on.
+4. **Per-principal `.well-known`/DNS endpoint publication** — **deferred** until a
+   principal actually needs to relocate a stack endpoint (not in the first slices).
+
+## Implementation slices (Stage 2)
+
+1. **Manifest schema + offline verifier** — define `NetworkManifest`; generalise
+   the existing `SignedAssertion` verify to "verify against ANY pinned trust-anchor
+   DID" (`did:web`/`did:key` resolution to an Ed25519 pubkey). Tracer bullet.
+2. **Pin config** — `policy.federated.trust_anchors[]` (admin DIDs) +
+   `manifest_sources[]`, back-compat with `registry.{url,pubkey}`.
+3. **git/HTTPS manifest fetcher** — ordered multi-source fetch with cached
+   fallback (generalises DD-10); verify offline against the pinned anchors.
+4. (later) NATS object-store source; per-principal `.well-known`/DNS.
