@@ -10,7 +10,7 @@
 
 cortex is **already ~80% decentralised** — and Luna's framing, while pointing at three real problems, over-states the centralisation by conflating three independent axes.
 
-The leaf-secret-authenticated pipe + per-side export/import that ADR-0013 ("Model B") already shipped **is literally BGP peering**: bilateral, each side wires its own half, a shared secret authenticates the transport, and *no operator trusts another operator's root.* Each principal runs their own NSC operator — that is genuine, structural sovereignty at the identity + transport layer. That part is done and right; do not touch it.
+The leaf-secret-authenticated pipe + per-side export/import that ADR-0013 ("Model B") already shipped **is literally BGP peering**: bilateral, each side wires its own half, a shared secret authenticates the transport, and *no NSC operator trusts another NSC operator's root.* Each principal runs their own NSC operator — that is genuine, structural sovereignty at the identity + transport layer. That part is done and right; do not touch it.
 
 What remains central is **three meta-layer artifacts, and they decentralise independently — with different answers each:**
 
@@ -71,8 +71,8 @@ Do **not** abolish the registry — that's the load-bearing RIR/DNS-root anchor.
 - Principals **pin admin DIDs, not a central URL.** Anyone can run a registry; others point at it. Registry-as-default-transit, not registry-as-authority.
 - Per-principal endpoint location via self-published `.well-known` / DNS SRV+TXT (decouple stable identity from physical endpoint). Optional seed+gossip (SWIM) only if/when live membership is needed. **No DHT** — at tens of principals it degenerates to a full mesh anyway.
 
-### 4.4 Trust model — capabilities over allowlists *(later, optional)*
-"Principal X admitted stack Y to network Z" becomes a **capability** (Biscuit — public-key-verifiable, offline-attenuable — or a signed JWT-VC if attenuation isn't needed) issued by the network-admin DID, held by Y, verified locally by any peer against X's pubkey. The central member-table collapses to **a small set of trusted admin DIDs**. Prefer **short-TTL admission capabilities** (expire-and-re-issue) over online revocation; borrow CT's posture — an append-only log of admission events every principal can monitor. Only pursue this once §4.2 lands and P2P attenuation is actually needed; keys are Ed25519, the *same primitive NSC nkeys already use*.
+### 4.4 Trust model — admission credentials over allowlists *(later, optional)*
+"Principal X admitted stack Y to network Z" becomes an **admission credential** — an attenuable, offline-verifiable token in the object-capability style (Biscuit — public-key-verifiable, offline-attenuable — or a signed JWT-VC if attenuation isn't needed) issued by the network-admin DID, held by Y, verified locally by any peer against X's pubkey. (Note: "admission credential" here is a *trust token*, distinct from cortex's canonical **Capability** = a bus-routable ability.) The central member-table collapses to **a small set of trusted admin DIDs**. Prefer **short-TTL admission credentials** (expire-and-re-issue) over online revocation; borrow CT's posture — an append-only log of admission events every principal can monitor. Only pursue this once §4.2 lands and P2P attenuation is actually needed; keys are Ed25519, the *same primitive NSC nkeys already use*.
 
 ## 5. Staging & reversibility
 
@@ -81,10 +81,10 @@ Do **not** abolish the registry — that's the load-bearing RIR/DNS-root anchor.
 | 0 | Split metafactory / community hubs | low | yes (descriptor flip) |
 | 1 | Per-network `admin_dids` in schema + checks; global allowlist → metafactory bootstrap only | medium | yes (allowlist retained) |
 | 2 | Registry → self-hostable signed manifest; pin admin DIDs not URL; per-principal `.well-known` | medium-high | yes (central registry stays a default) |
-| 3 | Capability-based admission (Biscuit/VC) + transparency log | high | additive |
+| 3 | Admission credentials (Biscuit/VC, object-capability style) + transparency log | high | additive |
 
 Each stage is independently shippable and respects ADR-0013/0015. Stage 0+1 already answer Luna's question in practice (per-network sovereignty + no single dominant transport). Stage 2+3 complete the "run-your-own-registry, peer P2P" vision without ever chasing trustless purity.
 
 ## 6. The one irreducible residual
 
-You can decentralise *admission* fully. You **cannot** eliminate *some* agreed-upon root of authority per network without also eliminating the ability to say "this principal is not one of us." Each network keeps exactly one root — its admin DID. Mitigate its blast radius with did:web (rotatable) + HSM or M-of-N threshold signing, and short capability TTLs. That residual is a feature, not a failure: it's precisely what BGP's RPKI, DNS's root, and CT's root programs all kept — and what email's refusal to have it cost it its decentralisation.
+You can decentralise *admission* fully. You **cannot** eliminate *some* agreed-upon root of authority per network without also eliminating the ability to say "this principal is not one of us." Each network keeps exactly one root — its admin DID. Mitigate its blast radius with did:web (rotatable) + HSM or M-of-N threshold signing, and short admission-credential TTLs. That residual is a feature, not a failure: it's precisely what BGP's RPKI, DNS's root, and CT's root programs all kept — and what email's refusal to have it cost it its decentralisation.
