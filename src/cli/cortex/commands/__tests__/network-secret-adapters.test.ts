@@ -71,7 +71,13 @@ describe("reload targeting — config-path match", () => {
       signal: (pid) => signalled.push(pid),
     });
 
-    await expect(ports.hub.reload()).rejects.toThrow(/could not target the hub reload/);
+    let err: unknown;
+    try {
+      await ports.hub.reload();
+    } catch (e) {
+      err = e;
+    }
+    expect(String(err)).toMatch(/could not target the hub reload/);
     expect(signalled.length).toBe(0);
   });
 });
@@ -129,7 +135,13 @@ describe("reload — gate failure still gates", () => {
       psLister: async () => [{ pid: 1, command: `nats-server -c ${hubConf}` }],
       signal: (pid) => signalled.push(pid),
     });
-    await expect(ports.hub.reload()).rejects.toThrow(/-t exited 1/);
+    let err: unknown;
+    try {
+      await ports.hub.reload();
+    } catch (e) {
+      err = e;
+    }
+    expect(String(err)).toMatch(/-t exited 1/);
     expect(signalled.length).toBe(0);
   });
 });
