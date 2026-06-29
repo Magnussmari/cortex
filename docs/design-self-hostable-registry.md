@@ -4,9 +4,9 @@
 **Issue:** #1322 · **Parent:** #110 · **Depends on:** #1321 (per-network admin in schema)
 **Refs:** `docs/research-federation-decentralization.md`, ADR-0003 (network-join control plane), ADR-0013 (sovereign federation), ADR-0005 (session-interior / cortex↔signal boundary), CONTEXT.md §Joining a network / §boundary-with-signal
 
-> Authored during an autonomous run while JC is away. This is the SPECIFY+PLAN
-> artifact for #1322 — **no implementation lands until #1321 merges and JC/Luna
-> approve this design.** Open questions for JC are collected at the end.
+> SPECIFY+PLAN artifact for #1322. The design's open questions have since been
+> **resolved with JC (2026-06-29)** — see the Decisions section below. #1321 has
+> merged; **implementation still waits on JC/Luna approving this design.**
 
 ## Problem
 
@@ -36,14 +36,17 @@ central URL, and verifies a **portable signed manifest** offline.
 - Network-wide observability / peer-liveness — that is **signal's** domain
   (CONTEXT.md §boundary-with-signal, ADR-0005). This design is cortex
   control-plane only: a stack's own join/anchor config.
-- Capability-based admission (Biscuit/VC) — a separate follow-on (see below).
+- Admission credentials (Biscuit/VC, object-capability style) — a separate follow-on (see below).
 
 ## Design
 
 ### 1. Portable signed network manifest
 
-The descriptor is **already** a `SignedAssertion` (registry signs every response;
-clients pin + verify, DD-9). Promote it to a self-contained, relocatable
+The descriptor is **already** a `SignedAssertion` — the registry signs each
+*response* for transport integrity, but it anchors **no trust** (CONTEXT.md
+§Joining a network: the registry "signs nothing" in the trust sense — it is a
+pubkey directory, not a CA; clients pin + verify, DD-9). Promote it to a
+self-contained, relocatable
 **network manifest** that carries everything a joiner needs and is verifiable
 **offline** against pinned admin DIDs:
 
@@ -60,7 +63,8 @@ NetworkManifest {
 
 Key shift from today: the manifest is signed by a **network-admin DID** (the
 authority a joiner already trusts via #1321), so it no longer *requires* the
-hosted registry's signing key to be trustworthy — it can be served from
+hosted registry's signing key as a trust anchor — that key is transport /
+back-compat metadata, never trust. The manifest can be served from
 **anywhere**: git, an HTTPS file, a NATS object-store bucket, or the existing
 hosted registry. Verification is **offline** against the pinned admin DID set.
 
@@ -107,7 +111,7 @@ up/down membership is needed; it would run *under* the manifest's trust model.
 - **Verification:** offline signature check against pinned anchors. No hosted
   service must be online or honest for a cached manifest to be trusted.
 - **Revocation/freshness:** `expires_at` + re-fetch; short manifest lifetimes
-  over online revocation. (Capability-based admission, below, sharpens this.)
+  over online revocation. (Admission credentials, below, sharpen this.)
 
 ## Control-plane / wire-protocol compliance
 
@@ -130,8 +134,8 @@ stack's own anchor/join config, not network-wide observability.
 
 ## Follow-on (separate issue, NOT this scope)
 
-**Capability-based admission** — replace the roster-membership lookup with an
-attenuable, offline-verifiable **capability** (Biscuit, public-key-verifiable; or
+**Admission credentials** — replace the roster-membership lookup with an
+attenuable, offline-verifiable **token** in the object-capability style (Biscuit, public-key-verifiable; or
 signed JWT-VC) issued by the network-admin DID: "principal X admitted to network
 Z" becomes a token X holds and any peer verifies against the admin DID, with
 short TTLs + a CT-style append-only admission log. Same Ed25519 primitive the NSC
@@ -164,7 +168,7 @@ manifest-verifier + any self-host registry mode.
    stays a default source throughout (back-compat).
 3. **Manifest lifetime (`expires_at`)** — default I'll use unless told otherwise:
    **24h** (short enough to bound revocation latency, long enough to avoid churn);
-   tunable per network. Revisit alongside the capability-based-admission follow-on.
+   tunable per network. Revisit alongside the admission-credentials follow-on.
 4. **Per-principal `.well-known`/DNS endpoint publication** — **deferred** until a
    principal actually needs to relocate a stack endpoint (not in the first slices).
 
