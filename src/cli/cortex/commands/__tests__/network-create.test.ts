@@ -213,6 +213,47 @@ describe("create --network-admins (#1321)", () => {
     const stored = await getStore(registryEnv).getNetwork("research-collab");
     expect(stored?.admin_pubkeys).toBe(pna);
   });
+
+  test("--apply: a PER-NETWORK admin CANNOT set admin_pubkeys via the CLI → registry 403 (anti-self-escalation, #1321/ADR-0020)", async () => {
+    // Demonstrates the server-side gate end-to-end through the CLI — the claim
+    // "setting admin_pubkeys is global-admin-only" is proven here, not just asserted.
+    const { seedPath: globalSeed, adminPubkey: globalPub } = await mintAdminSeed();
+    const { seedPath: pnaSeed, adminPubkey: pnaPub } = await mintAdminSeed();
+    const { adminPubkey: accomplice } = await mintAdminSeed();
+    const reg = await makeRegistryKey();
+    const registryEnv: Env = {
+      REGISTRY_SIGNING_KEY: reg.signingKey,
+      REGISTRY_PUBLIC_KEY: reg.publicKey,
+      REGISTRY_ADMIN_PUBKEYS: globalPub, // only the global admin is allowlisted
+      ENVIRONMENT: "test",
+    };
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      return registryApp.fetch(req, registryEnv);
+    }) as typeof globalThis.fetch;
+
+    // Global admin creates the network, naming pna as its per-network admin.
+    const create = await dispatchNetwork([
+      "create", "research-collab", "--hub", "tls://h:7422", "--leaf-port", "7422",
+      "--admin-seed", globalSeed, "--network-admins", pnaPub,
+      "--registry-url", "https://network.test", "--apply",
+    ]);
+    expect(create.exitCode).toBe(0);
+
+    // pna (a per-network admin, NOT on the global allowlist) tries to add an
+    // accomplice to the admin set → the registry refuses (anti-self-escalation).
+    const escalate = await dispatchNetwork([
+      "create", "research-collab", "--hub", "tls://h:7422", "--leaf-port", "7422",
+      "--admin-seed", pnaSeed, "--network-admins", accomplice,
+      "--registry-url", "https://network.test", "--apply",
+    ]);
+    expect(escalate.exitCode).toBe(1);
+    expect(escalate.stderr).toContain("admin_pubkeys_requires_global_admin");
+
+    // The admin set is unchanged — the escalation did not land.
+    const stored = await getStore(registryEnv).getNetwork("research-collab");
+    expect(stored?.admin_pubkeys).toBe(pnaPub);
+  });
 });
 
 // =============================================================================

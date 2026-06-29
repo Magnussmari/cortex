@@ -1169,9 +1169,13 @@ async function runCreate(
   const registryUrl = optionalValueFlag(flags, "--registry-url") ?? DEFAULT_REGISTRY_URL;
 
   // #1321 — optional per-network admins (comma-separated base64 Ed25519 pubkeys).
-  // The registry accepts admin_pubkeys ONLY from a GLOBAL admin (ADR-0020); the
-  // CLI validates the SHAPE locally for fast feedback and normalises (trim, drop
-  // blanks) before signing. Omitted → a plain topology create/update.
+  // This CLI ONLY validates the SHAPE locally (fast feedback) and normalises
+  // (trim, drop blanks) before signing — it makes no authorization decision. The
+  // global-admin-only gate on SETTING admin_pubkeys (anti-self-escalation) is
+  // enforced server-side by the registry, already merged in #1321 / ADR-0020
+  // (routes/networks.ts → `admin_pubkeys_requires_global_admin`); the
+  // per-network-admin negative case is exercised end-to-end in network-create.test.ts.
+  // Omitted → a plain topology create/update.
   let adminPubkeys: string | undefined;
   const networkAdminsRaw = optionalValueFlag(flags, "--network-admins");
   if (networkAdminsRaw !== undefined) {
@@ -2583,8 +2587,10 @@ Flags (all OPTIONAL OVERRIDES — derived from cortex.yaml when omitted; #753):
                           REGISTRY_ADMIN_PUBKEYS allowlist must contain that pubkey.
   --network-admins <csv>  (create) comma-separated base64 Ed25519 pubkeys to set as
                           THIS network's per-network admins (#1321). They may admit
-                          onto its roster + update its topology. Accepted only from a
-                          GLOBAL admin's claim. Omit → defers to REGISTRY_ADMIN_PUBKEYS.
+                          onto its roster + update its topology. Setting this field is
+                          gated to a GLOBAL admin by the registry (#1321/ADR-0020);
+                          the CLI only validates shape. Omit → defers to
+                          REGISTRY_ADMIN_PUBKEYS.
   --registry-url <url>    (create) registry base URL (default: https://network.meta-factory.ai).
   --apply                 Execute the live mutation (default: dry-run).
   --json                  Emit a { status, items, data, error } envelope.
