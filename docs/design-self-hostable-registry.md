@@ -1,6 +1,6 @@
 # Design: self-hostable + peerable registry (signed network manifest)
 
-**Status:** design / spec (implementation deferred — depends on #1321) · **Date:** 2026-06-29
+**Status:** design / spec (implementation deferred pending JC/Luna approval; prerequisite #1321 ✓ merged) · **Date:** 2026-06-29
 **Issue:** #1322 · **Parent:** #110 · **Depends on:** #1321 (per-network admin in schema)
 **Refs:** `docs/research-federation-decentralization.md`, ADR-0003 (network-join control plane), ADR-0013 (sovereign federation), ADR-0005 (session-interior / cortex↔signal boundary), CONTEXT.md §Joining a network / §boundary-with-signal
 
@@ -33,10 +33,12 @@ central URL, and verifies a **portable signed manifest** offline.
 
 - Abolishing the registry / pure trustless P2P (the research's explicit anti-goal).
 - A DHT (at tens of principals it degenerates to a full mesh — pure overhead).
-- Network-wide observability / peer-liveness — that is **signal's** domain
-  (CONTEXT.md §boundary-with-signal, ADR-0005). This design is cortex
-  control-plane only: a stack's own join/anchor config.
-- Admission credentials (Biscuit/VC, object-capability style) — a separate follow-on (see below).
+- Agent/peer **presence** + the MC Network view — that's cortex's own `agent`-domain
+  lifecycle (`agent.{online|heartbeat|offline|capabilities-changed}`, CONTEXT.md
+  §Agent presence), not this registry spec. Session-interior / trace observability
+  is signal's domain (CONTEXT.md §boundary-with-signal, ADR-0005). This design is
+  cortex control-plane only: a stack's own join/anchor config.
+- An admission-credential / offline-roster-proof follow-on (see below) — separate scope.
 
 ## Design
 
@@ -84,9 +86,11 @@ policy.federated:
 ```
 
 A manifest is accepted iff its signature verifies against a pinned `trust_anchor`
-DID. Sources are tried in order; a stale/unreachable source falls through to the
-next (DD-10 cached-fallback behaviour generalises to multi-source). The hosted
-registry remains a valid (default) source — nothing breaks for existing pins.
+DID. Sources are tried in order, but **freshness wins over reachability**: the
+manifest with the newest valid `issued_at` is selected, so a reachable source
+serving an older (still-unexpired) manifest cannot shadow a newer one — DD-10
+cached-fallback covers *unreachable*, not *stale-but-up*. The hosted registry
+remains a valid (default) source — existing pins keep working.
 
 ### 3. Per-principal endpoint self-publication
 
@@ -134,12 +138,19 @@ stack's own anchor/join config, not network-wide observability.
 
 ## Follow-on (separate issue, NOT this scope)
 
-**Admission credentials** — replace the roster-membership lookup with an
-attenuable, offline-verifiable **token** in the object-capability style (Biscuit, public-key-verifiable; or
-signed JWT-VC) issued by the network-admin DID: "principal X admitted to network
-Z" becomes a token X holds and any peer verifies against the admin DID, with
-short TTLs + a CT-style append-only admission log. Same Ed25519 primitive the NSC
-nkeys already use. File separately when pursued.
+**Offline roster proof** — let a peer verify roster membership *offline* from a
+signed, cacheable **membership assertion** (the network-admin DID signs "X is on
+network Z's roster"), instead of a live roster lookup. Admission still **mints
+nothing** (ADR-0015) — this is a verifiable cache of roster state, not an issued
+bearer credential.
+
+> **Boundary note (do not silently cross):** turning this into attenuable bearer
+> tokens (Biscuit / JWT-VC, object-capability style, with TTLs + a CT-style
+> append-only log) would make admission *issue credentials* — which **reverses
+> the ADR-0015 "admission mints nothing" boundary**. That is a deliberate
+> architecture change requiring its own ADR + a CONTEXT.md update before adoption;
+> it is recorded here as a possibility, not a decision. Same Ed25519 primitive the
+> nsc nkeys use. File separately when/if pursued.
 
 ## Constraint surfaced by the #1321 review (Luna)
 
@@ -162,12 +173,19 @@ manifest-verifier + any self-host registry mode.
    (need rotation), stacks are disposable. #1321 stores raw base64 pubkeys today;
    a thin DID wrapper/adapter maps a stack pubkey ↔ `did:key` and a principal ↔
    `did:web` without changing the stored bytes.
+   **Security — pin the key, not just the name:** a pinned `trust_anchor` MUST
+   store the resolved Ed25519 verification key (or a hash of the DID document),
+   not merely the `did:web` URL — otherwise verification depends on live DNS/HTTPS
+   and a domain/CA compromise could swap the manifest-signing key (breaking the
+   offline-trust property). `did:key` is self-certifying (the key *is* the name).
+   `did:web` **rotation** is therefore an explicit, signed update to the pinned
+   anchor set, never an implicit re-resolve.
 2. **First alternate manifest source — git / HTTPS file.** A signed manifest JSON
    served from a git repo or any HTTPS host: simplest to stand up + audit (free
    version history). NATS object store + others come later. The hosted registry
    stays a default source throughout (back-compat).
-3. **Manifest lifetime (`expires_at`)** — default I'll use unless told otherwise:
-   **24h** (short enough to bound revocation latency, long enough to avoid churn);
+3. **Manifest lifetime (`expires_at`)** — **24h, tunable per network**
+   (short enough to bound revocation latency, long enough to avoid churn);
    tunable per network. Revisit alongside the admission-credentials follow-on.
 4. **Per-principal `.well-known`/DNS endpoint publication** — **deferred** until a
    principal actually needs to relocate a stack endpoint (not in the first slices).
