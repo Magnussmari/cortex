@@ -30,11 +30,13 @@ Verify each before starting:
 | Requirement | Check | Notes |
 |---|---|---|
 | Bun | `bun --version` | The only supported runtime. Never use npm/yarn/node. |
-| NATS server with JetStream | `nats-server --version` | One isolated bus per stack (see §4). **Install:** macOS `brew install nats-server`; Linux — binary from [nats-io/nats-server releases](https://github.com/nats-io/nats-server/releases) or your distro package (JetStream is built in, enabled per-config). |
+| NATS server with JetStream | `nats-server --version` | One isolated bus per stack (see §4). **Install:** macOS `brew install nats-server`; Linux — binary from [nats-io/nats-server releases](https://github.com/nats-io/nats-server/releases) or your distro package (JetStream is built in, enabled per-config). **Verify the download** (`sha256sum` vs the release checksum) before running it. |
 | Claude Code, authenticated | `claude --version` | Default execution substrate for dispatched work. |
 | Discord bot token + guild | — | Bot must already be a **member of the target guild** with the **Message Content intent enabled** (Developer Portal). Only the principal can do this. |
 | guild id + channel ids | — | Discord client → Developer Mode → copy id. |
 | `arc` (optional) | `arc --version` | metafactory package manager; manages install + launchd lifecycle + signing-seed provisioning. |
+
+> **Optional hardening** (recommended): verify the NATS download's `sha256` against the release's published checksum before running it, and run Bun with a supply-chain scanner — `bun add -g @socketsecurity/bun-security-scanner` plus a `~/.bunfig.toml` `[install.security]` scanner entry. **Linux operators:** see [`docs/onboard-debian.md`](docs/onboard-debian.md) for the concrete, end-to-end Debian-13 walk.
 
 **Platform — macOS and Linux both supported.** The runtime is OS-agnostic (Bun,
 NATS, and the config `.conf` are identical); only the **service manager** differs:
