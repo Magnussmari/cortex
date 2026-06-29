@@ -10,7 +10,7 @@
 
 cortex is **already ~80% decentralised** — and Luna's framing, while pointing at three real problems, over-states the centralisation by conflating three independent axes.
 
-The leaf-secret-authenticated pipe + per-side export/import that ADR-0013 ("Model B") already shipped **is literally BGP peering**: bilateral, each side wires its own half, a shared secret authenticates the transport, and *no NSC operator trusts another NSC operator's root.* Each principal runs their own NSC operator — that is genuine, structural sovereignty at the identity + transport layer. That part is done and right; do not touch it.
+The leaf-secret-authenticated pipe + per-side export/import that ADR-0013 ("Model B") already shipped **is literally BGP peering**: bilateral, each side wires its own half, a shared secret authenticates the transport, and *no operator account trusts another operator account's root.* Each principal runs their own nsc operator — that is genuine, structural sovereignty at the identity + transport layer. That part is done and right; do not touch it.
 
 What remains central is **three meta-layer artifacts, and they decentralise independently — with different answers each:**
 
@@ -32,11 +32,11 @@ Per ADR-0013 (accepted 2026-06-18) and the code:
 
 - **Each principal runs their own NSC operator** (`OP_JC`, `OP_ANDREAS`). Nobody's identity is hosted in anyone else's operator. NSC is a self-sovereign trust root — a server needs only its own operator key to validate its own JWTs. (`docs/adr/0013` §Decision-1..4)
 - **The leaf link is a secret-authenticated transport pipe, not a cross-operator JWT-trust handshake.** Each side binds the link to a **local** account in its **own** operator. "Sovereignty is structural — it falls out of the pipe + per-side control, not from a trust protocol." (ADR-0013 §Decision-1)
-- **Export/import that bridges `federated.>` is purely local** — single-store, single-operator, each principal wires their own half via `arc nats add-federation-export`. (ADR-0013 §Decision-2; `src/cli/cortex/commands/network-federation-wiring.ts`)
+- **Export/import that bridges `federated.>` is purely local** — single-store, single nsc operator, each principal wires their own half via `arc nats add-federation-export`. (ADR-0013 §Decision-2; `src/cli/cortex/commands/network-federation-wiring.ts`)
 - **Per-stack signing keys are self-sovereign** — minted locally (`cortex provision-stack generate`), registered to the registry but never issued *by* it. (`src/cli/cortex/commands/network.ts`; registry stores `StackIdentity.stack_pubkey` only as a directory entry)
 - **The registry is already "DNS, not CA"** — a signature-verified pubkey directory + network descriptor, carrying no account-topology material. Every response is a `SignedAssertion`; clients pin `policy.federated.registry.pubkey` and verify before trusting. (ADR-0013 §Consequences; `src/services/network-registry/src/signing.ts`)
 
-**This maps one-to-one onto how the internet is decentralised**: sovereign identity per operator (≈ your own keys), bilateral secret-authenticated peering (≈ BGP sessions with MD5/TCP-AO), each side configuring its own filters (≈ per-AS route policy). cortex got the hard part right.
+**This maps one-to-one onto how the internet is decentralised**: sovereign identity per principal (≈ your own keys), bilateral secret-authenticated peering (≈ BGP sessions with MD5/TCP-AO), each side configuring its own filters (≈ per-AS route policy). cortex got the hard part right.
 
 ## 2. What is still central, and exactly where
 
