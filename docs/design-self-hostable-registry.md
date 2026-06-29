@@ -137,6 +137,19 @@ Z" becomes a token X holds and any peer verifies against the admin DID, with
 short TTLs + a CT-style append-only admission log. Same Ed25519 primitive the NSC
 nkeys already use. File separately when pursued.
 
+## Constraint surfaced by the #1321 review (Luna)
+
+Both #1321 gates keep the `REGISTRY_ADMIN_PUBKEYS`-empty → **503 fail-closed
+FIRST** ordering: a per-network admin cannot operate on a registry with no
+**global** admin configured. That is correct for the hosted `metafactory`
+registry — but a **self-hostable registry is exactly the no-global-admin case**.
+This design MUST therefore relax that coupling: on a self-hosted manifest/registry,
+**per-network admin DIDs must be sufficient on their own** (no global super-admin
+required), i.e. the 503-on-empty-global gate becomes "no trust anchor configured"
+rather than "no global admin configured". The trust anchor is the pinned
+per-network admin DID set, not a registry-wide allowlist. Carry this into the
+manifest-verifier + any self-host registry mode.
+
 ## Open questions for JC
 
 1. **DID method** for `admin_dids` / `trust_anchors` — `did:key` (zero infra, no
