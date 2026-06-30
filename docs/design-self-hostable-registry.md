@@ -2,7 +2,7 @@
 
 **Status:** design / spec (implementation deferred pending JC/Luna approval; prerequisite #1321 ✓ merged) · **Date:** 2026-06-29
 **Issue:** #1322 · **Parent:** #110 · **Depends on:** #1321 (per-network admin in schema)
-**Refs:** `docs/research-federation-decentralization.md`, ADR-0003 (network-join control plane), ADR-0013 (sovereign federation), ADR-0005 (session-interior / cortex↔signal boundary), CONTEXT.md §Joining a network / §boundary-with-signal
+**Refs:** `docs/research-federation-decentralization.md`, ADR-0003 (network-join control plane), ADR-0013 (sovereign federation), ADR-0015 (admission mints nothing), ADR-0020/#1321 (per-network admin authority), ADR-0005 (session-interior / cortex↔signal boundary), CONTEXT.md §Joining a network / §boundary-with-signal
 
 > SPECIFY+PLAN artifact for #1322. The design's open questions have since been
 > **resolved with JC (2026-06-29)** — see the Decisions section below. #1321 has
@@ -57,7 +57,7 @@ NetworkManifest {
   network_id
   hub_url, leaf_port              // topology (today's descriptor)
   admin_dids[]                    // the network's admins (from #1321 admin_pubkeys, as DIDs)
-  roster[] { principal_id, stack_id, principal_pubkey }   // admitted peers (DD-5)
+  roster[] { principal_id, stack_id, principal_pubkey }   // discovery/recognition only (DD-5)
   issued_at, expires_at
   signature                       // by a network admin DID (not a hosted-registry key)
 }
@@ -69,6 +69,14 @@ hosted registry's signing key as a trust anchor — that key is transport /
 back-compat metadata, never trust. The manifest can be served from
 **anywhere**: git, an HTTPS file, a NATS object-store bucket, or the existing
 hosted registry. Verification is **offline** against the pinned admin DID set.
+
+The manifest roster is a signed **discovery/recognition cache only**. A roster
+entry says "this principal/stack is recognized as admitted by this network's
+admin"; it does **not** grant bus access, mint a NATS account, create a leaf
+secret, widen `accept_subjects`, install export/import wiring, or authorize
+payload decryption. Transport access remains independently gated by ADR-0013's
+leaf-secret-authenticated pipe plus each side's local export/import and
+acceptance policy. Admission remains ADR-0015-compatible: it mints nothing.
 
 ### 2. Pin admin DIDs, not a URL
 
@@ -117,6 +125,47 @@ up/down membership is needed; it would run *under* the manifest's trust model.
 - **Revocation/freshness:** `expires_at` + re-fetch; short manifest lifetimes
   over online revocation. (Admission credentials, below, sharpen this.)
 
+### Admin-set authority and ADR-0020
+
+There are two authority modes, and the verifier MUST NOT blur them:
+
+1. **Hosted registry mode (ADR-0020 / #1321).** Network create remains a
+   hierarchical allocation act: only a global admin may set the initial
+   `admin_pubkeys`. A per-network admin may update topology and admit members,
+   but may not set/change `admin_pubkeys`; that anti-self-escalation gate fails
+   closed with `403 admin_pubkeys_requires_global_admin`.
+2. **Self-hosted manifest mode (this design).** There is no global admin above a
+   sovereign network. The authority root is the joiner's already-pinned
+   `trust_anchors[]`, resolved to Ed25519 verification keys. A manifest may
+   rotate or change `admin_dids[]` only if the update is signed by an
+   already-pinned anchor, then explicitly persisted as the new pin set. A
+   self-declared first manifest cannot bootstrap its own admin set.
+
+That second mode is coherent, but it is a different privilege model from the
+hosted registry's global-admin anti-self-escalation rule. Slice 1 must therefore
+ship with an ADR-0020 amendment or a new ADR that names this pinned-anchor +
+key-continuity model before the offline verifier is treated as the trust model.
+
+### Residual risks to carry into slice 1
+
+- **Revocation latency:** offline pinning has no live revocation channel. The
+  24h `expires_at` default is therefore the v1 compromise-recovery bound unless
+  an admin performs an out-of-band re-pin sooner.
+- **Rollback window:** "freshness wins" only compares reachable valid sources.
+  A joiner that can reach only a malicious source can be rolled back to an
+  older-but-unexpired manifest inside the lifetime window.
+- **Rotation is explicit:** `did:web` names are not implicitly re-resolved for
+  trust. Key/DID-document-hash rotation is an out-of-band signed re-pin, not an
+  automatic DNS/HTTPS update.
+- **1-of-N signing blast radius:** v1 accepts a manifest signed by any one
+  pinned admin DID. One compromised admin key can forge the whole manifest and
+  roster until expiry/re-pin. M-of-N admin signing is the future hardening path.
+- **`network_id` is anchor-relative:** once manifests are self-hosted, two
+  networks can both claim `network_id: acme` under different admin anchors. This
+  is not a trust break, but config and UX must treat `network_id` as meaningful
+  relative to the pinned anchor (or namespace it by anchor) rather than globally
+  unique.
+
 ## Control-plane / wire-protocol compliance
 
 Control-plane only. No subject shape, no envelope field, no
@@ -159,11 +208,11 @@ FIRST** ordering: a per-network admin cannot operate on a registry with no
 **global** admin configured. That is correct for the hosted `metafactory`
 registry — but a **self-hostable registry is exactly the no-global-admin case**.
 This design MUST therefore relax that coupling: on a self-hosted manifest/registry,
-**per-network admin DIDs must be sufficient on their own** (no global super-admin
-required), i.e. the 503-on-empty-global gate becomes "no trust anchor configured"
-rather than "no global admin configured". The trust anchor is the pinned
-per-network admin DID set, not a registry-wide allowlist. Carry this into the
-manifest-verifier + any self-host registry mode.
+there is no global super-admin above the network. The fail-closed condition becomes
+"no pinned trust anchor configured" rather than "no global admin configured". The
+trust anchor is the joiner's pinned per-network admin DID/key set, and changes to
+that set follow the key-continuity rule in [Admin-set authority and ADR-0020](#admin-set-authority-and-adr-0020).
+Carry this into the manifest-verifier + any self-host registry mode.
 
 ## Decisions (resolved with JC, 2026-06-29)
 
