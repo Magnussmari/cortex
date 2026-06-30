@@ -22,15 +22,19 @@ Trust forms between people, earned by building together: good ideas seen and cre
 Every action an agent takes is *for* a person, and the who-asked-for-what trail is **verifiable — not assumed.** The swarm can run on its own, but a human always carries the responsibility.
 **The test —** can you trace this action to an accountable human by signature, not by "trust me"?
 
-### 4. Sovereign by default
+### 4. Secure by design — never bolted on
+Trust and security are first principles you build *from*, not features you add once something ships. Capability, identity, and the audit trail belong to the architecture from the first commit — you review what a skill can do *before* it runs, not after it breaks. A stack that defers safety to "later" never earns it; retrofitted trust is the absence of trust. This is the one commitment that explains *why* the architecture looks the way it does.
+**The test —** if this change defers trust or security to "later," that is a finding, not a roadmap item.
+
+### 5. Sovereign by default
 Your work is yours. You decide what to share, with whom, and how far it travels. The secure, private default is the one we ship.
 **The test —** does the principal keep control of their data and the scope it travels in — without having to opt in to safety?
 
-### 5. Open and composable
+### 6. Open and composable
 No one owns the network. Anyone can join, bring their own assistants, build, and connect to others. The value is in composing, not in capturing.
 **The test —** does this keep the door open, or quietly build a wall?
 
-### 6. Legible, and easy — or it won't be used
+### 7. Legible, and easy — or it won't be used
 The whole system must surface to a person who can see and steer it. If it is hard, or hidden behind jargon, people won't engage — and an ecosystem no one joins is not one. Ease of engagement is a first-class requirement, not polish.
 **The test —** can a newcomer understand and command this without insider knowledge?
 
@@ -40,7 +44,8 @@ The whole system must surface to a person who can see and steer it. If it is har
 - **A crowd of bots replacing people.** The swarm serves the human; it never becomes the point.
 - **A walled garden.** No central owner, no lock-in, no gatekeeper deciding who belongs.
 - **Autonomy without accountability.** Nothing acts without a human it traces back to.
-- **A system only experts can use.** If engaging requires reading the source, we have failed principle 6.
+- **A stack that retrofits trust.** Security and accountability are designed in from the first commit; we refuse to bolt them on after something ships.
+- **A system only experts can use.** If engaging requires reading the source, we have failed principle 7.
 
 ---
 
