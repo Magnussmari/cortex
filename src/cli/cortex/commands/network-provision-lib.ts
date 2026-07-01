@@ -286,13 +286,15 @@ export function buildProvisionPlan(inputs: ProvisionInputs): PlanItem[] {
     },
     {
       // cortex#1333 — the SYS (system) account. An operator-mode NATS bus with
-      // JetStream enabled FATALS at boot without a configured system_account. We
-      // can't tell from this path whether a given stack enables JetStream — but SYS
-      // is inert when it doesn't and load-bearing when it does, so ensuring it is
-      // the safe default either way, and it removes the downstream boot-fatal for
-      // the JetStream case. Minting is gated on state.systemAccount in provisionStack
-      // (present-in-config => skip, absent => mint). Retires the raw `nsc add
-      // account SYS` workaround that #1332 documented.
+      // JetStream enabled FATALS at boot without a configured system_account. This
+      // path cannot see whether a given stack enables JetStream (that lives in the
+      // bus .conf, which provision never reads), so SYS is ensured unconditionally:
+      // the trade is one extra account in the operator store for a non-JetStream
+      // stack, in exchange for removing the boot-fatal on every JetStream stack.
+      // (A JetStream-config gate would require provision to read the bus config —
+      // see the PR discussion if that is preferred.) Minting is gated on
+      // state.systemAccount in provisionStack (present-in-config => skip, absent
+      // => mint). Retires the raw `nsc add account SYS` onboarding workaround.
       step: "system account",
       status: sysPresent ? "ok" : "mint",
       detail: sysPresent
@@ -407,12 +409,12 @@ export async function provisionStack(
   // 3.5 (cortex#1333) — ensure the SYS (system) account; see the rationale on the
   //     "system account" plan item above. Gated on state.systemAccount: mint only
   //     when config records no system_account, otherwise skip — this gate is the
-  //     idempotency, no arc-side addAccount dedup is assumed. The dedicated SYS
-  //     export at step 5.6 (gated on the SAME condition) writes system_account[_jwt]
-  //     to config even when the operator/account JWTs are already present — see the
-  //     blocker that decoupling fixed (cortex#1335).
-  const sysNeeded = force || state.systemAccount === undefined;
-  if (sysNeeded) {
+  //     idempotency, no arc-side addAccount dedup is assumed. The SAME gate value
+  //     drives the dedicated SYS export at step 5.6 (one constant, so mint and
+  //     export can never drift apart), which writes system_account[_jwt] to config
+  //     even when the operator/account JWTs are already present.
+  const sysConfigMissingOrForced = force || state.systemAccount === undefined;
+  if (sysConfigMissingOrForced) {
     const sys = await ports.operator.addAccount({ name: inputs.systemAccountName });
     if (!sys.ok) return fail(plan, steps, `add-account (system ${inputs.systemAccountName}) failed: ${sys.reason}`);
     steps.push(`system account ${sys.created ? "minted" : "present"}: ${sys.account} (${sys.pubKey})`);
@@ -478,33 +480,29 @@ export async function provisionStack(
     steps.push("operator-mode JWTs present in config (untouched)");
   }
 
-  // 5.6 (cortex#1335 blocker) — the SYS export is gated INDEPENDENTLY of the
-  // operator/account JWT export. An older provisioned stack can have
-  // operatorModeJwtsPresent === true (JWTs already in config) yet still lack
-  // system_account; folding SYS into jwtExportNeeded would mint SYS at step 3.5 but
-  // then SKIP the only write of system_account, leaving the JetStream boot-fatal in
-  // place. Gate on the SYS config field — the same condition that minted it above —
-  // so SYS is exported and written exactly when (and only when) config lacks it.
-  const sysExportNeeded = force || state.systemAccount === undefined;
-  if (sysExportNeeded) {
+  // 5.6 — the SYS export is gated INDEPENDENTLY of the operator/account JWT
+  // export, on the SAME constant that gated the mint at step 3.5. An older
+  // provisioned stack can have operatorModeJwtsPresent === true (JWTs already in
+  // config) yet still lack system_account; folding SYS into jwtExportNeeded would
+  // mint SYS at step 3.5 but then SKIP the only write of system_account, leaving
+  // the JetStream boot-fatal in place.
+  //
+  // A failed SYS export here FAILS provision (fail-fast, before the config
+  // write) — SYS was just ensured, so not-found means an arc store inconsistency,
+  // and returning ok while the advertised system_account wiring silently did not
+  // happen would mislead the caller. This also matches the module invariant:
+  // any arc failure aborts before the config write-back.
+  if (sysConfigMissingOrForced) {
     const sysRes = await ports.export.exportSystem({ name: inputs.systemAccountName });
-    if (sysRes.ok) {
-      systemAccount = sysRes.pubKey;
-      systemAccountJwt = sysRes.jwt;
-      steps.push(`system_account exported + wired: ${inputs.systemAccountName}`);
-    } else if (sysRes.notFound) {
-      // SYS was ensured at step 3.5, so not-found here implies an arc store
-      // inconsistency — surface it loudly rather than silently leaving config short
-      // (a stack that boots JetStream would still hit the boot-fatal).
-      steps.push(
-        `WARNING: ${inputs.systemAccountName} not found at export despite ensure — ` +
-          `system_account NOT written; JetStream boot-fatal may persist`,
-      );
-    } else {
-      steps.push(
-        `WARNING: system export skipped — ${sysRes.reason}; system_account NOT written`,
-      );
+    if (!sysRes.ok) {
+      const why = sysRes.notFound
+        ? `${inputs.systemAccountName} not found at export despite the step-3.5 ensure (arc store inconsistency)`
+        : `system export failed: ${sysRes.reason}`;
+      return fail(plan, steps, `${why} — system_account not written; aborting before config write`);
     }
+    systemAccount = sysRes.pubKey;
+    systemAccountJwt = sysRes.jwt;
+    steps.push(`system_account exported + wired: ${inputs.systemAccountName}`);
   }
 
   // 6. Write the resolved nats_infra fields back to the stack config.

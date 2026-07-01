@@ -98,7 +98,7 @@ function buildPorts(runner: ArcFederationRunner): { ports: ProvisionPorts; writt
   const exportPort = {
     exportOperator: async () => ({ ok: true as const, operatorJwt: "eyJ.op.sig", pubKey: "OD4D" }),
     exportAccount: async () => ({ ok: true as const, pubKey: FED_PUB, jwt: "eyJ.fed.sig" }),
-    exportSystem: async () => ({ ok: false as const, reason: "no SYS", notFound: true }),
+    exportSystem: async () => ({ ok: true as const, pubKey: "A" + "S".repeat(55), jwt: "eyJ.sys.sig" }),
   };
   // The REAL wiring adapter — only the arc subprocess runner is swapped.
   const federationWiring = buildFederationWiringAdapter(runner);

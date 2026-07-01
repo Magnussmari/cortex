@@ -313,19 +313,30 @@ describe("provisionStack — cortex#1265 operator-mode JWT export", () => {
     });
   });
 
-  test("SYS missing at export despite ensure → WARNS, omits (never clobbers) system fields", async () => {
+  test("SYS missing at export despite ensure → provision FAILS before the config write", async () => {
     // SYS is ensured at step 3.5 (cortex#1333), so exportSystem reporting it absent
-    // is an arc store inconsistency — surface it loudly, don't treat it as a benign
-    // optional skip (the old, pre-#1333 semantic).
+    // is an arc store inconsistency. Returning ok while the advertised
+    // system_account wiring silently did not happen would mislead the caller —
+    // fail fast, BEFORE the config write (the module's arc-failure invariant).
     const { ports, calls, written } = makePorts({ systemAbsent: true });
     const res = await provisionStack(baseInputs({ apply: true }), ports);
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain("not found at export despite the step-3.5 ensure");
     expect(calls).toContain("export-system:SYS");
-    expect(written[0]).toMatchObject({ operatorJwt: OP_JWT, accountJwt: FED_JWT });
-    // system fields omitted (not clobbered) when the export can't resolve SYS.
-    expect(written[0]?.systemAccount).toBeUndefined();
-    expect(written[0]?.systemAccountJwt).toBeUndefined();
-    expect(res.steps.join("\n")).toContain("not found at export despite ensure");
+    // fail-fast: NO config write happened at all.
+    expect(calls).not.toContain("config-write");
+    expect(written).toHaveLength(0);
+  });
+
+  test("a generic SYS export failure also FAILS provision before the config write", async () => {
+    const { ports, calls, written } = makePorts({
+      export: { exportSystem: async () => ({ ok: false, reason: "arc dependency unmet" }) },
+    });
+    const res = await provisionStack(baseInputs({ apply: true }), ports);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain("system export failed: arc dependency unmet");
+    expect(calls).not.toContain("config-write");
+    expect(written).toHaveLength(0);
   });
 
   test("idempotent: JWTs already in config → NO export calls (ensure-shaped)", async () => {
