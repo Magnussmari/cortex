@@ -526,7 +526,7 @@ myelin#36 draws an explicit boundary. Five concerns DO NOT live in the bus proto
 |---------|----------|----------------------|
 | Agent capability declaration (tools, envs, creds, reach) | M7 deployment config | `cortex.yaml` `agents[].roles + .trust + .presence` per §9 |
 | Orchestrator translation of principal intent → task graph | M7 orchestrator agent | The Delegate-receiving agent's internal logic (e.g. pilot's review-loop logic — not in cortex; pilot is its own M7 app) |
-| Compliance attestation (e.g. a customer STD-EXAMPLE-AI-001) | M7 deployment-time, signed at install | Cortex's `arc-manifest.yaml` + agent persona declarations; out of scope for v1 cortex but the slot exists |
+| Compliance attestation (e.g. a customer Gen-AI compliance standard) | M7 deployment-time, signed at install | Cortex's `arc-manifest.yaml` + agent persona declarations; out of scope for v1 cortex but the slot exists |
 | Notification surface routing | M7 surface-router | `cortex/src/bus/surface-router.ts` (§8) — exactly this concern |
 | Sub-agent trust floor | M7 orchestrator policy + chain-of-stamps | Cortex's agent registry + chain-of-stamps verification (myelin#31) |
 

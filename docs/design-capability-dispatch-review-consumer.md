@@ -559,7 +559,7 @@ The consumer's preconditions decide which nak kind to emit. Concrete preconditio
 
 **Preconditions:**
 
-- The agent's `compliance` block in cortex.yaml (per the a customer STD-EXAMPLE-AI-001 pattern, anchor doc §1 stratification §7.5) declares the request's classification / model-class / data-residency combination as forbidden.
+- The agent's `compliance` block in cortex.yaml (per a customer Gen-AI compliance-standard pattern, anchor doc §1 stratification §7.5) declares the request's classification / model-class / data-residency combination as forbidden.
 - The request's `extensions.actor.id` is on a compliance deny-list for this agent.
 
 **Emit:** `dispatch.task.failed` with `reason: { kind: "compliance_block", detail: "<compliance rule>" }`. Ack — compliance refusal is permanent for this request.
