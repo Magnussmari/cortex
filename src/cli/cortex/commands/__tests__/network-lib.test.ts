@@ -1019,16 +1019,16 @@ describe("join", () => {
     });
   });
 
-  test("accept_subjects = own ∪ peer subtrees, never the network id (wire contract, P2 #1087)", async () => {
+  test("accept_subjects = OWN-scope only, never a peer subtree or the network id (#1220)", async () => {
     const { ports, storeRef } = makeFakes({});
     await joinNetwork("metafactory", LOCAL, ports);
     const net = storeRef.networks[0]!;
-    // P2: own subtree (dispatch TO me) ∪ each roster peer's subtree (presence
-    // FROM peers). rosterFor() resolves one peer, jc/sage-host.
-    expect(net.accept_subjects).toEqual([
-      "federated.andreas.meta-factory.>",
-      "federated.jc.sage-host.agent.>", // peer = PRESENCE-ONLY (least privilege)
-    ]);
+    // #1220 — join PERSISTS own-scope only (peer PRESENCE is re-derived in-memory
+    // by the reconciler). rosterFor() resolves peer jc/sage-host, but its presence
+    // subtree is NOT persisted (it fails the boot config validator's own-scope rule).
+    expect(net.accept_subjects).toEqual(["federated.andreas.meta-factory.>"]);
+    // No peer subtree persisted.
+    expect(net.accept_subjects.some((s) => s.includes("jc.sage-host"))).toBe(false);
     // The wire contract STILL holds: subjects gate by principal/stack segments,
     // never the network id `metafactory` (note `meta-factory` is the stack SLUG,
     // a hyphenated segment that does not contain the un-hyphenated network id).
@@ -1374,12 +1374,16 @@ describe("#762 empty roster preserves hand-pins", () => {
 });
 
 // =============================================================================
-// P2 (#1087) — accept_subjects = own ∪ peer subtrees (dual-grammar, OQ2 fix)
+// cortex#1220 — join PERSISTS accept_subjects = OWN-scope ONLY
+// (peer PRESENCE subtrees are re-derived IN-MEMORY at runtime by the
+// federation-reconciler; persisting them fails the boot config validator).
 // =============================================================================
 
-describe("P2 #1087 accept_subjects derivation", () => {
-  test("normal join → OWN subtree ∪ each roster peer's subtree (dual-grammar)", async () => {
+describe("#1220 accept_subjects — join persists own-scope only", () => {
+  test("normal join → OWN subtree ONLY, even with a resolved roster peer", async () => {
     // rosterFor() yields one real peer: jc/sage-host (andreas is self → excluded).
+    // Pre-#1220 the writer persisted jc's `.agent.>` presence subtree too, which
+    // the daemon then refused to boot. Now the writer persists own-scope only.
     const { ports, storeRef } = makeFakes({});
     const res = await joinNetwork("metafactory", LOCAL, ports);
 
@@ -1387,11 +1391,13 @@ describe("P2 #1087 accept_subjects derivation", () => {
     const net = storeRef.networks.find((n) => n.id === "metafactory")!;
     expect(net.accept_subjects).toEqual([
       "federated.andreas.meta-factory.>", // dispatch addressed TO me (full subtree)
-      "federated.jc.sage-host.agent.>", // jc's presence, SOURCE-addressed (presence-only)
     ]);
+    // The peer is still written to peers[] (the gate resolves the source network
+    // from peers[]); only its PRESENCE subtree is kept OUT of the persisted accept-list.
+    expect(net.peers.map((p) => p.principal_id)).toEqual(["jc"]);
   });
 
-  test("the step log records the derived accept-list (not OWN-only)", async () => {
+  test("the step log records the own-scope accept-list (no peer subtree)", async () => {
     const { ports } = makeFakes({});
     const res = await joinNetwork("metafactory", LOCAL, ports);
 
@@ -1400,7 +1406,7 @@ describe("P2 #1087 accept_subjects derivation", () => {
       res.steps.some(
         (s) =>
           s.includes("federated.andreas.meta-factory.>") &&
-          s.includes("federated.jc.sage-host.agent.>"),
+          !s.includes("federated.jc.sage-host.agent.>"),
       ),
     ).toBe(true);
   });
@@ -1428,6 +1434,33 @@ describe("P2 #1087 accept_subjects derivation", () => {
     expect(net.accept_subjects).toEqual(["federated.andreas.meta-factory.>"]);
   });
 
+  test("validate-before-write REFUSES a merged config with an out-of-scope subject, does NOT write (#1220)", async () => {
+    // A stale entry a PRE-FIX join left behind: an OTHER network whose accept-list
+    // carries a peer PRESENCE subtree — OUT of andreas/meta-factory's own scope, so
+    // it would fail the daemon boot validator (the exact #1220 failure mode).
+    const staleBad: PolicyFederatedNetwork = {
+      id: "othernet",
+      leaf_node: "othernet",
+      peers: [],
+      accept_subjects: ["federated.jc.sage-host.agent.>"], // out of own scope
+      deny_subjects: [],
+      announce_capabilities: [],
+      max_hop: 1,
+    };
+    const { ports, storeRef } = makeFakes({ initialNetworks: [staleBad] });
+
+    const res = await joinNetwork("metafactory", LOCAL, ports);
+
+    // Refused BEFORE the config write: the reason names the offending subject +
+    // the fix, and the store is untouched (no partial write, no new entry).
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("refusing to write policy.federated.networks");
+    expect(res.reason).toContain("federated.jc.sage-host.agent.>");
+    expect(res.reason).toContain("#1220");
+    expect(storeRef.networks).toEqual([staleBad]);
+    expect(storeRef.networks.some((n) => n.id === "metafactory")).toBe(false);
+  });
+
   test("first-join empty roster → OWN-only accept-list (pre-P2 behaviour preserved)", async () => {
     const { ports, storeRef } = makeFakes({
       fetch: {
@@ -1444,6 +1477,96 @@ describe("P2 #1087 accept_subjects derivation", () => {
     expect(res.ok).toBe(true);
     const net = storeRef.networks.find((n) => n.id === "metafactory")!;
     expect(net.accept_subjects).toEqual(["federated.andreas.meta-factory.>"]);
+  });
+});
+
+// =============================================================================
+// cortex#1220 review blocker — join ENABLES the reconciler on a fresh join and
+// PRESERVES an operator's explicit choice on a re-join. Without this, narrowing
+// persisted accept_subjects to own-scope (above) admits ZERO peer presence,
+// because the reconciler that re-derives own ∪ peer in-memory is per-network
+// opt-in, default OFF — a silent in=0 regression.
+// =============================================================================
+
+describe("#1220 reconcile — join enables + preserves so peer presence is admitted", () => {
+  test("FRESH join → writes reconcile.enabled=true (reconciler is load-bearing post-#1220)", async () => {
+    // No initial networks — first join. The written entry must opt this network
+    // into the reconciler, else own-scope-only accept_subjects admit no peers.
+    const { ports, storeRef } = makeFakes({});
+    const res = await joinNetwork("metafactory", LOCAL, ports);
+
+    expect(res.ok).toBe(true);
+    const net = storeRef.networks.find((n) => n.id === "metafactory")!;
+    expect(net.reconcile).toBeDefined();
+    expect(net.reconcile!.enabled).toBe(true);
+    // Fresh enable is not an operator override, so no disabled-WARN.
+    expect((res.warnings ?? []).some((w) => w.includes("reconcile.enabled=false"))).toBe(false);
+  });
+
+  test("legacy re-join (prior entry has NO reconcile block) → self-heals to enabled=true", async () => {
+    // handPinnedNetwork carries no reconcile block (a pre-this-PR entry). A re-join
+    // upgrades it to enabled=true — the desired heal for existing deployments
+    // stuck in silent in=0. This is NOT overriding an explicit choice (none exists).
+    const { ports, storeRef } = makeFakes({
+      initialNetworks: [handPinnedNetwork("metafactory")],
+    });
+    const res = await joinNetwork("metafactory", LOCAL, ports);
+
+    expect(res.ok).toBe(true);
+    const net = storeRef.networks.find((n) => n.id === "metafactory")!;
+    expect(net.reconcile!.enabled).toBe(true);
+  });
+
+  test("RE-join PRESERVES an explicit reconcile.enabled=false (never forced true) + loud WARN", async () => {
+    // An operator deliberately disabled the reconciler for this network. A re-join
+    // must NOT silently re-enable it — but MUST warn that peer presence won't be
+    // admitted while it stays off (the silent in=0 mode, now announced).
+    const disabled: PolicyFederatedNetwork = {
+      ...handPinnedNetwork("metafactory"),
+      reconcile: { enabled: false, interval_ms: 60000 },
+    };
+    const { ports, storeRef } = makeFakes({ initialNetworks: [disabled] });
+    const res = await joinNetwork("metafactory", LOCAL, ports);
+
+    expect(res.ok).toBe(true);
+    const net = storeRef.networks.find((n) => n.id === "metafactory")!;
+    // Preserved verbatim — the explicit false SURVIVES the re-join.
+    expect(net.reconcile!.enabled).toBe(false);
+    // Loud, principal-visible WARN: both the warnings array and the step log.
+    expect(res.warnings).toBeDefined();
+    expect(res.warnings!.some((w) => w.includes("reconcile.enabled=false PRESERVED"))).toBe(true);
+    expect(
+      res.steps.some((s) => s.startsWith("WARN:") && s.includes("will NOT admit peer presence")),
+    ).toBe(true);
+  });
+
+  test("RE-join PRESERVES an explicit reconcile.enabled=true (no disabled-WARN)", async () => {
+    // A network already opted in stays opted in, verbatim, and does not trip the
+    // disabled-WARN. Also pins a non-default interval to prove verbatim carry.
+    const enabled: PolicyFederatedNetwork = {
+      ...handPinnedNetwork("metafactory"),
+      reconcile: { enabled: true, interval_ms: 30000 },
+    };
+    const { ports, storeRef } = makeFakes({ initialNetworks: [enabled] });
+    const res = await joinNetwork("metafactory", LOCAL, ports);
+
+    expect(res.ok).toBe(true);
+    const net = storeRef.networks.find((n) => n.id === "metafactory")!;
+    expect(net.reconcile).toEqual({ enabled: true, interval_ms: 30000 });
+    expect((res.warnings ?? []).some((w) => w.includes("reconcile.enabled=false"))).toBe(false);
+  });
+
+  test("enabling reconcile keeps the write boot-valid — own-scope accept_subjects unchanged", async () => {
+    // The reconcile field is orthogonal to the accept-list scope guard: adding it
+    // must not perturb the own-scope-only accept_subjects the validate-before-write
+    // gate requires (#1220). Fresh join → own-scope only AND reconcile enabled.
+    const { ports, storeRef } = makeFakes({});
+    const res = await joinNetwork("metafactory", LOCAL, ports);
+
+    expect(res.ok).toBe(true);
+    const net = storeRef.networks.find((n) => n.id === "metafactory")!;
+    expect(net.accept_subjects).toEqual(["federated.andreas.meta-factory.>"]);
+    expect(net.reconcile!.enabled).toBe(true);
   });
 });
 
