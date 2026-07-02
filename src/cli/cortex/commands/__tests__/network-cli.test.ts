@@ -16,7 +16,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { dispatchNetwork } from "../network";
+import { dispatchNetwork, joinBlockerMessage, shouldReplaceCredsPreflightError } from "../network";
+import type { OwnAdmissionState } from "../../../../common/registry/admission-state";
 import type { LoadedConfig } from "../../../../common/config/loader";
 import type { AgentConfig } from "../../../../common/types/config";
 
@@ -610,5 +611,132 @@ describe("leave public", () => {
     ], EMPTY_READER);
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toContain("nothing to do");
+  });
+});
+
+// =============================================================================
+// C-1315 — joinBlockerMessage: the actionable admission-state message that
+// REPLACES the misleading legacy `.creds not found (#821)` preflight on a
+// Model-B join with no resolved leaf secret.
+// =============================================================================
+
+describe("joinBlockerMessage (C-1315)", () => {
+  const NET = "metafactory";
+  function st(over: Partial<OwnAdmissionState>): OwnAdmissionState {
+    return {
+      state: over.state ?? "pending",
+      networkId: NET,
+      hasSealedSecret: over.hasSealedSecret ?? false,
+      peerPubkey: over.peerPubkey ?? "PUBKEY==",
+      ...(over.requestId !== undefined && { requestId: over.requestId }),
+    };
+  }
+
+  test("no-row → 'register first', names the network, NOT a .creds fix", () => {
+    const m = joinBlockerMessage(NET, st({ state: "no-row" }));
+    expect(m).toContain("no admission request exists");
+    expect(m).toContain(NET);
+    expect(m).toContain("register");
+    expect(m).toContain(".creds file is NOT the fix");
+  });
+
+  test("pending → surfaces the request-id + admit command", () => {
+    const m = joinBlockerMessage(NET, st({ state: "pending", requestId: "req-9" }));
+    expect(m).toContain("PENDING");
+    expect(m).toContain("req-9");
+    expect(m).toContain("cortex network admit req-9 --apply");
+  });
+
+  test("admitted-unsealed → tells the admin to seal (add-member <net> <pubkey>)", () => {
+    const m = joinBlockerMessage(NET, st({ state: "admitted-unsealed", requestId: "r", peerPubkey: "PK==" }));
+    expect(m).toContain("ADMITTED");
+    expect(m).toContain("cortex network secret add-member metafactory PK== --apply");
+    expect(m).toContain("auto-fetches");
+  });
+
+  test("admitted-sealed (open failed) → wrong-pubkey / re-seal guidance", () => {
+    const m = joinBlockerMessage(NET, st({ state: "admitted-sealed", hasSealedSecret: true, peerPubkey: "PK==" }));
+    expect(m).toContain("could not open it");
+    expect(m).toContain("PK==");
+  });
+
+  test("revoked / rejected → their own messages", () => {
+    expect(joinBlockerMessage(NET, st({ state: "revoked", requestId: "r" }))).toContain("REVOKED");
+    expect(joinBlockerMessage(NET, st({ state: "rejected", requestId: "r" }))).toContain("REJECTED");
+  });
+
+  test("unknown status → undefined (keep the original error)", () => {
+    expect(joinBlockerMessage(NET, st({ state: "unknown" }))).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// C-1315 (review major, #1397) — shouldReplaceCredsPreflightError: the #821
+// creds-preflight error is rewritten to the Model-B admission message ONLY on
+// the Model-B no-secret path, and NEVER on an explicit `--creds` / `--leaf-
+// secret` join or a non-#821 failure.
+// =============================================================================
+
+describe("shouldReplaceCredsPreflightError (C-1315 #821 guard, #1397)", () => {
+  const CREDS_821 =
+    "leaf creds file not found at /tmp/typo.creds — refusing to render a leaf remote " +
+    "that cannot authenticate to the hub. Set stack.nats_infra.creds_path (or pass --creds) " +
+    "to an existing .creds file (cortex#821).";
+
+  test("Model-B no-secret path (no --creds, no leaf secret, #821) → replace", () => {
+    expect(
+      shouldReplaceCredsPreflightError({
+        joinOk: false,
+        resolvedLeafSecret: undefined,
+        explicitCredsFlag: undefined,
+        reason: CREDS_821,
+      }),
+    ).toBe(true);
+  });
+
+  test("explicit --creds <bad-path> join → KEEP the original creds-not-found error (NOT the Model-B rewrite)", () => {
+    // The review-major regression: a user who opted into creds-file auth and
+    // typo'd the path must see the genuine error, never "a .creds file is NOT the fix".
+    expect(
+      shouldReplaceCredsPreflightError({
+        joinOk: false,
+        resolvedLeafSecret: undefined,
+        explicitCredsFlag: "/tmp/typo.creds",
+        reason: CREDS_821,
+      }),
+    ).toBe(false);
+  });
+
+  test("explicit --leaf-secret join (leaf secret resolved) → keep original", () => {
+    expect(
+      shouldReplaceCredsPreflightError({
+        joinOk: false,
+        resolvedLeafSecret: "SECRET",
+        explicitCredsFlag: undefined,
+        reason: CREDS_821,
+      }),
+    ).toBe(false);
+  });
+
+  test("a non-#821 failure → keep original (marker absent)", () => {
+    expect(
+      shouldReplaceCredsPreflightError({
+        joinOk: false,
+        resolvedLeafSecret: undefined,
+        explicitCredsFlag: undefined,
+        reason: "some other join failure",
+      }),
+    ).toBe(false);
+  });
+
+  test("a successful join → never replace", () => {
+    expect(
+      shouldReplaceCredsPreflightError({
+        joinOk: true,
+        resolvedLeafSecret: undefined,
+        explicitCredsFlag: undefined,
+        reason: CREDS_821,
+      }),
+    ).toBe(false);
   });
 });
