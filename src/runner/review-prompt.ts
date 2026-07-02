@@ -1,28 +1,62 @@
 import type { ReviewFlavor, ReviewRequestPayload } from "../bus/review-events";
 
 /**
- * Map a review `<flavor>` to the CodeReview skill lens that runs as the
- * PRIMARY lens for the review (compass#89 drift-1 fix). The flavor is the
+ * Map a review `<flavor>` to the CodeReview skill **workflow** that the reviewer
+ * is contractually instructed to invoke (compass#96 F3). The flavor is the
  * routing authority carried on the `tasks.code-review.<flavor>` subject and
  * stamped onto the payload by the review consumer.
  *
- * The mapping is deliberately small and total: only `security` and
- * `confidentiality` name a dedicated primary lens; every other flavor
- * (`typescript`, `python`, `generic`, …) and an unstamped payload
- * (`flavor === undefined`, e.g. legacy callers) fall through to the
- * full-coverage `FullReview` lens. The full flavor→workflow catalog
- * (`hardening`→HardeningReview, `skill-quality`→SkillReview, …) is F3's
- * scope (compass#96); this map is the minimum that makes the two shipped
- * dedicated lenses reachable and pins drift-1 shut.
+ * The mapping is deliberately small and total, and is the render of the
+ * authoritative catalog table in `src/common/types/review-flavors.ts`:
+ *   - `security`      → `SecurityReview`
+ *   - `hardening`     → `HardeningReview`
+ *   - `skill-quality` → `SkillReview`
+ *   - `confidentiality` → `FullReview` (the always-on §4 L3 exposure block already
+ *     makes the Confidentiality lens primary on every review — compass#96 F3
+ *     decision: no separate ConfidentialityReview workflow)
+ *   - every language flavor (`typescript`, `python`, `generic`, …) and an
+ *     unstamped payload (`flavor === undefined`, e.g. legacy callers) →
+ *     `FullReview` (full-coverage; the language is the emphasis, not a workflow).
+ *
+ * This SUPERSEDES compass#89's `lensForFlavor` (which named a primary *lens*):
+ * F3 promotes the directive from "run lens X" to "invoke workflow X", so the
+ * reviewer runs the actual CodeReview skill workflow rather than a prose gesture
+ * at a lens.
+ *
+ * GENUINELY exhaustive over `ReviewFlavor | undefined`: every flavor (and the
+ * unstamped `undefined`) is an EXPLICIT case, and the `default` branch pins
+ * `flavor` to `never`. Adding a 12th flavor to `REVIEW_FLAVORS` without a case
+ * here stops compiling (the `never` assignment fails) — the compiler forces the
+ * choice rather than letting a new flavor silently fall through to FullReview.
  */
-export function lensForFlavor(flavor: ReviewFlavor | undefined): string {
+export function workflowForFlavor(flavor: ReviewFlavor | undefined): string {
   switch (flavor) {
     case "security":
-      return "Security";
+      return "SecurityReview";
+    case "hardening":
+      return "HardeningReview";
+    case "skill-quality":
+      return "SkillReview";
+    // Full-coverage review — the language/generic/docs/confidentiality flavors
+    // carry their emphasis as a lens INSIDE FullReview, not a distinct workflow;
+    // `confidentiality` runs FullReview because the always-on §4 L3 exposure
+    // block already makes its lens primary. `undefined` = legacy/unstamped.
+    case undefined:
+    case "generic":
+    case "typescript":
+    case "python":
+    case "rust":
+    case "go":
+    case "sql":
+    case "docs":
     case "confidentiality":
-      return "Confidentiality";
-    default:
       return "FullReview";
+    default: {
+      // Compile-time exhaustiveness guard (repo idiom, cf. src/renderers/index.ts):
+      // if `flavor` is not `never` here, a REVIEW_FLAVORS entry lacks a case above.
+      const _exhaustive: never = flavor;
+      throw new Error(`unreachable review flavor: ${String(_exhaustive)}`);
+    }
   }
 }
 
@@ -82,12 +116,17 @@ export function buildReviewPrompt(payload: ReviewRequestPayload): string {
         '`github_review_id` as `0` and `github_review_url` as `""`.',
       ].join(" ");
 
-  // drift-1 fix (compass#89): the flavor stamped onto the payload selects the
-  // PRIMARY lens. Before this the flavor never reached the prompt, so every
-  // flavor produced a byte-identical review (the flavor-inert SEV-1).
-  const lens = lensForFlavor(payload.flavor);
+  // compass#96 F3 — the flavor stamped onto the payload selects the CodeReview
+  // skill WORKFLOW the reviewer must invoke. This is a CONTRACTUAL invocation
+  // (run this workflow), not a prose gesture at a lens — the reviewer's own
+  // `allowedSkills: ['code-review']` pin (buildReviewSessionOpts) makes the
+  // Skill tool available for it. Supersedes compass#89's primary-lens directive;
+  // the flavor still reaches the prompt, so flavors stay non-identical (drift-1
+  // remains pinned shut).
+  const workflow = workflowForFlavor(payload.flavor);
   const lensDirective =
-    `Run the CodeReview skill's **${lens}** lens as the primary lens for this review.`;
+    `Invoke the CodeReview skill — **${workflow}** workflow — then emit the ` +
+    `verdict block below.`;
 
   // ALWAYS-ON exposure + confidentiality instruction — appended for EVERY
   // flavor (design-software-factory-confidentiality.md §4 L3: "Confidentiality
