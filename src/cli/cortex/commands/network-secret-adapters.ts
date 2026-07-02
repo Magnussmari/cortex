@@ -3,11 +3,27 @@
  *
  * The real side effects the orchestrator (`network-secret-lib.ts`) depends on:
  *   - HUB-LOCAL: read/write the hub nats-server config (chmod 600 — it carries
- *     leaf secrets) + reload it (`nats-server --signal reload`, SIGHUP — an
- *     in-place authorization reload, no restart). A `-c <conf> -t` syntax gate
- *     runs first so a malformed config never reaches a live reload.
+ *     leaf secrets) + reload it (SIGHUP — an in-place authorization reload, no
+ *     restart). A `-c <conf> -t` syntax gate runs first so a malformed config
+ *     never reaches a live reload.
  *   - REGISTRY: the admin-signed admission-row LOOKUP + the hub-admin-signed
  *     sealed-secret delivery / revoke POSTs.
+ *
+ * #1317 — the reload targets the SPECIFIC hub process that serves THIS config,
+ * never a bare `nats-server --signal reload` (which refuses the moment >1
+ * nats-server runs locally — the normal multi-stack state). Resolution order:
+ * the config's `pid_file` (preferred — the server's self-report); otherwise the
+ * running nats-server whose argv loads this config path.
+ *
+ * #1396 (trust-path) — a resolved PID is NOT signalled blind. A `pid_file`
+ * survives a crash / `kill -9` and its PID can recycle onto an innocent process,
+ * and the enumerate→signal step has a TOCTOU window; so immediately before the
+ * SIGHUP we re-read the target PID's LIVE argv (`ps -p <pid> -o command=`) and
+ * refuse unless it is still a nats-server loading THIS config
+ * ({@link argvIsNatsServerForConfig}). The signal is a raw `process.kill(pid,
+ * "SIGHUP")` — the argv re-check, not a nats-aware `--signal reload=<pid>` form,
+ * is the safety. See {@link file://../../../common/nats/hub-reload-target.ts}
+ * for the pure core + the argv predicate.
  *
  * These are ONLY constructed on a real `--apply` (or dry-run, which still reads).
  * The orchestrator gates every MUTATION on `apply`, so the live mutating methods
@@ -15,12 +31,20 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, chmodSync, renameSync } from "fs";
+import { resolve as resolvePath } from "path";
 
 import { expandTilde } from "../../../common/config/loader";
 import { enforceChmod600 } from "../../../common/config/file-permissions";
 import { canonicalJSON } from "../../../common/registry/signing";
 import { sealToPrincipal } from "../../../common/crypto/seal-to-principal";
 import { mintLeafPsk } from "../../../common/nats/leaf-psk";
+import {
+  readPidFileDirective,
+  resolveHubReloadTarget,
+  argvIsNatsServerForConfig,
+  isNatsServerCommand,
+  type NatsProcess,
+} from "../../../common/nats/hub-reload-target";
 import {
   signClaimWithSeed,
   randomNonce,
@@ -35,6 +59,62 @@ import type {
   SecretCrypto,
 } from "./network-secret-ports";
 
+/**
+ * Enumerate the running nats-server processes (pid + full command line). Used to
+ * find the process serving a given hub config when no `pid_file` is declared.
+ * Injected so tests assert reload-targeting without spawning `ps`.
+ */
+export type NatsProcessLister = () => Promise<NatsProcess[]>;
+
+/** Send `signal` (e.g. "SIGHUP") to `pid`. Injected so tests don't kill PIDs. */
+export type SignalSender = (pid: number, signal: NodeJS.Signals) => void;
+
+/**
+ * Read the full command line (argv joined) of a SINGLE running PID, or undefined
+ * when the PID is not alive / not readable. Used for the pre-signal argv re-check
+ * (#1396). Injected so the trust-path re-check is testable without real processes.
+ */
+export type NatsProcessInspector = (pid: number) => Promise<string | undefined>;
+
+/** Real `ps`-backed process lister: every running nats-server with its argv. */
+export const bunNatsProcessLister: NatsProcessLister = async () => {
+  // `ps -axww -o pid=,command=` — no header, unlimited-width command column so a
+  // long `-c <path>` is never truncated. Filter to nats-server invocations.
+  const proc = Bun.spawn(["ps", "-axww", "-o", "pid=,command="], { stdout: "pipe", stderr: "pipe" });
+  await proc.exited;
+  const out = await new Response(proc.stdout).text();
+  const procs: NatsProcess[] = [];
+  for (const line of out.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    const sp = trimmed.indexOf(" ");
+    if (sp < 0) continue;
+    const pid = Number.parseInt(trimmed.slice(0, sp), 10);
+    const command = trimmed.slice(sp + 1).trim();
+    if (!Number.isInteger(pid)) continue;
+    // Match the nats-server binary at the head of the command (path-tolerant) —
+    // the ONE definition lives in the pure core, reused by the argv re-check.
+    if (isNatsServerCommand(command)) procs.push({ pid, command });
+  }
+  return procs;
+};
+
+/**
+ * Real `ps -p <pid> -o command=`-backed inspector: the live argv of one PID.
+ * Empty output / non-zero exit (no such process) → undefined. Portable across
+ * macOS + Linux; `/proc/<pid>/cmdline` would be a Linux-only alternative.
+ */
+export const bunNatsProcessInspector: NatsProcessInspector = async (pid) => {
+  const proc = Bun.spawn(["ps", "-p", pid.toString(), "-o", "command="], { stdout: "pipe", stderr: "pipe" });
+  await proc.exited;
+  if (proc.exitCode !== 0) return undefined; // no such process
+  const out = (await new Response(proc.stdout).text()).trim();
+  return out === "" ? undefined : out;
+};
+
+/** Real `process.kill`-backed signal sender. */
+export const bunSignalSender: SignalSender = (pid, signal) => process.kill(pid, signal);
+
 export interface LiveSecretPortsConfig {
   /** The hub nats-server config path (carries the leaf authorization users). */
   hubConfigPath: string;
@@ -44,6 +124,12 @@ export interface LiveSecretPortsConfig {
   material: StackIdentityMaterial;
   /** Injectable exec runner (tests). Production omits → bunExecRunner. */
   exec?: ExecRunner;
+  /** Injectable nats-server process lister (tests). Production omits → ps-backed. */
+  psLister?: NatsProcessLister;
+  /** Injectable per-PID argv inspector (tests). Production omits → `ps -p`-backed. */
+  inspect?: NatsProcessInspector;
+  /** Injectable signal sender (tests). Production omits → process.kill. */
+  signal?: SignalSender;
   /** Injectable fetch (tests). Production omits → globalThis.fetch. */
   fetchImpl?: typeof globalThis.fetch;
 }
@@ -65,6 +151,9 @@ export function buildLiveSecretPorts(cfg: LiveSecretPortsConfig): NetworkSecretP
 function buildLiveHubAuthPort(cfg: LiveSecretPortsConfig): HubAuthPort {
   const confPath = expandTilde(cfg.hubConfigPath);
   const exec = cfg.exec ?? bunExecRunner;
+  const psLister = cfg.psLister ?? bunNatsProcessLister;
+  const inspectProcess = cfg.inspect ?? bunNatsProcessInspector;
+  const sendSignal = cfg.signal ?? bunSignalSender;
   return {
     confPath,
     readConf(): Promise<string> {
@@ -99,13 +188,85 @@ function buildLiveHubAuthPort(cfg: LiveSecretPortsConfig): HubAuthPort {
           `cortex network secret: skipping nats-server -t gate (could not run nats-server: ${err instanceof Error ? err.message : String(err)})\n`,
         );
       }
-      // SIGHUP reload — nats-server applies authorization changes in place.
-      const reload = await exec(["nats-server", "--signal", "reload"]);
-      if (reload.code !== 0) {
-        throw new Error(`nats-server --signal reload exited ${reload.code.toString()}: ${reload.stderr.trim()}`);
+
+      // #1317 — reload the SPECIFIC hub that serves THIS config, never a bare
+      // `nats-server --signal reload` (it refuses when >1 nats-server runs —
+      // the normal multi-stack state). Prefer the config's `pid_file`; else
+      // match the running nats-server whose argv loads this config path.
+      const pidFromPidFile = readPidFromHubConfig(confPath);
+      let processes: NatsProcess[] = [];
+      if (pidFromPidFile === undefined) {
+        // Only enumerate when we have to (no pid_file to lean on).
+        processes = await psLister();
+      }
+      const targetRes = resolveHubReloadTarget(confPath, pidFromPidFile, processes);
+      if (!targetRes.ok) {
+        throw new Error(`could not target the hub reload: ${targetRes.reason}`);
+      }
+
+      // #1396 trust-path — NEVER signal an unverified PID. Whether the target came
+      // from the pid_file (which survives a crash/`kill -9` and can point at a
+      // recycled, unrelated PID) or from config-match (a sub-ms enumerate→signal
+      // TOCTOU window), re-read its LIVE argv HERE, immediately before the SIGHUP,
+      // and refuse unless it is still a nats-server loading THIS config. SIGHUP's
+      // default disposition is TERMINATE, so an unverified signal could kill an
+      // innocent process. Both paths funnel through the ONE argv predicate.
+      const { pid, via } = targetRes.target;
+      const liveArgv = await inspectProcess(pid);
+      if (liveArgv === undefined || !argvIsNatsServerForConfig(liveArgv, confPath)) {
+        throw new Error(
+          `refusing to SIGHUP pid ${pid.toString()} (resolved via ${via}): its live argv is not a ` +
+            `nats-server serving ${resolvePath(confPath)} — argv: ${liveArgv ?? "<no such process>"}. ` +
+            (via === "pid_file"
+              ? `The pid_file is likely STALE (the hub crashed and this PID was recycled onto another process). ` +
+                `Remove the stale pid_file or restart the hub, then retry.`
+              : `The hub likely exited between enumeration and reload. Restart it, then retry.`),
+        );
+      }
+
+      // SIGHUP — nats-server applies authorization changes in place, no restart.
+      try {
+        sendSignal(pid, "SIGHUP");
+      } catch (err) {
+        throw new Error(
+          `SIGHUP to hub nats-server pid ${pid.toString()} ` +
+            `(resolved via ${via}) failed: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
       }
     },
   };
+}
+
+/**
+ * If the hub config at `confPath` declares a `pid_file`, read the PID it holds.
+ * Returns `undefined` when no `pid_file` is declared OR the file is absent /
+ * unreadable / malformed — the caller then falls back to config-path matching.
+ */
+function readPidFromHubConfig(confPath: string): number | undefined {
+  let confText: string;
+  try {
+    confText = readFileSync(confPath, "utf-8");
+  } catch (_err) {
+    // The conf was just written by the orchestrator; an unreadable read here is
+    // unexpected but non-fatal — fall back to process matching.
+    return undefined;
+  }
+  const declared = readPidFileDirective(confText);
+  if (declared === undefined) return undefined;
+  const pidPath = expandTilde(declared);
+  if (!existsSync(pidPath)) return undefined;
+  let raw: string;
+  try {
+    raw = readFileSync(pidPath, "utf-8").trim();
+  } catch (err) {
+    process.stderr.write(
+      `cortex network secret: pid_file ${pidPath} declared but unreadable (${err instanceof Error ? err.message : String(err)}); falling back to process match\n`,
+    );
+    return undefined;
+  }
+  const pid = Number.parseInt(raw, 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 // ---------------------------------------------------------------------------
