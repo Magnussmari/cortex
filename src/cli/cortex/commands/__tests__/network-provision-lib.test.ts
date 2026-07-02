@@ -330,7 +330,7 @@ describe("provisionStack — cortex#1265 operator-mode JWT export", () => {
 
   test("a generic SYS export failure also FAILS provision before the config write", async () => {
     const { ports, calls, written } = makePorts({
-      export: { exportSystem: async () => ({ ok: false, reason: "arc dependency unmet" }) },
+      export: { exportSystem: async () => ({ ok: false, reason: "arc dependency unmet", notFound: false }) },
     });
     const res = await provisionStack(baseInputs({ apply: true }), ports);
     expect(res.ok).toBe(false);

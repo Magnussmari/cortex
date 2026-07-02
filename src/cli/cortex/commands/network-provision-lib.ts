@@ -161,8 +161,11 @@ export interface OperatorModeExportPort {
   >;
   /**
    * `arc nats export-system --name <name> --json` → SYS account pubkey + JWT.
-   * `notFound` distinguishes "no SYS account exists" (a clean skip — SYS is
-   * optional, `nsc add operator` does not mint one) from a real arc failure.
+   * `notFound` distinguishes "no SYS account exists" from a real arc failure.
+   * Since cortex#1333, provision ensures SYS at step 3.5 before this export, so a
+   * `notFound` here is an arc operator-store inconsistency (NOT a benign skip):
+   * the caller hard-fails on either result to avoid persisting a JetStream stack
+   * config without a `system_account`.
    */
   exportSystem(opts: { name: string }): Promise<
     { ok: true; pubKey: string; jwt: string } | { ok: false; reason: string; notFound: boolean }
@@ -211,7 +214,11 @@ export interface ProvisionInputs {
   operatorName: string;
   federationAccountName: string;
   agentsAccountName: string;
-  /** cortex#1265 — the SYS (system) account name to best-effort export (default "SYS"). */
+  /**
+   * The SYS (system) account name (default "SYS"). Since cortex#1333 provision
+   * ensures it (step 3.5) and hard-requires its export (step 5.6) — no longer a
+   * best-effort/optional export, as JetStream operator-mode fatals without it.
+   */
   systemAccountName: string;
   /** `stack.nkey_seed_path` — where the signing seed is / will be written. */
   seedPath: string;
@@ -495,10 +502,23 @@ export async function provisionStack(
   if (sysConfigMissingOrForced) {
     const sysRes = await ports.export.exportSystem({ name: inputs.systemAccountName });
     if (!sysRes.ok) {
+      // A failed SYS export is fatal: SYS was ensured at step 3.5, so not-found
+      // means an arc operator-store inconsistency, and any failure leaves config
+      // without system_account — a JetStream stack then boot-fatals ("system
+      // account not setup") at first start while provision claimed success. Fail
+      // loudly, with the remediation, BEFORE the config write (step 6) so no
+      // short/misleading config is persisted.
       const why = sysRes.notFound
         ? `${inputs.systemAccountName} not found at export despite the step-3.5 ensure (arc store inconsistency)`
         : `system export failed: ${sysRes.reason}`;
-      return fail(plan, steps, `${why} — system_account not written; aborting before config write`);
+      return fail(
+        plan,
+        steps,
+        `${why} — system_account NOT written (a JetStream stack would boot-fatal at first start); ` +
+          `aborting before config write. Remediation: re-run \`cortex network provision\`; if it persists, ` +
+          `inspect the store with \`arc nats export-system --name ${inputs.systemAccountName} --json\` and ` +
+          `repair the operator account tree.`,
+      );
     }
     systemAccount = sysRes.pubKey;
     systemAccountJwt = sysRes.jwt;
