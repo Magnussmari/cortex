@@ -46,7 +46,10 @@ function makePorts(overrides?: {
     },
     addAccount: async ({ name }) => {
       calls.push(`add-account:${name}`);
-      const pubKey = name.endsWith("_AGENTS") ? AGENTS_PUB : FED_PUB;
+      let pubKey: string;
+      if (name.endsWith("_AGENTS")) pubKey = AGENTS_PUB;
+      else if (name === "SYS") pubKey = SYS_PUB;
+      else pubKey = FED_PUB;
       return { ok: true, account: name, pubKey, created: true, alreadyExisted: false };
     },
     ...overrides?.operator,
@@ -115,6 +118,7 @@ function baseInputs(over?: Partial<ProvisionInputs>, state?: Partial<ProvisionSt
     state: {
       federationAccount: undefined,
       agentsAccount: undefined,
+      systemAccount: undefined,
       signingSeedExists: false,
       operatorModeJwtsPresent: false,
       ...state,
@@ -156,20 +160,21 @@ describe("deriveProvisionNames", () => {
 });
 
 describe("buildProvisionPlan", () => {
-  test("empty stack → 4 ensure actions (operator + 2 accounts + signing) + 2 wire steps", () => {
+  test("empty stack → 5 ensure actions (operator + 3 accounts + signing) + 2 wire steps", () => {
     const plan = buildProvisionPlan(baseInputs());
     const mintLike = plan.filter((p) => p.status === "mint" || p.status === "generate");
     expect(mintLike.map((p) => p.step)).toEqual([
       "nsc operator",
       "federation account",
       "agents account",
+      "system account",
       "signing seed",
     ]);
   });
 
   test("fully-provisioned stack → every account/seed step is [ok]", () => {
     const plan = buildProvisionPlan(
-      baseInputs({}, { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, signingSeedExists: true }),
+      baseInputs({}, { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, systemAccount: SYS_PUB, signingSeedExists: true }),
     );
     const mintLike = plan.filter((p) => p.status === "mint" || p.status === "generate");
     expect(mintLike).toEqual([]);
@@ -177,7 +182,7 @@ describe("buildProvisionPlan", () => {
 
   test("partial state: operator+fed present, agents absent → only agents mints", () => {
     const plan = buildProvisionPlan(
-      baseInputs({}, { federationAccount: FED_PUB, agentsAccount: undefined, signingSeedExists: true }),
+      baseInputs({}, { federationAccount: FED_PUB, agentsAccount: undefined, systemAccount: SYS_PUB, signingSeedExists: true }),
     );
     const mintLike = plan.filter((p) => p.status === "mint" || p.status === "generate");
     expect(mintLike.map((p) => p.step)).toEqual(["agents account"]);
@@ -188,7 +193,7 @@ describe("buildProvisionPlan", () => {
       baseInputs({ force: true }, { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, signingSeedExists: true }),
     );
     const mintLike = plan.filter((p) => p.status === "mint" || p.status === "generate");
-    expect(mintLike.length).toBe(4);
+    expect(mintLike.length).toBe(5);
   });
 });
 
@@ -213,6 +218,7 @@ describe("provisionStack — apply on an empty stack", () => {
       "init-operator:OP_ANDREAS",
       "add-account:ANDREAS_RESEARCH_FED",
       "add-account:ANDREAS_RESEARCH_AGENTS",
+      "add-account:SYS",
       "signing-generate:~/.config/nats/andreas-research.seed",
       `wire:${FED_PUB}->${AGENTS_PUB}:apply`,
       // cortex#1265 — the JWT export bridges wiring → config write-back.
@@ -252,7 +258,10 @@ describe("provisionStack — idempotent apply re-run", () => {
   test("fully-provisioned stack → no operator/account/signing mint calls", async () => {
     const { ports, calls } = makePorts({ signing: { exists: () => true } });
     const res = await provisionStack(
-      baseInputs({ apply: true }, { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, signingSeedExists: true }),
+      baseInputs(
+        { apply: true },
+        { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, systemAccount: SYS_PUB, signingSeedExists: true },
+      ),
       ports,
     );
     expect(res.ok).toBe(true);
@@ -304,16 +313,30 @@ describe("provisionStack — cortex#1265 operator-mode JWT export", () => {
     });
   });
 
-  test("an ABSENT SYS account is a clean skip — operator+account still written", async () => {
+  test("SYS missing at export despite ensure → provision FAILS before the config write", async () => {
+    // SYS is ensured at step 3.5 (cortex#1333), so exportSystem reporting it absent
+    // is an arc store inconsistency. Returning ok while the advertised
+    // system_account wiring silently did not happen would mislead the caller —
+    // fail fast, BEFORE the config write (the module's arc-failure invariant).
     const { ports, calls, written } = makePorts({ systemAbsent: true });
     const res = await provisionStack(baseInputs({ apply: true }), ports);
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain("not found at export despite the step-3.5 ensure");
     expect(calls).toContain("export-system:SYS");
-    expect(written[0]).toMatchObject({ operatorJwt: OP_JWT, accountJwt: FED_JWT });
-    // system fields omitted (not clobbered) when SYS is absent.
-    expect(written[0]?.systemAccount).toBeUndefined();
-    expect(written[0]?.systemAccountJwt).toBeUndefined();
-    expect(res.steps.join("\n")).toContain("system_account skipped");
+    // fail-fast: NO config write happened at all.
+    expect(calls).not.toContain("config-write");
+    expect(written).toHaveLength(0);
+  });
+
+  test("a generic SYS export failure also FAILS provision before the config write", async () => {
+    const { ports, calls, written } = makePorts({
+      export: { exportSystem: async () => ({ ok: false, reason: "arc dependency unmet", notFound: false }) },
+    });
+    const res = await provisionStack(baseInputs({ apply: true }), ports);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain("system export failed: arc dependency unmet");
+    expect(calls).not.toContain("config-write");
+    expect(written).toHaveLength(0);
   });
 
   test("idempotent: JWTs already in config → NO export calls (ensure-shaped)", async () => {
@@ -321,13 +344,39 @@ describe("provisionStack — cortex#1265 operator-mode JWT export", () => {
     const res = await provisionStack(
       baseInputs(
         { apply: true },
-        { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, signingSeedExists: true, operatorModeJwtsPresent: true },
+        // a TRULY fully-provisioned stack — system_account present too, else SYS
+        // export must still fire (see the cortex#1335 blocker test below).
+        { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, systemAccount: SYS_PUB, signingSeedExists: true, operatorModeJwtsPresent: true },
       ),
       ports,
     );
     expect(res.ok).toBe(true);
     expect(calls.some((c) => c.startsWith("export-"))).toBe(false);
     expect(res.steps.join("\n")).toContain("operator-mode JWTs present in config (untouched)");
+  });
+
+  test("cortex#1335 blocker: JWTs present but NO system_account → SYS still exported + written", async () => {
+    // An older provisioned stack: operator/account JWTs already in config, but
+    // system_account was never minted. SYS provisioning must NOT be coupled to the
+    // JWT export gate — otherwise apply finishes without writing system_account and
+    // the JetStream boot-fatal survives the "fix".
+    const { ports, calls, written } = makePorts();
+    const res = await provisionStack(
+      baseInputs(
+        { apply: true },
+        { federationAccount: FED_PUB, agentsAccount: AGENTS_PUB, systemAccount: undefined, signingSeedExists: true, operatorModeJwtsPresent: true },
+      ),
+      ports,
+    );
+    expect(res.ok).toBe(true);
+    // operator/account JWT export stays skipped (present, untouched)...
+    expect(calls).not.toContain("export-operator:OP_ANDREAS");
+    expect(res.steps.join("\n")).toContain("operator-mode JWTs present in config (untouched)");
+    // ...but SYS is minted AND exported AND written — the decoupled gate.
+    expect(calls).toContain("add-account:SYS");
+    expect(calls).toContain("export-system:SYS");
+    expect(written[0]?.systemAccount).toBe(SYS_PUB);
+    expect(written[0]?.systemAccountJwt).toBe(SYS_JWT);
   });
 
   test("--force re-exports the JWTs even when already present", async () => {
