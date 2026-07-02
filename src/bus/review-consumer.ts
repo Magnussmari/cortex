@@ -78,6 +78,7 @@ import type { MyelinSubscriber } from "./myelin/subscriber";
 import type { AckDecision } from "./myelin/subscriber";
 import {
   createReviewTaskFailedEvent,
+  isReviewFlavor,
   type DispatchTaskFailedReason,
   type ReviewEventSource,
   type ReviewRequestPayload,
@@ -735,6 +736,28 @@ export class ReviewConsumer {
       return { kind: "term", reason: "payload validation failed" };
     }
 
+    // 2.4. drift-1 fix (compass#89): stamp the review <flavor> onto the payload.
+    //       The flavor is derived from `envelope.type` (via `extractFlavor`
+    //       above), and `type` ∈ myelin `SIGNABLE_FIELDS` — so it is
+    //       signature-covered and tamper-evident under `signing: enforce`. That
+    //       is what makes stamping HERE, before the 2.5 chain-verification gate,
+    //       safe: a downgraded flavor rewrites a signed field, so the gate
+    //       rejects the whole envelope and the tampered value never reaches a
+    //       review. (The flavor comes from the signed `type`, NOT the unsigned
+    //       wire subject — see `extractFlavor`.) The wire payload itself never
+    //       carries flavor. This one assignment threads flavor into EVERY prompt
+    //       builder (`buildReviewPrompt`, the CO-7 `buildUntrustedReviewPrompt`,
+    //       `sage-runner`) with zero signature changes — they all already
+    //       receive `payload`. Without it, `code-review.security` and
+    //       `code-review.typescript` produced a byte-identical prompt (the
+    //       flavor-inert SEV-1). We narrow through `isReviewFlavor` so an
+    //       unknown/off-vocabulary suffix is left unstamped (→ default
+    //       FullReview lens) rather than widening the payload type to a bare
+    //       string.
+    if (isReviewFlavor(flavor)) {
+      payload.flavor = flavor;
+    }
+
     // 2.5. Signature-chain verification gate (cortex#327). Runs after the
     //      cheap structural checks (subject + payload shape) so a
     //      malformed envelope still fails with `cant_do: payload validation`
@@ -1343,11 +1366,18 @@ export function deriveFlavors(capabilities: readonly string[]): string[] {
  * Extract `<flavor>` from a `tasks.code-review.<flavor>` envelope's
  * `type` field. Returns `null` if the envelope isn't a review request.
  *
- * The envelope `type` (NOT the wire subject) is the canonical source —
- * the wire subject includes the namespace prefix (`local.{principal}.`) and a
- * malformed subject would falsely match a partial slice. Pull-mode
- * subjects pass through as-is in NATS but the type field is what the
- * validator-approved envelope carries.
+ * SECURITY — reads `envelope.type` ONLY, never the raw NATS `_subject`.
+ * `type` ∈ myelin `SIGNABLE_FIELDS` (`@the-metafactory/myelin`
+ * `src/identity/canonicalize.ts`), so the derived flavor is
+ * signature-covered and tamper-evident under `signing: enforce`: a peer
+ * that tries to downgrade the lens (e.g. `confidentiality` → `generic`)
+ * must rewrite a signed field, which fails chain verification and is
+ * rejected. **Do NOT "simplify" this to parse the raw NATS subject** — the
+ * subject is UNSIGNED, so parsing it would drop signature coverage and
+ * reopen a silent lens-downgrade attack. (It is also less correct: the wire
+ * subject carries the `local.{principal}.` namespace prefix and a malformed
+ * subject could falsely match a partial slice.) The `_subject` param is
+ * intentionally unused — kept only for call-site signature symmetry.
  */
 export function extractFlavor(envelope: Envelope, _subject: string): string | null {
   const t = envelope.type;

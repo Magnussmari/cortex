@@ -187,6 +187,23 @@ export interface ReviewRequestPayload {
    * backwards compatibility with pre-sage#43 publishers.
    */
   forge?: "github" | "gitlab";
+  /**
+   * The review `<flavor>` for this request — the routing key for the review's
+   * PRIMARY lens (compass#89, drift-1 fix). Derived from `envelope.type`
+   * (`tasks.code-review.<flavor>`), which ∈ myelin `SIGNABLE_FIELDS`, so it is
+   * signature-covered → tamper-evident under `signing: enforce` (a downgraded
+   * flavor rewrites a signed field and fails chain verification). NOT carried
+   * on the wire as a payload field: cortex STAMPS it from the signed
+   * `envelope.type` in the review consumer (via `extractFlavor` — the signed
+   * type, NEVER the unsigned NATS subject) right after
+   * `parseReviewRequestPayload`, so it threads into every prompt builder
+   * (`buildReviewPrompt`, the CO-7 `buildUntrustedReviewPrompt`, `sage-runner`)
+   * with zero signature changes. OPTIONAL for wire back-compat: undefined ⇒ the
+   * default (FullReview) lens. Before this field, `code-review.security` and
+   * `code-review.typescript` produced a BYTE-IDENTICAL prompt — the
+   * flavor-inert SEV-1 this closes.
+   */
+  flavor?: ReviewFlavor;
 }
 
 /** Options for {@link createReviewRequestEvent}. */
@@ -311,6 +328,19 @@ export interface ReviewVerdictPayload {
   };
   /** Total inline comments posted with the review. */
   inline_comments: number;
+  /**
+   * compass#89 (design-software-factory-confidentiality.md §4 L3) —
+   * **machine-checkable execution evidence** that the Confidentiality lens ran
+   * for this review. `true` when the reviewer ran the lens (always-on for an
+   * EXPOSED repo), `false` when it deliberately did not. The autonomous loop
+   * parses this to distinguish a clean confidentiality run from a silent skip.
+   *
+   * OPTIONAL for wire forward-compat: REQUIRED would fail-closed every existing
+   * reviewer and the sage engine (which returns `cant_do` for the flavor and
+   * defers its lens threading to compass#99). Absent ⇒ "lens-ran unknown",
+   * NOT "lens did not run".
+   */
+  confidentiality_lens_ran?: boolean;
   /**
    * cortex#503 — **Presentation markdown.** Deterministic markdown computed
    * by cortex (NOT the reviewing agent) from the structured verdict fields
