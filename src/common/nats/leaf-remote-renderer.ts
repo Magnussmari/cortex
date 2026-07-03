@@ -827,7 +827,7 @@ function hasNonLeafInclude(text: string): boolean {
 export interface OperatorModeLeafPackage {
   /** The NSC operator JWT (`eyJ…`) — the root of the local account tree. */
   operatorJwt: string;
-  /** The issued account public key (nkey-U, `A…`) the leaf binds to. */
+  /** The issued account public key (nkey-U, `A…`) the leaf binds to (FED). */
   account: string;
   /** The issued account's JWT (`eyJ…`) — preloaded under `resolver_preload`. */
   accountJwt: string;
@@ -835,27 +835,137 @@ export interface OperatorModeLeafPackage {
   systemAccount?: string;
   /** OPTIONAL system account JWT — preloaded alongside the issued account. */
   systemAccountJwt?: string;
+  /**
+   * cortex#1480 (join-1, epic #1479) — the stack's own per-stack AGENTS
+   * account (`stack.nats_infra.agents_account`, ADR-0012 isolation),
+   * OPTIONAL. When present (together with {@link
+   * OperatorModeLeafPackage.agentsAccountJwt}), {@link renderOperatorModeBlocks}
+   * preloads it ALONGSIDE the FED account (and SYS, if any) so ONE render
+   * produces a `resolver_preload` carrying every account the stack actually
+   * uses. Closes the gap where a bus's AGENTS account got preloaded (by
+   * make-live's always-run per-account append) while its FED account never
+   * did (historically only rendered on a truly-from-scratch bootstrap) —
+   * producing the "does not define account <FED>" fail-closed on join.
+   * Absent for callers with no AGENTS material (e.g. `cortex network join`,
+   * which only ever needs FED/SYS).
+   */
+  agentsAccount?: string;
+  /**
+   * cortex#1480 — the AGENTS account's JWT, paired with {@link
+   * OperatorModeLeafPackage.agentsAccount}. Required whenever `agentsAccount`
+   * is set (mirrors the {@link OperatorModeLeafPackage.systemAccount} /
+   * {@link OperatorModeLeafPackage.systemAccountJwt} pairing rule).
+   */
+  agentsAccountJwt?: string;
 }
 
 /**
  * The outcome of {@link renderOperatorModeBlocks}:
- *   - `converted` — the config was anonymous; the rendered operator-mode config
- *     is in `conf` (the orchestrator writes it).
+ *   - `converted` — either the config was anonymous (the operator-mode blocks
+ *     were rendered from scratch), OR it was ALREADY operator-mode under this
+ *     package's operator but missing one or more of the accounts the package
+ *     carries (cortex#1480 — those missing accounts were appended into the
+ *     EXISTING `resolver_preload` block). Either way `conf` is what the
+ *     orchestrator writes.
  *   - `already` — the config is ALREADY operator-mode under THIS package's
- *     operator JWT; `conf` is the unchanged bytes (a byte-stable no-op).
- *   - `refuse` — cannot convert: material absent/malformed, OR the config is
- *     already operator-mode under a DIFFERENT operator (never clobber it).
+ *     operator JWT AND already preloads every account the package carries;
+ *     `conf` is the unchanged bytes (a byte-stable no-op).
+ *   - `refuse` — cannot convert: material absent/malformed, the config is
+ *     already operator-mode under a DIFFERENT operator (never clobber it), or
+ *     it is operator-mode with no locatable `resolver_preload { … }` block to
+ *     append a missing account into.
  */
 export type OperatorModeConversion =
   | { status: "converted"; conf: string }
   | { status: "already"; conf: string }
   | { status: "refuse"; reason: string };
 
-/** A marker line so a human reading the converted config knows join wrote it. */
+/** A marker line so a reader of the converted config knows join wrote it. */
 const OPERATOR_MODE_MARKER =
   "// --- operator-mode blocks rendered by cortex network join (O-3, #1053) ---";
 const OPERATOR_MODE_MARKER_END =
   "// --- end operator-mode blocks ---";
+
+/**
+ * cortex#1480 — the shared "an OPTIONAL package account must be well-formed AND
+ * paired with its JWT" validator, used for BOTH the SYS and AGENTS package
+ * accounts (a half-specified account would emit a preload / `system_account`
+ * line the server can't resolve). Absent (undefined/empty) pubkey ⇒ ok (the
+ * account is optional). Extracted so the two rules cannot drift.
+ */
+function validateOptionalPackageAccount(
+  short: "SYS" | "AGENTS",
+  pubkey: string | undefined,
+  jwt: string | undefined,
+): { ok: true } | { ok: false; reason: string } {
+  if (pubkey === undefined || pubkey.length === 0) return { ok: true };
+  const noun = short === "SYS" ? "system account" : "agents account";
+  if (!NKEY_ACCOUNT.test(pubkey)) {
+    return { ok: false, reason: `${noun} ${JSON.stringify(pubkey)} is not an nkey-U account public key` };
+  }
+  if (jwt === undefined || jwt.length === 0 || !JWT_SHAPE.test(jwt)) {
+    return {
+      ok: false,
+      reason:
+        `${short === "SYS" ? "a" : "an"} ${noun} was offered without a valid ${noun} JWT — ` +
+        `\`resolver_preload\` must carry the ${short} account's JWT too.`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * cortex#1480 — true iff `natsConfigText` carries a top-level `system_account:`
+ * directive (comments stripped, so a commented-out one does not count).
+ */
+function hasSystemAccountDirective(natsConfigText: string): boolean {
+  return /^[ \t]*system_account[ \t]*[:=]/m.test(stripConfigComments(natsConfigText));
+}
+
+/**
+ * cortex#1480 — append a top-level `system_account: <pubkey>` directive. The
+ * pubkey is a validated nkey-U (emitted bare, matching the from-scratch render).
+ */
+function appendSystemAccountDirective(natsConfigText: string, sysPubkey: string): string {
+  const base = natsConfigText.replace(/\n+$/, "");
+  return `${base}\nsystem_account: ${sysPubkey}\n`;
+}
+
+/**
+ * Insert `insertion` immediately before the closing brace of the
+ * `resolver_preload { … }` block in `text`. Uses a brace-matched scan so a
+ * nested object inside the block can't confuse the close detection. Returns the
+ * new text, or null when no resolver_preload block is found.
+ *
+ * cortex#1480 (join-1, epic #1479) — lives here (rather than
+ * network-make-live-adapters.ts, its original home) so {@link
+ * renderOperatorModeBlocks} can reuse it PURELY when ENSURING a missing
+ * account into an ALREADY operator-mode config (the "same operator, missing
+ * account" branch) — the same text-splice make-live's `appendAccount` adapter
+ * already used for the AGENTS account, now the single source for BOTH join's
+ * O-3 conversion path and make-live's bootstrap/ensure path.
+ * `network-make-live-adapters.ts` re-exports this name so its existing
+ * importers are unaffected.
+ */
+export function insertIntoResolverPreload(text: string, insertion: string): string | null {
+  const key = /resolver_preload\s*[:=]?\s*\{/.exec(text);
+  if (key === null) return null;
+  const open = key.index + key[0].length - 1; // index of the `{`
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        // Insert before this closing brace (which sits at column 0 of its line).
+        const lineStart = text.lastIndexOf("\n", i) + 1;
+        return text.slice(0, lineStart) + insertion + text.slice(lineStart);
+      }
+    }
+  }
+  return null; // unbalanced braces — refuse to edit
+}
 
 /**
  * Render the SOP §B0.1 operator-mode blocks INTO `currentConf` from a leaf
@@ -864,13 +974,29 @@ const OPERATOR_MODE_MARKER_END =
  * to write the result, then proceeds with the existing leaf-remote render.
  *
  * Conversion rules:
- *   - **anonymous bus + complete package** → `converted`: append the four blocks,
- *     KEEPING the stack's own identity/ports/JS domain verbatim, NOT touching
- *     any `leafnodes`/`include` (the join renders its own per-network leaf).
- *   - **already operator-mode under THIS operator** → `already` (idempotent
- *     no-op: re-running a converted bus must not duplicate or drift).
+ *   - **anonymous bus + complete package** → `converted`: append the four blocks
+ *     (operator + optional system_account + resolver + resolver_preload for
+ *     FED [+ AGENTS, if the package carries one] [+ SYS]), KEEPING the stack's
+ *     own identity/ports/JS domain verbatim, NOT touching any `leafnodes`/
+ *     `include` (the join renders its own per-network leaf).
+ *   - **already operator-mode under THIS operator, every package account
+ *     already preloaded** → `already` (idempotent no-op: re-running a
+ *     converted bus must not duplicate or drift).
+ *   - **already operator-mode under THIS operator, but MISSING one or more of
+ *     the package's accounts** (cortex#1480) → `converted`: append ONLY the
+ *     missing `<pubkey>: <jwt>` entries into the EXISTING `resolver_preload`
+ *     block. This is the fix for the real "does not define account <FED>"
+ *     fail-closed: a bus bootstrapped before its FED account existed (or
+ *     hand-converted carrying only AGENTS) stayed "already operator-mode"
+ *     forever under the old operator-JWT-only check, so FED was never
+ *     preloaded. Presence is checked with {@link natsConfigCanBindAccount} —
+ *     the SAME token-boundary-safe check #794 uses — so a merely-embedded or
+ *     comment-only mention never counts as "already there".
  *   - **already operator-mode under a DIFFERENT operator** → `refuse`: never
  *     clobber a bus standing on someone else's account tree.
+ *   - **already operator-mode under THIS operator but no `resolver_preload`
+ *     block can be located to append a missing account into** → `refuse` with
+ *     an actionable reason (never silently drop the missing account).
  *   - **material absent/malformed** → `refuse` with an actionable reason (this
  *     is the #794 fail-fast, preserved for the genuinely-unconvertible case).
  *
@@ -889,6 +1015,8 @@ export function renderOperatorModeBlocks(
   const accountJwt = pkg.accountJwt.trim();
   const systemAccount = pkg.systemAccount?.trim();
   const systemAccountJwt = pkg.systemAccountJwt?.trim();
+  const agentsAccount = pkg.agentsAccount?.trim();
+  const agentsAccountJwt = pkg.agentsAccountJwt?.trim();
 
   if (operatorJwt.length === 0) {
     return {
@@ -927,40 +1055,93 @@ export function renderOperatorModeBlocks(
         "issued account's JWT (pass --account-jwt or set stack.nats_infra.account_jwt).",
     };
   }
-  // A SYS account is OPTIONAL, but if one is offered it must be well-formed
-  // AND paired with its JWT (a half-specified SYS account would emit a
-  // `system_account` line with no preload → nats-server can't resolve it).
+  // A SYS and an AGENTS account are each OPTIONAL, but if one is offered it must
+  // be well-formed AND paired with its JWT (a half-specified account would emit a
+  // preload / `system_account` line nats-server can't resolve). One shared
+  // validator so the two rules can't drift (cortex#1480).
+  const sysValid = validateOptionalPackageAccount("SYS", systemAccount, systemAccountJwt);
+  if (!sysValid.ok) return { status: "refuse", reason: sysValid.reason };
+  const agentsValid = validateOptionalPackageAccount("AGENTS", agentsAccount, agentsAccountJwt);
+  if (!agentsValid.ok) return { status: "refuse", reason: agentsValid.reason };
+
+  // The accounts THIS package wants preloaded — FED always, AGENTS/SYS when
+  // the package carries them. Shared by BOTH the "already, ensure missing"
+  // branch (2) and the "anonymous, render from scratch" branch (3) below so
+  // the two paths can never preload a different account set.
+  const wantedAccounts: { label: string; pubkey: string; jwt: string }[] = [
+    { label: "FED", pubkey: account, jwt: accountJwt },
+  ];
+  if (agentsAccount !== undefined && agentsAccount.length > 0) {
+    wantedAccounts.push({ label: "AGENTS", pubkey: agentsAccount, jwt: agentsAccountJwt ?? "" });
+  }
   if (systemAccount !== undefined && systemAccount.length > 0) {
-    if (!NKEY_ACCOUNT.test(systemAccount)) {
-      return {
-        status: "refuse",
-        reason: `system account ${JSON.stringify(pkg.systemAccount)} is not an nkey-U account public key`,
-      };
-    }
-    if (
-      systemAccountJwt === undefined ||
-      systemAccountJwt.length === 0 ||
-      !JWT_SHAPE.test(systemAccountJwt)
-    ) {
-      return {
-        status: "refuse",
-        reason:
-          "a system account was offered without a valid system account JWT — " +
-          "`resolver_preload` must carry the SYS account's JWT too.",
-      };
-    }
+    wantedAccounts.push({ label: "SYS", pubkey: systemAccount, jwt: systemAccountJwt ?? "" });
   }
 
-  // 2) Already operator-mode? Decide between idempotent no-op and clobber-refuse.
+  // 2) Already operator-mode? Decide between idempotent no-op, an ENSURE of any
+  // MISSING package account, and a clobber-refuse.
   if (natsConfigHasAccountTree(currentConf)) {
     const stripped = stripConfigComments(currentConf);
     const existingOperatorJwt = /^[ \t]*operator[ \t]*[:=][ \t]*(\S+)/m.exec( // operator-mode block line
       stripped,
     );
-    // SAME operator JWT already present → this package already converted it.
-    // Byte-stable no-op (the orchestrator may skip the write).
     if (existingOperatorJwt?.[1] === operatorJwt) {
-      return { status: "already", conf: currentConf };
+      // SAME operator JWT already present. cortex#1480 — that alone is NOT
+      // sufficient to call it "already done": a bus bootstrapped before its
+      // FED account existed (or hand-converted carrying only AGENTS) is
+      // STILL operator-mode under the SAME operator, yet resolver_preload may
+      // be missing one or more of the accounts THIS package carries. Presence
+      // is checked with natsConfigCanBindAccount — the SAME token-boundary-safe
+      // check #794 uses — so a merely-embedded or comment-only mention never
+      // counts as "present".
+      const missing = wantedAccounts.filter(
+        (w) => !natsConfigCanBindAccount(currentConf, w.pubkey).canBind,
+      );
+      // cortex#1480 — an operator-mode config needs BOTH the SYS account
+      // PRELOADED (resolver_preload) AND a top-level `system_account: <SYS>`
+      // directive naming it: the preload lets nats-server RESOLVE the account,
+      // the directive tells it to USE that account as the system account (the
+      // `docs/config-layout/nats-server.conf.example` template documents both as
+      // required together for a JetStream bus). The from-scratch branch (3) below
+      // emits both, so this ensure-branch must match — otherwise a config that
+      // gains its SYS account here would know the account but never treat it as
+      // the system account. Add the directive idempotently: only when the package
+      // carries a SYS and the config has no `system_account:` directive yet
+      // (never clobber an existing one).
+      const sysDirectiveNeeded =
+        systemAccount !== undefined &&
+        systemAccount.length > 0 &&
+        !hasSystemAccountDirective(currentConf);
+      if (missing.length === 0 && !sysDirectiveNeeded) {
+        // Byte-stable no-op (the orchestrator may skip the write).
+        return { status: "already", conf: currentConf };
+      }
+      let next = currentConf;
+      if (missing.length > 0) {
+        // One terse provenance marker for the whole appended run — this writes
+        // into the caller's LIVE nats config, so no per-line commentary.
+        const insertion =
+          "  // added by cortex network join/make-live (cortex#1480)\n" +
+          missing.map((w) => `  ${w.pubkey}: ${w.jwt}\n`).join("");
+        const inserted = insertIntoResolverPreload(next, insertion);
+        if (inserted === null) {
+          return {
+            status: "refuse",
+            reason:
+              "the nats config is operator-mode under this operator but has no " +
+              "resolver_preload { … } block to add the missing account(s) into " +
+              `(${missing.map((w) => `${w.label} ${w.pubkey}`).join(", ")}) — convert/repair the ` +
+              "bus by hand (docs/sop-stack-onboarding.md §B0.1).",
+          };
+        }
+        next = inserted;
+      }
+      if (sysDirectiveNeeded) {
+        // sysDirectiveNeeded ⇒ systemAccount is defined (TS narrows the aliased
+        // const condition), so no non-null assertion is needed.
+        next = appendSystemAccountDirective(next, systemAccount);
+      }
+      return { status: "converted", conf: next };
     }
     // Operator-mode under a DIFFERENT (or unreadable) operator JWT — NEVER clobber.
     return {
@@ -976,12 +1157,7 @@ export function renderOperatorModeBlocks(
   // We APPEND them (KEEPING the stack's own identity/ports/JS domain verbatim,
   // and never touching any leafnodes/include). The trailing newline of the
   // source config is normalised so the appended block sits on its own lines.
-  const preload: string[] = [
-    `  ${account}: ${accountJwt}`,
-  ];
-  if (systemAccount !== undefined && systemAccount.length > 0) {
-    preload.push(`  ${systemAccount}: ${systemAccountJwt ?? ""}`);
-  }
+  const preload: string[] = wantedAccounts.map((w) => `  ${w.pubkey}: ${w.jwt}`);
 
   const blocks: string[] = [
     OPERATOR_MODE_MARKER,

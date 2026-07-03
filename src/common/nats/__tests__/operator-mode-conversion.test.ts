@@ -29,6 +29,7 @@ import { describe, expect, test } from "bun:test";
 import {
   renderOperatorModeBlocks,
   natsConfigHasAccountTree,
+  natsConfigCanBindAccount,
   type OperatorModeConversion,
   type OperatorModeLeafPackage,
 } from "../leaf-remote-renderer";
@@ -42,6 +43,39 @@ function mustConvert(result: OperatorModeConversion): string {
     );
   }
   return result.conf;
+}
+
+/**
+ * cortex#1480 — INDEPENDENT structural parse of the rendered `resolver_preload
+ * { … }` block: returns the account pubkeys that appear as literal `<pubkey>:`
+ * KEY lines inside it. Deliberately does NOT call any production predicate
+ * (`natsConfigCanBindAccount`), so a keystone assertion built on it can't be
+ * circular with the code under test (which computes what to append USING that
+ * predicate). Test-only; a small hand-rolled brace-matched extractor.
+ */
+function preloadKeys(conf: string): string[] {
+  const m = /resolver_preload\s*[:=]?\s*\{/.exec(conf);
+  if (m === null) return [];
+  const open = m.index + m[0].length - 1;
+  let depth = 0;
+  let end = -1;
+  for (let i = open; i < conf.length; i++) {
+    if (conf[i] === "{") depth++;
+    else if (conf[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end < 0) return [];
+  const keys: string[] = [];
+  for (const line of conf.slice(open + 1, end).split("\n")) {
+    const km = /^\s*(A[A-Z2-7]{55})\s*:/.exec(line);
+    if (km?.[1] !== undefined) keys.push(km[1]);
+  }
+  return keys;
 }
 
 // =============================================================================
@@ -75,6 +109,11 @@ const ACCOUNT_JWT =
 const SYS_ACCOUNT = "ADSYS6VXCEEKH62BYKGBHXQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVM";
 const SYS_ACCOUNT_JWT =
   "eyJhbGciOiJlZDI1NTE5LW5rZXkiLCJ0eXAiOiJKV1QifQ.FAKE_SYS_JWT_BODY.sig";
+// cortex#1480 (join-1, epic #1479) — the AGENTS account, the third leg of the
+// "FED + AGENTS + SYS" trio a fully-converged resolver_preload must carry.
+const AGENTS_ACCOUNT = "A" + "G".repeat(55);
+const AGENTS_ACCOUNT_JWT =
+  "eyJhbGciOiJlZDI1NTE5LW5rZXkiLCJ0eXAiOiJKV1QifQ.FAKE_AGENTS_JWT_BODY.sig";
 
 const PACKAGE: OperatorModeLeafPackage = {
   operatorJwt: OPERATOR_JWT,
@@ -86,6 +125,18 @@ const PACKAGE_WITH_SYS: OperatorModeLeafPackage = {
   ...PACKAGE,
   systemAccount: SYS_ACCOUNT,
   systemAccountJwt: SYS_ACCOUNT_JWT,
+};
+
+const PACKAGE_WITH_AGENTS: OperatorModeLeafPackage = {
+  ...PACKAGE,
+  agentsAccount: AGENTS_ACCOUNT,
+  agentsAccountJwt: AGENTS_ACCOUNT_JWT,
+};
+
+const PACKAGE_WITH_ALL_THREE: OperatorModeLeafPackage = {
+  ...PACKAGE_WITH_SYS,
+  agentsAccount: AGENTS_ACCOUNT,
+  agentsAccountJwt: AGENTS_ACCOUNT_JWT,
 };
 
 // =============================================================================
@@ -138,6 +189,40 @@ describe("renderOperatorModeBlocks — convert an anonymous bus (O-3 D2)", () =>
     expect(conf).toContain(`system_account: ${SYS_ACCOUNT}`);
     // and the SYS account is preloaded too
     expect(conf).toContain(`${SYS_ACCOUNT}: ${SYS_ACCOUNT_JWT}`);
+  });
+
+  // cortex#1480 (join-1, epic #1479) — resolver_preload must carry EVERY
+  // account the stack federates on: FED (always), AGENTS and SYS when the
+  // package carries them — and ONLY those it declares (no stray entries).
+  test("cortex#1480: preloads AGENTS alongside FED when the package carries one, and omits SYS when absent", () => {
+    const conf = mustConvert(renderOperatorModeBlocks(ANON_CONF, PACKAGE_WITH_AGENTS));
+    expect(conf).toContain(`${ACCOUNT}: ${ACCOUNT_JWT}`);
+    expect(conf).toContain(`${AGENTS_ACCOUNT}: ${AGENTS_ACCOUNT_JWT}`);
+    // "only those it declares" — no SYS account line was offered, so none renders.
+    expect(conf).not.toContain("system_account:");
+    expect(conf).not.toContain(SYS_ACCOUNT);
+  });
+
+  test("cortex#1480: preloads all three (FED + AGENTS + SYS) when the package carries all three", () => {
+    const conf = mustConvert(renderOperatorModeBlocks(ANON_CONF, PACKAGE_WITH_ALL_THREE));
+    expect(conf).toContain(`${ACCOUNT}: ${ACCOUNT_JWT}`);
+    expect(conf).toContain(`${AGENTS_ACCOUNT}: ${AGENTS_ACCOUNT_JWT}`);
+    expect(conf).toContain(`${SYS_ACCOUNT}: ${SYS_ACCOUNT_JWT}`);
+    expect(conf).toContain(`system_account: ${SYS_ACCOUNT}`);
+  });
+
+  test("cortex#1480 ACCEPTANCE KEYSTONE: FED + AGENTS + SYS each appear as a literal preload KEY in the rendered " +
+    "resolver_preload block — asserted by an INDEPENDENT structural parse (NOT the production bind predicate). With " +
+    "fake JWTs this is text-structure-verified, not nats-server-verified", () => {
+    const conf = mustConvert(renderOperatorModeBlocks(ANON_CONF, PACKAGE_WITH_ALL_THREE));
+    const keys = preloadKeys(conf);
+    expect(keys).toContain(ACCOUNT);
+    expect(keys).toContain(AGENTS_ACCOUNT);
+    expect(keys).toContain(SYS_ACCOUNT);
+    // Secondary sanity check via the production predicate — kept, but NOT the
+    // keystone: it would be circular (renderOperatorModeBlocks decides what to
+    // append using this SAME predicate).
+    expect(natsConfigCanBindAccount(conf, ACCOUNT).canBind).toBe(true);
   });
 });
 
@@ -269,5 +354,139 @@ describe("renderOperatorModeBlocks — never clobber a foreign operator", () => 
     const convertedConf = mustConvert(renderOperatorModeBlocks(ANON_CONF, PACKAGE));
     const again = renderOperatorModeBlocks(convertedConf, PACKAGE);
     expect(again.status).toBe("already");
+  });
+});
+
+// =============================================================================
+// cortex#1480 (join-1, epic #1479) — ENSURE a MISSING account under the SAME
+// operator. This is the RED-first spec for the real production bug: a bus
+// bootstrapped before its FED account existed (or hand-converted carrying
+// only the AGENTS account) stays "operator-mode under the SAME operator"
+// forever, so the OLD operator-JWT-only "already" check silently left FED
+// un-preloaded — the exact "does not define account <FED>" fail-closed that
+// blocked the metafactory-community bring-up.
+// =============================================================================
+
+describe("renderOperatorModeBlocks — cortex#1480: ensure a MISSING account under the SAME operator", () => {
+  // A bus operator-mode under OPERATOR_JWT (the SAME operator PACKAGE uses)
+  // whose resolver_preload carries ONLY the AGENTS account — exactly the
+  // real-world shape (make-live's always-run AGENTS append succeeded; FED
+  // never got preloaded because the old bootstrap gate only fired when
+  // resolver_preload was WHOLLY ABSENT).
+  const AGENTS_ONLY_CONF = [
+    "server_name: community-andreas",
+    "listen: 127.0.0.1:4224",
+    `operator: ${OPERATOR_JWT}`,
+    "resolver: MEMORY",
+    "resolver_preload: {",
+    `  ${AGENTS_ACCOUNT}: ${AGENTS_ACCOUNT_JWT}`,
+    "}",
+    "",
+  ].join("\n");
+
+  test("precondition: the bus IS operator-mode but does NOT yet bind FED (the real bug's starting state)", () => {
+    expect(natsConfigHasAccountTree(AGENTS_ONLY_CONF)).toBe(true);
+    expect(natsConfigCanBindAccount(AGENTS_ONLY_CONF, ACCOUNT).canBind).toBe(false);
+  });
+
+  test("a FED-only package on the AGENTS-only bus ENSURES (appends) the missing FED account — status 'converted', not 'already'", () => {
+    const result = renderOperatorModeBlocks(AGENTS_ONLY_CONF, PACKAGE);
+    expect(result.status).toBe("converted");
+    const conf = mustConvert(result);
+    expect(conf).toContain(`${ACCOUNT}: ${ACCOUNT_JWT}`);
+    // the pre-existing AGENTS entry survives untouched.
+    expect(conf).toContain(`${AGENTS_ACCOUNT}: ${AGENTS_ACCOUNT_JWT}`);
+    // no duplicate `operator:` line — the skeleton itself was NOT re-rendered,
+    // only the missing account was spliced into the EXISTING resolver_preload.
+    const operatorLines = conf.split("\n").filter((l) => /^[ \t]*operator[ \t]*:/.test(l)); // operator-mode block
+    expect(operatorLines).toHaveLength(1);
+  });
+
+  test("ACCEPTANCE KEYSTONE: after the ensure, the FED pubkey appears as a literal preload KEY (INDEPENDENT structural parse, not the production predicate)", () => {
+    const conf = mustConvert(renderOperatorModeBlocks(AGENTS_ONLY_CONF, PACKAGE));
+    expect(preloadKeys(conf)).toContain(ACCOUNT);
+    // pre-existing AGENTS key survives too.
+    expect(preloadKeys(conf)).toContain(AGENTS_ACCOUNT);
+  });
+
+  test("re-running the SAME package again after the ensure is now a byte-stable 'already' (nothing left missing)", () => {
+    const ensuredConf = mustConvert(renderOperatorModeBlocks(AGENTS_ONLY_CONF, PACKAGE));
+    const again = renderOperatorModeBlocks(ensuredConf, PACKAGE);
+    expect(again.status).toBe("already");
+    if (again.status !== "already") throw new Error("expected already");
+    expect(again.conf).toBe(ensuredConf); // byte-stable, no drift, no duplicate splice.
+  });
+
+  test("a package carrying an AGENTS account ALSO ensures AGENTS into a FED-only bus", () => {
+    // FED-only bus (mirrors a bus bootstrapped before AGENTS was ever included).
+    const fedOnlyConf = mustConvert(renderOperatorModeBlocks(ANON_CONF, PACKAGE));
+    expect(preloadKeys(fedOnlyConf)).not.toContain(AGENTS_ACCOUNT);
+
+    const result = renderOperatorModeBlocks(fedOnlyConf, PACKAGE_WITH_AGENTS);
+    expect(result.status).toBe("converted");
+    const conf = mustConvert(result);
+    expect(preloadKeys(conf)).toContain(ACCOUNT);
+    expect(preloadKeys(conf)).toContain(AGENTS_ACCOUNT);
+  });
+
+  // cortex#1480 — an operator-mode bus needs BOTH the SYS account in
+  // resolver_preload AND a top-level `system_account:` directive; the ensure
+  // path must add the directive too (not only the preload entry), or the server
+  // would know the account but never use it as the system account.
+  test("ensuring a SYS account into an operator-mode bus that lacks the `system_account:` directive ADDS the directive too", () => {
+    // A FED-only bus rendered from scratch carries NO `system_account:` (no SYS
+    // in that package) — the real starting shape.
+    const fedOnlyNoSys = mustConvert(renderOperatorModeBlocks(ANON_CONF, PACKAGE));
+    expect(fedOnlyNoSys).not.toContain("system_account:");
+
+    const result = renderOperatorModeBlocks(fedOnlyNoSys, PACKAGE_WITH_SYS);
+    expect(result.status).toBe("converted");
+    const conf = mustConvert(result);
+    // SYS added to resolver_preload (structural) AND the top-level directive set.
+    expect(preloadKeys(conf)).toContain(SYS_ACCOUNT);
+    expect(conf).toContain(`system_account: ${SYS_ACCOUNT}`);
+  });
+
+  test("the SYS-directive ensure is idempotent: re-running is byte-stable 'already', directive not duplicated", () => {
+    const fedOnly = mustConvert(renderOperatorModeBlocks(ANON_CONF, PACKAGE));
+    const ensured = mustConvert(renderOperatorModeBlocks(fedOnly, PACKAGE_WITH_SYS));
+    const again = renderOperatorModeBlocks(ensured, PACKAGE_WITH_SYS);
+    expect(again.status).toBe("already");
+    if (again.status !== "already") throw new Error("expected already");
+    expect(again.conf).toBe(ensured);
+    const directiveLines = ensured
+      .split("\n")
+      .filter((l) => /^[ \t]*system_account[ \t]*:/.test(l));
+    expect(directiveLines).toHaveLength(1);
+  });
+
+  test("does NOT clobber an EXISTING `system_account:` directive when ensuring other accounts", () => {
+    // A bus whose SYS directive + SYS preload already exist, but FED is missing.
+    const withSysDirective = [
+      `operator: ${OPERATOR_JWT}`,
+      `system_account: ${SYS_ACCOUNT}`,
+      "resolver: MEMORY",
+      "resolver_preload: {",
+      `  ${SYS_ACCOUNT}: ${SYS_ACCOUNT_JWT}`,
+      "}",
+      "",
+    ].join("\n");
+    const conf = mustConvert(renderOperatorModeBlocks(withSysDirective, PACKAGE_WITH_SYS));
+    // FED got added; SYS directive stays exactly once (never re-appended).
+    expect(preloadKeys(conf)).toContain(ACCOUNT);
+    const directiveLines = conf.split("\n").filter((l) => /^[ \t]*system_account[ \t]*:/.test(l));
+    expect(directiveLines).toHaveLength(1);
+  });
+
+  test("refuses (never silently drops the missing account) when operator-mode under THIS operator but no resolver_preload block exists to append into", () => {
+    const noPreloadBlock = [
+      `operator: ${OPERATOR_JWT}`,
+      `system_account: ${SYS_ACCOUNT}`, // an operator-mode signal, but no resolver_preload block anywhere
+      "",
+    ].join("\n");
+    const result = renderOperatorModeBlocks(noPreloadBlock, PACKAGE);
+    expect(result.status).toBe("refuse");
+    if (result.status !== "refuse") throw new Error("expected refuse");
+    expect(result.reason).toContain("resolver_preload");
   });
 });
