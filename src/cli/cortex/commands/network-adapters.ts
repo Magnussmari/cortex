@@ -56,6 +56,8 @@ import {
 } from "../../../common/nats/nats-service-manager";
 import { NetworkRegistryClient } from "../../../common/registry/network-client";
 import { NetworkCache } from "../../../common/registry/network-cache";
+import { backupConfigFile } from "../../../common/nats/config-backup";
+import { probeHealthzMonitor } from "../../../common/nats/healthz-probe";
 import {
   findCortexDaemonDescriptor,
   type DaemonLocatorIO,
@@ -546,6 +548,12 @@ function buildLeafFilePort(cfg: LivePortsConfig, mutate: boolean): LeafFilePort 
       // (e.g. 022 → 0644) would otherwise leave it world-readable. 0600 is the
       // correct floor even for a creds-path-only leaf (defence in depth).
       const leafPath = join(dir, leafIncludeFileName(inputs.descriptor.network_id));
+      // cortex#1483 (join-4) — a same-directory, timestamped `.bak` sidecar of
+      // whatever was there BEFORE this write (a re-join overwriting a prior
+      // working leaf include). No-op when the file is new. In ADDITION to (not
+      // instead of) the in-process snapshot/restore (#821) — a .bak survives the
+      // process exiting, giving a hand-recovery path even outside a `join` retry.
+      backupConfigFile(leafPath, "join");
       writeFileSync(leafPath, content, { mode: 0o600 });
       chmodSync(leafPath, 0o600);
     },
@@ -566,6 +574,8 @@ function buildLeafFilePort(cfg: LivePortsConfig, mutate: boolean): LeafFilePort 
       const next = ensureLeafInclude(current, networkId);
       if (next === current) return; // byte-stable no-op.
       mkdirSync(dirname(configPath), { recursive: true });
+      // cortex#1483 (join-4) — .bak the base config BEFORE the directive write.
+      backupConfigFile(configPath, "join");
       writeFileSync(configPath, next, "utf-8");
     },
     removeInclude(networkId) {
@@ -576,6 +586,8 @@ function buildLeafFilePort(cfg: LivePortsConfig, mutate: boolean): LeafFilePort 
       const current = readFileSync(configPath, "utf-8");
       const next = removeLeafInclude(current, networkId);
       if (next === current) return; // no-op.
+      // cortex#1483 (join-4) — .bak the base config BEFORE the directive removal.
+      backupConfigFile(configPath, "leave");
       writeFileSync(configPath, next, "utf-8");
     },
     list() {
@@ -625,6 +637,9 @@ function buildLeafFilePort(cfg: LivePortsConfig, mutate: boolean): LeafFilePort 
       // inert — it surfaces the decision in the step log without touching disk.
       if (result.status === "converted" && mutate) {
         mkdirSync(dirname(configPath), { recursive: true });
+        // cortex#1483 (join-4) — .bak whatever was there before the conversion
+        // (a no-op when the config is new — nothing to back up).
+        backupConfigFile(configPath, "join");
         // Security-review MAJOR (#1058) — ATOMIC write (tmp + rename). A
         // non-atomic writeFileSync truncated by a SIGKILL/OOM mid-write would
         // leave corrupt HOCON that crashes nats-server on its next restart →
@@ -1081,32 +1096,34 @@ function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerP
       // #821 MAJOR-1 — cheap pre-restart syntax gate: `nats-server -c <cfg> -t`.
       // Dry-run is inert. The gate is NECESSARY-NOT-SUFFICIENT (a syntax check
       // that does not resolve leaf creds/accounts — it passed for the original
-      // crash), so a non-zero exit is a HARD signal the config is broken, while a
-      // missing `nats-server` binary is SKIPPED (returns ok) rather than blocking
-      // the join on a machine where the test tool isn't installed.
-      if (!mutate) return { ok: true };
+      // crash), so a non-zero exit is a HARD `invalid` signal.
+      //
+      // cortex#1495 BLOCKER — a missing `nats-server` binary (spawn ENOENT) is
+      // `skipped`, NOT `valid`: fail-OPEN'ing here (the pre-fix `ok:true`) would
+      // let a bad config reload onto a live bus on any host without the binary.
+      // The caller warns loudly + proceeds on `skipped`, refuses on `invalid`.
+      if (!mutate) return { status: "valid" };
       const configPath = expandTilde(cfg.natsConfigPath ?? "");
       if (configPath.length === 0) {
         // No config to test — the restart step will surface the real error.
-        return { ok: true };
+        return { status: "valid" };
       }
       let result: { code: number; stderr: string };
       try {
         result = await bunExecRunner(["nats-server", "-c", configPath, "-t"]);
       } catch (err) {
-        // Spawn failure (e.g. binary not on PATH) → SKIP the gate, don't block.
-        process.stderr.write(
-          `network join: skipping nats-server -t gate (could not run nats-server: ${err instanceof Error ? err.message : String(err)})\n`,
-        );
-        return { ok: true };
+        return {
+          status: "skipped",
+          reason: `could not run nats-server -t: ${err instanceof Error ? err.message : String(err)}`,
+        };
       }
       if (result.code !== 0) {
         return {
-          ok: false,
+          status: "invalid",
           reason: `nats-server -c ${configPath} -t exited ${result.code.toString()}: ${result.stderr.trim()}`,
         };
       }
-      return { ok: true };
+      return { status: "valid" };
     },
     async isHealthy() {
       // #821 — probe nats-server's HTTP monitor to confirm it actually came back
@@ -1128,41 +1145,17 @@ function buildNatsServerPort(cfg: LivePortsConfig, mutate: boolean): NatsServerP
       // monitor we cannot confirm liveness, but we MUST NOT roll back a join
       // whose policy + peer were already written (the false-FAIL incident: a
       // single-file `local.conf` with no `http_port` ECONNREFUSED `:8222` and
-      // rolled back a good join). Absent monitor → treat as healthy.
-      if (!monitor.configured) return { healthy: true };
-      const base = monitor.url.replace(/\/+$/, "");
+      // rolled back a good join). Absent monitor → treat as healthy, but flag it
+      // INCONCLUSIVE (cortex#1495 important 3) so the caller's step log says
+      // "inconclusive, treated as healthy" rather than "verified healthy".
+      if (!monitor.configured) return { healthy: true, inconclusive: true };
       // #821 MAJOR — BOUND the probe. A monitor that accepts the TCP connection
       // but never responds (hung/deadlocked nats-server — exactly the failure the
       // probe exists to catch) would hang an unbounded `fetch` forever and stall
-      // joinNetwork with no verdict. AbortSignal.timeout aborts after the
-      // configured budget; a timeout/abort is treated as healthy:false (the
-      // restart did NOT bring a responsive bus up).
+      // joinNetwork with no verdict. cortex#1495 v3 — the fetch+timeout+error-map
+      // body is the SHARED `probeHealthzMonitor` so join + make-live can't drift.
       const timeoutMs = cfg.healthProbeTimeoutMs ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS;
-      try {
-        const res = await fetch(`${base}/healthz`, {
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (!res.ok) {
-          return {
-            healthy: false,
-            reason: `nats-server monitor ${base}/healthz returned HTTP ${res.status.toString()}`,
-          };
-        }
-        return { healthy: true };
-      } catch (err) {
-        // A timeout/abort means the monitor accepted but did not respond in time
-        // — the bus is hung, NOT healthy. A connection error means it's down or
-        // the port isn't listening. Either way the restart did NOT bring a
-        // healthy bus up. Distinguish the timeout for an actionable reason.
-        const isTimeout =
-          err instanceof DOMException && err.name === "TimeoutError";
-        return {
-          healthy: false,
-          reason: isTimeout
-            ? `nats-server monitor ${base}/healthz timed out after ${timeoutMs.toString()}ms (accepted the connection but never responded — bus hung)`
-            : `nats-server monitor ${base} unreachable: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
+      return probeHealthzMonitor(monitor.url, timeoutMs);
     },
   };
 }

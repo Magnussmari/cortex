@@ -45,6 +45,13 @@ import {
 } from "../../../common/types/cortex-config";
 import type { NetworkRosterResult } from "../../../common/registry/types";
 import { pskFingerprint } from "../../../common/nats/leaf-psk";
+import {
+  probeHealthWithSettle,
+  realClock,
+  settleFailureReason,
+  INCONCLUSIVE_HEALTH_NOTICE,
+  type ConfigValidationOutcome,
+} from "../../../common/nats/restart-with-settle";
 import type { OperatorModeLeafPackage } from "../../../common/nats/leaf-remote-renderer";
 import { buildRosterPeers } from "../../../bus/agent-network/roster-read";
 import {
@@ -770,17 +777,19 @@ export async function joinNetwork(
     // ultimately shell out via Bun.spawn, which THROWS SYNCHRONOUSLY on ENOENT
     // (launchctl/systemctl/nats-server not on PATH). joinNetwork is documented
     // "never throws", so guard the call: a thrown spawn error becomes a clean
-    // failure verdict, not an uncaught stack trace that wedges the CLI.
-    let validate: { ok: true } | { ok: false; reason: string };
+    // failure verdict, not an uncaught stack trace that wedges the CLI. A THROW
+    // is an unexpected contract violation (the real adapter never throws — it
+    // returns `skipped` on ENOENT), so treat it fail-SAFE as `invalid`/refuse.
+    let validate: ConfigValidationOutcome;
     try {
       validate = await natsServer.validateConfig();
     } catch (err) {
       validate = {
-        ok: false,
+        status: "invalid",
         reason: `nats-server config validation could not run: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
-    if (!validate.ok) {
+    if (validate.status === "invalid") {
       try {
         ports.leafFile.restoreLeafState(snapshot);
       } catch (err) {
@@ -803,6 +812,16 @@ export async function joinNetwork(
         ...(warnings.length > 0 && { warnings }),
       };
     }
+    if (validate.status === "skipped") {
+      // cortex#1495 BLOCKER — "could not validate" is NOT "valid". Proceed (so a
+      // host without `nats-server` on PATH isn't hard-blocked) but WARN LOUDLY
+      // that the pre-reload safety gate did not run, never a silent pass.
+      const warn =
+        `could not run \`nats-server -t\` — ${validate.reason}; proceeding WITHOUT the ` +
+        `pre-reload validation safety gate (a broken config will not be caught before restart)`;
+      warnings.push(warn);
+      steps.push(`WARN: ${warn}`);
+    }
 
     // #821 — a restart that EXITS non-zero, OR one that exits 0 but leaves the
     // server DOWN (the community crash: `launchctl kickstart` returned 0, then
@@ -818,19 +837,28 @@ export async function joinNetwork(
     // (throws synchronously on ENOENT) / fetch; a throw here becomes a failure
     // result, never an uncaught escape from joinNetwork.
     const restartAndProbe = async (): Promise<
-      { ok: true } | { ok: false; reason: string }
+      { ok: true; inconclusive: boolean } | { ok: false; reason: string }
     > => {
       try {
         const r = await natsServer.restart();
         if (!r.ok) return { ok: false, reason: r.reason };
-        const health = await natsServer.isHealthy();
-        if (!health.healthy) {
-          return {
-            ok: false,
-            reason: `nats-server did not come back up after restart (${health.reason})`,
-          };
+        // cortex#1483 (join-4) — a SETTLE WINDOW, not a single immediate probe.
+        // `launchctl kickstart`/`systemctl restart` returning does not mean
+        // nats-server has rebound its HTTP monitor port yet; a lone probe here
+        // races that startup window and reads a HEALTHY bus as DOWN (the exact
+        // #1476 gap-2 false alarm: "bus may be DOWN, intervene manually" on a
+        // perfectly healthy bus). Poll with backoff — a slow-but-healthy bus is
+        // never mistaken for a genuinely down one; only exhausting the whole
+        // window without a healthy result is a real failure.
+        const settled = await probeHealthWithSettle(
+          () => natsServer.isHealthy(),
+          ports.settle,
+          ports.clock ?? realClock,
+        );
+        if (!settled.healthy) {
+          return { ok: false, reason: settleFailureReason(settled.attempts, settled.reason) };
         }
-        return { ok: true };
+        return { ok: true, inconclusive: settled.inconclusive === true };
       } catch (err) {
         return {
           ok: false,
@@ -851,7 +879,7 @@ export async function joinNetwork(
         ports.leafFile.restoreLeafState(snapshot);
         const recovery = await restartAndProbe();
         rollbackNote = recovery.ok
-          ? "rolled back leaf config + restarted nats-server (bus restored to prior state, verified healthy)"
+          ? `rolled back leaf config + restarted nats-server (bus restored to prior state, ${recovery.inconclusive ? INCONCLUSIVE_HEALTH_NOTICE : "verified healthy"})`
           : `rolled back leaf config but the recovery restart did NOT bring the bus back up (${recovery.reason}) — bus may be DOWN, intervene manually`;
       } catch (err) {
         rollbackNote = `rollback FAILED (${err instanceof Error ? err.message : String(err)}) — bus may be DOWN, intervene manually`;
@@ -867,7 +895,13 @@ export async function joinNetwork(
         warnings: [...warnings, rollbackNote],
       };
     }
-    steps.push("restarted nats-server to load leaf config (verified healthy)");
+    // cortex#1495 important 3 — do NOT claim "verified healthy" when the probe was
+    // inconclusive (#831 no-monitor). Report what actually happened.
+    steps.push(
+      initial.inconclusive
+        ? `restarted nats-server to load leaf config (${INCONCLUSIVE_HEALTH_NOTICE})`
+        : "restarted nats-server to load leaf config (verified healthy)",
+    );
   }
 
   // (e.2) Restart the cortex daemon so it reconnects to the bus (now carrying

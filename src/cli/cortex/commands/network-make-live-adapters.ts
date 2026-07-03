@@ -9,20 +9,28 @@
  * tree + JWT come from arc (ADR-0013 Model B invariant).
  */
 
-import { existsSync, readFileSync, writeFileSync, copyFileSync, chmodSync, readdirSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, copyFileSync, chmodSync, readdirSync, mkdirSync, renameSync, rmSync } from "fs";
 import { homedir } from "os";
 import { join, dirname } from "path";
+import { Socket } from "net";
 
 import { parseDocument } from "yaml";
 
 import { expandTilde } from "../../../common/config/loader";
-import { renderOperatorModeBlocks, renderBaseIsolatedConfig } from "../../../common/nats/leaf-remote-renderer";
+import {
+  renderOperatorModeBlocks,
+  renderBaseIsolatedConfig,
+  natsConfigMonitorUrl,
+  natsConfigClientListen,
+} from "../../../common/nats/leaf-remote-renderer";
+import { probeHealthzMonitor } from "../../../common/nats/healthz-probe";
 import {
   selectNatsServiceManager,
   currentServicePlatform,
   bunExecRunner,
   type ServicePlatform,
 } from "../../../common/nats/nats-service-manager";
+import { backupConfigFile } from "../../../common/nats/config-backup";
 import {
   findCortexDaemonDescriptor,
   parsePlistProgramArguments,
@@ -37,6 +45,8 @@ import type {
   ServiceRestartPort,
   MakeLiveConfigWritePort,
   MakeLivePorts,
+  NatsCanaryPort,
+  NatsConfigSnapshot,
 } from "./network-make-live-lib";
 
 // =============================================================================
@@ -224,8 +234,10 @@ export function buildResolverPreloadAdapter(): ResolverPreloadPort {
         if (next === null) {
           return { ok: false, reason: `could not locate a resolver_preload { … } block in ${abs}` };
         }
-        // Back up before the in-place edit (timestamped — the rollback artefact).
-        copyFileSync(abs, `${abs}.bak-makelive-${Date.now().toString()}`);
+        // cortex#1483 (join-4) — back up before the in-place edit (timestamped —
+        // the rollback artefact), via the ONE shared .bak helper so this and the
+        // bootstrap write below never drift on naming.
+        backupConfigFile(abs, "makelive");
         writeFileSync(abs, next, "utf-8");
         return { ok: true, changed: true };
       } catch (err) {
@@ -285,7 +297,7 @@ export function buildResolverPreloadAdapter(): ResolverPreloadPort {
         // freshly-synthesised config has nothing to back up. Ensure the parent dir
         // exists, then write in place.
         if (fileExists) {
-          copyFileSync(abs, `${abs}.bak-makelive-${Date.now().toString()}`);
+          backupConfigFile(abs, "makelive");
         } else {
           mkdirSync(dirname(abs), { recursive: true });
         }
@@ -461,6 +473,190 @@ export function buildMakeLiveConfigWriteAdapter(mutate: boolean): MakeLiveConfig
   };
 }
 
+// =============================================================================
+// Canary adapter (cortex#1483, join-4) — validate/snapshot/health/rollback
+// around the nats-server restart. Mirrors network-adapters.ts's
+// buildNatsServerPort (validateConfig via `nats-server -t`, isHealthy via the
+// config's own /healthz monitor) + the #821 leaf-state snapshot/restore
+// pattern, adapted to make-live's single nats config file (no per-network leaf
+// include — the whole config IS the mutation target here).
+// =============================================================================
+
+// cortex#1495 nit 4 — kept LOCAL rather than imported from network-adapters.ts
+// (join's adapter), so make-live's canary adapter doesn't reach across into
+// join's module for a shared default. Mirrors network-adapters.ts's
+// DEFAULT_HEALTH_PROBE_TIMEOUT_MS (a 5s probe bound); the two are independent by
+// design. (cortex#1495 v2: the :8222 monitor DEFAULT was dropped — a bus with no
+// declared monitor now falls back to a TCP client-port probe, not a guessed :8222.)
+const MAKELIVE_HEALTH_PROBE_TIMEOUT_MS = 5000;
+/** NATS default client listen port — the TCP-connect liveness target when a bus declares no monitor. */
+const NATS_DEFAULT_CLIENT_PORT = 4222;
+
+/**
+ * cortex#1495 v3 (important) — map a PARSED nats `listen` host to the address the
+ * liveness TCP connect should actually dial:
+ *   - a specific host (`10.0.0.5`, `localhost`, an IPv6 literal) is used as-is —
+ *     hardcoding `127.0.0.1` would false-fail (and false-rollback) a bus that
+ *     listens on a non-loopback address;
+ *   - a WILDCARD bind is reachable via loopback: `0.0.0.0` → `127.0.0.1`,
+ *     `::`/`[::]` → `::1`;
+ *   - an empty/unparseable host (bare `port:` / `listen: <port>`) → `127.0.0.1`.
+ */
+function connectHostForListen(rawHost: string): string {
+  const h = rawHost.trim();
+  if (h === "" || h === "0.0.0.0") return "127.0.0.1";
+  if (h === "::" || h === "[::]") return "::1";
+  return h;
+}
+
+/**
+ * cortex#1495 v2 (important 2) — an injectable bounded TCP-connect probe. A bus
+ * with NO HTTP monitor (the #1476 community class) still has a client listen
+ * port; a successful connect is a REAL liveness signal (the process is up and
+ * accepting), a refused/timed-out connect means the restart left it DOWN → the
+ * orchestrator's auto-rollback fires. Injected so tests script connect-ok /
+ * connect-fail without opening a real socket. Resolves `true` on connect,
+ * `false` on refusal/timeout/error. NEVER rejects.
+ */
+export type TcpConnectProbe = (host: string, port: number, timeoutMs: number) => Promise<boolean>;
+
+/** Real bounded TCP connect (node `net.Socket`); destroyed the moment it settles. */
+const realTcpConnectProbe: TcpConnectProbe = (host, port, timeoutMs) =>
+  new Promise<boolean>((resolve) => {
+    const socket = new Socket();
+    let settled = false;
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => { finish(true); });
+    socket.once("timeout", () => { finish(false); });
+    socket.once("error", () => { finish(false); });
+    socket.connect(port, host);
+  });
+
+/**
+ * Live {@link NatsCanaryPort}. `nats-server -t` gate, snapshot/restore, and a
+ * two-tier post-restart liveness probe: the config's `/healthz` monitor when one
+ * is declared, else a TCP connect to the client listen port (cortex#1495 v2).
+ * `tcpConnect` is injectable so tests exercise the no-monitor path without a real
+ * socket; production uses {@link realTcpConnectProbe}.
+ */
+export function buildNatsCanaryAdapter(
+  mutate: boolean,
+  healthProbeTimeoutMs?: number,
+  tcpConnect: TcpConnectProbe = realTcpConnectProbe,
+): NatsCanaryPort {
+  return {
+    async validateConfig(natsConfigPath) {
+      // #821 MAJOR-1 parity — cheap pre-restart syntax gate. Dry-run is inert.
+      // cortex#1495 v2 (suggestion) — the "invalid config → -t refuses the reload"
+      // contract is exercised at the ORCHESTRATION level with FAKE ports only
+      // (network-make-live.test.ts). It is not asserted against a real nats-server:
+      // that needs the `nats-server` binary in CI (out of scope) and would be flaky.
+      // The `code !== 0 → invalid` mapping below is the single point of trust.
+      if (!mutate) return { status: "valid" };
+      const abs = expandTilde(natsConfigPath);
+      let result: { code: number; stderr: string };
+      try {
+        result = await bunExecRunner(["nats-server", "-c", abs, "-t"]);
+      } catch (err) {
+        // cortex#1495 BLOCKER — a missing binary (spawn ENOENT) is `skipped`,
+        // NOT `valid`: fail-OPEN here would let a bad config reload onto a live
+        // bus on any host without `nats-server` on PATH. The orchestrator warns
+        // loudly + proceeds on `skipped` rather than silently passing.
+        return {
+          status: "skipped",
+          reason: `could not run nats-server -t: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      if (result.code !== 0) {
+        return {
+          status: "invalid",
+          reason: `nats-server -c ${abs} -t exited ${result.code.toString()}: ${result.stderr.trim()}`,
+        };
+      }
+      return { status: "valid" };
+    },
+    snapshot(natsConfigPath) {
+      const abs = expandTilde(natsConfigPath);
+      return {
+        natsConfigPath: abs,
+        contents: existsSync(abs) ? readFileSync(abs, "utf-8") : undefined,
+      };
+    },
+    restore(snapshot: NatsConfigSnapshot) {
+      if (!mutate) return;
+      const { natsConfigPath, contents } = snapshot;
+      if (contents === undefined) {
+        // The config did not exist pre-mutation (the from-scratch bootstrap
+        // path) — remove what make-live wrote so a retry starts clean.
+        rmSync(natsConfigPath, { force: true });
+        return;
+      }
+      // Atomic write (temp + rename) — a crash mid-rollback must never corrupt
+      // the very config it is trying to restore (mirrors network-adapters.ts's
+      // O-3 atomicWriteFileSync).
+      // cortex#1495 v2 (important 1) — the nats config is SECRET-bearing (leaf
+      // creds, hub authorization users, payload keys), so the restore write is
+      // created 0600 (mode on the temp + explicit chmod against a permissive
+      // umask), same discipline as the `.bak` sidecar and the leaf-include write.
+      const tmp = `${natsConfigPath}.tmp-canary-restore-${process.pid.toString()}`;
+      writeFileSync(tmp, contents, { mode: 0o600 });
+      chmodSync(tmp, 0o600);
+      renameSync(tmp, natsConfigPath);
+    },
+    async isHealthy(natsConfigPath) {
+      if (!mutate) return { healthy: true };
+      const abs = expandTilde(natsConfigPath);
+      const timeoutMs = healthProbeTimeoutMs ?? MAKELIVE_HEALTH_PROBE_TIMEOUT_MS;
+      const configText = existsSync(abs) ? readFileSync(abs, "utf-8") : undefined;
+      // Same precedence as network-adapters.ts's resolveMonitorBase: derive the
+      // monitor from the config's own http_port/monitor_port/http.
+      let base: string | undefined;
+      if (configText !== undefined) {
+        const derived = natsConfigMonitorUrl(configText);
+        if (derived !== undefined) base = derived;
+      }
+
+      // cortex#1495 v2 (important 2) — a bus with NO HTTP monitor (the #1476
+      // community bus class: no `http_port`) must NOT read as inconclusive-healthy,
+      // or auto-rollback goes inert on the exact config that motivated this slice.
+      // Fall back to a REAL liveness signal: a bounded TCP connect to the client
+      // listen address (parsed from `listen:`/`host:`+`port:`). Connect ⇒ genuinely
+      // healthy (NOT inconclusive); refused/timeout ⇒ unhealthy → the orchestrator
+      // rolls back. cortex#1495 v3 — dial the PARSED host (wildcard/empty mapped to
+      // loopback), never a hardcoded 127.0.0.1 that would false-fail a bus bound to
+      // a specific non-loopback address. RESIDUAL: a listening client port proves
+      // the process is up + accepting, not that JetStream fully recovered — but it
+      // catches the "nats-server crashed on the new config" case the slice targets.
+      if (base === undefined) {
+        if (configText === undefined) {
+          // The client listen addr genuinely can't be resolved (config
+          // absent/unreadable) — disclosed fallback to inconclusive-healthy.
+          return { healthy: true, inconclusive: true };
+        }
+        const listen = natsConfigClientListen(configText);
+        const host = connectHostForListen(listen?.host ?? "");
+        const port = listen?.port ?? NATS_DEFAULT_CLIENT_PORT;
+        const connected = await tcpConnect(host, port, timeoutMs);
+        return connected
+          ? { healthy: true }
+          : {
+              healthy: false,
+              reason: `bus client port ${host}:${port.toString()} not accepting connections after restart (no HTTP monitor to probe; TCP connect failed)`,
+            };
+      }
+      // cortex#1495 v3 — shared `/healthz` fetch+timeout+error-map (join + make-live
+      // call the ONE helper so their probe bodies can't drift).
+      return probeHealthzMonitor(base, timeoutMs);
+    },
+  };
+}
+
 /** Build the live {@link MakeLivePorts} bundle for a real `--apply` run. */
 export function buildLiveMakeLivePorts(mutate: boolean): MakeLivePorts {
   return {
@@ -469,5 +665,6 @@ export function buildLiveMakeLivePorts(mutate: boolean): MakeLivePorts {
     resolver: buildResolverPreloadAdapter(),
     restart: buildServiceRestartAdapter(mutate),
     configWrite: buildMakeLiveConfigWriteAdapter(mutate),
+    natsCanary: buildNatsCanaryAdapter(mutate),
   };
 }

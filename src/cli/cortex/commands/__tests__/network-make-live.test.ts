@@ -23,11 +23,13 @@ import {
   type MakeLivePorts,
   type MakeLiveState,
 } from "../network-make-live-lib";
-import { insertIntoResolverPreload, findNatsServerDescriptor, buildResolverPreloadAdapter } from "../network-make-live-adapters";
+import { insertIntoResolverPreload, findNatsServerDescriptor, buildResolverPreloadAdapter, buildNatsCanaryAdapter } from "../network-make-live-adapters";
 import type { DaemonLocatorIO } from "../daemon-locator";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import type { SettleWindowOptions } from "../../../../common/nats/restart-with-settle";
+import { instantClock } from "./settle-test-helpers";
 
 const AGENTS_PUB = "A" + "R".repeat(55);
 const AGENTS_JWT = "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJzdWIiOiJBQVJSIn0.sig";
@@ -68,8 +70,34 @@ function makePorts(over?: {
   daemonDescriptor?: string | undefined;
   exportFails?: boolean;
   mintFails?: boolean;
+  /**
+   * cortex#1483 (join-4) — wire a fake `natsCanary` port. Absent (default) ⇒
+   * `ports.natsCanary` stays `undefined` (the pre-#1483 behaviour every
+   * existing test above depends on).
+   */
+  withNatsCanary?: boolean;
+  /** cortex#1483 — make the canary's `nats-server -t` gate report INVALID. */
+  canaryValidateFails?: boolean;
+  /**
+   * cortex#1495 BLOCKER — make the canary's `-t` gate report SKIPPED (binary
+   * missing): make-live must WARN loudly + PROCEED (not refuse, not silent pass).
+   */
+  canaryValidateSkips?: boolean;
+  /** cortex#1483 — model the INITIAL restart's post-restart health. Default: healthy. */
+  canaryNatsHealthy?: boolean;
+  /** cortex#1483 — model the RECOVERY restart's post-restart health. Default: healthy. */
+  canaryRecoveryHealthy?: boolean;
+  /** cortex#1483 — healthy starting from the Nth poll WITHIN the initial phase. */
+  canaryNatsHealthyAfterAttempt?: number;
+  /** cortex#1483 — settle-window tuning threaded onto `ports.settle`. */
+  settle?: SettleWindowOptions;
 }): { ports: MakeLivePorts; calls: string[] } {
   const calls: string[] = [];
+  // cortex#1483 — the canary's snapshot is whatever `snapshot()` was called
+  // with; `restore()` records the restore + lets tests assert it ran.
+  let canaryConfigContents = "ORIGINAL-CONFIG-BYTES";
+  let canaryRestartCount = 0;
+  const canaryPhaseAttempts: Record<number, number> = {};
   const ports: MakeLivePorts = {
     creds: {
       mint: async ({ botName, account, credsPath }) => {
@@ -105,6 +133,7 @@ function makePorts(over?: {
       }),
       restartNats: async () => {
         calls.push("restart-nats");
+        canaryRestartCount++; // cortex#1483 — phase counter for the canary's isHealthy fake
         return { ok: true };
       },
       restartDaemon: async () => {
@@ -112,6 +141,49 @@ function makePorts(over?: {
         return { ok: true };
       },
     },
+    ...(over?.withNatsCanary === true
+      ? {
+          natsCanary: {
+            async validateConfig() {
+              calls.push("canary-validate");
+              if (over.canaryValidateFails === true) {
+                return { status: "invalid", reason: "nats-server -t: parse error" };
+              }
+              if (over.canaryValidateSkips === true) {
+                return { status: "skipped", reason: "could not run nats-server -t: spawn nats-server ENOENT" };
+              }
+              return { status: "valid" };
+            },
+            snapshot(natsConfigPath) {
+              calls.push("canary-snapshot");
+              return { natsConfigPath, contents: canaryConfigContents };
+            },
+            restore(snapshot) {
+              calls.push("canary-restore");
+              canaryConfigContents = snapshot.contents ?? "";
+            },
+            async isHealthy() {
+              calls.push("canary-isHealthy");
+              // cortex#1483 — phase (initial vs recovery) keyed off how many
+              // restartNats() calls have happened so far, mirroring network-lib
+              // test's `rec.natsRestarts` phase discriminator.
+              const phase = canaryRestartCount;
+              const isRecoveryProbe = phase > 1;
+              canaryPhaseAttempts[phase] = (canaryPhaseAttempts[phase] ?? 0) + 1;
+              const attemptInPhase = canaryPhaseAttempts[phase];
+              const healthy =
+                !isRecoveryProbe && over.canaryNatsHealthyAfterAttempt !== undefined
+                  ? attemptInPhase >= over.canaryNatsHealthyAfterAttempt
+                  : isRecoveryProbe
+                    ? over.canaryRecoveryHealthy ?? true
+                    : over.canaryNatsHealthy ?? true;
+              return healthy ? { healthy: true } : { healthy: false, reason: "monitor port 8222 not listening" };
+            },
+          },
+        }
+      : {}),
+    ...(over?.settle !== undefined ? { settle: over.settle } : {}),
+    clock: instantClock(),
   };
   return { ports, calls };
 }
@@ -329,6 +401,120 @@ describe("makeLiveStack — apply", () => {
     const txt = res.steps.join("\n");
     expect(txt).toContain("WARNING");
     expect(txt).toContain("NOT FOUND");
+  });
+});
+
+// ── cortex#1483 (join-4, epic #1479) — canary safety: validate-before-reload,
+// snapshot-before-mutate, settle-window health-verify, auto-rollback ───────────
+describe("makeLiveStack — cortex#1483 canary safety (natsCanary port)", () => {
+  test("no natsCanary wired → pre-#1483 behaviour: exit code trusted, no validate/health/rollback", async () => {
+    const { ports, calls } = makePorts(); // withNatsCanary omitted
+    const res = await makeLiveStack(makeInputs({ credsFileExists: true, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(true);
+    expect(calls).not.toContain("canary-validate");
+    expect(calls).not.toContain("canary-isHealthy");
+  });
+
+  test("valid config + healthy restart → validate THEN restart THEN health-verify, in order", async () => {
+    const { ports, calls } = makePorts({ withNatsCanary: true });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: true, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(true);
+    const order = calls.filter((c) => c.startsWith("canary-") || c === "restart-nats");
+    expect(order).toEqual(["canary-snapshot", "canary-validate", "restart-nats", "canary-isHealthy"]);
+    expect(res.steps.join("\n")).toContain("verified healthy");
+  });
+
+  test("invalid config → caught by -t BEFORE restart; restart never attempted; resolver write reverted", async () => {
+    const { ports, calls } = makePorts({ withNatsCanary: true, canaryValidateFails: true });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: true, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("config validation (-t) failed");
+    expect(calls).not.toContain("restart-nats");
+    expect(calls).toContain("canary-restore");
+    // Never proceeded to mint/daemon-restart after the refused reload.
+    expect(calls).not.toContain("restart-daemon");
+  });
+
+  test("slow-but-healthy bus (healthy on the 3rd poll) → NO false 'bus DOWN', no rollback", async () => {
+    const { ports, calls } = makePorts({ withNatsCanary: true, canaryNatsHealthyAfterAttempt: 3 });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: true, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(true);
+    expect(calls.filter((c) => c === "restart-nats").length).toBe(1);
+    expect(calls).not.toContain("canary-restore");
+    expect(calls.filter((c) => c === "canary-isHealthy").length).toBe(3);
+  });
+
+  test("genuinely unhealthy across the whole settle window → auto-rollback restores the snapshot + reloads", async () => {
+    const { ports, calls } = makePorts({
+      withNatsCanary: true,
+      canaryNatsHealthy: false,
+      settle: { maxAttempts: 2, initialDelayMs: 1 },
+    });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: true, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("2 health check(s)");
+    expect(calls).toContain("canary-restore");
+    // Rollback re-restarts + re-probes (recovery healthy by default → 1 more probe).
+    expect(calls.filter((c) => c === "restart-nats").length).toBe(2);
+    expect(calls.filter((c) => c === "canary-isHealthy").length).toBe(2 + 1);
+    expect(res.reason).toContain("restored to prior state");
+  });
+
+  test("worst case: recovery also stays unhealthy → clear manual-intervention warning, never claims 'restored'", async () => {
+    const { ports, calls } = makePorts({
+      withNatsCanary: true,
+      canaryNatsHealthy: false,
+      canaryRecoveryHealthy: false,
+      settle: { maxAttempts: 2, initialDelayMs: 1 },
+    });
+    const res = await makeLiveStack(makeInputs({ credsFileExists: true, resolverHasAccount: false }), ports);
+    expect(res.ok).toBe(false);
+    expect(calls).toContain("canary-restore");
+    expect(res.reason).not.toContain("restored to prior state");
+    expect(res.reason).toContain("intervene manually");
+  });
+
+  // ── cortex#1495 v2 (important 2): the no-monitor bus (the #1476 class) is now
+  // liveness-probed by a real TCP connect, so auto-rollback is NO LONGER inert.
+  // End-to-end with the REAL canary adapter (injected TCP probe) + fake services.
+  test("v2 end-to-end: no-monitor bus + client port DOWN → real canary reports unhealthy → auto-rollback fires", async () => {
+    const cdir = mkdtempSync(join(tmpdir(), "cortex-canary-e2e-"));
+    try {
+      const conf = join(cdir, "local.conf");
+      writeFileSync(conf, "listen: 127.0.0.1:4222\n", "utf-8"); // valid HOCON, NO http monitor
+      const { ports, calls } = makePorts({ settle: { maxAttempts: 2, initialDelayMs: 1 } });
+      ports.natsCanary = buildNatsCanaryAdapter(true, undefined, async () => false); // client port DOWN
+      const res = await makeLiveStack(
+        makeInputs({ credsFileExists: true, resolverHasAccount: false }, { natsConfigPath: conf }),
+        ports,
+      );
+      expect(res.ok).toBe(false);
+      expect(res.reason).toContain("not accepting connections");
+      // Rollback restored the config; the daemon was never restarted into a down bus.
+      expect(readFileSync(conf, "utf-8")).toBe("listen: 127.0.0.1:4222\n");
+      expect(calls).not.toContain("restart-daemon");
+    } finally {
+      rmSync(cdir, { recursive: true, force: true });
+    }
+  });
+
+  test("v2 end-to-end: no-monitor bus + client port UP → real canary reports healthy → no rollback, proceeds", async () => {
+    const cdir = mkdtempSync(join(tmpdir(), "cortex-canary-e2e-"));
+    try {
+      const conf = join(cdir, "local.conf");
+      writeFileSync(conf, "listen: 127.0.0.1:4222\n", "utf-8");
+      const { ports, calls } = makePorts({ settle: { maxAttempts: 2, initialDelayMs: 1 } });
+      ports.natsCanary = buildNatsCanaryAdapter(true, undefined, async () => true); // client port UP
+      const res = await makeLiveStack(
+        makeInputs({ credsFileExists: true, resolverHasAccount: false }, { natsConfigPath: conf }),
+        ports,
+      );
+      expect(res.ok).toBe(true);
+      // No rollback; the flow proceeded to the daemon restart.
+      expect(calls).toContain("restart-daemon");
+    } finally {
+      rmSync(cdir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -587,5 +773,201 @@ describe("makeLiveStack — defaulted credsPath write-back", () => {
     expect(res.ok).toBe(true);
     expect(writes).toHaveLength(0);
     expect(calls).not.toContain("config-write");
+  });
+});
+
+// ── cortex#1483 (join-4) — buildNatsCanaryAdapter (real fs + real HTTP probe) ───
+
+describe("buildNatsCanaryAdapter (live)", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cortex-canary-")); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test("snapshot → mutate → restore reverts the config to exactly the prior bytes", () => {
+    const conf = join(dir, "local.conf");
+    const original = "server_name: work\nlisten: 127.0.0.1:4222\n";
+    writeFileSync(conf, original, "utf-8");
+    const adapter = buildNatsCanaryAdapter(true);
+
+    const snap = adapter.snapshot(conf);
+    expect(snap.contents).toBe(original);
+
+    writeFileSync(conf, "server_name: work\nresolver_preload: { A: eyJ }\n", "utf-8");
+    adapter.restore(snap);
+    expect(readFileSync(conf, "utf-8")).toBe(original);
+  });
+
+  test("cortex#1495 v2 (important 1): the restored (secret-bearing) config lands mode 0600 even under a permissive umask", () => {
+    const conf = join(dir, "local.conf");
+    const original = "server_name: work\nresolver_preload: { SECRET: eyJcreds }\n";
+    writeFileSync(conf, original, "utf-8");
+    const adapter = buildNatsCanaryAdapter(true);
+    const snap = adapter.snapshot(conf);
+
+    // Corrupt the live config (simulate a crashing restart's bad render)...
+    writeFileSync(conf, "broken\n", "utf-8");
+    // ...then roll back under a permissive umask so a mode-less write would land
+    // 0644. The restore must still land 0600 (the config carries leaf creds etc.).
+    const prevUmask = process.umask(0o022);
+    try {
+      adapter.restore(snap);
+    } finally {
+      process.umask(prevUmask);
+    }
+    expect(readFileSync(conf, "utf-8")).toBe(original);
+    expect(statSync(conf).mode & 0o777).toBe(0o600);
+  });
+
+  test("restore removes a config that did NOT exist pre-mutation (the from-scratch bootstrap path)", () => {
+    const conf = join(dir, "local.conf");
+    const adapter = buildNatsCanaryAdapter(true);
+
+    const snap = adapter.snapshot(conf); // file absent → contents: undefined
+    expect(snap.contents).toBeUndefined();
+
+    writeFileSync(conf, "bootstrapped-from-scratch\n", "utf-8");
+    adapter.restore(snap);
+    expect(existsSync(conf)).toBe(false);
+  });
+
+  test("dry-run restore is inert (writes nothing)", () => {
+    const conf = join(dir, "local.conf");
+    const original = "server_name: work\n";
+    writeFileSync(conf, original, "utf-8");
+    const adapter = buildNatsCanaryAdapter(false);
+
+    const snap = adapter.snapshot(conf);
+    writeFileSync(conf, "mutated\n", "utf-8");
+    adapter.restore(snap);
+    expect(readFileSync(conf, "utf-8")).toBe("mutated\n");
+  });
+
+  test("isHealthy probes the config's own monitor and reports healthy on a 200", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        return new URL(req.url).pathname === "/healthz"
+          ? new Response("ok", { status: 200 })
+          : new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const conf = join(dir, "local.conf");
+      writeFileSync(conf, `http_port: ${(server.port ?? 0).toString()}\n`, "utf-8");
+      const adapter = buildNatsCanaryAdapter(true);
+      const res = await adapter.isHealthy(conf);
+      expect(res.healthy).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("isHealthy reports unhealthy when the config's monitor is unreachable", async () => {
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, "http_port: 1\n", "utf-8"); // nothing listens on :1
+    const adapter = buildNatsCanaryAdapter(true);
+    const res = await adapter.isHealthy(conf);
+    expect(res.healthy).toBe(false);
+  });
+
+  test("cortex#1495 v2: no monitor + client port UP (TCP connect ok) → genuinely healthy, NOT inconclusive", async () => {
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, "listen: 127.0.0.1:4222\n", "utf-8"); // no http_port monitor
+    const probed: { host: string; port: number }[] = [];
+    const adapter = buildNatsCanaryAdapter(true, undefined, async (host, port) => {
+      probed.push({ host, port });
+      return true; // client port accepting → bus is up
+    });
+    const res = await adapter.isHealthy(conf);
+    expect(res.healthy).toBe(true);
+    // A REAL signal — no longer flagged inconclusive.
+    expect("inconclusive" in res && res.inconclusive).not.toBe(true);
+    // Probed the parsed client listen host:port.
+    expect(probed).toEqual([{ host: "127.0.0.1", port: 4222 }]);
+  });
+
+  test("cortex#1495 v3: no monitor + a NON-loopback listen host → probes THAT host (no false 127.0.0.1)", async () => {
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, "listen: 10.0.0.5:4222\n", "utf-8"); // bound to a specific address
+    const probed: { host: string; port: number }[] = [];
+    const adapter = buildNatsCanaryAdapter(true, undefined, async (host, port) => {
+      probed.push({ host, port });
+      return true;
+    });
+    const res = await adapter.isHealthy(conf);
+    expect(res.healthy).toBe(true);
+    // v3 important — the parsed host is dialled, NOT a hardcoded 127.0.0.1.
+    expect(probed).toEqual([{ host: "10.0.0.5", port: 4222 }]);
+  });
+
+  test("cortex#1495 v3: no monitor + a WILDCARD listen host maps to loopback for the connect", async () => {
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, "listen: 0.0.0.0:4222\n", "utf-8"); // wildcard bind
+    const probed: { host: string; port: number }[] = [];
+    const adapter = buildNatsCanaryAdapter(true, undefined, async (host, port) => {
+      probed.push({ host, port });
+      return true;
+    });
+    await adapter.isHealthy(conf);
+    // 0.0.0.0 is reachable via loopback → probe 127.0.0.1.
+    expect(probed).toEqual([{ host: "127.0.0.1", port: 4222 }]);
+  });
+
+  test("cortex#1495 v2: no monitor + client port DOWN (TCP connect fails) → UNHEALTHY (rollback will fire)", async () => {
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, "port: 4299\n", "utf-8"); // client port via `port:`, no monitor
+    const probed: { host: string; port: number }[] = [];
+    const adapter = buildNatsCanaryAdapter(true, undefined, async (host, port) => {
+      probed.push({ host, port });
+      return false; // nothing accepting → the restart left the bus down
+    });
+    const res = await adapter.isHealthy(conf);
+    expect(res.healthy).toBe(false);
+    if (!res.healthy) expect(res.reason).toContain("not accepting connections");
+    // Bare `port:` → empty host defaulted to loopback; port parsed as 4299.
+    expect(probed).toEqual([{ host: "127.0.0.1", port: 4299 }]);
+  });
+
+  test("cortex#1495 v2: no monitor + client listen unresolvable (config absent) → discloses inconclusive-healthy", async () => {
+    let tcpCalled = false;
+    const adapter = buildNatsCanaryAdapter(true, undefined, async () => {
+      tcpCalled = true;
+      return true;
+    });
+    const res = await adapter.isHealthy(join(dir, "does-not-exist.conf"));
+    expect(res.healthy).toBe(true);
+    expect("inconclusive" in res && res.inconclusive).toBe(true);
+    // Nothing to connect to — the TCP probe is not even attempted.
+    expect(tcpCalled).toBe(false);
+  });
+
+  test("dry-run isHealthy is trivially healthy (never probes)", async () => {
+    const adapter = buildNatsCanaryAdapter(false);
+    const res = await adapter.isHealthy("/x/local.conf");
+    expect(res.healthy).toBe(true);
+  });
+
+  test("dry-run validateConfig is inert (valid, never spawns)", async () => {
+    const adapter = buildNatsCanaryAdapter(false);
+    const res = await adapter.validateConfig("/x/local.conf");
+    expect(res.status).toBe("valid");
+  });
+
+  test("cortex#1495 BLOCKER: validateConfig is three-state (valid | invalid | skipped), never a silent fail-open", async () => {
+    // Mirrors network-adapters.test.ts's MAJOR-1 pattern: we can't guarantee
+    // nats-server is installed on CI, so assert a well-formed three-state result.
+    // A missing binary MUST be `skipped` (with a reason), NEVER a silent `valid`
+    // — that fail-open is the exact BLOCKER this slice closes.
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, "server_name: work\nlisten: 127.0.0.1:4222\n", "utf-8");
+    const adapter = buildNatsCanaryAdapter(true);
+    const res = await adapter.validateConfig(conf);
+    if (res.status === "invalid") {
+      expect(res.reason).toContain("nats-server");
+    } else if (res.status === "skipped") {
+      expect(res.reason).toContain("nats-server");
+    } else {
+      expect(res.status).toBe("valid");
+    }
   });
 });

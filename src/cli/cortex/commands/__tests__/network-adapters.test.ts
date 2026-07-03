@@ -208,6 +208,35 @@ describe("#754 live leaf-include wiring", () => {
     expect(after).toContain("system_account: ADSYSACCOUNT");
   });
 
+  test("cortex#1483 (join-4): ensureInclude writes a timestamped .bak of the PRIOR local.conf before mutating", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    const original = bareLocalConf();
+    writeFileSync(conf, original, "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    ports.leafFile.ensureInclude("metafactory");
+
+    const baks = readdirSync(dir).filter((f) => f.startsWith("local.conf.bak-join-"));
+    expect(baks.length).toBe(1);
+    expect(readFileSync(join(dir, baks[0]!), "utf-8")).toBe(original);
+    // The live file carries the NEW content, not the backed-up original.
+    expect(readFileSync(conf, "utf-8")).toContain('include "leafnodes-metafactory.conf"');
+  });
+
+  test("cortex#1483 (join-4): a byte-stable ensureInclude re-run writes NO extra .bak (no-op, nothing to protect)", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, bareLocalConf(), "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    ports.leafFile.ensureInclude("metafactory"); // mutates → 1 backup
+    ports.leafFile.ensureInclude("metafactory"); // idempotent no-op → no 2nd backup
+
+    const baks = readdirSync(dir).filter((f) => f.startsWith("local.conf.bak-join-"));
+    expect(baks.length).toBe(1);
+  });
+
   test("ensureInclude is idempotent + byte-stable on the live file", () => {
     const dir = freshDir();
     const conf = join(dir, "local.conf");
@@ -317,6 +346,21 @@ describe("O-3 live convertToOperatorMode — round-trip a real temp nats config"
     expect(after).toContain("domain: community-andreas");
     // NO leaf include — join renders its own
     expect(after).not.toMatch(/include[ \t]+["']leafnodes-/);
+  });
+
+  test("cortex#1483 (join-4): a converting write backs up the PRE-conversion bytes to a timestamped .bak", () => {
+    const dir = freshDir();
+    const conf = join(dir, "community.conf");
+    const original = anonLocalConf();
+    writeFileSync(conf, original, "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    const result = ports.leafFile.convertToOperatorMode(FAKE_PACKAGE);
+    expect(result.status).toBe("converted");
+
+    const baks = readdirSync(dir).filter((f) => f.startsWith("community.conf.bak-join-"));
+    expect(baks.length).toBe(1);
+    expect(readFileSync(join(dir, baks[0]!), "utf-8")).toBe(original);
   });
 
   test("already-operator-mode bus under the SAME operator → 'already', file unchanged + leaf can be added", () => {
@@ -1150,6 +1194,29 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
     expect(statSync(leafPath).mode & 0o777).toBe(0o600);
   });
 
+  test("cortex#1483 (join-4): a RE-write of the leaf include backs up the PRIOR bytes to a timestamped .bak", () => {
+    const dir = freshDir();
+    const conf = join(dir, "local.conf");
+    writeFileSync(conf, bareLocalConf(), "utf-8");
+    const ports = buildLivePorts(cfgWithConfig(conf));
+
+    const binding = {
+      credentials: "/Users/andreas/.config/nats/andreas.creds",
+      account: "AADPQ7M7LQZTKPNF5CTE7V4XKB2FUYPGKLWZVMW6VXCEEKH62BYKGBHX",
+    };
+    // First write — nothing to back up yet.
+    ports.leafFile.write({ descriptor: brandVerified(descriptorForLeaf("metafactory")), binding });
+    const leafPath = join(dir, "leafnodes-metafactory.conf");
+    const firstWrite = readFileSync(leafPath, "utf-8");
+    expect(readdirSync(dir).some((f) => f.startsWith("leafnodes-metafactory.conf.bak-join-"))).toBe(false);
+
+    // A re-join re-renders the SAME network — the prior bytes must be .bak'd.
+    ports.leafFile.write({ descriptor: brandVerified(descriptorForLeaf("metafactory")), binding });
+    const baks = readdirSync(dir).filter((f) => f.startsWith("leafnodes-metafactory.conf.bak-join-"));
+    expect(baks.length).toBe(1);
+    expect(readFileSync(join(dir, baks[0]!), "utf-8")).toBe(firstWrite);
+  });
+
   test("restore rewrites a pre-existing include file back to its prior bytes + keeps a pre-existing directive", () => {
     const dir = freshDir();
     const conf = join(dir, "local.conf");
@@ -1359,27 +1426,30 @@ describe("#821 live leaf-file pre-flight + rollback adapters", () => {
     }
   });
 
-  test("MAJOR-1: validateConfig SKIPS (ok) when nats-server is not on PATH (no block)", async () => {
-    // The live adapter shells out to `nats-server -t`; on a host without the
-    // binary it must SKIP the gate (return ok), never block the join. We can't
-    // guarantee nats-server is absent on CI, so assert the result is well-formed
-    // (ok:true when skipped/passed; ok:false only with a -t reason).
+  test("MAJOR-1 / cortex#1495: validateConfig is three-state (valid | invalid | skipped), never a silent fail-open", async () => {
+    // The live adapter shells out to `nats-server -t`. We can't guarantee the
+    // binary's presence on CI, so assert the result is a well-formed three-state
+    // outcome: `valid`/`skipped` when the config is fine or the binary is missing,
+    // `invalid` (with a reason) only on a real -t failure. Crucially there is NO
+    // `ok:true` fail-open path any more — a missing binary is `skipped`, not `valid`.
     const dir = freshDir();
     const conf = join(dir, "local.conf");
     writeFileSync(conf, bareLocalConf(), "utf-8");
     const ports = buildLivePorts(cfgWithConfig(conf));
     const res = await ports.natsServer!.validateConfig();
-    if (!res.ok) {
+    if (res.status === "invalid") {
+      expect(res.reason).toContain("nats-server");
+    } else if (res.status === "skipped") {
       expect(res.reason).toContain("nats-server");
     } else {
-      expect(res.ok).toBe(true);
+      expect(res.status).toBe("valid");
     }
   });
 
-  test("MAJOR-1: dry-run validateConfig is inert (ok, never spawns)", async () => {
+  test("MAJOR-1: dry-run validateConfig is inert (valid, never spawns)", async () => {
     const ports = buildDryRunPorts(cfgWithConfig("/x/local.conf"));
     const res = await ports.natsServer!.validateConfig();
-    expect(res.ok).toBe(true);
+    expect(res.status).toBe("valid");
   });
 
   test("NIT-1: credsExist rejects a directory, a 0-byte file, and a non-creds file", () => {

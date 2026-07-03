@@ -40,6 +40,12 @@ import type {
   StackLeafBinding,
 } from "../../../common/nats/leaf-remote-renderer";
 import type { PolicyFederatedNetwork } from "../../../common/types/cortex-config";
+import type {
+  ClockPort,
+  ConfigValidationOutcome,
+  HealthProbeResult,
+  SettleWindowOptions,
+} from "../../../common/nats/restart-with-settle";
 
 // =============================================================================
 // Trust-boundary type — only a VERIFIED descriptor flows into the renderer.
@@ -343,10 +349,19 @@ export interface NatsServerPort {
    * leaf-remote's account against the account tree, so it PASSED for the original
    * #821 crash. It is therefore NECESSARY-NOT-SUFFICIENT: a cheap extra gate
    * layered ON TOP of the account-required + creds-exist + health-probe defenses,
-   * never the primary defense. A dry-run is inert (returns ok). When `nats-server`
-   * is not on PATH the gate is SKIPPED (returns ok) rather than blocking the join.
+   * never the primary defense.
+   *
+   * cortex#1495 BLOCKER — returns a THREE-state {@link ConfigValidationOutcome}:
+   *   - `valid`   — `-t` exited 0 (or dry-run / no config to test): reload safe.
+   *   - `invalid` — `-t` exited non-zero: the config IS broken → the caller
+   *     refuses the reload (never crash the bus on a config we know is bad).
+   *   - `skipped` — could NOT validate (`nats-server` not on PATH / spawn
+   *     failed). This is NOT "valid" — the caller must warn LOUDLY that the gate
+   *     did not run, then proceed (so hosts without the binary aren't hard-blocked)
+   *     rather than silently pass. The pre-#1495 code returned `ok:true` here,
+   *     which fail-OPEN let a bad config reload onto a live bus.
    */
-  validateConfig(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  validateConfig(): Promise<ConfigValidationOutcome>;
   /**
    * #821 — restart-safety HEALTH PROBE. After a restart, confirm nats-server
    * actually came back UP (its monitor port is listening / the process is
@@ -363,8 +378,12 @@ export interface NatsServerPort {
    * would additionally poll `/leafz` for the expected remote (the C-797
    * leaf-state surface). Tracked as a follow-up; liveness is sufficient to catch
    * the #821 crash (a crashed server fails `/healthz`).
+   *
+   * cortex#1495 important 3 — the `{ healthy: true }` variant may carry
+   * `inconclusive: true` for the #831 no-monitor case, so the caller's step log
+   * can say "inconclusive, treated as healthy" instead of "verified healthy".
    */
-  isHealthy(): Promise<{ healthy: true } | { healthy: false; reason: string }>;
+  isHealthy(): Promise<HealthProbeResult>;
 }
 
 /**
@@ -534,4 +553,20 @@ export interface NetworkPorts {
    * join. Default: `false` (dry-run safe). Live ports set this to `true`.
    */
   apply?: boolean;
+  /**
+   * cortex#1483 (join-4) — the settle-window RETRY/BACKOFF tuning for the
+   * post-restart health verdict (see {@link probeHealthWithSettle}). Absent ⇒
+   * {@link probeHealthWithSettle}'s own sane defaults (5 attempts, 500ms→4s
+   * exponential backoff) — a single immediate probe (the pre-#1483 behaviour,
+   * and the exact #1476 gap-2 false-alarm) is no longer the default anywhere a
+   * `natsServer` port is wired. Tests inject small values so they run fast
+   * without depending on {@link NetworkPorts.clock}.
+   */
+  settle?: SettleWindowOptions;
+  /**
+   * cortex#1483 (join-4) — injectable wall-clock wait for the settle-window
+   * backoff delays. Absent ⇒ the real `setTimeout`-backed clock. Tests inject
+   * an instant clock so a multi-attempt settle window never actually sleeps.
+   */
+  clock?: ClockPort;
 }
