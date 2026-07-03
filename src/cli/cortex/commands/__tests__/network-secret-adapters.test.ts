@@ -28,6 +28,8 @@ import { createUser } from "nkeys.js";
 import { buildLiveSecretPorts, type NatsProcessInspector } from "../network-secret-adapters";
 import type { NatsProcess } from "../../../../common/nats/hub-reload-target";
 import { materialFromSeedString } from "../../../../bus/stack-provisioning";
+import { NetworkCache } from "../../../../common/registry/network-cache";
+import type { NetworkDescriptor, NetworkRosterResult } from "../../../../common/registry/types";
 
 let tmp: string;
 let hubConf: string;
@@ -277,5 +279,117 @@ describe("reload — gate failure still gates", () => {
     }
     expect(String(err)).toMatch(/-t exited 1/);
     expect(signalled.length).toBe(0);
+  });
+});
+
+// =============================================================================
+// cortex#1481 — LIVE HubLocalityPort: reads the SAME DD-10 network-cache file
+// `cortex network join` writes (read-only, local disk — never a live registry
+// round trip), + an injectable hostname. Both are hermetic (tmp cache dir,
+// fake hostname) — never the developer's real ~/.config/cortex or real host.
+// =============================================================================
+describe("buildLiveHubLocalityPort (via buildLiveSecretPorts)", () => {
+  function fakeDescriptor(networkId: string, hubUrl: string): NetworkDescriptor {
+    return { network_id: networkId, hub_url: hubUrl, leaf_port: 7422, members: [] };
+  }
+  function fakeRoster(networkId: string): NetworkRosterResult {
+    return { network_id: networkId, members: [] };
+  }
+
+  test("resolveHubUrl reads the cached descriptor's hub_url written by `network join`", async () => {
+    const cacheDir = mkdtempSync(join(tmp, "netcache-"));
+    const cache = new NetworkCache({ cacheDir });
+    cache.store("metafactory", fakeDescriptor("metafactory", "tls://andreas-vm.example.com:7422"), fakeRoster("metafactory"));
+
+    const ports = buildLiveSecretPorts({
+      hubConfigPath: hubConf,
+      registryUrl: "http://127.0.0.1:0",
+      material: material(),
+      networkCache: cache,
+      hostname: () => "jc-laptop.local",
+    });
+
+    await expect(ports.hubLocality.resolveHubUrl("metafactory")).resolves.toBe("tls://andreas-vm.example.com:7422");
+    expect(ports.hubLocality.localHostname()).toBe("jc-laptop.local");
+  });
+
+  test("resolveHubUrl resolves undefined when nothing is cached for the network (fail-safe upstream)", async () => {
+    const cacheDir = mkdtempSync(join(tmp, "netcache-empty-"));
+    const cache = new NetworkCache({ cacheDir });
+
+    const ports = buildLiveSecretPorts({
+      hubConfigPath: hubConf,
+      registryUrl: "http://127.0.0.1:0",
+      material: material(),
+      networkCache: cache,
+      hostname: () => "jc-laptop.local",
+    });
+
+    await expect(ports.hubLocality.resolveHubUrl("never-joined")).resolves.toBeUndefined();
+  });
+
+  test("localHostname defaults to the injected os.hostname() when not overridden", () => {
+    const cacheDir = mkdtempSync(join(tmp, "netcache-hn-"));
+    const ports = buildLiveSecretPorts({
+      hubConfigPath: hubConf,
+      registryUrl: "http://127.0.0.1:0",
+      material: material(),
+      networkCache: new NetworkCache({ cacheDir }),
+    });
+    // Whatever the real machine's hostname is — just prove it's a non-empty string
+    // and that the port doesn't hard-fail without an injected override.
+    expect(typeof ports.hubLocality.localHostname()).toBe("string");
+    expect(ports.hubLocality.localHostname().length).toBeGreaterThan(0);
+  });
+
+  // Sage review Important 2 — the DNS→local-interface probe, with injected fake
+  // resolver + interface lister (no real DNS / NIC read).
+  function portsWith(opts: {
+    resolveHostAddresses: (host: string) => Promise<string[]>;
+    localInterfaceAddresses: () => string[];
+  }) {
+    return buildLiveSecretPorts({
+      hubConfigPath: hubConf,
+      registryUrl: "http://127.0.0.1:0",
+      material: material(),
+      networkCache: new NetworkCache({ cacheDir: mkdtempSync(join(tmp, "netcache-iface-")) }),
+      hostname: () => "macjcf",
+      resolveHostAddresses: opts.resolveHostAddresses,
+      localInterfaceAddresses: opts.localInterfaceAddresses,
+    });
+  }
+
+  test("hubHostIsLocalInterface → true when the hub FQDN resolves to a local NIC address", async () => {
+    const ports = portsWith({
+      resolveHostAddresses: async () => ["203.0.113.7", "192.168.1.42"],
+      localInterfaceAddresses: () => ["127.0.0.1", "192.168.1.42", "::1"],
+    });
+    await expect(ports.hubLocality.hubHostIsLocalInterface("tls://nats.meta-factory.dev:7422")).resolves.toBe(true);
+  });
+
+  test("hubHostIsLocalInterface → false when the hub FQDN resolves to a NON-local address", async () => {
+    const ports = portsWith({
+      resolveHostAddresses: async () => ["203.0.113.7"],
+      localInterfaceAddresses: () => ["127.0.0.1", "192.168.1.42"],
+    });
+    await expect(ports.hubLocality.hubHostIsLocalInterface("tls://nats.meta-factory.dev:7422")).resolves.toBe(false);
+  });
+
+  test("hubHostIsLocalInterface → false (fail-safe) when DNS resolution throws, never rethrows", async () => {
+    const ports = portsWith({
+      resolveHostAddresses: async () => { throw new Error("ENOTFOUND (fake)"); },
+      localInterfaceAddresses: () => ["127.0.0.1"],
+    });
+    await expect(ports.hubLocality.hubHostIsLocalInterface("tls://nats.meta-factory.dev:7422")).resolves.toBe(false);
+  });
+
+  test("hubHostIsLocalInterface → false for an unparseable hub_url (never calls the resolver)", async () => {
+    let resolverCalled = false;
+    const ports = portsWith({
+      resolveHostAddresses: async () => { resolverCalled = true; return []; },
+      localInterfaceAddresses: () => ["127.0.0.1"],
+    });
+    await expect(ports.hubLocality.hubHostIsLocalInterface("not a url :::")).resolves.toBe(false);
+    expect(resolverCalled).toBe(false);
   });
 });
