@@ -140,6 +140,9 @@ Rules:
   proposal ("I'd record: …").
 - Re-ask terms already listed in the CONTEXT.md settled terms section.
 - Route to an email that is not listed under the grounding's Routable people.
+- Write @mentions, names, or the '## Routable people' list into message, question,
+  next_question, or topic text — no trailing "@name / @name" on messages. Routable
+  people exist ONLY for kind="route" replies, and only as route_to.email.
 - Write @mentions, names, or the '## Routable people' list into `message`, question text,
   `next_question`, or `topic` fields — no trailing "@name / @name" on a message.  The
   '## Routable people' list is FOR `kind="route"` decisions ONLY; people appear in your
