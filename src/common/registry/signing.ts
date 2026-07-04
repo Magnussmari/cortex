@@ -15,8 +15,12 @@
  * lock-step.
  *
  * Sign is intentionally absent: cortex never signs registry assertions.
- * Only principal-side registration (separate concern, lives elsewhere
- * in the federation tooling) signs.
+ * Only principal-side registration signs — `signAdminRequest`
+ * (cortex#1517, S3, epic #1514) lives in `bus/stack-provisioning.ts`, not
+ * here: that module already owns `signClaimWithSeed` + the NKey/PKCS#8
+ * bridge, and importing it into this file (this file's `canonicalJSON`
+ * already flows INTO `stack-provisioning.ts`) would form a common↔bus
+ * import cycle. Keeping the signer in `bus/` makes it one-directional.
  */
 
 // =============================================================================
