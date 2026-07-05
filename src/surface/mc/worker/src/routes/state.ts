@@ -1,6 +1,16 @@
 /**
  * G-400/G-406: GET /api/state — Dashboard snapshot.
- * Returns the same DashboardSnapshot shape as the local API, reading from D1.
+ *
+ * `DashboardSnapshot` (below) is authored independently in this file, from
+ * the D1 projection this worker populates via event ingestion
+ * (`routes/ingest.ts`) — it does not mirror or stay in sync with any local
+ * assembly. Cortex's local dashboard serves granular REST (`/api/agents`,
+ * `/api/working-agents`, `/api/tasks`, …) plus incremental WS projections;
+ * there is no local `/api/state` equivalent (S6, #1520). `buildSnapshot()`
+ * and the routes that read its cached output are typed against one exported
+ * `DashboardSnapshot`, so a shape change on one side is a compile error on
+ * the other instead of a silent runtime drift.
+ *
  * Public endpoint (no auth required) — the dashboard is a static site.
  *
  * G-406: Module-level snapshot cache with ETag/304 support.
@@ -11,6 +21,223 @@ import { Hono } from "hono";
 import type { Env } from "../index";
 import type { Classification } from "../../../../bus/myelin/envelope-validator";
 import { assembleSessionTree, type SessionTreeNode } from "../lib/session-tree";
+
+// ---------------------------------------------------------------------------
+// S6 (#1520): DashboardSnapshot contract
+//
+// One exported type per section of the `/api/state` / `/api/dashboard`
+// payload, so `buildSnapshot()` (producer) and the routes that read its
+// cached JSON back (consumers) are checked against the same shape.
+//
+// ADR-0005 (Session interior, CONTEXT.md): every field below is lifecycle
+// metadata — with two known, deliberate exceptions, neither of them RAW
+// interior (a raw tool-call argument/output object, a full unbounded prompt,
+// a diff, or a message array never appear here; D1's schema has no column
+// for any of those categories on the 4 tables this file reads — see the
+// allow-list guard in `__tests__/dashboard-snapshot-contract.test.ts`, which
+// checks SHAPE, not content — read that file's header before assuming more
+// than it actually enforces):
+//   - `AgentCurrentTask.description` (sourced from `sessions.description`) —
+//     up to a 200-char PREVIEW of the triggering prompt. Truncated at the
+//     source (`EventLogger.hook.ts`'s `preview.slice(0, 200)` →
+//     `payload.prompt_preview`) and passed through `sanitizeDescription()`
+//     (strips `toolu_*` IDs) in `common/event-processor.ts` before it ever
+//     reaches D1. Also the sole `recentCompletions[].description`.
+//   - `SessionActivityEntry.detail` (G-410) — a pre-sanitized, truncated
+//     per-event-type action summary (`extractActivityEntry`, e.g. "Editing
+//     foo.ts" or a redacted, 100-char-capped command preview), never the raw
+//     tool_input/tool_output it summarizes.
+// Both sanitizers run at ingest time, upstream of this file; `state.ts` never
+// re-validates or re-sanitizes a row's values on read.
+//
+// `github_events.payload` IS a raw JSON-blob column — small, curated GitHub
+// metadata (branch/additions/deletions for a PR, commit/file counts for a
+// push — not session interior), read by `getRecentGitHubEvents` but never
+// forwarded into `ActivityFeedItem`.
+// ---------------------------------------------------------------------------
+
+/** IAW D.5.3 sovereignty block — `null` when none of the three fields are populated. */
+export interface SovereigntyInfo {
+  classification: Classification | null;
+  dataResidency: string | null;
+  homePrincipal: string | null;
+}
+
+/** One activity-feed entry surfaced under `agents[].currentTask.activity` (G-410). */
+export interface SessionActivityEntry {
+  timestamp: string;
+  icon: string;
+  label: string;
+  detail: string;
+}
+
+/** A session's current-task detail, as surfaced on an active/recently-terminal agent tile. */
+export interface AgentCurrentTask {
+  sessionId: string;
+  agentId: string;
+  agentName: string;
+  project: string | null;
+  /** Ingest-time-sanitized 200-char prompt preview — see the ADR-0005 note above. */
+  description: string;
+  githubIssue: string | null;
+  startedAt: string;
+  eventsCount: number;
+  lastEvent: string;
+  lastEventAt: string;
+  progress: { completed: number; total: number } | null;
+  activity: SessionActivityEntry[];
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    costUsd?: number;
+  };
+  status: "active" | "completed" | "failed";
+  completedAt?: string;
+  durationMs?: number | null;
+  /** ST-P4 — the session-tree edge; `null` ⇒ agent-rooted. */
+  parentSessionId: string | null;
+  substrate: string;
+}
+
+/** One agent tile in the snapshot's `agents` list (session-keyed, not agent-identity-keyed). */
+export interface AgentTile {
+  id: string;
+  name: string;
+  principalId: string | null;
+  homePrincipal: string | null;
+  sovereignty: SovereigntyInfo | null;
+  status: "active" | "completed";
+  currentTask: AgentCurrentTask;
+}
+
+/** One completed/failed session in `recentCompletions`. */
+export interface RecentCompletionItem {
+  agentId: string;
+  agentName: string;
+  principalId: string | null;
+  project: string | null;
+  /** Ingest-time-sanitized 200-char prompt preview — see the ADR-0005 note above. */
+  description: string;
+  durationMs: number | null;
+  completedAt: string;
+  prUrl: string | null;
+  githubIssue: string | null;
+  status: "completed" | "failed";
+  homePrincipal: string | null;
+  sovereignty: SovereigntyInfo | null;
+}
+
+/**
+ * The `github_events.event_type` values every writer emits — enumerated from
+ * `common/github-events.ts`'s PR/issue processors (`pr_opened`/`pr_merged`/
+ * `pr_closed`/`pr_reopened`, `issue_opened`/`issue_closed`/`issue_reopened`,
+ * `comment`) plus `push`/`release`, and cross-checked against the sync-route
+ * writer (`routes/sync.ts`, same literal set). The D1 column itself is an
+ * untyped TEXT with no CHECK constraint, so a row could in principle carry
+ * something else — hence the `(string & {})` escape hatch, which keeps the
+ * known values autocompletable without falsely claiming exhaustiveness.
+ */
+export type GithubEventType =
+  | "pr_opened" | "pr_merged" | "pr_closed" | "pr_reopened"
+  | "issue_opened" | "issue_closed" | "issue_reopened"
+  | "comment" | "push" | "release"
+  | (string & {});
+
+/** One merged entry in `recentActivity` — either a session completion or a GitHub event. */
+export type ActivityFeedItem =
+  | {
+      type: "task_completed" | "task_failed";
+      source: "session";
+      timestamp: string;
+      agentId: string;
+      agentName: string;
+      project: string | null;
+      /** Ingest-time-sanitized 200-char prompt preview — see the ADR-0005 note above. */
+      description: string;
+      durationMs: number | null;
+      prUrl: string | null;
+      githubIssue: string | null;
+      status: "completed" | "failed";
+    }
+  | {
+      type: GithubEventType;
+      source: "github";
+      timestamp: string;
+      repo: string;
+      title: string | null;
+      number: number | null;
+      url: string | null;
+      author: string | null;
+      agentAuthored: boolean;
+    };
+
+/** One 5h/7d usage-quota reading (per-account or per-principal). */
+export interface UsageSnapshotInfo {
+  fiveHour: { utilization: number; resetsAt: string } | null;
+  sevenDay: { utilization: number; resetsAt: string } | null;
+  sevenDayOpus: { utilization: number; resetsAt: string } | null;
+  sevenDaySonnet: { utilization: number; resetsAt: string } | null;
+  // `monthlyLimit`/`usedCredits` are future-numeric placeholders: no D1 column
+  // backs them yet (usage_snapshots has no `monthly_limit`/`used_credits`
+  // schema columns), so both are always constructed as literal `null` today.
+  // Typed `number | null` (not frozen `null`) so a future column can start
+  // populating them without a DashboardSnapshot type change.
+  extraUsage: { isEnabled: boolean; monthlyLimit: number | null; usedCredits: number | null } | null;
+  updatedAt: string;
+}
+
+/** Today's rollup counters. */
+export interface DailyStats {
+  prsMerged: number;
+  issuesClosed: number;
+  commits: number;
+  filesChanged: number;
+  sessionsCompleted: number;
+}
+
+/**
+ * The `/api/state` payload shape — also the `state` slice of the combined
+ * `/api/dashboard` payload ({@link CombinedDashboardPayload}, below).
+ */
+export interface DashboardSnapshot {
+  projects: Array<{ id: string; displayName: string }>;
+  agents: AgentTile[];
+  sessionTree: SessionTreeNode[];
+  recentCompletions: RecentCompletionItem[];
+  recentActivity: ActivityFeedItem[];
+  stats: { today: DailyStats };
+  accountUsage: UsageSnapshotInfo | null;
+  principalUsage: Record<string, UsageSnapshotInfo>;
+  homePrincipals: string[];
+  updatedAt: string;
+}
+
+/** One repo's dashboard summary ({@link buildRepos}). */
+export interface RepoSummary {
+  fullName: string;
+  shortName: string;
+  description: string | null;
+  defaultBranch: string | null;
+  openIssues: number;
+  openPRs: number;
+  syncedAt: string;
+}
+
+/** One day's activity-heatmap row ({@link buildHeatmap}). */
+export interface HeatmapDay {
+  day: string;
+  github: number;
+  agent: number;
+  byAuthor: Record<string, number>;
+}
+
+/** The combined `/api/dashboard` payload — {@link getCachedSnapshot}'s cached shape. */
+export interface CombinedDashboardPayload {
+  state: DashboardSnapshot;
+  repos: RepoSummary[];
+  heatmap: { days: HeatmapDay[] };
+}
 
 // ---------------------------------------------------------------------------
 // G-406: Module-level cache
@@ -34,7 +261,7 @@ export async function buildSnapshot(
   db: D1Database,
   project?: string | null,
   homePrincipal?: string | null,
-) {
+): Promise<DashboardSnapshot> {
   const [agents, completions, activity, dailyStats, projects, accountUsage, principalUsage, homePrincipals] = await Promise.all([
     getActiveAgents(db, project, homePrincipal),
     getRecentCompletions(db, project, undefined, homePrincipal),
@@ -76,7 +303,7 @@ export async function buildSnapshot(
 }
 
 /** Build repos list from D1 (same query as repos.ts GET /api/repos). */
-export async function buildRepos(db: D1Database) {
+export async function buildRepos(db: D1Database): Promise<RepoSummary[]> {
   const { results } = await db.prepare(`
     SELECT r.full_name, r.short_name, r.description, r.default_branch, r.synced_at,
            COALESCE(i.open_count, 0) AS open_issues,
@@ -101,7 +328,7 @@ export async function buildRepos(db: D1Database) {
 }
 
 /** Build activity heatmap from D1 (same query as stats.ts GET /api/stats/activity). */
-export async function buildHeatmap(db: D1Database, days = 7) {
+export async function buildHeatmap(db: D1Database, days = 7): Promise<HeatmapDay[]> {
   const now = new Date();
   const startDate = new Date(now.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
   const endDate = new Date(now.getTime() + 86400000).toISOString().slice(0, 10);
@@ -194,7 +421,7 @@ export async function getCachedSnapshot(db: D1Database): Promise<{ json: string;
       buildHeatmap(db),
     ]);
 
-    const combined = { state, repos, heatmap: { days: heatmap } };
+    const combined: CombinedDashboardPayload = { state, repos, heatmap: { days: heatmap } };
     const json = JSON.stringify(combined);
 
     const hashBuffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(json));
@@ -235,7 +462,22 @@ stateRoutes.get("/api/state", async (c) => {
   // (ETag is on the combined /api/dashboard payload — using it here would be
   // a semantic mismatch since this returns only the state slice)
   const { json } = await getCachedSnapshot(db);
-  const combined = JSON.parse(json);
+  // The `as CombinedDashboardPayload` below is an UNCHECKED assertion — it
+  // gives `.state` a type for this one call site, but TypeScript does NOT
+  // verify the parsed JSON actually has this shape; a genuine
+  // producer↔consumer drift would compile silently here. The real
+  // compile-time link is above, in `getCachedSnapshot()`:
+  // `const combined: CombinedDashboardPayload = { state, repos, heatmap: {
+  // days: heatmap } }` fails to compile the moment `buildSnapshot()`'s
+  // return type drifts from `DashboardSnapshot`. That guard only fires under
+  // THIS FILE'S OWN `bunx tsc` — the worker has its own tsconfig, and the
+  // root tsconfig (the one CI actually runs) excludes `src/surface/mc/worker`
+  // entirely, so nothing currently runs the worker's tsc in CI (see the
+  // follow-up issue tracking this gap). `dashboardRoutes.ts`'s
+  // `/api/dashboard`, by contrast, returns `new Response(json, {...})`
+  // straight from the cache (dashboard.ts:13-23) — it never touches `.state`
+  // and has no equivalent gap.
+  const combined = JSON.parse(json) as CombinedDashboardPayload;
   return c.json(combined.state);
 });
 
@@ -247,7 +489,7 @@ async function getActiveAgents(
   db: D1Database,
   project?: string | null,
   homePrincipal?: string | null,
-) {
+): Promise<AgentTile[]> {
   let sql = `
     SELECT session_id, principal_id, agent_id, agent_name, project, description,
            github_issue, started_at, completed_at, duration_ms, status, pr_url,
@@ -398,11 +640,7 @@ function applyHomePrincipalFilter(homePrincipal?: string | null): {
  * the frontend can fast-path the "pre-IAW row, render nothing" case without
  * a per-field truthy check.
  */
-function buildSovereignty(r: Record<string, unknown>): {
-  classification: Classification | null;
-  dataResidency: string | null;
-  homePrincipal: string | null;
-} | null {
+function buildSovereignty(r: Record<string, unknown>): SovereigntyInfo | null {
   const classification = r.classification as Classification | null | undefined;
   const dataResidency = r.data_residency as string | null | undefined;
   const homePrincipal = r.home_principal as string | null | undefined;
@@ -420,8 +658,8 @@ function buildSovereignty(r: Record<string, unknown>): {
 async function getSessionActivities(
   db: D1Database,
   sessionIds: string[],
-): Promise<Map<string, Array<{ timestamp: string; icon: string; label: string; detail: string }>>> {
-  const map = new Map<string, Array<{ timestamp: string; icon: string; label: string; detail: string }>>();
+): Promise<Map<string, SessionActivityEntry[]>> {
+  const map = new Map<string, SessionActivityEntry[]>();
   if (sessionIds.length === 0) return map;
 
   // D1 doesn't support WHERE IN with bound arrays easily, so batch manually
@@ -454,7 +692,7 @@ async function getRecentCompletions(
   project?: string | null,
   limit = 50,
   homePrincipal?: string | null,
-) {
+): Promise<RecentCompletionItem[]> {
   let sql = `
     SELECT agent_id, agent_name, principal_id, project, description, duration_ms,
            completed_at, pr_url, github_issue, status,
@@ -515,14 +753,18 @@ async function getKnownHomePrincipals(db: D1Database): Promise<string[]> {
   return (results ?? []).map((r) => r.home_principal as string);
 }
 
-async function getRecentActivity(db: D1Database, project?: string | null, limit = 500) {
+async function getRecentActivity(
+  db: D1Database,
+  project?: string | null,
+  limit = 500,
+): Promise<ActivityFeedItem[]> {
   // Merge session completions and GitHub events into one timeline
   const [completions, githubEvents] = await Promise.all([
     getRecentCompletions(db, project, limit),
     getRecentGitHubEvents(db, project, limit),
   ]);
 
-  const items: Array<Record<string, unknown>> = [];
+  const items: ActivityFeedItem[] = [];
 
   for (const c of completions) {
     items.push({
@@ -562,7 +804,26 @@ async function getRecentActivity(db: D1Database, project?: string | null, limit 
   return items.slice(0, limit);
 }
 
-async function getRecentGitHubEvents(db: D1Database, project?: string | null, limit = 100) {
+interface GithubEventRow {
+  eventId: string;
+  repo: string;
+  eventType: GithubEventType;
+  title: string | null;
+  number: number | null;
+  url: string | null;
+  author: string | null;
+  agentAuthored: boolean;
+  linkedSession: string | null;
+  payload: string | null;
+  createdAt: string;
+  receivedAt: string;
+}
+
+async function getRecentGitHubEvents(
+  db: D1Database,
+  project?: string | null,
+  limit = 100,
+): Promise<GithubEventRow[]> {
   let sql = `
     SELECT event_id, repo, event_type, title, number, url, author,
            agent_authored, linked_session, payload, created_at, received_at
@@ -583,7 +844,7 @@ async function getRecentGitHubEvents(db: D1Database, project?: string | null, li
   return (results ?? []).map((r: Record<string, unknown>) => ({
     eventId: r.event_id as string,
     repo: r.repo as string,
-    eventType: r.event_type as string,
+    eventType: r.event_type as GithubEventType,
     title: r.title as string | null,
     number: r.number as number | null,
     url: r.url as string | null,
@@ -596,7 +857,7 @@ async function getRecentGitHubEvents(db: D1Database, project?: string | null, li
   }));
 }
 
-async function getDailyStats(db: D1Database, date?: string) {
+async function getDailyStats(db: D1Database, date?: string): Promise<DailyStats> {
   const day = date ?? new Date().toISOString().slice(0, 10);
 
   const [sessionsResult, prsResult, issuesResult, pushResult] = await Promise.all([
@@ -640,7 +901,7 @@ async function getProjects(db: D1Database): Promise<string[]> {
   return (results ?? []).map((r: Record<string, unknown>) => r.name as string);
 }
 
-async function getLatestAccountUsage(db: D1Database) {
+async function getLatestAccountUsage(db: D1Database): Promise<UsageSnapshotInfo | null> {
   const row = await db.prepare(`
     SELECT source, five_hour_pct, five_hour_resets, seven_day_pct, seven_day_resets,
            seven_day_opus_pct, seven_day_sonnet_pct, extra_usage_enabled, recorded_at
@@ -681,7 +942,7 @@ async function getLatestAccountUsage(db: D1Database) {
   };
 }
 
-async function getPerPrincipalUsage(db: D1Database): Promise<Record<string, ReturnType<typeof formatUsageRow>>> {
+async function getPerPrincipalUsage(db: D1Database): Promise<Record<string, UsageSnapshotInfo>> {
   const { results } = await db.prepare(`
     SELECT u.principal_id, u.source, u.five_hour_pct, u.five_hour_resets,
            u.seven_day_pct, u.seven_day_resets, u.seven_day_opus_pct,
@@ -695,7 +956,7 @@ async function getPerPrincipalUsage(db: D1Database): Promise<Record<string, Retu
     ) latest ON u.principal_id = latest.principal_id AND u.recorded_at = latest.max_recorded
   `).all();
 
-  const map: Record<string, ReturnType<typeof formatUsageRow>> = {};
+  const map: Record<string, UsageSnapshotInfo> = {};
   for (const row of results ?? []) {
     const principalId = row.principal_id as string;
     map[principalId] = formatUsageRow(row);
@@ -703,7 +964,7 @@ async function getPerPrincipalUsage(db: D1Database): Promise<Record<string, Retu
   return map;
 }
 
-function formatUsageRow(row: Record<string, unknown>) {
+function formatUsageRow(row: Record<string, unknown>): UsageSnapshotInfo {
   return {
     fiveHour: (row.five_hour_pct as number | null) != null
       ? { utilization: row.five_hour_pct as number, resetsAt: (row.five_hour_resets as string) ?? "" }
