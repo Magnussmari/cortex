@@ -85,7 +85,6 @@ import {
   type BrainAttachmentRef,
   buildDispatchTaskEnvelope,
   BRAIN_TASK_SUBJECT_FAMILY,
-  type BrainConsumerAgent,
 } from "./bus/brain-consumer";
 import {
   SurfacePrincipalGate,
@@ -93,14 +92,12 @@ import {
   type PrincipalIdentity,
 } from "./bus/surface-principal-gate";
 import { GateReplyRouter } from "./bus/gate-reply-router";
-import { makeExecBrainRunner } from "./brain/exec-brain-runner";
 import { DaemonBrainHost } from "./brain/daemon-brain-host";
 import { wireDevConsumers } from "./runner/dev-consumer-boot";
 import { wireReviewConsumers } from "./runner/review-consumer-boot";
-import {
-  ReleaseConsumer,
-  type ReleaseConsumerAgent,
-} from "./runner/release-consumer";
+import { wireBrainConsumers } from "./runner/brain-consumer-boot";
+import { wireReleaseConsumers } from "./runner/release-consumer-boot";
+import { ReleaseConsumer } from "./runner/release-consumer";
 import {
   provisionReviewStream,
   provisionReviewConsumer,
@@ -749,56 +746,6 @@ function targetAgentForDispatch(
     }),
     ...(agent.strictMcpConfig === true && { strictMcpConfig: true }),
   };
-}
-
-/**
- * Bot Packs B-1 (cortex#1033 §Maintainability) — collect the declared brain
- * secrets from THIS process's env. Only named keys are forwarded into the
- * brain's minimal env (the runner enforces the minimal-env policy; §8). A
- * named-but-unset secret is simply absent (logged once for visibility — the
- * install-time consent is the arc-side gate). Pure except for the stderr log.
- */
-function collectBrainSecrets(
-  agentId: string,
-  declared: readonly string[],
-): Record<string, string> {
-  const secrets: Record<string, string> = {};
-  const missing: string[] = [];
-  for (const name of declared) {
-    const value = process.env[name];
-    if (value !== undefined) secrets[name] = value;
-    else missing.push(name);
-  }
-  if (missing.length > 0) {
-    process.stderr.write(
-      `cortex: brain agent=${agentId} declares secrets not present in the ` +
-        `environment: [${missing.join(",")}] — they will be absent from ` +
-        `the brain process (install-time consent is the arc-side gate)\n`,
-    );
-  }
-  return secrets;
-}
-
-/**
- * Bot Packs B-1 (cortex#1033 §Maintainability) — read the persona text once at
- * brain start. `personaPath` is the loader-resolved file PATH. A
- * missing/unreadable persona is non-fatal: returns `undefined` (the brain
- * receives no persona) and logs once.
- */
-function loadBrainPersona(
-  agentId: string,
-  personaPath: string,
-): string | undefined {
-  try {
-    return readFileSync(personaPath, "utf-8");
-  } catch (personaErr) {
-    process.stderr.write(
-      `cortex: brain agent=${agentId} persona unreadable at "${personaPath}": ` +
-        `${personaErr instanceof Error ? personaErr.message : String(personaErr)} — ` +
-        `proceeding without persona\n`,
-    );
-    return undefined;
-  }
 }
 
 /**
@@ -2309,209 +2256,28 @@ export async function startCortex(
       })
     : undefined;
 
-  const startBrainConsumersForAgent = async (agent: Agent): Promise<void> => {
-    try {
-      const brain = agent.runtime?.brain;
-      if (brain?.kind !== "exec" || brain.run === undefined) {
-        // Defensive: the caller filters to exec brains with a `run`; a
-        // mis-routed builtin/absent brain is a no-op, not a crash.
-        return;
-      }
-      const caps = agent.runtime?.capabilities ?? [];
-      const consumerAgent: BrainConsumerAgent = {
-        id: agent.id,
-        capabilities: caps,
-        dispatchCapabilities: brain.dispatch_capabilities,
-        ...(agent.runtime?.maxConcurrent !== undefined && {
-          maxConcurrent: agent.runtime.maxConcurrent,
-        }),
-        ...(agent.runtime?.modelClass !== undefined && {
-          modelClass: agent.runtime.modelClass,
-        }),
-      };
-
-      // Resolve the per-task runner over the manifest `brain` block. `{pack}`
-      // expands to `{base}/{agentId}` (the arc install dir; design §7.1). The
-      // declared secrets resolve from THIS process's env at spawn — only the
-      // named keys are forwarded into the brain's minimal env (the runner
-      // enforces the minimal-env policy; §8). A named-but-unset secret is
-      // simply absent in the env (logged once for visibility). cortex#1033
-      // §Maintainability — secret collection + persona load are extracted to the
-      // module-level `collectBrainSecrets` / `loadBrainPersona` helpers so this
-      // startup closure reads as a sequence of named steps.
-      const packDir = join(brainPackBaseDir, agent.id);
-      const secrets = collectBrainSecrets(agent.id, brain.secrets);
-
-      // Persona delivered to the brain — per-task brains receive it on each task
-      // event; daemon brains receive it ONCE in the `hello` handshake (§5
-      // "Persona delivery"). A missing/unreadable persona is non-fatal.
-      const personaText = loadBrainPersona(agent.id, agent.persona);
-
-      // Bot Packs B-2 — `lifecycle: daemon` is hosted by a long-lived
-      // DaemonBrainHost (spawn once, socket-multiplex tasks, supervise + drain);
-      // `per-task` (default) keeps the B-1 per-spawn runner. Both feed the SAME
-      // BrainConsumer policy seam (the consumer is lifecycle-agnostic — it routes
-      // brain effects through the host hooks identically). The lifecycle-specific
-      // runner is mutually exclusive: a daemon agent passes `daemonHost` (no
-      // per-task runner constructed), a per-task agent passes `runBrainTask`.
-      // The `principalGate` (B-3, cortex#1021 W-2): when the principal has a
-      // configured surface identity, every brain consumer gets the SHARED
-      // `surfacePrincipalGate` — `ask_principal` renders to the task's
-      // surface/thread and awaits the principal's identity-checked reply via
-      // the `gateReplyRouter` bridge (wired into each adapter's inbound flow
-      // at adapter start). Tasks that are bus-only, on a surface this
-      // instance doesn't host, or on a surface with no configured principal
-      // id STILL fail closed inside the gate (resolve-time checks). With no
-      // principal surface identity at all the consumer keeps its
-      // DenyAllPrincipalGate default (B-1 fail-closed).
-      // Sovereignty audit-parity by default, mirroring ReviewConsumer (a
-      // self-declared modelClass is spoofable until bound to the signing
-      // identity, cortex#327).
-      const baseConsumerOpts = {
-        agent: consumerAgent,
-        source: systemEventSource,
-        runtime,
-        ...(personaText !== undefined && { persona: personaText }),
-        ...(surfacePrincipalGate !== undefined && {
-          principalGate: surfacePrincipalGate,
-        }),
-      };
-      let daemonHost: DaemonBrainHost | undefined;
-      let consumer: BrainConsumer;
-      if (brain.lifecycle === "daemon") {
-        daemonHost = new DaemonBrainHost({
-          agentId: agent.id,
-          run: brain.run,
-          packDir,
-          secrets,
-          maxRestarts: brain.maxRestarts,
-          ...(personaText !== undefined && { persona: personaText }),
-          // On degradation (restart budget exhausted) surface the agent via the
-          // presence producer's capability-change signal (drop to empty caps),
-          // the same path the reconcile uses (§7.4). Read the holder lazily —
-          // the producer is constructed after this boot closure runs.
-          onDegraded: (degradedId: string): void => {
-            const producer = brainPresenceHolder.producer;
-            if (producer !== null) {
-              producer.publishCapabilitiesChanged(degradedId, []);
-            }
-            process.stderr.write(
-              `cortex: daemon brain agent=${degradedId} marked DEGRADED — ` +
-                `restart budget exhausted; presence signalled\n`,
-            );
-          },
-        });
-        // Spawn + connect + hello. A spawn/connect failure is logged; the
-        // consumer still registers so a later reload can replace it. The
-        // consumer's runner (the host's runTask) fast-fails not_now until the
-        // host connects, so no task is silently lost.
-        // Non-blocking start (sage cortex#1035 round 3): start() resolves on
-        // the socket handshake, so awaiting here would make cortex boot
-        // latency the SUM of every daemon's spawn+auth. The consumer's
-        // runner fast-fails not_now until the host connects (documented
-        // above), so registering the consumer before the handshake settles
-        // loses nothing — failures land in the same stderr path.
-        void daemonHost.start().catch((startErr: unknown) => {
-          process.stderr.write(
-            `cortex: daemon brain host start failed for agent=${agent.id}: ` +
-              `${startErr instanceof Error ? startErr.message : String(startErr)}\n`,
-          );
-        });
-        daemonBrainHosts.push(daemonHost);
-        consumer = new BrainConsumer({ ...baseConsumerOpts, daemonHost });
-      } else {
-        const runBrainTask = makeExecBrainRunner({ run: brain.run, packDir, secrets });
-        consumer = new BrainConsumer({ ...baseConsumerOpts, runBrainTask });
-      }
-      brainConsumers.push(consumer);
-
-      // Provision + bind one durable pull consumer per declared capability.
-      // Subject grammar: `local.{principal}.{stack}.tasks.{capability}` (the
-      // myelin task-envelope grammar the design + agent envelopes use — the
-      // capability is a literal trailing segment, no `>` wildcard since a brain
-      // task subject is exact per capability). Durable name is unique per
-      // (principal, agent, capability).
-      //
-      // cortex#1033 §Architecture/§HonestOracle — provision ALL capability
-      // durables UP-FRONT and AWAIT them BEFORE calling `consumer.start()`, so
-      // the bind inside `start()` cannot race ahead of a not-yet-created durable
-      // on a virgin broker. This mirrors the review path (which awaits
-      // `provisionReviewConsumer` before `consumer.start()`); the brain path
-      // previously fired `void provisionReviewConsumer(...)` from inside the
-      // synchronous `resolve` callback, which returned the subscription params
-      // immediately while provisioning was still in flight. `resolve` is now a
-      // pure subject/durable resolver with no side effect.
-      // B-3 (cortex#1021): brain task subjects live on the `brain.` family /
-      // BRAIN_TASKS stream — NOT `tasks.`/CODE_REVIEW (where B-1 bound them,
-      // a stream that never carried non-code-review capabilities). The inbound
-      // dispatch publishes onto exactly this subject.
-      const brainCapabilities = consumerAgent.capabilities;
-      const brainDurableFor = (capability: string): string =>
-        `cortex-brain-consumer-${reviewPrincipalId}-${agent.id}-${capability.replaceAll(".", "-")}`;
-      const brainPatternFor = (capability: string): string =>
-        `local.${reviewPrincipalId}.${derivedStack.stack}.${BRAIN_TASK_SUBJECT_FAMILY}.${capability}`;
-
-      if (reviewJsm !== null) {
-        // Independent durables — provision in one parallel wave (sage
-        // cortex#1033 round 2); still awaited as a whole BEFORE start().
-        await Promise.all(
-          brainCapabilities.map(async (capability) => {
-            const durable = brainDurableFor(capability);
-            try {
-              await provisionReviewConsumer({
-                jsm: reviewJsm,
-                stream: brainTasksStream,
-                durable,
-                filterSubject: brainPatternFor(capability),
-                maxDeliver: reviewConsumerMaxDeliver,
-              });
-            } catch (provisionErr) {
-              // Don't abort — let `consumer.start()` surface the bind failure
-              // through its own dormant/skip path (mirrors the review path).
-              process.stderr.write(
-                `cortex: provisionReviewConsumer (brain) failed for "${durable}": ` +
-                  `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
-              );
-            }
-          }),
-        );
-      }
-
-      const started = await consumer.start({
-        resolve: (capability) => ({
-          pattern: brainPatternFor(capability),
-          stream: brainTasksStream,
-          durable: brainDurableFor(capability),
-        }),
-      });
-
-      const capSummary =
-        started.capabilities.length > 0 ? started.capabilities.join(",") : "(none)";
-      if (started.subscribedCapabilities.length > 0) {
-        console.log(
-          `cortex: brain consumer ready for agent=${agent.id} kind=exec ` +
-            `capabilities=[${capSummary}] subscribed=[${started.subscribedCapabilities.join(",")}] ` +
-            `gate=${surfacePrincipalGate !== undefined ? "surface" : "deny-all"}`,
-        );
-      } else {
-        console.log(
-          `cortex: brain consumer DORMANT for agent=${agent.id} kind=exec ` +
-            `capabilities=[${capSummary}] ` +
-            `gate=${surfacePrincipalGate !== undefined ? "surface" : "deny-all"} ` +
-            `— cortex MyelinRuntime subscriptions disabled ` +
-            `(G-1111 pending; tasks.{capability} envelopes will not be claimed by this brain)`,
-        );
-      }
-    } catch (err) {
-      // Per CLAUDE.md: log every error. One brain's wiring failure does NOT
-      // abort boot; the consumer (if pushed) stays in `brainConsumers[]` so the
-      // shutdown drain still calls `.stop()` (idempotent).
-      process.stderr.write(
-        `cortex: brain consumer init failed for agent=${agent.id}: ` +
-          `${err instanceof Error ? err.message : String(err)}\n`,
-      );
-    }
-  };
+  // S8 (epic #1514, cortex#1522) — the brain-consumer construction extracted
+  // to `wireBrainConsumers` (mirrors S7's `wireReviewConsumers`). Renamed at
+  // destructure (`startBrainForAgent`, not the bare `startForAgent` the
+  // module returns) because review's own `startForAgent` binding above lives
+  // in this SAME top-level scope — the two are unrelated bindings that would
+  // otherwise collide. Called at BOTH the boot loop below and the
+  // `agents.d/` hot-reload path (isBrainHosted, further down), exactly where
+  // the inline closure used to be called.
+  const { startForAgent: startBrainForAgent } = wireBrainConsumers({
+    brainPackBaseDir,
+    reviewPrincipalId,
+    stack: derivedStack.stack,
+    systemEventSource,
+    runtime,
+    ...(surfacePrincipalGate !== undefined && { surfacePrincipalGate }),
+    brainPresenceHolder,
+    brainConsumers,
+    daemonBrainHosts,
+    reviewJsm,
+    brainTasksStream,
+    reviewConsumerMaxDeliver,
+  });
 
   // Boot: start review consumers for every code-review-capable agent. Same
   // `startForAgent` the hot-reload path calls for a newly-added agent.
@@ -2521,7 +2287,7 @@ export async function startCortex(
   // Boot: start brain consumers for every exec-brain agent (B-1). Same closure
   // the hot-reload path calls for a newly-added exec-brain agent.
   for (const agent of brainAgents) {
-    await startBrainConsumersForAgent(agent);
+    await startBrainForAgent(agent);
   }
   if (reviewConsumers.length === 0) {
     // cortex#314 — same first-install-safety promotion as the
@@ -2638,141 +2404,29 @@ export async function startCortex(
       }
     }
 
+    // S8 (epic #1514, cortex#1522) — the per-agent construct+provision+start+
+    // log body extracted to `wireReleaseConsumers`. Unlike the brain/review
+    // lanes, this construction has exactly ONE call site (this loop) and no
+    // `agents.d/` hot-reload path — see the module's file header for why that
+    // asymmetry is preserved, not "fixed".
+    // Block-scoped: shadows nothing outside this `if` (review's own
+    // `startForAgent` above is a sibling top-level binding, not visible from
+    // inside a nested reload closure the way brain's must be — release has no
+    // hot-reload path, so this name only ever needs to live here).
+    const { startForAgent } = wireReleaseConsumers({
+      principalId,
+      systemEventSource,
+      runtime,
+      makeOfferAdmission,
+      releaseConsumers,
+      releaseJsm,
+      releaseStream,
+      releaseConsumerMaxDeliver,
+      releaseOfferingPatterns,
+      releaseSubjectPattern,
+    });
     for (const agent of releaseCapableAgents) {
-      try {
-        const caps = agent.runtime?.capabilities ?? [];
-        const consumerAgent: ReleaseConsumerAgent = {
-          id: agent.id,
-          capabilities: caps,
-          ...(agent.runtime?.maxConcurrent !== undefined && {
-            maxConcurrent: agent.runtime.maxConcurrent,
-          }),
-        };
-        // F-4.1 — no executor wired yet (see block header). The consumer is
-        // dormant-but-present: capability declared + gate ladder live.
-        const consumer = new ReleaseConsumer({
-          agent: consumerAgent,
-          source: systemEventSource,
-          runtime,
-          // CO-2/CO-4 — per-offer-scope admission gate (inert on `local.`).
-          offerAdmission: makeOfferAdmission("release.cut"),
-        });
-        releaseConsumers.push(consumer);
-
-        const durable = `cortex-release-consumer-${principalId}-${agent.id}`;
-        if (releaseJsm !== null) {
-          try {
-            const outcome = await provisionReviewConsumer({
-              jsm: releaseJsm,
-              stream: releaseStream,
-              durable,
-              maxDeliver: releaseConsumerMaxDeliver,
-            });
-            if (outcome === "created") {
-              console.log(
-                `cortex: provisioned JetStream durable "${durable}" on stream "${releaseStream}"`,
-              );
-            } else if (outcome === "updated") {
-              console.log(
-                `cortex: reconciled JetStream durable "${durable}" on stream "${releaseStream}"`,
-              );
-            }
-          } catch (provisionErr) {
-            process.stderr.write(
-              `cortex: provisionReviewConsumer failed for "${durable}": ` +
-                `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
-            );
-          }
-        }
-
-        // CO-2 (cortex#941) — bind on the offering-admitted scope prefixes.
-        // `releaseOfferingPatterns[0]` is byte-identical to
-        // `releaseSubjectPattern` for the CO-1 default (`local`-only); the
-        // `.slice(1)` loop is empty unless `release.cut` is offered wider.
-        const primaryReleasePattern =
-          releaseOfferingPatterns[0] ?? releaseSubjectPattern;
-        const started = await consumer.start({
-          pattern: primaryReleasePattern,
-          stream: releaseStream,
-          durable,
-        });
-        // F-4.1 — log line flags `executor=none` so a principal grepping boot
-        // can see the lane is declared but the forge seam is not yet wired.
-        if (started.subscribed) {
-          console.log(
-            `cortex: release consumer ready for agent=${agent.id} capability=release.cut executor=none (gated; principal-grant required) — PRINCIPAL-GATED, ALWAYS-HUMAN`,
-          );
-        } else {
-          console.log(
-            `cortex: release consumer DORMANT for agent=${agent.id} capability=release.cut executor=none — cortex MyelinRuntime subscriptions disabled (G-1111 pending; tasks.release.cut envelopes will not be claimed by this consumer)`,
-          );
-        }
-        // CO-2 — extra offering scopes (federated/public) beyond the primary
-        // local one, each on its own scope-named durable. Empty for the CO-1
-        // default ⇒ byte-identical boot.
-        for (const extraPattern of releaseOfferingPatterns.slice(1)) {
-          const scopeToken = extraPattern.split(".", 1)[0] ?? "scope";
-          // A NEW consumer instance per extra scope (one filter per JetStream
-          // pull consumer) — same idiom as the review lane + the NIT-fix on the
-          // dev lane. The CO-2/CO-4 admission gate is wired here too so the
-          // wider-scope release dispatch clears its floor.
-          const extraConsumer = new ReleaseConsumer({
-            agent: consumerAgent,
-            source: systemEventSource,
-            runtime,
-            offerAdmission: makeOfferAdmission("release.cut"),
-          });
-          releaseConsumers.push(extraConsumer);
-          const extraDurable = `cortex-release-consumer-offer-${scopeToken}-${principalId}-${agent.id}`;
-          if (releaseJsm !== null) {
-            try {
-              const outcome = await provisionReviewConsumer({
-                jsm: releaseJsm,
-                stream: releaseStream,
-                durable: extraDurable,
-                maxDeliver: releaseConsumerMaxDeliver,
-              });
-              if (outcome === "created") {
-                console.log(
-                  `cortex: provisioned JetStream durable "${extraDurable}" on stream "${releaseStream}"`,
-                );
-              } else if (outcome === "updated") {
-                console.log(
-                  `cortex: reconciled JetStream durable "${extraDurable}" on stream "${releaseStream}"`,
-                );
-              }
-            } catch (provisionErr) {
-              process.stderr.write(
-                `cortex: provisionReviewConsumer failed for "${extraDurable}": ` +
-                  `${provisionErr instanceof Error ? provisionErr.message : String(provisionErr)}\n`,
-              );
-            }
-          }
-          const extraStarted = await extraConsumer.start({
-            pattern: extraPattern,
-            stream: releaseStream,
-            durable: extraDurable,
-          });
-          if (extraStarted.subscribed) {
-            console.log(
-              `cortex: release consumer (offer:${scopeToken}) ready for agent=${agent.id} capability=release.cut executor=none pattern=${extraPattern}`,
-            );
-          } else {
-            console.log(
-              `cortex: release consumer (offer:${scopeToken}) DORMANT for agent=${agent.id} capability=release.cut executor=none — cortex MyelinRuntime subscriptions disabled (${extraPattern} envelopes will not be claimed by this consumer)`,
-            );
-          }
-        }
-      } catch (err) {
-        // Per CLAUDE.md "no empty catch blocks": a single agent's release
-        // consumer crash does NOT abort boot — siblings still wire. The
-        // consumer stays in `releaseConsumers[]` so the shutdown drain still
-        // calls `.stop()` (idempotent — handles the "never subscribed" case).
-        process.stderr.write(
-          `cortex: release consumer init failed for agent=${agent.id}: ` +
-            `${err instanceof Error ? err.message : String(err)}\n`,
-        );
-      }
+      await startForAgent(agent);
     }
   }
 
@@ -4611,7 +4265,7 @@ export async function startCortex(
         if (isReviewCapable(agent)) {
           await startForAgent(agent);
         } else if (isBrainHosted(agent)) {
-          await startBrainConsumersForAgent(agent);
+          await startBrainForAgent(agent);
         }
       }),
     );
