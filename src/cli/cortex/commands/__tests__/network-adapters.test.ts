@@ -13,7 +13,7 @@
  * live ports bundle.
  */
 
-import { describe, test, expect, afterEach } from "bun:test";
+import { describe, test, expect, afterEach, beforeEach } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, chmodSync, statSync } from "fs";
 import { tmpdir, homedir } from "os";
 import { join } from "path";
@@ -2418,5 +2418,78 @@ describe("#800 daemon restart port", () => {
     const res = await ports.daemon.restart();
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toContain("no cortex daemon service found");
+  });
+});
+
+// =============================================================================
+// #1527 — dry-run `network join` must NOT register with the registry.
+// registerStack upserts the stack pubkey AND raises a network-pinned PENDING
+// admission row; a preview (`join` without `--apply`) touching that is
+// join-issues-2026-06-26 §8. We stub global fetch to throw, so ANY HTTP attempt
+// fails the test — the dry-run gate must short-circuit before the transport.
+// =============================================================================
+
+describe("#1527 dry-run registerStack gate", () => {
+  const realFetch = globalThis.fetch;
+  let seedDir: string;
+  let seedPath: string;
+
+  const cfgWithRegistry = () => ({
+    networkId: "metafactory",
+    principalId: "jc",
+    stackId: "jc/default",
+    platform: "darwin" as const,
+    // A reachable-looking registry + a REAL seed on disk: absent the gate,
+    // registerStack loads the seed, signs the claim, and POSTs it here.
+    registryUrl: "https://registry.example.test",
+    seedPath,
+    announceCapabilities: ["code-review.typescript"],
+  });
+
+  // A genuine seed so the LIVE path's loadSeedMaterial succeeds and control
+  // actually reaches the network — otherwise a live-path test would fail at
+  // seed-load before ever exercising the gate (Sage HonestOracle catch).
+  beforeEach(() => {
+    seedDir = mkdtempSync(join(tmpdir(), "c1527-seed-"));
+    seedPath = join(seedDir, "stack.seed");
+    generateStackIdentity({ seedPath });
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    rmSync(seedDir, { recursive: true, force: true });
+  });
+
+  test("dry-run registerStack returns the skip note and makes ZERO fetch calls", async () => {
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error("#1527: dry-run registerStack must not hit the network");
+    }) as unknown as typeof fetch;
+
+    const ports = buildDryRunPorts(cfgWithRegistry());
+    const res = await ports.registry.registerStack();
+
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.note).toContain("dry-run");
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("live registerStack reaches the registry POST (gate is dry-run only)", async () => {
+    // Same config + a valid seed, so the live path runs to completion and
+    // actually hits the network. We count fetch calls and throw to avoid a
+    // real registry — asserting fetchCalls > 0 proves it got PAST the gate to
+    // the transport (not merely that it avoided the dry-run note).
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error("network down (test)");
+    }) as unknown as typeof fetch;
+
+    const ports = buildLivePorts(cfgWithRegistry());
+    const res = await ports.registry.registerStack();
+
+    expect(fetchCalls).toBeGreaterThan(0);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason.toLowerCase()).not.toContain("dry-run");
   });
 });
