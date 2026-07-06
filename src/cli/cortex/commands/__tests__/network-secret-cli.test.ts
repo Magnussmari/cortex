@@ -8,13 +8,14 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createUser } from "nkeys.js";
 import {
   dispatchNetwork,
   __setJoinLeafSecretFetcherForTests,
+  __setLeafCredsInstallDirForTests,
   __setDiscordRemoveClientForTests,
   type SecretPortsFactory,
   type KeyRotationPortsFactory,
@@ -27,6 +28,7 @@ import type {
 } from "../network-secret-ports";
 import type { PolicyFederatedNetwork } from "../../../../common/types/cortex-config";
 import type { FetchSealedLeafSecretInput } from "../../../../common/registry/fetch-sealed-secret";
+import { FAKE_CREDS } from "../../../../common/registry/__tests__/fixtures";
 
 let tmp: string;
 let seedPath: string;
@@ -611,7 +613,10 @@ describe("cortex network secret revoke-member — C-1349 rotate-now recommendati
 // =============================================================================
 
 describe("cortex network join — plug-and-play leaf-secret auto-fetch", () => {
-  afterEach(() => __setJoinLeafSecretFetcherForTests(null));
+  afterEach(() => {
+    __setJoinLeafSecretFetcherForTests(null);
+    __setLeafCredsInstallDirForTests(null);
+  });
 
   test("join with NO configured leaf-secret AUTO-fetches it from the admission gate", async () => {
     // A real joiner seed so materialFromSeedString succeeds.
@@ -622,7 +627,7 @@ describe("cortex network join — plug-and-play leaf-secret auto-fetch", () => {
     const seen: FetchSealedLeafSecretInput[] = [];
     __setJoinLeafSecretFetcherForTests(async (input) => {
       seen.push(input);
-      return { ok: true, leafPsk: "AUTO-PSK", leafUser: "andreas" };
+      return { ok: true, kind: "psk", leafPsk: "AUTO-PSK", leafUser: "andreas" };
     });
 
     // Dry-run join (no --apply): the descriptor fetch will fail against the
@@ -643,6 +648,96 @@ describe("cortex network join — plug-and-play leaf-secret auto-fetch", () => {
     expect(seen[0]!.networkId).toBe("metafactory");
     expect(seen[0]!.principalId).toBe("andreas");
     expect(seen[0]!.registryUrl).toBe("http://127.0.0.1:0");
+    // #1597 (R7) — the join declares the member's OWN identities so a v2
+    // credential minted for a different subject is refused inside the fetch.
+    expect(seen[0]!.expectedLeafUsers).toContain("andreas/default");
+    expect(seen[0]!.expectedLeafUsers).toContain("andreas");
+  });
+
+  // ===========================================================================
+  // #1597 (epic #1595) — v2 payload: the delivered per-member credential FILE
+  // is installed at the conventional 0600 path before the join renders.
+  // ===========================================================================
+
+  /** Write a real joiner seed (so materialFromSeedString succeeds) → its path. */
+  function writeJoinerSeed(name: string): string {
+    const p = join(tmp, name);
+    writeFileSync(p, new TextDecoder().decode(createUser().getSeed()), { mode: 0o600 });
+    chmodSync(p, 0o600);
+    return p;
+  }
+
+  /** The shared dry-run join argv (descriptor fetch fails against the
+   *  unreachable registry, but the auto-fetch + install run FIRST). */
+  function joinArgs(seedPath: string): string[] {
+    return [
+      "join", "metafactory",
+      "--principal", "andreas",
+      "--registry-url", "http://127.0.0.1:0",
+      "--seed-path", seedPath,
+      "--account", "A" + "B".repeat(55),
+      "--nats-config", join(tmp, "local.conf"),
+      "--plist", join(tmp, "nats.plist"),
+    ];
+  }
+
+  function fakeV2Fetcher(creds: string): void {
+    __setJoinLeafSecretFetcherForTests(async () => ({
+      ok: true,
+      kind: "creds",
+      creds,
+      leafUser: "andreas/default",
+      mintedAt: "2026-07-06T00:00:00Z",
+    }));
+  }
+
+  test("a v2 (credential-file) payload is installed 0600 at the conventional per-network path", async () => {
+    const installDir = join(tmp, "nats-install");
+    __setLeafCredsInstallDirForTests(installDir);
+    fakeV2Fetcher(FAKE_CREDS);
+
+    await dispatchNetwork(joinArgs(writeJoinerSeed("joiner3.seed")), (() => ({})) as never);
+
+    const installed = join(installDir, "metafactory-leaf.creds");
+    expect(readFileSync(installed, "utf-8")).toBe(FAKE_CREDS);
+    // 0600 — not group- or world-readable (the acceptance bar).
+    expect(statSync(installed).mode & 0o777).toBe(0o600);
+  });
+
+  test("v2 install REPLACES a pre-existing looser file with different content, ending 0600", async () => {
+    // Exercises the WRITE branch against a pre-existing 0644 file (the Sage
+    // #1609 window). Asserts the END state only — content replaced, final mode
+    // 0600; the no-transit-through-group-readable property is guaranteed by
+    // the tmp+rename design in installLeafCreds, not observable from here.
+    const installDir = join(tmp, "nats-install-2");
+    const installed = join(installDir, "metafactory-leaf.creds");
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(installed, "-----BEGIN NATS USER JWT-----\nOLD\n", { mode: 0o644 });
+
+    __setLeafCredsInstallDirForTests(installDir);
+    fakeV2Fetcher(FAKE_CREDS);
+
+    await dispatchNetwork(joinArgs(writeJoinerSeed("joiner4.seed")), (() => ({})) as never);
+
+    expect(readFileSync(installed, "utf-8")).toBe(FAKE_CREDS);
+    expect(statSync(installed).mode & 0o777).toBe(0o600);
+  });
+
+  test("v2 install is byte-stable + re-asserts 0600 on an IDENTICAL pre-existing looser file", async () => {
+    // Same content on disk → the write branch is skipped (no mtime churn) and
+    // only the trailing chmod tightens the looser pre-existing mode.
+    const installDir = join(tmp, "nats-install-3");
+    const installed = join(installDir, "metafactory-leaf.creds");
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(installed, FAKE_CREDS, { mode: 0o644 });
+
+    __setLeafCredsInstallDirForTests(installDir);
+    fakeV2Fetcher(FAKE_CREDS);
+
+    await dispatchNetwork(joinArgs(writeJoinerSeed("joiner5.seed")), (() => ({})) as never);
+
+    expect(readFileSync(installed, "utf-8")).toBe(FAKE_CREDS);
+    expect(statSync(installed).mode & 0o777).toBe(0o600);
   });
 
   test("an explicit --leaf-secret SUPPRESSES the auto-fetch", async () => {

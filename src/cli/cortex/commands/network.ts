@@ -40,9 +40,9 @@
  * Exit codes: 0 success · 1 operational failure · 2 usage error.
  */
 
-import { existsSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readFile } from "fs/promises";
-import { join } from "path";
+import { dirname, join } from "path";
 
 import { expandTilde, loadConfigWithAgents } from "../../../common/config/loader";
 import type { LoadedConfig } from "../../../common/config/loader";
@@ -794,10 +794,98 @@ export function __setJoinLeafSecretFetcherForTests(f: LeafSecretFetcher | null):
   joinLeafSecretFetcherOverride = f;
 }
 
+/**
+ * #1597 — where a fetched v2 per-member `.creds` file is installed. Deliberately
+ * the `-leaf` suffixed name, NOT `defaultCredsPath`'s `<network>.creds`: the
+ * derive convention path may carry a hand-placed Model-A file we must never
+ * clobber. Tests inject a tmp dir via {@link __setLeafCredsInstallDirForTests}.
+ */
+const LEAF_CREDS_INSTALL_DIR = "~/.config/nats";
+let leafCredsInstallDirOverride: string | null = null;
+
+/** Test-only — redirect the v2 creds install dir to a tmp dir. */
+export function __setLeafCredsInstallDirForTests(dir: string | null): void {
+  leafCredsInstallDirOverride = dir;
+}
+
+function leafCredsInstallPath(networkId: string): string {
+  const dir = leafCredsInstallDirOverride ?? expandTilde(LEAF_CREDS_INSTALL_DIR);
+  return join(dir, `${networkId}-leaf.creds`);
+}
+
+/**
+ * #1597 — install the fetched v2 credential file at the conventional path.
+ * Written as a NEW same-dir tmp file EXCLUSIVELY created 0600 (flag "wx" — a
+ * stale tmp from a crashed run is removed, never silently reused, so
+ * `writeFileSync`'s create-only mode semantics always apply), then renamed
+ * over the target: a direct overwrite of a looser pre-existing file would
+ * expose the fresh credential group-readable until a trailing chmod (Sage
+ * #1609). The tmp+rename keeps the text 0600 from creation to install AND
+ * makes the replacement atomic. When the content already matches, the write
+ * is skipped (re-join idempotency — no content/mtime churn) but a looser
+ * pre-existing mode is still tightened to 0600. BOTH mutations — the write
+ * and the mode-tighten — are reported to the caller, which surfaces them on
+ * stderr (this runs in dry-run too — see the call site).
+ */
+function installLeafCreds(
+  networkId: string,
+  creds: string,
+): { path: string; wrote: boolean; tightened: boolean } {
+  const path = leafCredsInstallPath(networkId);
+  let existing: string | undefined;
+  try {
+    existing = readFileSync(path, "utf-8");
+  } catch (err) {
+    // Only ENOENT means "not installed yet" — surface EACCES/EISDIR/etc. as
+    // the real filesystem problem they are (the caller's catch reports them).
+    if ((err as { code?: string }).code !== "ENOENT") throw err;
+    existing = undefined;
+  }
+  const wrote = existing !== creds;
+  if (wrote) {
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp-${process.pid}`;
+    rmSync(tmp, { force: true }); // a stale tmp (crash + PID reuse) may be loose
+    try {
+      writeFileSync(tmp, creds, { mode: 0o600, flag: "wx" });
+      renameSync(tmp, path);
+    } catch (err) {
+      // Never leave the credential text behind under the tmp name.
+      try {
+        rmSync(tmp, { force: true });
+      } catch (_cleanupErr) {
+        // Best-effort cleanup only — the write/rename failure is the real error.
+      }
+      throw err;
+    }
+  }
+  // Tighten a looser mode ONLY when needed, and report it: even the
+  // identical-content path is a (metadata) mutation when a pre-existing file
+  // was group-readable. A fresh tmp+rename install is already 0600.
+  const tightened = (statSync(path).mode & 0o777) !== 0o600;
+  if (tightened) chmodSync(path, 0o600);
+  return { path, wrote, tightened };
+}
+
+/**
+ * The join-side result of the auto-fetch, discriminated by which leaf-auth
+ * shape the sealed envelope delivered (#1597):
+ *   - `secret-auth` (v1) — the Model-B shared-string pipe; join renders the
+ *     URL-userinfo remote.
+ *   - `creds-file` (v2)  — a per-member NSC user `.creds` was fetched and is
+ *     ALREADY INSTALLED at `credsPath` (0600); join points the stack binding at
+ *     it and renders the existing creds-file remote branch.
+ */
+type AutoFetchedLeafAuth =
+  | { kind: "secret-auth"; leafSecret: string; leafUser: string; payloadKey?: string; payloadKeyKid?: string }
+  | { kind: "creds-file"; credsPath: string; leafUser: string; payloadKey?: string; payloadKeyKid?: string };
+
 async function maybeAutoFetchLeafSecret(
   networkId: string,
   inputs: { leafSecret?: string; seedPath: string; registryUrl: string; principal: string },
-): Promise<{ leafSecret: string; leafUser: string; payloadKey?: string; payloadKeyKid?: string } | undefined> {
+  /** #1597 (R7) — the member's OWN identities a v2 credential must be minted for. */
+  expectedLeafUsers: readonly string[],
+): Promise<AutoFetchedLeafAuth | undefined> {
   // Only when no leaf secret was resolved from flag/config (don't override an
   // explicit secret-auth join).
   if (inputs.leafSecret !== undefined) return undefined;
@@ -823,9 +911,57 @@ async function maybeAutoFetchLeafSecret(
     networkId,
     principalId: inputs.principal,
     material,
+    expectedLeafUsers,
   });
   if (!res.ok) return undefined;
+
+  // #1597 — a v2 envelope delivered a per-member `.creds` file (operator-mode
+  // hub). Install it NOW, before the ports split: the #821 existence preflight
+  // is a pure read in BOTH live and dry-run, so the file must exist for either
+  // mode to render a truthful plan (the issue pins this ordering: "the #821
+  // existence preflight passes because the file was just written"). This is a
+  // DELIBERATE carve-out from the "dry-run touches nothing" contract — it
+  // installs only the member's OWN delivered credential at its conventional
+  // 0600 path (the same member-local class as the enforceChmod600 above); the
+  // nats config / plist / registry writes all stay behind --apply. EVERY
+  // mutation this carve-out performs — a content write AND a mode tighten —
+  // is surfaced by the stderr notice below, so dry-run output stays honest.
+  if (res.kind === "creds") {
+    let install: { path: string; wrote: boolean; tightened: boolean };
+    try {
+      install = installLeafCreds(networkId, res.creds);
+    } catch (err) {
+      // Best-effort like every other auto-fetch failure: fall through to the
+      // existing join behaviour, surfacing why on stderr (never the creds).
+      // On a v2-only hub with nothing at the derive-time creds path this is
+      // NOT silent: the #821 existence preflight then fails the join loudly.
+      process.stderr.write(
+        `cortex network join: fetched a v2 leaf credential for "${networkId}" but could not ` +
+          `install it: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      return undefined;
+    }
+    if (install.wrote || install.tightened) {
+      const action = install.wrote
+        ? "installed the fetched per-member leaf credential file at"
+        : "tightened the mode of the leaf credential file at";
+      process.stderr.write(
+        `cortex network join: ${action} ${install.path} (0600). NOTE: this happens even ` +
+          `without --apply, so the leaf-file preflight previews truthfully; all other join ` +
+          `mutations stay behind --apply.\n`,
+      );
+    }
+    return {
+      kind: "creds-file",
+      credsPath: install.path,
+      leafUser: res.leafUser,
+      ...(res.payloadKey !== undefined && { payloadKey: res.payloadKey }),
+      ...(res.payloadKeyKid !== undefined && { payloadKeyKid: res.payloadKeyKid }),
+    };
+  }
+
   return {
+    kind: "secret-auth",
     leafSecret: res.leafPsk,
     leafUser: res.leafUser,
     // C-1349 Slice 1 — carry the sealed payload key K (+ kid) through to the
@@ -1068,14 +1204,39 @@ async function runJoin(
   // ADR-0018 PR5b — plug-and-play: when no leaf secret came from flag/config,
   // auto-fetch + unseal it from the admission gate (the joiner never handles a
   // secret). Best-effort: undefined ⇒ fall through to the existing behaviour.
-  const autoSecret = await maybeAutoFetchLeafSecret(networkId, inputs);
+  //
+  // #1597 (R7) — the member's OWN identities a fetched v2 per-member credential
+  // must be minted for: both the flag/locator-honouring identity (the admission
+  // row's principal) and the boot-pinned identity (C-1436/C-1364 — what the
+  // daemon stamps on the wire), in `{principal}/{stack}` and bare-principal
+  // forms (v1's leaf_user convention is the bare principal id). Every entry is
+  // one of OUR identities, so the set stays a strict R7 guard: a credential
+  // minted for a different member can never match.
+  const expectedLeafUsers = [
+    ...new Set([
+      `${inputs.principal}/${slugRes.slug}`,
+      inputs.principal,
+      `${inputs.bootPrincipal}/${inputs.bootStackSlug}`,
+      inputs.bootPrincipal,
+    ]),
+  ];
+  const autoAuth = await maybeAutoFetchLeafSecret(networkId, inputs, expectedLeafUsers);
+  const autoSecret = autoAuth?.kind === "secret-auth" ? autoAuth : undefined;
   const resolvedLeafSecret = inputs.leafSecret ?? autoSecret?.leafSecret;
   const resolvedLeafUser = inputs.leafUser ?? autoSecret?.leafUser;
+  // #1597 — a fetched v2 credential file was installed at its conventional
+  // 0600 path: point the stack binding THERE (instead of the derive-time creds
+  // path) so joinNetwork renders the existing creds-file remote branch — the
+  // exact shape production operator-mode leaves run. The #821 existence
+  // preflight passes because the file was just written.
+  const resolvedCredsPath =
+    autoAuth?.kind === "creds-file" ? autoAuth.credsPath : expandTilde(inputs.credsPath);
   // C-1349 Slice 1 — the sealed envelope's payload key K (+ kid), when the admin
   // sealed one via `secret add-member`/`rotate`. Present ⇒ join writes
   // `encryption: enabled` + `payload_key` (+ kid) into stacks/<slug>.yaml.
-  const resolvedPayloadKey = autoSecret?.payloadKey;
-  const resolvedPayloadKeyKid = autoSecret?.payloadKeyKid;
+  // Rides BOTH envelope versions (#1597).
+  const resolvedPayloadKey = autoAuth?.payloadKey;
+  const resolvedPayloadKeyKid = autoAuth?.payloadKeyKid;
 
   const stack: JoiningStack = {
     // C-1436 — the own-scope federation identity's PRINCIPAL segment MUST derive
@@ -1102,7 +1263,7 @@ async function runJoin(
     // fail daemon boot (or be falsely refused). Pin the guard to `bootStackSlug`
     // so guard + boot can never split. See cortex#1364.
     stackSlug: inputs.bootStackSlug,
-    credentials: expandTilde(inputs.credsPath),
+    credentials: resolvedCredsPath,
     account: inputs.account,
     // C-1224 (ADR-0013 Model B) — pass the secret-auth leaf material (when
     // resolved, including PR5b's auto-fetched leaf PSK) so the join renders a
