@@ -47,6 +47,7 @@ import { dirname, join } from "path";
 import { expandTilde, loadConfigWithAgents } from "../../../common/config/loader";
 import type { LoadedConfig } from "../../../common/config/loader";
 import { enforceChmod600 } from "../../../common/config/file-permissions";
+import { NetworkCache } from "../../../common/registry/network-cache";
 import {
   materialFromSeedString,
   buildNetworkCreateClaim,
@@ -366,6 +367,10 @@ const SPEC: SubcommandSpec<NetworkSubcommand> = {
         "--admin-seed": "value",
         "--network-admins": "value",
         "--registry-url": "value",
+        // #1598 — hub-mode / resolver-mode attestation (closed enums; the
+        // registry re-validates and serves them on the SIGNED descriptor).
+        "--hub-mode": "value",
+        "--resolver-mode": "value",
         "--apply": "bool",
         "--dry-run": "bool",
       },
@@ -2215,6 +2220,24 @@ async function runCreate(
     adminPubkeys = entries.join(",");
   }
 
+  // #1598 — optional hub-mode / resolver-mode attestation (closed enums,
+  // validated locally for fast feedback; the registry validator re-checks).
+  // resolver-mode only means something for an operator hub — refuse the
+  // incoherent combination here too.
+  const hubModeRaw = optionalValueFlag(flags, "--hub-mode");
+  if (hubModeRaw !== undefined && hubModeRaw !== "operator" && hubModeRaw !== "simple") {
+    return usageError("create", `--hub-mode "${hubModeRaw}" must be "operator" or "simple"`, json);
+  }
+  const resolverModeRaw = optionalValueFlag(flags, "--resolver-mode");
+  if (resolverModeRaw !== undefined && resolverModeRaw !== "nats" && resolverModeRaw !== "memory") {
+    return usageError("create", `--resolver-mode "${resolverModeRaw}" must be "nats" or "memory"`, json);
+  }
+  if (resolverModeRaw !== undefined && hubModeRaw !== "operator") {
+    return usageError("create", `--resolver-mode requires --hub-mode operator`, json);
+  }
+  const hubMode = hubModeRaw as "operator" | "simple" | undefined;
+  const resolverMode = resolverModeRaw as "nats" | "memory" | undefined;
+
   // Load the admin nkey seed + derive its base64 pubkey (the SAME key shape +
   // signing path provision-stack uses), then build the signed claim.
   const matRes = await adminMaterialFromSeedFile(seedRes.value);
@@ -2228,6 +2251,8 @@ async function runCreate(
       leafPort,
       material: matRes.material,
       adminPubkeys,
+      ...(hubMode !== undefined && { hubMode }),
+      ...(resolverMode !== undefined && { resolverMode }),
     });
   } catch (err) {
     return opError("create", `failed to build network-create claim: ${err instanceof Error ? err.message : String(err)}`, json);
@@ -2255,6 +2280,8 @@ async function runCreate(
       `  admin_pubkey: ${matRes.material.pubkeyB64}`,
       `  fingerprint:  ${matRes.material.fingerprint}`,
       `  network_admins: ${adminPubkeys ?? "(none — defers to global REGISTRY_ADMIN_PUBKEYS)"}`,
+      `  hub_mode:     ${hubMode ?? "(unattested)"}`,
+      `  resolver_mode: ${resolverMode ?? "(unattested)"}`,
       ``,
       `Would POST ${registryUrl}/networks/${networkId}:`,
       JSON.stringify(body, null, 2),
@@ -2912,6 +2939,10 @@ async function runAdmit(
       adminSeedPath: seedRes.value,
       // Already nkey-U-validated above (fail-fast before the admission commits).
       ...(admitHubAccount !== undefined && { hubAccount: admitHubAccount }),
+      // cortex#1598 — DEFERRED operator-mode attestation resolver (the network id
+      // is only known after the row fetch inside runNetworkAdmit).
+      resolveOperatorAttestation: (networkId: string) =>
+        resolveOperatorAttestation(flags, networkId, DEFAULT_READER),
       ...(discordMember !== undefined && {
         discord: {
           member: discordMember,
@@ -3178,6 +3209,59 @@ const DEFAULT_KEY_ROTATION_PORTS_FACTORY: KeyRotationPortsFactory = (cfg) =>
  * A config that EXISTS but fails to parse/validate FAILS (surfaced to the admin)
  * rather than silently downgrading a network that is supposed to be encrypted.
  */
+/**
+ * cortex#1598 (epic #1595 slice 2) — resolve the OPERATOR-MODE attestation for a
+ * network. `hub_mode` / `resolver_mode` come off the last VERIFIED descriptor
+ * (the SAME DD-10 `~/.config/cortex/network-cache/` cache the hub-locality read
+ * uses) when present — the verified attestation wins — ELSE off the hub owner's
+ * own `policy.federated.networks[<id>].hub_mode`/`.resolver_mode`.
+ *
+ * The local-config fallback is LOAD-BEARING, not cosmetic: the hub owner runs
+ * `network create`, not `join`, so they may have NO cached descriptor for their
+ * OWN network. Reading only the cache would leave `hubMode` undefined and
+ * silently degrade an operator network to the PSK/hub-write path — writing an
+ * inline leaf user onto an operator hub and crashing it (cortex#794), the exact
+ * F4 failure Guard A exists to prevent. The local declaration closes that gap.
+ * A network with NEITHER a cached descriptor NOR a local declaration resolves to
+ * simple (unattested = legacy/simple, the design §5.1 / registry `validate.ts`
+ * back-compat rule) — so an operator network MUST be attested one way or the
+ * other. The hub FED account comes from `--hub-fed-account` → else the local
+ * `hub_fed_account`. Injectable cache for tests.
+ */
+export function resolveOperatorAttestation(
+  flags: FlagMap,
+  networkId: string,
+  load: ConfigReader,
+  cache: NetworkCache = new NetworkCache({
+    cacheDir: expandTilde(join("~", ".config", "cortex", "network-cache")),
+  }),
+): { hubMode?: "operator" | "simple"; resolverMode?: "nats" | "memory"; hubFedAccount?: string } {
+  const descriptor = cache.load(networkId)?.descriptor;
+
+  // Read the local config once (the hub owner's own declaration + the FED
+  // account). Non-fatal if unreadable — the operator branch fail-fasts clearly
+  // on a missing FED account, and the separate payload-key read reports a broken
+  // config with its own message.
+  let cfgNetwork: import("../../../common/types/cortex-config").PolicyFederatedNetwork | undefined;
+  try {
+    const cfg = load(resolveLocalStackConfigPath(flags));
+    cfgNetwork = cfg.policy?.federated?.networks.find((n) => n.id === networkId);
+  } catch (_err) {
+    cfgNetwork = undefined;
+  }
+
+  // Verified descriptor wins; the hub owner's local declaration is the fallback.
+  const hubMode = descriptor?.hub_mode ?? cfgNetwork?.hub_mode;
+  const resolverMode = descriptor?.resolver_mode ?? cfgNetwork?.resolver_mode;
+  const hubFedAccount = optionalValueFlag(flags, "--hub-fed-account") ?? cfgNetwork?.hub_fed_account;
+
+  return {
+    ...(hubMode !== undefined && { hubMode }),
+    ...(resolverMode !== undefined && { resolverMode }),
+    ...(hubFedAccount !== undefined && hubFedAccount.length > 0 && { hubFedAccount }),
+  };
+}
+
 function resolveHubPayloadKey(
   flags: FlagMap,
   networkId: string,
@@ -3321,6 +3405,11 @@ async function runSecret(
     payloadKeyKid = kRes.payloadKeyKid;
   }
 
+  // cortex#1598 — operator-mode attestation (hub_mode/resolver_mode off the
+  // verified descriptor + the hub FED account). Absent ⇒ the simple/PSK path
+  // (unchanged); present + operator-mode ⇒ addOrRotate mints a scoped user + seals v2.
+  const op = resolveOperatorAttestation(flags, networkId, load);
+
   const ports = portsFactory({ hubConfigPath, registryUrl, material: matRes.material });
   const inputs: SecretInputs = {
     action,
@@ -3332,6 +3421,9 @@ async function runSecret(
     ...(payloadKeyKid !== undefined && { payloadKeyKid }),
     sealOnly,
     ...(hubAccount !== undefined && { hubAccount }),
+    ...(op.hubMode !== undefined && { hubMode: op.hubMode }),
+    ...(op.resolverMode !== undefined && { resolverMode: op.resolverMode }),
+    ...(op.hubFedAccount !== undefined && { hubFedAccount: op.hubFedAccount }),
     apply: applyRes.apply,
   };
 

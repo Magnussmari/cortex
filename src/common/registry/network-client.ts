@@ -369,11 +369,31 @@ function parseDescriptor(
   const members: string[] = p.members.filter(
     (m): m is string => typeof m === "string",
   );
+  // #1598 — the OPTIONAL hub/resolver-mode attestation. A present-but-invalid
+  // value is a wire-contract violation on a SIGNED payload: reject the whole
+  // descriptor (never degrade a malformed attestation to "unattested" — the
+  // admit guards branch on it).
+  if (p.hub_mode !== undefined && p.hub_mode !== "operator" && p.hub_mode !== "simple") {
+    return undefined;
+  }
+  if (p.resolver_mode !== undefined && p.resolver_mode !== "nats" && p.resolver_mode !== "memory") {
+    return undefined;
+  }
+  // Coherence invariant (mirrors `validate.ts` at write time): resolver_mode is
+  // only meaningful on an operator hub. Re-assert it HERE so a verified reader
+  // can rely on the illegal `{ hub_mode: simple, resolver_mode }` state never
+  // reaching them off the signed descriptor — the enum checks above alone leave
+  // that state representable.
+  if (p.resolver_mode !== undefined && p.hub_mode !== "operator") {
+    return undefined;
+  }
   return {
     network_id: networkId,
     hub_url: p.hub_url,
     leaf_port: p.leaf_port,
     members,
+    ...(p.hub_mode !== undefined && { hub_mode: p.hub_mode }),
+    ...(p.resolver_mode !== undefined && { resolver_mode: p.resolver_mode }),
   };
 }
 
