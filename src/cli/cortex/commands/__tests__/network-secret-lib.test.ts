@@ -42,6 +42,9 @@ interface Recorder {
   minted: string[];
   /** cortex#1598 — the natsUser argument of each scoped-mint call, in order. */
   scopedMints: string[];
+  /** cortex#1599 — natsUser of each reissue (rotate) / revoke scoped-user call. */
+  reissues: string[];
+  revokedScopedUsers: string[];
 }
 
 function makePorts(opts: {
@@ -53,7 +56,7 @@ function makePorts(opts: {
    * `userAlreadyPresent` flips to true on the SECOND call so idempotency (C2)
    * is observable. Omit → `ports.scopedMint` is undefined (unwired).
    */
-  scopedMint?: { creds: string; failWith?: string };
+  scopedMint?: { creds: string; failWith?: string; revokeFailWith?: string; revokeFailCode?: "PUSH_FAILED" | "USER_NOT_FOUND" };
   // cortex#1481 — hub-locality fakes. Defaults resolve LOCAL (loopback alias)
   // so every PRE-#1481 test keeps its local-hub-write assumption unchanged.
   /** Cached hub_url the fake `resolveHubUrl` returns. Default: loopback (LOCAL). */
@@ -73,6 +76,8 @@ function makePorts(opts: {
   const revoked: string[] = [];
   const minted: string[] = [];
   const scopedMints: string[] = [];
+  const reissues: string[] = [];
+  const revokedScopedUsers: string[] = [];
   let mintCounter = 0;
   const hubUrl = opts.noHubCache === true ? undefined : (opts.hubUrl ?? "tls://localhost:7422");
   const localHostname = opts.localHostname ?? "localhost";
@@ -131,6 +136,29 @@ function makePorts(opts: {
             userAlreadyPresent: scopedMints.length > 1,
           };
         },
+        reissueScopedUser: async ({ natsUser }: { natsUser: string }) => {
+          reissues.push(natsUser);
+          if (opts.scopedMint!.failWith !== undefined) {
+            return { ok: false as const, reason: opts.scopedMint!.failWith, code: "OTHER" as const };
+          }
+          return {
+            ok: true as const,
+            creds: opts.scopedMint!.creds,
+            // NEW material — a DIFFERENT pubkey than the mint/revoked one (rotation's
+            // defining property: fresh key, so the revoke doesn't kill the new user).
+            userPubKey: "U" + "C".repeat(55),
+            signingKeyPubKey: "A" + "B".repeat(55),
+            accountPubKey: "A" + "D".repeat(55),
+            revokedPubKey: "U" + "A".repeat(55),
+          };
+        },
+        revokeScopedUser: async ({ natsUser }: { natsUser: string }) => {
+          revokedScopedUsers.push(natsUser);
+          if (opts.scopedMint!.revokeFailWith !== undefined) {
+            return { ok: false as const, reason: opts.scopedMint!.revokeFailWith, code: opts.scopedMint!.revokeFailCode ?? "PUSH_FAILED" };
+          }
+          return { ok: true as const, revokedPubKey: "U" + "A".repeat(55) };
+        },
       },
     }),
   };
@@ -145,6 +173,8 @@ function makePorts(opts: {
     revoked,
     minted,
     scopedMints,
+    reissues,
+    revokedScopedUsers,
   };
 }
 
@@ -307,27 +337,112 @@ describe("cortex#1598 — operator-mode add-member (scoped mint + v2 seal)", () 
     expect(report.reason).toContain("hub federation account");
   });
 
-  test("rotate on an operator network → refused-and-deferred (cortex#1599)", async () => {
+  test("cortex#1599 — rotate on an operator network re-mints FRESH material + seals v2 (revoked ≠ new)", async () => {
     const r = makePorts({
       admitted: { request_id: "req1", principal_id: "alice", stack_id: "alice/laptop" },
       scopedMint: { creds: FAKE_CREDS },
     });
     const report = await runNetworkSecret(operatorInputs({ action: "rotate" }), r.ports);
-    expect(report.ok).toBe(false);
-    expect(report.reason).toContain("1599");
+    expect(report.ok).toBe(true);
+    expect(report.applied).toBe(true);
+    // reissue ran (NOT plain mint); the dotted user is rotated.
+    expect(r.reissues).toEqual(["alice.laptop"]);
     expect(r.scopedMints.length).toBe(0);
+    // A v2 envelope carrying the NEW creds was sealed + posted, ZERO hub writes.
+    expect(r.posted.length).toBe(1);
+    expect(r.posted[0]!.blob).toContain('"v":2');
+    expect(r.writes.length).toBe(0);
+    // This verifies the cortex WIRING: reissue's revokedPubKey (old) and
+    // userPubKey (new) flow to DISTINCT data fields (never conflated). That
+    // arc's REAL reissue mints fresh material (old ≠ new key on the nsc store) is
+    // tested against the actual nsc-verb flow in arc#270's suite
+    // (nats-federated-user-lifecycle.test.ts asserts revokedPubKey !== newPubKey
+    // via distinct pre/post-mint pubkeys); here the fake returns two constants so
+    // the cortex side can assert it threads them through without conflation.
+    expect(report.data.revoked_pubkey).toBe("U" + "A".repeat(55));
+    expect(report.data.user_pubkey).toBe("U" + "C".repeat(55));
+    expect(report.data.revoked_pubkey).not.toBe(report.data.user_pubkey);
+    expect(report.data.envelope_version).toBe("2");
   });
 
-  test("revoke-member on an operator network → refused-and-deferred (cortex#1599)", async () => {
+  test("cortex#1599 — revoke-member on an operator network cuts transport (revoke+push) THEN marks the row REVOKED", async () => {
     const r = makePorts({
       admitted: { request_id: "req1", principal_id: "alice", stack_id: "alice/laptop" },
       scopedMint: { creds: FAKE_CREDS },
     });
     const report = await runNetworkSecret(operatorInputs({ action: "revoke-member" }), r.ports);
-    expect(report.ok).toBe(false);
-    expect(report.reason).toContain("1599");
+    expect(report.ok).toBe(true);
+    expect(report.applied).toBe(true);
+    // The scoped user was revoked+pushed at runtime, and the registry row marked REVOKED.
+    expect(r.revokedScopedUsers).toEqual(["alice.laptop"]);
+    expect(r.revoked).toEqual(["req1"]);
+    // NEVER an inline hub-config write on the operator path.
     expect(r.writes.length).toBe(0);
+    expect(report.data.revoked_pubkey).toBe("U" + "A".repeat(55));
+  });
+
+  test("cortex#1599 — a hub revoke failure aborts BEFORE the registry mark (no REVOKED row over a live credential)", async () => {
+    const r = makePorts({
+      admitted: { request_id: "req1", principal_id: "alice", stack_id: "alice/laptop" },
+      scopedMint: { creds: FAKE_CREDS, revokeFailWith: "push refused (no resolver)" },
+    });
+    const report = await runNetworkSecret(operatorInputs({ action: "revoke-member" }), r.ports);
+    expect(report.ok).toBe(false);
+    expect(report.reason).toContain("hub transport NOT cut");
+    // Hub revoke was attempted but the registry row was left ADMITTED (untouched).
+    expect(r.revokedScopedUsers).toEqual(["alice.laptop"]);
     expect(r.revoked.length).toBe(0);
+  });
+
+  test("cortex#1599 — a USER_NOT_FOUND revoke is FAIL-CLOSED (never marks REVOKED on the ambiguous case)", async () => {
+    // USER_NOT_FOUND is ambiguous — already-cut vs a wrong --hub-fed-account /
+    // never-minted user with a LIVE credential elsewhere. Marking the row REVOKED
+    // on that guess would be the exact fail-open the hub-first order prevents, so
+    // it aborts and leaves the row ADMITTED (safe: never a REVOKED row over a
+    // possibly-live credential).
+    const r = makePorts({
+      admitted: { request_id: "req1", principal_id: "alice", stack_id: "alice/laptop" },
+      scopedMint: { creds: FAKE_CREDS, revokeFailWith: "user not found", revokeFailCode: "USER_NOT_FOUND" },
+    });
+    const report = await runNetworkSecret(operatorInputs({ action: "revoke-member" }), r.ports);
+    expect(report.ok).toBe(false);
+    expect(report.reason).toContain("ambiguous");
+    expect(r.revoked.length).toBe(0); // the registry row is NOT marked REVOKED
+  });
+
+  test("cortex#1599 — rotate refuses when the reissue port is absent (arc too old)", async () => {
+    // scopedMint wired for add/mint but the test omits reissue by using a bespoke port.
+    const r = makePorts({ admitted: { request_id: "req1", principal_id: "alice", stack_id: "alice/laptop" } });
+    // A scopedMint with ONLY mintScopedUser (no reissue) — arc#270 not available.
+    r.ports.scopedMint = { mintScopedUser: r.ports.scopedMint?.mintScopedUser ?? (async () => ({ ok: false as const, reason: "x", code: "OTHER" as const })) };
+    const report = await runNetworkSecret(operatorInputs({ action: "rotate" }), r.ports);
+    expect(report.ok).toBe(false);
+    expect(report.reason).toContain("reissue-federated-user");
+  });
+
+  test("cortex#1599 — revoke refuses resolver_mode !== nats (would silently regress)", async () => {
+    const r = makePorts({
+      admitted: { request_id: "req1", principal_id: "alice", stack_id: "alice/laptop" },
+      scopedMint: { creds: FAKE_CREDS },
+    });
+    const report = await runNetworkSecret(operatorInputs({ action: "revoke-member", resolverMode: "memory" }), r.ports);
+    expect(report.ok).toBe(false);
+    expect(report.reason).toContain("resolver_mode: nats");
+    expect(r.revokedScopedUsers.length).toBe(0);
+  });
+
+  test("cortex#1599 — ROTATE also refuses resolver_mode !== nats (rotate revoke+pushes the old key)", async () => {
+    // Guard B is BEFORE the mint/reissue branch, so it covers rotate too — a
+    // memory resolver can't learn the old-key revocation, so rotating away a
+    // compromised key would leave it live. Refuse, and NEVER reach reissue.
+    const r = makePorts({
+      admitted: { request_id: "req1", principal_id: "alice", stack_id: "alice/laptop" },
+      scopedMint: { creds: FAKE_CREDS },
+    });
+    const report = await runNetworkSecret(operatorInputs({ action: "rotate", resolverMode: "memory" }), r.ports);
+    expect(report.ok).toBe(false);
+    expect(report.reason).toContain("resolver_mode: nats");
+    expect(r.reissues.length).toBe(0);
   });
 
   test("a scoped-mint failure is surfaced (no seal, no post)", async () => {

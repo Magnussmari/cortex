@@ -588,6 +588,28 @@ async function addOrRotate(
  * rotate/revoke on an operator network is the nsc rotate/revoke slice
  * (cortex#1599) — refused-and-deferred here.
  */
+/**
+ * cortex#1598/#1599 — the two names a scoped operator user is known by (do not
+ * conflate): the DOTTED nsc username (the `{{name()}}` scope-template
+ * convention) and the SLASH member identity the v2 envelope carries (what
+ * #1597's install refuses a mismatched credential against). The stack segment is
+ * the admitted row's `stack_id` trailing segment (the part after the last "/"
+ * for the canonical `{principal}/{stack}` form); a present-but-slashless
+ * `stack_id` is used VERBATIM (never silently collapsed to "default" — that
+ * would target the wrong scoped username); only a wholly-absent `stack_id` falls
+ * back to "default".
+ */
+function deriveScopedUserNames(row: { principal_id: string; stack_id?: string }): {
+  natsUser: string;
+  leafUserSlash: string;
+} {
+  const stackSeg =
+    row.stack_id === undefined || row.stack_id.length === 0
+      ? "default"
+      : row.stack_id.slice(row.stack_id.lastIndexOf("/") + 1) || "default";
+  return { natsUser: `${row.principal_id}.${stackSeg}`, leafUserSlash: `${row.principal_id}/${stackSeg}` };
+}
+
 async function operatorModeSeal(
   inputs: SecretInputs,
   ports: NetworkSecretPorts,
@@ -603,13 +625,6 @@ async function operatorModeSeal(
   const { row, memberPubkeyB64, steps, data } = ctx;
   data.hub_mode = "operator";
 
-  // rotate on an operator network re-mints the scoped credential — the nsc
-  // rotate/revoke slice (cortex#1599), gated on the resolver migration.
-  if (rotate) {
-    return fail(action, inputs, steps, data,
-      `rotate on an operator-mode network re-mints the scoped nsc credential — that is the nsc rotate/revoke slice (cortex#1599), gated on the MEMORY→nats resolver migration. Re-run add-member to idempotently re-export the current credential.`);
-  }
-
   // Guard A (deliver): --deliver oob is the shared-PSK handover — meaningless on
   // an operator hub. Refuse before any mint.
   if (inputs.deliver !== "sealed") {
@@ -617,12 +632,15 @@ async function operatorModeSeal(
       `operator-mode network "${inputs.networkId}" seals a subject-scoped credential; --deliver oob (shared-PSK handover) cannot run. Use sealed delivery.`);
   }
 
-  // Guard B (§5.1): the scoped mint edits the FED account JWT; a preloaded
-  // (memory) resolver can't learn it without a hub restart, silently regressing
-  // admit + revoke. Refuse unless the network attests a push-capable resolver.
+  // Guard B (§5.1) — applies to BOTH add-member AND rotate: a scoped mint edits
+  // the FED account JWT, and rotate's revoke+push of the OLD key needs the push
+  // to land too. A preloaded (memory) resolver can't learn either without a hub
+  // restart, silently regressing (rotating away a compromised key would leave
+  // the old credential LIVE). Refuse unless the network attests a push-capable
+  // resolver — this is BEFORE the mint/reissue branch, so rotate is guarded.
   if (inputs.resolverMode !== "nats") {
     return fail(action, inputs, steps, data,
-      `operator-mode admit needs a push-capable resolver (resolver_mode: nats) — network "${inputs.networkId}" attests "${inputs.resolverMode ?? "unset"}". A scoped mint edits the federation account JWT; a preloaded (memory) resolver cannot learn it without a hub restart. Migrate the hub resolver first (cortex#1599 prerequisite).`);
+      `operator-mode ${rotate ? "rotate" : "admit"} needs a push-capable resolver (resolver_mode: nats) — network "${inputs.networkId}" attests "${inputs.resolverMode ?? "unset"}". A scoped ${rotate ? "rotate revoke+pushes the old key and re-mints" : "mint edits the federation account JWT"}; a preloaded (memory) resolver cannot learn it without a hub restart. Migrate the hub resolver first (cortex#1599 prerequisite).`);
   }
 
   // The mint port + the hub FED account are both required on this path.
@@ -635,21 +653,7 @@ async function operatorModeSeal(
       `operator-mode admit needs the hub federation account — pass --hub-fed-account <ACCOUNT> or set policy.federated.networks[${inputs.networkId}].hub_fed_account.`);
   }
 
-  // Two DIFFERENT names (do not conflate): the DOTTED nsc username (the
-  // `{{name()}}` scope-template convention), and the SLASH member identity the
-  // v2 envelope carries — what #1597's install refuses a mismatched credential
-  // against. The stack segment is the admitted row's `stack_id` trailing
-  // segment: the part after the last "/" for the canonical `{principal}/{stack}`
-  // form; a present-but-slashless `stack_id` is used VERBATIM as the segment (do
-  // not silently collapse a real value to "default" — that would mint under the
-  // wrong scoped username); only a wholly-absent `stack_id` falls back to
-  // "default".
-  const stackSeg =
-    row.stack_id === undefined || row.stack_id.length === 0
-      ? "default"
-      : (row.stack_id.slice(row.stack_id.lastIndexOf("/") + 1) || "default");
-  const natsUser = `${row.principal_id}.${stackSeg}`;
-  const leafUserSlash = `${row.principal_id}/${stackSeg}`;
+  const { natsUser, leafUserSlash } = deriveScopedUserNames(row);
   data.leaf_user = leafUserSlash;
   data.nats_user = natsUser;
 
@@ -662,7 +666,9 @@ async function operatorModeSeal(
 
   if (!inputs.apply) {
     steps.push(
-      `would: mint scoped user "${natsUser}" (arc add-federated-user) → seal v2 creds (leaf_user ${leafUserSlash}) → deliver to admission row ${row.request_id} — NO hub config write`,
+      rotate
+        ? `would: ROTATE scoped user "${natsUser}" (arc reissue-federated-user: revoke+push old key, re-mint fresh) → seal v2 creds (leaf_user ${leafUserSlash}) → deliver to admission row ${row.request_id} — NO hub config write`
+        : `would: mint scoped user "${natsUser}" (arc add-federated-user) → seal v2 creds (leaf_user ${leafUserSlash}) → deliver to admission row ${row.request_id} — NO hub config write`,
     );
     steps.push(
       payloadKey !== undefined
@@ -672,29 +678,59 @@ async function operatorModeSeal(
     return plan(action, inputs, steps, data);
   }
 
-  // Mint the scoped user (idempotency + refusal is arc's job — a second admit
-  // re-exports with userAlreadyPresent:true, which is C2 for free).
-  const mint = await ports.scopedMint.mintScopedUser({
-    hubFedAccount: inputs.hubFedAccount,
-    natsUser,
-    networkId: inputs.networkId,
-  });
-  if (!mint.ok) {
-    return fail(action, inputs, steps, data,
-      `scoped-user mint failed (${mint.code ?? "OTHER"}): ${mint.reason}`);
+  // ROTATE (cortex#1599) re-mints FRESH material (revoke+push old, re-mint under
+  // the scoped key); add-member mints idempotently (arc re-exports the existing
+  // user with userAlreadyPresent:true — C2 for free). Both return a sealable
+  // creds text + the account/signing pubkeys the probe-then-stamp (C3) reads.
+  //
+  // ROTATE PARTIAL-FAILURE WINDOW (asymmetric with revoke, by nature): arc's
+  // reissue revokes the OLD key BEFORE cortex seals + delivers the NEW creds
+  // (you cannot deliver creds you have not minted, and minting re-keys). So a
+  // seal/deliver failure AFTER a successful reissue leaves the member briefly
+  // offline — old key dead, new creds not yet delivered — until rotate is
+  // re-run (which mints fresh again + delivers). This is inherent to a re-key;
+  // the fail messages below name it so the operator knows to re-run.
+  let creds: string;
+  let userPubKey: string;
+  let signingKeyPubKey: string;
+  let accountPubKey: string;
+  if (rotate) {
+    if (ports.scopedMint.reissueScopedUser === undefined) {
+      return fail(action, inputs, steps, data,
+        `operator-mode rotate needs an arc that provides 'reissue-federated-user' (arc#270) — the reissue port is not wired. Run 'arc upgrade'.`);
+    }
+    const r = await ports.scopedMint.reissueScopedUser({ hubFedAccount: inputs.hubFedAccount, natsUser, networkId: inputs.networkId });
+    if (!r.ok) {
+      return fail(action, inputs, steps, data, `scoped-user rotate failed (${r.code ?? "OTHER"}): ${r.reason}`);
+    }
+    creds = r.creds;
+    userPubKey = r.userPubKey;
+    signingKeyPubKey = r.signingKeyPubKey;
+    accountPubKey = r.accountPubKey;
+    data.revoked_pubkey = r.revokedPubKey;
+    steps.push(
+      `scoped user: "${natsUser}" ROTATED (old ${r.revokedPubKey.slice(0, 12)}… revoked+pushed, new ${r.userPubKey.slice(0, 12)}…) — runtime, no hub restart`,
+    );
+  } else {
+    const mint = await ports.scopedMint.mintScopedUser({ hubFedAccount: inputs.hubFedAccount, natsUser, networkId: inputs.networkId });
+    if (!mint.ok) {
+      return fail(action, inputs, steps, data, `scoped-user mint failed (${mint.code ?? "OTHER"}): ${mint.reason}`);
+    }
+    creds = mint.creds;
+    userPubKey = mint.userPubKey;
+    signingKeyPubKey = mint.signingKeyPubKey;
+    accountPubKey = mint.accountPubKey;
+    data.scope_already_present = String(mint.scopeAlreadyPresent);
+    data.user_already_present = String(mint.userAlreadyPresent);
+    steps.push(
+      `scoped user: "${natsUser}" minted (scope ${mint.signingKeyPubKey.slice(0, 12)}…, userAlreadyPresent=${String(mint.userAlreadyPresent)})`,
+    );
   }
-  // Fingerprint-class fields only — NEVER the creds/JWT/seed. The account +
-  // signing pubkeys are what the admit fold's probe-then-stamp (C3) reads to
-  // verify the account is visible on the hub resolver before stamping.
-  data.user_pubkey = mint.userPubKey;
-  data.signing_key = mint.signingKeyPubKey;
-  data.account_pubkey = mint.accountPubKey;
-  data.scope_already_present = String(mint.scopeAlreadyPresent);
-  data.user_already_present = String(mint.userAlreadyPresent);
+  // Fingerprint-class fields only — NEVER the creds/JWT/seed.
+  data.user_pubkey = userPubKey;
+  data.signing_key = signingKeyPubKey;
+  data.account_pubkey = accountPubKey;
   data.envelope_version = "2";
-  steps.push(
-    `scoped user: "${natsUser}" minted (scope ${mint.signingKeyPubKey.slice(0, 12)}…, userAlreadyPresent=${String(mint.userAlreadyPresent)})`,
-  );
 
   if (payloadKey !== undefined) {
     const kFp = await pskFingerprint(payloadKey);
@@ -703,22 +739,27 @@ async function operatorModeSeal(
     steps.push(`payload key: sealed K (kid ${payloadKeyKid}, fp ${kFp}) — join installs encryption`);
   }
 
+  // On the rotate path the old key is ALREADY revoked, so any seal/deliver
+  // failure below leaves the member offline until re-run (see the window note).
+  const rotateOfflineTail = rotate
+    ? " — ROTATE already revoked the old key, so the member is offline until you re-run rotate"
+    : "";
   let sealed: string;
   try {
     const envelope = encodeLeafSecretEnvelopeV2({
-      creds: mint.creds,
+      creds,
       leaf_user: leafUserSlash,
       minted_at: (inputs.now?.() ?? new Date()).toISOString(),
       ...(payloadKey !== undefined && { payload_key: payloadKey, payload_key_kid: payloadKeyKid }),
     });
     sealed = await ports.crypto.seal(envelope, memberPubkeyB64);
   } catch (err) {
-    return fail(action, inputs, steps, data, `failed to seal the v2 scoped credential: ${errText(err)}`);
+    return fail(action, inputs, steps, data, `failed to seal the v2 scoped credential: ${errText(err)}${rotateOfflineTail}`);
   }
   try {
     await ports.delivery.postSealedSecret(row.request_id, sealed);
   } catch (err) {
-    return fail(action, inputs, steps, data, `failed to deliver the sealed v2 credential to the registry: ${errText(err)}`);
+    return fail(action, inputs, steps, data, `failed to deliver the sealed v2 credential to the registry: ${errText(err)}${rotateOfflineTail}`);
   }
   steps.push(`deliver:    sealed v2 creds → posted to admission row ${row.request_id}`);
 
@@ -775,16 +816,14 @@ async function revokeMember(
   steps.push(`member:     ${memberPubkeyB64.slice(0, 12)}… (request ${row.request_id})`);
   steps.push(`leaf user:  ${leafUser}`);
 
-  // cortex#1598 (C4) — revoke on an operator-mode network must nsc-revoke the
-  // scoped user + push the account JWT, NOT drop an inline hub `authorization`
-  // user (there is none). That is the nsc rotate/revoke slice (cortex#1599),
-  // gated on the resolver migration. Refuse-and-defer rather than silently
-  // dropping a non-existent user and marking the row REVOKED while the member's
-  // scoped credential stays live on the hub.
+  // cortex#1599 (C4) — OPERATOR-MODE revoke. There is NO inline hub
+  // `authorization` user to drop (an operator hub has none); admit nsc-revokes
+  // the scoped user + pushes the account JWT — a RUNTIME cut, no hub restart.
+  // Order: hub transport FIRST, then mark the registry row REVOKED, with the
+  // partial-failure paths handled (never a live credential under a REVOKED row,
+  // never a REVOKED-marked row while the credential is still live).
   if (inputs.hubMode === "operator") {
-    data.hub_mode = "operator";
-    return fail(action, inputs, steps, data,
-      `revoke on an operator-mode network must nsc-revoke the scoped user + push the account JWT — that is the nsc rotate/revoke slice (cortex#1599), gated on the MEMORY→nats resolver migration. Not available in this build.`);
+    return revokeMemberOperator(inputs, ports, { row, steps, data });
   }
 
   if (!inputs.apply) {
@@ -819,6 +858,89 @@ async function revokeMember(
     await ports.delivery.revoke(row.request_id);
   } catch (err) {
     return fail(action, inputs, steps, data, `hub transport cut, but failed to mark the admission row REVOKED: ${errText(err)}`);
+  }
+  steps.push(`registry:   admission row ${row.request_id} marked REVOKED (sealed blob cleared)`);
+
+  const report = plan(action, inputs, steps, data);
+  report.applied = true;
+  return report;
+}
+
+/**
+ * cortex#1599 (C4) — the OPERATOR-MODE revoke-member branch. Cuts the member's
+ * transport at RUNTIME (`arc nats revoke-federated-user` = nsc revocations +
+ * push), NO hub restart, then marks the registry row REVOKED. Hub-first so a
+ * failed transport cut never leaves a REVOKED-marked row while the credential is
+ * still live; a failed registry mark after a successful cut is surfaced (the
+ * member is already off transport, the row just needs a re-mark).
+ */
+async function revokeMemberOperator(
+  inputs: SecretInputs,
+  ports: NetworkSecretPorts,
+  ctx: {
+    row: { request_id: string; principal_id: string; stack_id?: string };
+    steps: string[];
+    data: Record<string, string>;
+  },
+): Promise<SecretReport> {
+  const action: SecretAction = "revoke-member";
+  const { row, steps, data } = ctx;
+  data.hub_mode = "operator";
+  const { natsUser } = deriveScopedUserNames(row);
+  data.nats_user = natsUser;
+
+  // Guard (§5.1): the revoke push targets the FED account JWT — a preloaded
+  // (memory) resolver cannot learn it without a hub restart, so the runtime cut
+  // silently regresses. Refuse unless the network attests a push-capable resolver.
+  if (inputs.resolverMode !== "nats") {
+    return fail(action, inputs, steps, data,
+      `operator-mode revoke needs a push-capable resolver (resolver_mode: nats) — network "${inputs.networkId}" attests "${inputs.resolverMode ?? "unset"}". A revoke pushes the federation account JWT; a preloaded (memory) resolver cannot learn it without a hub restart, silently regressing the cut. Migrate the hub resolver first.`);
+  }
+  if (ports.scopedMint?.revokeScopedUser === undefined) {
+    return fail(action, inputs, steps, data,
+      `operator-mode revoke needs an arc that provides 'revoke-federated-user' (arc#270) — the revoke port is not wired. Run 'arc upgrade'.`);
+  }
+  if (inputs.hubFedAccount === undefined || inputs.hubFedAccount.length === 0) {
+    return fail(action, inputs, steps, data,
+      `operator-mode revoke needs the hub federation account — pass --hub-fed-account <ACCOUNT> or set policy.federated.networks[${inputs.networkId}].hub_fed_account.`);
+  }
+
+  if (!inputs.apply) {
+    steps.push(`would: nsc-revoke scoped user "${natsUser}" + push (arc revoke-federated-user; RUNTIME cut, no hub restart) → mark admission row ${row.request_id} REVOKED`);
+    return plan(action, inputs, steps, data);
+  }
+
+  // 1. Cut hub transport FIRST (revoke + push). ANY failure aborts BEFORE the
+  //    registry mark — never a REVOKED row over a still-live credential.
+  //    USER_NOT_FOUND is FAIL-CLOSED, not treated as "already cut": it is
+  //    AMBIGUOUS — the user may be gone because a prior cut succeeded, OR because
+  //    the account is wrong (`--hub-fed-account` typo) / the user was never
+  //    minted, in which case a live credential runs elsewhere. Marking the row
+  //    REVOKED on that guess is the exact fail-open the hub-first order exists to
+  //    prevent. So we abort; a partial failure (cut succeeded, mark failed) is
+  //    resolved by the operator verifying the user is really gone, then re-marking
+  //    the row — never by a blind re-run.
+  const rev = await ports.scopedMint.revokeScopedUser({ hubFedAccount: inputs.hubFedAccount, natsUser, networkId: inputs.networkId });
+  if (!rev.ok) {
+    return fail(action, inputs, steps, data,
+      `hub transport NOT cut — scoped-user revoke failed (${rev.code ?? "OTHER"}): ${rev.reason}. The registry row is left ADMITTED (unchanged) so it never misreports a live member as revoked` +
+      (rev.code === "USER_NOT_FOUND"
+        ? ` — NOTE: USER_NOT_FOUND is ambiguous (already-cut vs a wrong --hub-fed-account / never-minted user), so it is NOT auto-treated as a cut. Verify the account + user, then re-mark the row if the credential is genuinely gone.`
+        : `.`));
+  }
+  data.revoked_pubkey = rev.revokedPubKey;
+  steps.push(`hub:        scoped user "${natsUser}" revoked + pushed (${rev.revokedPubKey.slice(0, 12)}…) — transport cut at runtime, no hub restart`);
+
+  // 2. Mark the registry row REVOKED. If this fails, transport is ALREADY cut —
+  //    surface it honestly: a plain re-run WON'T recover the row, because the
+  //    scoped user is now gone and the re-run's revoke hits USER_NOT_FOUND, which
+  //    fail-closes (above). So the operator must mark the row REVOKED out-of-band
+  //    (the registry revoke endpoint) rather than re-running this command.
+  try {
+    await ports.delivery.revoke(row.request_id);
+  } catch (err) {
+    return fail(action, inputs, steps, data,
+      `hub transport cut (the member is off the bus), but failed to mark the admission row REVOKED: ${errText(err)}. The credential is ALREADY revoked — do NOT re-run this command (the re-run's revoke would hit USER_NOT_FOUND and abort); mark the row REVOKED out-of-band via the registry revoke endpoint.`);
   }
   steps.push(`registry:   admission row ${row.request_id} marked REVOKED (sealed blob cleared)`);
 
