@@ -48,6 +48,7 @@ import { expandTilde, loadConfigWithAgents } from "../../../common/config/loader
 import type { LoadedConfig } from "../../../common/config/loader";
 import { enforceChmod600 } from "../../../common/config/file-permissions";
 import { NetworkCache } from "../../../common/registry/network-cache";
+import { NetworkRegistryClient } from "../../../common/registry/network-client";
 import {
   materialFromSeedString,
   buildNetworkCreateClaim,
@@ -2174,6 +2175,36 @@ async function adminMaterialFromSeedFile(
   }
 }
 
+/** A minimal fetch-and-cache client seam — the subset of {@link NetworkRegistryClient}
+ *  the descriptor-cache seed needs. Injectable so the seed is unit-testable. */
+type DescriptorCacheClient = { fetchAndCache: (id: string) => Promise<{ status: string }> };
+
+/**
+ * cortex#1652 — best-effort: fetch + VERIFY + cache the network's descriptor so a
+ * subsequent `admit` on this machine resolves the operator-mode attestation off
+ * the verified descriptor (nothing else populates the cache for the create-then-
+ * admit hub-owner flow — only `join` does). NEVER throws; returns whether the
+ * cache was seeded + a reason on failure. The client factory is injectable for
+ * tests; production uses {@link NetworkRegistryClient} (TOFU on the registry
+ * pubkey when none is pinned — the admin is writing to a registry they hold the
+ * admin seed for).
+ */
+export async function seedAdminDescriptorCache(
+  networkId: string,
+  registryUrl: string,
+  registryPubkey: string | undefined,
+  makeClient: (cfg: { url: string; pubkey?: string }) => DescriptorCacheClient = (cfg) =>
+    new NetworkRegistryClient(cfg),
+): Promise<{ seeded: boolean; reason?: string }> {
+  try {
+    const client = makeClient({ url: registryUrl, ...(registryPubkey !== undefined ? { pubkey: registryPubkey } : {}) });
+    const cached = await client.fetchAndCache(networkId);
+    return cached.status === "ok" ? { seeded: true } : { seeded: false, reason: cached.status };
+  } catch (err) {
+    return { seeded: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 async function runCreate(
   networkId: string,
   flags: FlagMap,
@@ -2307,6 +2338,18 @@ async function runCreate(
     return opError("create", reason, json);
   }
 
+  // #1652 — seed this admin's descriptor cache so a later `admit` here resolves
+  // the operator-mode attestation (see {@link seedAdminDescriptorCache}). Never
+  // fails create; surfaced on failure so admit doesn't silently go PSK.
+  const seed = await seedAdminDescriptorCache(networkId, registryUrl, optionalValueFlag(flags, "--registry-pubkey"));
+  if (!seed.seeded) {
+    process.stderr.write(
+      `cortex network create: (note) descriptor cache NOT seeded for "${networkId}" (${seed.reason ?? "unknown"}). ` +
+        `A later admit here resolves hub_mode from this cache OR the networks[] entry whose id is "${networkId}". ` +
+        `If NEITHER is present, admit takes the simple/PSK path (the #1610 fail-open) — set hub_mode on that networks[] entry, or re-run create when the registry is reachable, before admitting on an operator network.\n`,
+    );
+  }
+
   if (json) {
     return ok(
       renderJson(
@@ -2315,6 +2358,7 @@ async function runCreate(
           registry_url: registryUrl,
           applied: "true",
           admin_fingerprint: matRes.material.fingerprint,
+          descriptor_cached: String(seed.seeded),
         }),
       ),
     );
