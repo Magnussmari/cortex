@@ -35,7 +35,10 @@ import {
   type ProbeEchoReplyPayload,
 } from "../../../bus/probe-responder";
 import type { LoadedConfig } from "../../../common/config/loader";
-import type { NetworkPingPorts } from "./network-ping-ports";
+import type {
+  LeafzCounters,
+  NetworkPingPorts,
+} from "./network-ping-ports";
 
 // ---------------------------------------------------------------------------
 // Config derivation (the #753 config-derivation seam, ping subset)
@@ -123,12 +126,26 @@ export function derivePingInputs(opts: {
     opts.network !== undefined
       ? networks.filter((n) => n.id === opts.network)
       : networks;
-  const isConfiguredPeer = scoped.some((n) =>
+  const matchingNetworks = scoped.filter((n) =>
     n.peers.some(
       (p) =>
         p.principal_id === opts.targetPrincipal && p.stack_id === targetStackId,
     ),
   );
+  const isConfiguredPeer = matchingNetworks.length > 0;
+
+  // cortex#1728 (guard 4) — the network's `leaf_node` scopes the leafz sampler.
+  // Resolve it ONLY when exactly one network carries this peer with a distinct
+  // leaf_node: if the peer sits on multiple networks with DIFFERENT leaves (no
+  // `--network` selector), we can't tell which leaf the probe rides, so we leave
+  // it undefined (the sampler omits the diagnostic rather than sample the wrong
+  // leaf). Two networks that share ONE `leaf_node` (the pool-key case) collapse
+  // to that single unambiguous leaf.
+  const distinctLeafNodes = [
+    ...new Set(matchingNetworks.map((n) => n.leaf_node)),
+  ];
+  const networkLeafNode =
+    distinctLeafNodes.length === 1 ? distinctLeafNodes[0] : undefined;
 
   return {
     ok: true,
@@ -142,6 +159,7 @@ export function derivePingInputs(opts: {
       count: opts.count,
       timeoutMs: opts.timeoutMs,
       isConfiguredPeer,
+      ...(networkLeafNode !== undefined && { networkLeafNode }),
     },
   };
 }
@@ -206,6 +224,16 @@ export interface PingInputs {
    * caller from config; `false` ⇒ `not-configured` (nothing emitted).
    */
   isConfiguredPeer: boolean;
+  /**
+   * cortex#1728 (guard 4) — the `leaf_node` name of the network the probe rides
+   * (the network whose `peers[]` contains the target). The leafz sampler scopes
+   * its `/leafz` read to THIS leaf so the counter delta reflects only this
+   * network's traffic, never a sibling leaf's heartbeats. `undefined` when the
+   * network's `leaf_node` can't be resolved (peer in multiple networks with no
+   * `--network` selector, or none declares a leaf_node) — the sampler then omits
+   * the diagnostic rather than misattribute.
+   */
+  networkLeafNode?: string;
 }
 
 /** One probe's result row (for per-seq reporting). */
@@ -225,6 +253,39 @@ export interface PingStats {
   rttMaxMs?: number;
 }
 
+/**
+ * cortex#1728 (guard 4) — which half of the leaf path a `timeout` failure lives
+ * on, folded from the local `/leafz` counter delta measured across the probe
+ * volley.
+ *
+ *   - `remote`       — probes crossed the leaf (`out` +N) but no echo returned
+ *                      (`in` +0): the peer responder / echo leg is broken, NOT
+ *                      our egress.
+ *   - `local-egress` — nothing left the leaf (`out` +0): OUR egress is broken
+ *                      (leaf account / binding), not the peer.
+ *   - `inconclusive` — counters moved in a shape that does not cleanly
+ *                      disambiguate (e.g. `out` +0 AND `in` +N, or unchanged
+ *                      because another sender shares the leaf): report the raw
+ *                      delta without a directional claim.
+ */
+export type LeafzHalf = "remote" | "local-egress" | "inconclusive";
+
+/**
+ * cortex#1728 (guard 4) — the structured leafz diagnosis attached to a ping
+ * result. Present only when a before/after `/leafz` sample was obtained AND the
+ * verdict is `timeout` (the only verdict the half-disambiguation informs).
+ */
+export interface LeafzDiagnosis {
+  /** Which half the failure is on. */
+  half: LeafzHalf;
+  /** `out_msgs` delta across the probe volley (probes that left the leaf). */
+  outDelta: number;
+  /** `in_msgs` delta across the probe volley (echoes that returned). */
+  inDelta: number;
+  /** The rendered, human-facing diagnostic line. */
+  line: string;
+}
+
 export interface PingResult {
   /** The overall verdict — the worst/most-informative across all probes. */
   verdict: PingVerdict;
@@ -233,6 +294,12 @@ export interface PingResult {
   stats: PingStats;
   /** Human-facing reason when not reachable (surfaced in the CLI output). */
   detail?: string;
+  /**
+   * cortex#1728 (guard 4) — best-effort local-`/leafz` half-disambiguation for a
+   * `timeout` verdict. Absent when no leafz sampler was wired, a sample failed,
+   * or the verdict is not `timeout`. Additive diagnostic context; never gates.
+   */
+  leafz?: LeafzDiagnosis;
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +432,84 @@ export function classifyRoundTrip(
 }
 
 // ---------------------------------------------------------------------------
+// cortex#1728 (guard 4) — leafz half-disambiguation
+// ---------------------------------------------------------------------------
+
+/**
+ * cortex#1728 (guard 4) — diagnose WHICH half of the leaf path a `timeout`
+ * failure lives on, from the local `/leafz` counter delta measured across the
+ * probe volley.
+ *
+ * Live evidence (the first two-principal join): the monitor delta was decisive
+ * both times.
+ *
+ *   - `out` incremented, `in` +0 ⇒ probes crossed the leaf but no echo returned
+ *     ⇒ the failure is REMOTE (peer responder / echo leg), not local egress;
+ *   - `out` +0 ⇒ nothing left the leaf ⇒ LOCAL egress is broken (leaf
+ *     account/binding), not the peer.
+ *
+ * Any other shape (e.g. `out` +0 AND `in` +N, or a negative delta from a
+ * counter reset / reconnect between samples) is `inconclusive` — report the raw
+ * numbers without a directional claim rather than assert a wrong half.
+ *
+ * PURE — no I/O; the ports supply the two samples. Returns `undefined` when
+ * either sample is missing (nothing to diff) so the caller omits the line.
+ */
+export function diagnoseLeafzDelta(
+  before: LeafzCounters | undefined,
+  after: LeafzCounters | undefined,
+): LeafzDiagnosis | undefined {
+  if (before === undefined || after === undefined) return undefined;
+  const outDelta = after.outMsgs - before.outMsgs;
+  const inDelta = after.inMsgs - before.inMsgs;
+
+  // A negative delta means the counter went BACKWARDS between samples (leaf
+  // reconnect / server restart reset the counters) — the diff is meaningless,
+  // so we cannot claim a half.
+  if (outDelta < 0 || inDelta < 0) {
+    return {
+      half: "inconclusive",
+      outDelta,
+      inDelta,
+      line: `leafz counters moved unexpectedly (out ${fmtDelta(outDelta)}, in ${fmtDelta(inDelta)}) — leaf may have reconnected mid-probe; cannot localise the failure`,
+    };
+  }
+
+  if (outDelta > 0 && inDelta === 0) {
+    return {
+      half: "remote",
+      outDelta,
+      inDelta,
+      line: `${outDelta} probe(s) crossed the leaf (out ${fmtDelta(outDelta)}) but no echo returned (in +0) — the failure is REMOTE (peer responder / echo leg), not local egress`,
+    };
+  }
+
+  if (outDelta === 0) {
+    return {
+      half: "local-egress",
+      outDelta,
+      inDelta,
+      line: `0 probes left the leaf (out +0) — LOCAL egress is broken (leaf account/binding, not the peer)`,
+    };
+  }
+
+  // out +N AND in +N, or any other non-directional shape: a reply DID come back
+  // over the leaf yet the ping still timed out (nonce mismatch, slow echo,
+  // shared-leaf noise). Report the raw delta without asserting a half.
+  return {
+    half: "inconclusive",
+    outDelta,
+    inDelta,
+    line: `leaf counters advanced on both legs (out ${fmtDelta(outDelta)}, in ${fmtDelta(inDelta)}) but the probe timed out — traffic crossed both ways; the failure is not a clean egress/echo split`,
+  };
+}
+
+/** Format a non-negative counter delta as `+N` (negatives kept as-is). */
+function fmtDelta(n: number): string {
+  return n >= 0 ? `+${n}` : String(n);
+}
+
+// ---------------------------------------------------------------------------
 // The orchestrator
 // ---------------------------------------------------------------------------
 
@@ -394,6 +539,13 @@ export async function pingPeer(
     inputs.requesterPrincipal,
     inputs.requesterStack,
   );
+
+  // cortex#1728 (guard 4) — sample THIS network's leaf `/leafz` counters BEFORE
+  // the probe volley so a `timeout` verdict can be localised to a half from the
+  // delta. Scoped to `inputs.networkLeafNode` (never summed across sibling
+  // leaves — the #1731 review BLOCK). Best-effort: an unresolvable leaf_node or
+  // a failed sample just omits the diagnostic line.
+  const leafzBefore = await sampleLeafzBestEffort(ports, inputs.networkLeafNode);
 
   for (let seq = 1; seq <= inputs.count; seq++) {
     const nonce = ports.newNonce();
@@ -430,6 +582,13 @@ export async function pingPeer(
     }
   }
 
+  // cortex#1728 (guard 4) — sample AFTER the volley; diff against the before
+  // sample to localise the failure. Only meaningful for `timeout` (the verdict
+  // whose four-way cause list this delta disambiguates); computed here but
+  // attached below only when the overall verdict is `timeout`.
+  const leafzAfter = await sampleLeafzBestEffort(ports, inputs.networkLeafNode);
+  const leafzDiagnosis = diagnoseLeafzDelta(leafzBefore, leafzAfter);
+
   // Overall verdict: reachable iff at least one probe got a conformant echo.
   // Otherwise pick the most-informative failure across the probes
   // (no-responder > refused > timeout > not-configured precedence — a
@@ -458,7 +617,39 @@ export async function pingPeer(
     ...(detail !== undefined && overall !== "reachable"
       ? { detail: failureDetail(overall, inputs) }
       : {}),
+    // cortex#1728 (guard 4) — fold the leafz half-disambiguation into a
+    // `timeout` verdict only (the verdict whose ambiguous cause list it
+    // resolves). Omitted for reachable / not-configured, and whenever no
+    // before/after sample was obtained.
+    ...(overall === "timeout" && leafzDiagnosis !== undefined
+      ? { leafz: leafzDiagnosis }
+      : {}),
   };
+}
+
+/**
+ * cortex#1728 (guard 4) — read THIS network's leaf `/leafz` counters if a
+ * sampler is wired AND the network's `leaf_node` is known, swallowing ANY
+ * failure to `undefined`. The whole guard is additive diagnostic context: a
+ * leafz read must NEVER fail or perturb the ping. A missing `leafNode` (peer on
+ * multiple networks with no `--network` selector) omits the sample rather than
+ * risk sampling the wrong leaf.
+ */
+async function sampleLeafzBestEffort(
+  ports: NetworkPingPorts,
+  leafNode: string | undefined,
+): Promise<LeafzCounters | undefined> {
+  if (ports.leafz === undefined || leafNode === undefined) return undefined;
+  try {
+    return await ports.leafz.sample(leafNode);
+  } catch (err) {
+    // Best-effort: a failed leafz read degrades to "no diagnostic line", never
+    // a failed ping. Log to stderr so the read failure is not silent.
+    process.stderr.write(
+      `network-ping: leafz sample failed (diagnostic line omitted): ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    return undefined;
+  }
 }
 
 /** Pick the overall verdict from the per-probe verdicts. */

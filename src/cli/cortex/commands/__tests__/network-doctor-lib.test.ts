@@ -28,6 +28,7 @@ import type { PolicyFederatedNetwork } from "../../../../common/types/cortex-con
 import {
   DOCTOR_EXIT_CODE,
   runDoctorChecks,
+  selectNetworkLeaf,
   type DoctorCheck,
 } from "../network-doctor-lib";
 import type {
@@ -36,6 +37,7 @@ import type {
   NetworkDoctorPorts,
 } from "../network-doctor-ports";
 import type {
+  LeafzCounters,
   NetworkPingPorts,
   ProbeFireInputs,
   ProbeRoundTripResult,
@@ -61,6 +63,9 @@ function loadedConfig(peers: { principal_id: string; stack_id: string }[]): Load
         networks: [
           {
             id: "metafactory-community",
+            // cortex#1728 — leaf_node so derivePingInputs resolves the scoping
+            // key the leafz sampler is invoked with (matches network() fixture).
+            leaf_node: "hub",
             peers,
           } as unknown as NonNullable<
             NonNullable<LoadedConfig["policy"]>["federated"]
@@ -119,9 +124,10 @@ function fakeMonitorPort(opts: {
 /** A fake probe-bus port (the exact `NetworkPingPorts` shape `pingPeer` consumes). */
 function fakeProbe(
   respond: (fired: ProbeFireInputs, seq: number) => ProbeRoundTripResult,
+  leafzReadings?: (LeafzCounters | undefined)[],
 ): NetworkPingPorts {
   let seq = 0;
-  return {
+  const ports: NetworkPingPorts = {
     bus: {
       fireProbe: async (f) => {
         seq++;
@@ -131,6 +137,19 @@ function fakeProbe(
     newNonce: () => `nonce-${seq}`,
     newCorrelationId: () => `corr-${seq}`,
   };
+  // cortex#1728 (guard 4) — inject a scripted before/after leafz sampler so the
+  // doctor timeout leg can fold the half-disambiguation.
+  if (leafzReadings !== undefined) {
+    let call = 0;
+    ports.leafz = {
+      sample: async (_leafNode: string) => {
+        const r = leafzReadings[call];
+        call++;
+        return r;
+      },
+    };
+  }
+  return ports;
 }
 
 /** Build a conformant echo reply for a fired probe (mock responder). */
@@ -458,6 +477,45 @@ describe("runDoctorChecks — (e) peer timeout", () => {
     expect(res.exitCode).toBe(DOCTOR_EXIT_CODE.broken);
   });
 
+  test("cortex#1728 — leafz out+/in0 sharpens the timeout fix to the REMOTE half", async () => {
+    const ports: NetworkDoctorPorts = {
+      config: fakeConfigPort([network()], "ACCOUNT_A"),
+      monitor: fakeMonitorPort({ configured: true, leafz: ESTABLISHED_LEAFZ }),
+      probe: fakeProbe(() => ({ kind: "timeout" }), [
+        { outMsgs: 10, inMsgs: 5 }, // before
+        { outMsgs: 11, inMsgs: 5 }, // after: probe crossed, no echo back ⇒ remote
+      ]),
+    };
+    const res = await runDoctorChecks(ports, {
+      cfg: loadedConfig([{ principal_id: "jc", stack_id: "jc/default" }]),
+      networkId: "metafactory-community",
+    });
+    const peerCheck = findCheck(res.checks, "peer-reachable:jc/default");
+    expect(peerCheck.status).toBe("fail");
+    expect(peerCheck.detail).toContain("REMOTE");
+    expect(peerCheck.fix).toContain("peer/echo leg");
+    expect(peerCheck.fix).not.toContain("peer/hub"); // the sharper remediation wins
+  });
+
+  test("cortex#1728 — leafz out+0 sharpens the timeout fix to the LOCAL-egress half", async () => {
+    const ports: NetworkDoctorPorts = {
+      config: fakeConfigPort([network()], "ACCOUNT_A"),
+      monitor: fakeMonitorPort({ configured: true, leafz: ESTABLISHED_LEAFZ }),
+      probe: fakeProbe(() => ({ kind: "timeout" }), [
+        { outMsgs: 10, inMsgs: 5 }, // before
+        { outMsgs: 10, inMsgs: 5 }, // after: nothing left the leaf ⇒ local egress
+      ]),
+    };
+    const res = await runDoctorChecks(ports, {
+      cfg: loadedConfig([{ principal_id: "jc", stack_id: "jc/default" }]),
+      networkId: "metafactory-community",
+    });
+    const peerCheck = findCheck(res.checks, "peer-reachable:jc/default");
+    expect(peerCheck.status).toBe("fail");
+    expect(peerCheck.detail).toContain("LOCAL egress");
+    expect(peerCheck.fix).toContain("local egress");
+  });
+
   test("partial peer failure (one of two peers times out) ⇒ degraded, not broken", async () => {
     const twoPeerNetwork = network({
       peers: [
@@ -691,5 +749,53 @@ describe("runDoctorChecks — sealed-secret-hub-authorized (Pair 3, documented s
     expect(c.detail).toContain("opaque ciphertext");
     // A skip never blocks a healthy verdict.
     expect(res.verdict).toBe("healthy");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cortex#1728 (guard 4) — selectNetworkLeaf: SCOPED leaf attribution
+// (the #1731 review BLOCK — never sum sibling leaves' counters)
+// ---------------------------------------------------------------------------
+
+describe("selectNetworkLeaf — multi-leaf attribution (cortex#1728)", () => {
+  // A real host runs several leaves that share the hub ip:port.
+  const MULTI_LEAF: LeafzResponse = {
+    leafs: [
+      { name: "metafactory", account: "ACCT_MF", in_msgs: 5, out_msgs: 5 },
+      { name: "community", account: "ACCT_COMM", in_msgs: 99, out_msgs: 99 },
+      { name: "halden", account: "ACCT_HAL", in_msgs: 7, out_msgs: 7 },
+    ],
+  };
+
+  test("matches ONLY the named leaf — sibling counters are never included", () => {
+    const m = selectNetworkLeaf(MULTI_LEAF, "metafactory");
+    expect(m?.match).toBe("named");
+    expect(m?.leaf.out_msgs).toBe(5); // metafactory's own, NOT the summed 111
+    expect(m?.leaf.in_msgs).toBe(5);
+  });
+
+  test("matches on account as a secondary key", () => {
+    const m = selectNetworkLeaf(MULTI_LEAF, "ACCT_COMM");
+    expect(m?.match).toBe("named");
+    expect(m?.leaf.out_msgs).toBe(99);
+  });
+
+  test("multi-leaf bus with NO name/account match ⇒ undefined (never misattribute)", () => {
+    // This is the core of the review BLOCK: metafactory egress could be dead
+    // (out+0) while community ticks — if we summed, we'd mask the break. With no
+    // match on a 3-leaf bus we refuse to attribute.
+    expect(selectNetworkLeaf(MULTI_LEAF, "unknown-leaf")).toBeUndefined();
+  });
+
+  test("lone-leaf bus ⇒ attributes the single leaf even without a name match", () => {
+    const lone: LeafzResponse = { leafs: [{ name: "hub", in_msgs: 3, out_msgs: 4 }] };
+    const m = selectNetworkLeaf(lone, "some-network-leaf");
+    expect(m?.match).toBe("lone-fallback");
+    expect(m?.leaf.out_msgs).toBe(4);
+  });
+
+  test("empty leafs ⇒ undefined", () => {
+    expect(selectNetworkLeaf({ leafs: [] }, "hub")).toBeUndefined();
+    expect(selectNetworkLeaf({}, "hub")).toBeUndefined();
   });
 });

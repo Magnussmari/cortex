@@ -16,11 +16,19 @@
  * `--count N` reuses one NATS connection.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+
 import type { AgentConfig } from "../../../common/types/config";
 import type { Envelope } from "../../../bus/myelin/envelope-validator";
+import type { LoadedConfig } from "../../../common/config/loader";
+import { expandTilde } from "../../../common/config/loader";
+import { natsConfigMonitorUrl } from "../../../common/nats/leaf-remote-renderer";
 import type { MyelinRuntime, BusEnvelopeSigner } from "../../../bus/myelin/runtime";
 import { startMyelinRuntime } from "../../../bus/myelin/runtime";
+import { selectNetworkLeaf } from "./network-doctor-lib";
 import type {
+  LeafzCounters,
+  LeafzSamplerPort,
   ProbeBusPort,
   ProbeFireInputs,
   ProbeRoundTripResult,
@@ -145,4 +153,89 @@ function replyScopePrefix(pattern: string): string {
   // Strip a trailing `>` wildcard; keep the dotted literal prefix.
   if (pattern.endsWith(".>")) return pattern.slice(0, -1); // keep trailing dot
   return pattern;
+}
+
+// =============================================================================
+// cortex#1728 (guard 4) — live `/leafz` sampler
+// =============================================================================
+
+/** Upstream-default nats-server HTTP monitor base (the `http_port` default). */
+const DEFAULT_MONITOR_BASE = "http://127.0.0.1:8222";
+
+/** Bound the monitor fetch so a hung monitor can't stall the ping. */
+const LEAFZ_FETCH_TIMEOUT_MS = 2000;
+
+/**
+ * cortex#1728 (guard 4) — resolve the nats-server HTTP monitor base from the
+ * loaded config, mirroring `network-adapters.ts`'s `resolveMonitorBase`
+ * precedence but from a {@link LoadedConfig}: derive from the stack's nats
+ * config file (`http_port`/`monitor_port`/`http`), else the upstream default.
+ * Pure/read-only; a missing/unreadable config falls back to the default base.
+ */
+function resolveMonitorBaseFromLoaded(cfg: LoadedConfig): string {
+  const configPath = expandTilde(cfg.stack?.nats_infra?.config_path ?? "");
+  if (configPath.length > 0 && existsSync(configPath)) {
+    try {
+      const derived = natsConfigMonitorUrl(readFileSync(configPath, "utf-8"));
+      if (derived !== undefined) return derived.replace(/\/+$/, "");
+    } catch {
+      // Unreadable nats config — fall back to the default base. Best-effort:
+      // the sampler is additive diagnostic context, never a gate (see below).
+    }
+  }
+  return DEFAULT_MONITOR_BASE;
+}
+
+/**
+ * cortex#1728 (guard 4) — a live {@link LeafzSamplerPort} over the nats-server
+ * `/leafz` monitor endpoint, SCOPED to the pinged network's own leaf.
+ *
+ * A host runs SEVERAL leaves that all dial the same hub ip:port (this stack:
+ * metafactory + community + halden), so summing `out_msgs`/`in_msgs` across all
+ * of them picks up other networks' heartbeat traffic and MISATTRIBUTES the
+ * diagnosis — e.g. metafactory egress dead (out+0 on that leaf) while community
+ * ticks out+2 would sum to out+2 and MASK the local-egress break, the exact
+ * failure guard 4 exists to catch (#1731 review BLOCK). We therefore select the
+ * ONE leaf attributable to the `leafNode` via the SHARED {@link selectNetworkLeaf}
+ * attribution `doctor` uses (name/account match, or the lone-leaf fallback on a
+ * single-leaf bus), and read only that leaf's counters. When the target leaf
+ * cannot be uniquely identified (2+ leaves, no name match) we return `undefined`
+ * — omit the diagnostic, never misattribute.
+ *
+ * BEST-EFFORT by contract: every failure path (monitor unreachable, non-200,
+ * malformed body, timeout, no unique leaf) resolves `undefined`, so the ping
+ * proceeds without a diagnostic line and NEVER fails on account of the sampler.
+ */
+export function createLiveLeafzSampler(cfg: LoadedConfig): LeafzSamplerPort {
+  const base = resolveMonitorBaseFromLoaded(cfg);
+  return {
+    async sample(leafNode: string): Promise<LeafzCounters | undefined> {
+      // Bound the fetch: a monitor that accepts the TCP connection but never
+      // responds (hung nats-server) must not hang the ping.
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        controller.abort();
+      }, LEAFZ_FETCH_TIMEOUT_MS);
+      try {
+        const res = await fetch(`${base}/leafz`, { signal: controller.signal });
+        if (!res.ok) return undefined;
+        const body = (await res.json()) as {
+          leafs?: { account?: string; name?: string; in_msgs?: number; out_msgs?: number }[];
+        };
+        // Scope to THIS network's leaf only — never sum across sibling leaves.
+        const match = selectNetworkLeaf(body, leafNode);
+        if (match === undefined) return undefined;
+        return {
+          outMsgs: typeof match.leaf.out_msgs === "number" ? match.leaf.out_msgs : 0,
+          inMsgs: typeof match.leaf.in_msgs === "number" ? match.leaf.in_msgs : 0,
+        };
+      } catch {
+        // Monitor genuinely unreachable / aborted — degrade to "no sample".
+        // The orchestrator omits the diagnostic line; the ping is unaffected.
+        return undefined;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
 }
