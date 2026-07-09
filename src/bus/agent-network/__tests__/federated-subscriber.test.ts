@@ -809,3 +809,179 @@ describe("E.5 — BLOCKER: source-bound identity (no provenance spoof)", () => {
     await handle.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// FS-1 (cortex#1825, design §3 D-1) — PRESENCE-BY-MEMBERSHIP
+// ---------------------------------------------------------------------------
+//
+// D-1: an ADMITTED member of the verified admission roster folds its presence
+// even with NO `peers[]` offering — membership IS the accept-list for presence.
+// This drops the offerings precondition, NOT the crypto/source-binding. The
+// oracle is injected as `isAdmittedMemberOfNetwork` (NETWORK-SCOPED, cortex#1825
+// review); DD-11 stays fail-closed via `handPinnedPrincipals`.
+//
+// cortex#1825 review — membership-fold is LEAF-SCOPED: it fires ONLY when the
+// source is admitted on a network the DELIVERING leaf serves. So these tests run
+// on a DEDICATED leaf (`RESEARCH_LEAF`, the production shape — a joined network
+// with its own `leaf_node`, delivered on that leaf), NOT `primary`. Delivery on
+// `primary` (the shared local link, no per-network isolation) can NEVER
+// membership-fold — see the cross-network / bare-forgery regressions in
+// fs1-adversarial-probe.test.ts.
+
+const RESEARCH_LEAF = "leaf-research";
+
+/** joel-less network on a DEDICATED leaf (production federation shape). */
+function networkWithoutJoelOnLeaf(): PolicyFederatedNetwork {
+  return {
+    id: "research-collab",
+    leaf_node: RESEARCH_LEAF,
+    peers: [],
+    accept_subjects: ["federated.joel.research.agent.>"],
+    deny_subjects: [],
+    announce_capabilities: [],
+    max_hop: 3,
+  };
+}
+
+describe("FS-1 — presence-by-membership fold", () => {
+  test("AC1: admitted member with NO peers[] offering, delivered on ITS OWN network's leaf ⇒ FOLDED by membership", async () => {
+    const runtime = makeFakeRuntime();
+    const registry = new AgentPresenceRegistry();
+    const handle = await startFederatedAgentPresenceSubscriber({
+      runtime,
+      registry,
+      // joel is NOT in peers[] and NOT on accept_subjects for its own subtree —
+      // the gate would deny `peer_not_in_accept_list` (unknown_network)...
+      federated: federatedPolicy([networkWithoutJoelOnLeaf()]),
+      source: SYSTEM_SOURCE,
+      // ...but joel IS an admitted member OF research-collab ⇒ presence-by-
+      // membership folds, because the envelope arrives on that network's leaf.
+      isAdmittedMemberOfNetwork: (p, nid) =>
+        p === "joel" && nid === "research-collab",
+    });
+    runtime.fire(foreignOnline(), FED_SUBJECT, RESEARCH_LEAF);
+    await flush();
+    const agents = registry.getAgents();
+    expect(agents.length).toBe(1);
+    expect(agents[0]?.agentId).toBe("sage");
+    expect(agents[0]?.principal).toBe("joel");
+    expect(agents[0]?.origin).toMatchObject({ kind: "foreign", principal: "joel" });
+    await handle.stop();
+  });
+
+  test("AC2: a NON-member (absent from the roster) is STILL denied — no membership fold", async () => {
+    const runtime = makeFakeRuntime();
+    const registry = new AgentPresenceRegistry();
+    const handle = await startFederatedAgentPresenceSubscriber({
+      runtime,
+      registry,
+      federated: federatedPolicy([networkWithoutJoelOnLeaf()]),
+      source: SYSTEM_SOURCE,
+      // joel is NOT an admitted member ⇒ the offerings deny stands (unknown_network).
+      isAdmittedMemberOfNetwork: (p) => p === "someone-else",
+    });
+    runtime.fire(foreignOnline(), FED_SUBJECT, RESEARCH_LEAF);
+    await flush();
+    expect(registry.getAgents().length).toBe(0); // denied — not folded
+    await handle.stop();
+  });
+
+  test("AC2 (default): omitting the oracle ⇒ byte-identical pre-FS-1 (peers[]-only) behaviour", async () => {
+    const runtime = makeFakeRuntime();
+    const registry = new AgentPresenceRegistry();
+    const handle = await startFederatedAgentPresenceSubscriber({
+      runtime,
+      registry,
+      federated: federatedPolicy([networkWithoutJoelOnLeaf()]),
+      source: SYSTEM_SOURCE,
+      // No isAdmittedMemberOfNetwork ⇒ defaults to "never a member" ⇒ joel denied.
+    });
+    runtime.fire(foreignOnline(), FED_SUBJECT, RESEARCH_LEAF);
+    await flush();
+    expect(registry.getAgents().length).toBe(0);
+    await handle.stop();
+  });
+
+  test("AC4 (DD-11): a HAND-PINNED member is NEVER re-admitted by membership (pin-mismatch stays fail-closed)", async () => {
+    const runtime = makeFakeRuntime();
+    const registry = new AgentPresenceRegistry();
+    const handle = await startFederatedAgentPresenceSubscriber({
+      runtime,
+      registry,
+      // joel dropped from peers[] by a DD-11 pin-mismatch at config load ⇒ gate
+      // denies. joel IS an admitted member, BUT it carries a local hand-pin...
+      federated: federatedPolicy([networkWithoutJoelOnLeaf()]),
+      source: SYSTEM_SOURCE,
+      isAdmittedMemberOfNetwork: (p, nid) =>
+        p === "joel" && nid === "research-collab",
+      // ...so the membership override MUST be skipped — DD-11 unchanged.
+      handPinnedPrincipals: new Set(["joel"]),
+    });
+    runtime.fire(foreignOnline(), FED_SUBJECT, RESEARCH_LEAF);
+    await flush();
+    expect(registry.getAgents().length).toBe(0); // fail-closed — not folded
+    await handle.stop();
+  });
+
+  test("AC5: source-binding UNCHANGED — a membership-admitted member cannot paint a foreign scope", async () => {
+    const runtime = makeFakeRuntime();
+    const registry = new AgentPresenceRegistry();
+    // Seed a LOCAL record that a spoof would try to overwrite.
+    registry.apply(
+      createAgentOnlineEvent({
+        source: { principal: "andreas", stack: "meta-factory", instance: "local" },
+        identity: { nkey_public_key: "ULOCAL", agent_id: "luna", assistant_name: "Luna" },
+        scope: { principal: "andreas", stack: "meta-factory" },
+        capabilities: [],
+        startedAt: new Date("2026-06-11T08:00:00.000Z"),
+      }),
+    );
+    const handle = await startFederatedAgentPresenceSubscriber({
+      runtime,
+      registry,
+      federated: federatedPolicy([networkWithoutJoelOnLeaf()]),
+      source: SYSTEM_SOURCE,
+      // joel folds by membership — but the payload claims andreas/meta-factory,
+      // a scope joel does NOT own. Source-binding (applyForeign verifiedScope)
+      // must DROP it: membership does not weaken source-binding.
+      isAdmittedMemberOfNetwork: (p, nid) =>
+        p === "joel" && nid === "research-collab",
+    });
+    runtime.fire(spoofOnline("luna"), FED_SUBJECT, RESEARCH_LEAF);
+    await flush();
+    // The real local luna survives; no foreign spoof painted it.
+    const luna = registry.getAgents().find((a) => a.agentId === "luna");
+    expect(luna?.origin).toBe("local");
+    expect(registry.getAgents().length).toBe(1); // no spoof record folded
+    await handle.stop();
+  });
+
+  test("safety denials (deny_subjects) are NEVER overridden by membership", async () => {
+    const runtime = makeFakeRuntime();
+    const registry = new AgentPresenceRegistry();
+    // joel IS a peer AND an admitted member, but its presence subtree is on the
+    // DENY list — a deny is a safety check, NOT an offering, so membership must
+    // NOT override it.
+    const deniedNetwork: PolicyFederatedNetwork = {
+      id: "research-collab",
+      leaf_node: "primary",
+      peers: [{ principal_id: "joel", stack_id: "joel/research" }],
+      accept_subjects: ["federated.joel.research.agent.>"],
+      deny_subjects: ["federated.joel.research.agent.>"],
+      announce_capabilities: [],
+      max_hop: 3,
+    };
+    const handle = await startFederatedAgentPresenceSubscriber({
+      runtime,
+      registry,
+      federated: federatedPolicy([deniedNetwork]),
+      source: SYSTEM_SOURCE,
+      isAdmittedMemberOfNetwork: (p, nid) =>
+        p === "joel" && nid === "research-collab",
+    });
+    runtime.fire(foreignOnline(), FED_SUBJECT, "primary");
+    await flush();
+    expect(registry.getAgents().length).toBe(0); // deny stands — not folded
+    await handle.stop();
+  });
+});
