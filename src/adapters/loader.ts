@@ -24,7 +24,11 @@
  *      deterministic (bundle-name-sorted) order:
  *        a. org-trust gate (ADR-0024 D4 mitigation #1 — org-trusted repos
  *           only, unconditionally, regardless of the external flag);
- *        b. external-flag / first-party-renderer gate (OQ6/OQ9);
+ *        b. external-flag / first-party gate (OQ6/OQ9, extended cortex#1794
+ *           S9a) — a first-party RENDERER (in-tree allowlist) or a
+ *           first-party ADAPTER (repoUrl declared under cortex's OWN
+ *           `arc-manifest.yaml` `dependencies:`, read fresh each load —
+ *           {@link isFirstPartyBundle}) loads even with the flag off;
  *        c. compat gate — `Bun.semver.satisfies(SURFACE_SDK_VERSION,
  *           manifest.sdkRange)` (D1, loader-authoritative);
  *        d. duplicate-id gate — an in-tree plugin (or an earlier-loaded
@@ -66,7 +70,7 @@
  * has something to check coverage against.
  */
 
-import { existsSync, realpathSync } from "fs";
+import { existsSync, readFileSync, realpathSync } from "fs";
 import { homedir } from "os";
 import { join, resolve as resolvePath, sep } from "path";
 import { pathToFileURL } from "url";
@@ -403,6 +407,11 @@ const FIRST_PARTY_RENDERER_REPOS: ReadonlySet<string> = new Set([
   // never this production constant.
 ]);
 
+/** Shared empty-set default for {@link isFirstPartyBundle}'s adapter branch
+ *  — never populated in place; a genuinely empty allowlist just means "no
+ *  adapter exemption this call" (the fail-closed posture). */
+const EMPTY_REPO_SET: ReadonlySet<string> = new Set();
+
 function normalizeRepoUrl(url: string): string {
   return url.trim().replace(/\.git$/i, "").replace(/\/$/, "").toLowerCase();
 }
@@ -414,6 +423,204 @@ export function isFirstPartyRendererBundle(
 ): boolean {
   if (kind !== "renderer") return false;
   return allowlist.has(normalizeRepoUrl(arcPackage.repoUrl));
+}
+
+/**
+ * cortex#1794 (S9a) — the ADAPTER analogue of {@link isFirstPartyRendererBundle}.
+ * `kind`-gated the same way (an adapter bundle is NEVER exempt through the
+ * renderer allowlist, and vice versa — the two exemptions are namespaced by
+ * kind, never merged), but the allowlist source is different in kind, not
+ * just in content: the renderer allowlist ({@link FIRST_PARTY_RENDERER_REPOS})
+ * is a hardcoded in-tree constant; the adapter allowlist is COMPUTED fresh
+ * at every load from {@link readCortexDeclaredAdapterRepos} and handed in
+ * explicitly by the caller — this function stays a pure predicate over
+ * whatever set it's given, with no I/O and no default of its own, so a
+ * caller can never forget which allowlist it's checking against.
+ */
+export function isFirstPartyAdapterBundle(
+  arcPackage: Pick<ArcPackage, "repoUrl">,
+  kind: PluginKind,
+  allowlist: ReadonlySet<string>,
+): boolean {
+  if (kind !== "adapter") return false;
+  return allowlist.has(normalizeRepoUrl(arcPackage.repoUrl));
+}
+
+/**
+ * cortex#1794 (S9a) — kind-aware dispatch composing both first-party
+ * exemptions into one call so `loadOneBundle` (and any future caller) never
+ * has to branch on `kind` itself to decide which allowlist applies. Renderer
+ * behavior is delegated VERBATIM to {@link isFirstPartyRendererBundle}
+ * (same function, same default, zero behavior change — the regression
+ * guarantee for OQ9) and only the adapter branch is new.
+ */
+export function isFirstPartyBundle(
+  arcPackage: Pick<ArcPackage, "repoUrl">,
+  kind: PluginKind,
+  allowlists: {
+    rendererAllowlist?: ReadonlySet<string>;
+    adapterAllowlist?: ReadonlySet<string>;
+  } = {},
+): boolean {
+  if (kind === "renderer") {
+    return isFirstPartyRendererBundle(arcPackage, kind, allowlists.rendererAllowlist);
+  }
+  return isFirstPartyAdapterBundle(arcPackage, kind, allowlists.adapterAllowlist ?? EMPTY_REPO_SET);
+}
+
+/**
+ * cortex#1794 (S9a) — a dependency `name` in cortex's OWN `arc-manifest.yaml`
+ * grants the adapter exemption ONLY if it also asserts, by its OWN name
+ * shape, that it IS a cortex-owned adapter-type component — never merely
+ * "cortex depends on it for some reason". This is the fix for a code-review
+ * MAJOR (PR #1942): an earlier version of this anchor treated cortex's
+ * ENTIRE `dependencies:` list as adapter-exempt, so `arc` (the package
+ * manager) and `metafactory-discord` (ADR-0017 CLI/skill *tooling* —
+ * explicitly NOT the adapter, per ADR-0024's own migration provenance
+ * section) would BOTH have granted the exemption to any `kind: adapter`
+ * plugin they ever happened to ship, despite neither being declared FOR
+ * adapter-trust reasons. That is exactly the failure ADR-0024 §OQ9 names:
+ * *"'First-party' must be a checkable property of a bundle, not a naming
+ * convention… an unchecked 'first-party' exemption is a trust hole wearing
+ * a friendly name."* — the naming convention there is about a BUNDLE
+ * claiming its own trust; here the risk was the REVERSE mistake, reading
+ * "listed as a dependency" as "trusted as an adapter" when a dependency can
+ * be declared for any number of unrelated reasons.
+ *
+ * The fix narrows to the **ecosystem-wide, structurally-checkable**
+ * repo-naming standard (compass `standards/component-repo-naming.md`, PR
+ * the-metafactory/compass#115, adopted the same day as the epic #1784
+ * decision this anchor implements): a cortex-owned adapter bundle's repo
+ * name is ALWAYS `metafactory-cortex-adapter-<name>` (`<owner>` = `cortex`,
+ * `<type>` = `adapter`) — locked BEFORE the first such repo is created
+ * specifically so this epic's extractions have a stable name to check
+ * against ("Requested by Andreas 2026-07-12", same standard doc). This is
+ * still un-spoofable for the same reason as before — the NAME is read out
+ * of cortex's own PR-reviewed manifest, never anything the bundle
+ * self-declares — the narrowing only adds a SECOND, independently-checkable
+ * requirement on TOP of "declared by cortex": the declared name must also
+ * self-identify, in a fixed and enforced shape, as a cortex-adapter
+ * component. `arc` and `metafactory-discord` (or its scheduled rename,
+ * `metafactory-bundle-discord` — compass#116) never match this shape, by
+ * construction: neither is a `metafactory-cortex-adapter-*` name, so
+ * neither is EVER treated as first-party for the adapter exemption, no
+ * matter what kind of `cortex-plugin.yaml` a bundle at that name might one
+ * day ship. See {@link ADAPTER_BUNDLE_DEP_NAME_RE}.
+ */
+const ADAPTER_BUNDLE_DEP_NAME_RE = /^metafactory-cortex-adapter-[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * cortex#1794 (S9a, epic #1784 "Andreas decision 2026-07-12") — the
+ * un-spoofable first-party ADAPTER anchor: cortex's OWN, PR-reviewed
+ * `arc-manifest.yaml` `dependencies:` block, NARROWED to only the entries
+ * whose `name` matches {@link ADAPTER_BUNDLE_DEP_NAME_RE} (see that
+ * constant's doc comment for why the narrowing is required — PR #1942
+ * code-review MAJOR). This is deliberately NOT a hardcoded allowlist like
+ * {@link FIRST_PARTY_RENDERER_REPOS} — it is read fresh at every load, so
+ * declaring a new first-party adapter bundle (e.g. the planned
+ * `metafactory-cortex-adapter-web`) is a plain `arc-manifest.yaml` PR, never
+ * a `loader.ts` code change.
+ *
+ * Why this is un-spoofable: a bundle's OWN manifest (`cortex-plugin.yaml`)
+ * and arc's `tier` field were already rejected as trust anchors for the
+ * renderer exemption above (both fully controlled by the bundle author —
+ * see {@link isFirstPartyRendererBundle}'s doc comment for the empirical
+ * evidence). `arc-manifest.yaml` `dependencies:` has the SAME shape of
+ * un-spoofability: it is CORTEX's manifest, shipped in CORTEX's repo, only
+ * ever changed by a PR against CORTEX — a bundle author publishing
+ * `metafactory-evil-adapter` cannot make cortex's own dependency list
+ * declare their repo, AND (post-narrowing) could not even self-select into
+ * the exemption by picking a matching name for their OWN repo — membership
+ * requires appearing, under that exact name, in CORTEX's manifest, which
+ * only a cortex-repo PR controls either way.
+ *
+ * Deriving a repo URL from a dependency `name`: `arc-manifest.yaml`
+ * dependency names in this ecosystem ARE the GitHub repo name under the
+ * trusted `the-metafactory` org, by the repo-first install convention
+ * (ADR-0017 — see cortex's own `arc-manifest.yaml`, the `metafactory-discord`
+ * entry: "the bundle is `arc install`-able from the
+ * the-metafactory/metafactory-discord repo"). So `name:
+ * "metafactory-cortex-adapter-web"` derives
+ * `https://github.com/the-metafactory/metafactory-cortex-adapter-web`,
+ * normalized the same way {@link normalizeRepoUrl} normalizes an installed
+ * bundle's `arc list`-recorded `repoUrl`, making membership a plain
+ * set-lookup. Every derived URL is by construction inside `the-metafactory`
+ * — this composes with (never replaces) the unconditional
+ * {@link isTrustedOrgRepo} gate, which still runs first and independently
+ * for every bundle.
+ *
+ * **Threat-model note (both this anchor AND {@link isTrustedOrgRepo}):**
+ * un-spoofability here ultimately rests on arc recording `repoUrl` as the
+ * package's actual git clone source (confirmed empirically against a live
+ * `arc list --json` — S6). If a future arc version ever added a `--repo-url`
+ * override decoupled from the real clone source, BOTH gates would fall
+ * together — this is an explicit cross-repo (arc) dependency of cortex's
+ * entire plugin trust model, not something this module can independently
+ * verify or defend against; it is recorded here so a future arc change is
+ * evaluated against it.
+ *
+ * **Persistence-via-self-rewrite (author-flagged, PR #1942 nit):** an
+ * already-loaded bundle — which, under D4's accepted full-daemon-authority
+ * model, already has filesystem access equivalent to the daemon — could
+ * rewrite cortex's OWN `arc-manifest.yaml` on disk to grant a FUTURE bundle
+ * this exemption on the next boot. This is NOT symmetric with the renderer
+ * allowlist's equivalent risk, only equivalent UNDER D4's full-compromise
+ * assumption: {@link FIRST_PARTY_RENDERER_REPOS} is a compiled-in TS
+ * constant, so self-granting via it means editing `loader.ts` source AND
+ * getting a rebuild to pick it up; this anchor is a plain YAML data file,
+ * read fresh every boot, no rebuild required — a strictly CHEAPER edit for
+ * an attacker who already has arbitrary file write. Under D4 (arbitrary
+ * code exec inside an already-loaded plugin = full compromise) neither
+ * barrier stops the attacker; the difference is defense-in-depth cost, not
+ * whether the barrier holds — recorded here, not fixed here, because D4
+ * already accepts this class of risk for v1 (named future escalation:
+ * registry signing / separate-process-over-IPC, ADR-0024 D4).
+ *
+ * Fail-closed by design: ANY read/parse failure — missing file, invalid
+ * YAML, no `dependencies:` key, non-array `dependencies:`, a dependency
+ * entry with no string `name` — is caught and returns an EMPTY set, never
+ * throws and never crashes boot. An unreadable manifest can only NARROW
+ * trust (no adapter bundle gets the exemption that boot); it must never be
+ * able to WIDEN it.
+ */
+export function readCortexDeclaredAdapterRepos(manifestPath: string): ReadonlySet<string> {
+  try {
+    const raw = readFileSync(manifestPath, "utf-8");
+    const parsed: unknown = parseYaml(raw);
+    if (!isRecord(parsed)) return new Set();
+    const deps: unknown = parsed.dependencies;
+    if (!Array.isArray(deps)) return new Set();
+    const repos = new Set<string>();
+    for (const dep of deps) {
+      if (!isRecord(dep) || typeof dep.name !== "string") continue;
+      const name = dep.name.trim();
+      // PR #1942 MAJOR fix — only a dependency name that self-identifies as
+      // a cortex-owned ADAPTER component (the compass#115 naming standard)
+      // grants the exemption. `arc`, `metafactory-discord`, and any other
+      // legitimately-declared-but-unrelated dependency never match, no
+      // matter what they ship.
+      if (!ADAPTER_BUNDLE_DEP_NAME_RE.test(name)) continue;
+      repos.add(normalizeRepoUrl(`https://github.com/the-metafactory/${name}`));
+    }
+    return repos;
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Default location of cortex's OWN `arc-manifest.yaml`, resolved relative to
+ * THIS module's location on disk — mirrors the established
+ * `getCortexVersion`/`getVersion`/`readIntendedVersion` pattern
+ * (`src/bus/dispatch-handler.ts`, `src/cortex.ts`,
+ * `src/cli/cortex/commands/release.ts`) that already reads cortex's own
+ * `arc-manifest.yaml` this same way. Deliberately NOT `defaultPkgRoot()` —
+ * that trusted root holds OTHER installed packages' bundles, never cortex's
+ * own checkout.
+ */
+export function defaultCortexManifestPath(): string {
+  // src/adapters/loader.ts -> repo root is two levels up.
+  return resolvePath(import.meta.dir, "..", "..", "arc-manifest.yaml");
 }
 
 // =============================================================================
@@ -506,8 +713,10 @@ export interface LoadedPluginInfo {
   bundleName: string;
   kind: PluginKind;
   id: string;
-  /** True when this bundle loaded under the OQ9 first-party-renderer
-   *  exemption rather than because `system.plugins.external` was on. */
+  /** True when this bundle loaded under a first-party exemption — the OQ9
+   *  renderer allowlist, or the cortex#1794 S9a adapter exemption (repoUrl
+   *  declared under cortex's own `arc-manifest.yaml` `dependencies:`) —
+   *  rather than because `system.plugins.external` was on. */
   firstParty: boolean;
 }
 
@@ -535,6 +744,26 @@ export interface LoadPluginsOptions {
   /** Test seam — see {@link isFirstPartyRendererBundle}. Production callers
    *  never set this (defaults to the real in-tree allowlist). */
   firstPartyRendererRepos?: ReadonlySet<string>;
+  /**
+   * cortex#1794 (S9a) test seam — pre-resolved first-party ADAPTER allowlist.
+   * Production callers never set this: it is computed automatically, once
+   * per {@link loadExternalPlugins} call, from cortex's own
+   * `arc-manifest.yaml` via {@link readCortexDeclaredAdapterRepos}. Set this
+   * ONLY in tests that want to inject the allowlist directly instead of
+   * pointing {@link cortexManifestPath} at a fixture file; if both are set,
+   * this one wins (`cortexManifestPath` is never read).
+   */
+  firstPartyAdapterRepos?: ReadonlySet<string>;
+  /**
+   * cortex#1794 (S9a) test seam — where to read cortex's OWN
+   * `arc-manifest.yaml` from when deriving the first-party adapter allowlist
+   * (ignored if {@link firstPartyAdapterRepos} is set explicitly). Defaults
+   * to {@link defaultCortexManifestPath} — cortex's REAL manifest at its
+   * real repo-relative location. Tests point this at a fixture manifest so
+   * the "declared dependency" mechanism is exercised end-to-end without
+   * depending on (or mutating) the real file.
+   */
+  cortexManifestPath?: string;
 }
 
 export interface LoadPluginsResult {
@@ -558,6 +787,17 @@ export async function loadExternalPlugins(
   const skipped: SkippedPluginInfo[] = [];
   const failed: FailedPluginInfo[] = [];
 
+  // cortex#1794 (S9a) — resolve the first-party ADAPTER allowlist ONCE per
+  // load, not per bundle: `readCortexDeclaredAdapterRepos` is a file read +
+  // YAML parse, and every bundle in this load is gated against the SAME
+  // snapshot of cortex's own manifest (a manifest edit mid-loop, however
+  // implausible, must not gate different bundles inconsistently within one
+  // boot). Explicit `firstPartyAdapterRepos` (test seam) always wins over
+  // reading a manifest at all.
+  const firstPartyAdapterRepos =
+    options.firstPartyAdapterRepos ??
+    readCortexDeclaredAdapterRepos(options.cortexManifestPath ?? defaultCortexManifestPath());
+
   const { bundles, issues: discoveryIssues } = await discoverPluginBundles({
     pkgRoot: options.pkgRoot,
     runner: options.runner,
@@ -575,6 +815,7 @@ export async function loadExternalPlugins(
         registry,
         externalEnabled,
         firstPartyRendererRepos: options.firstPartyRendererRepos,
+        firstPartyAdapterRepos,
         loaded,
         skipped,
         failed,
@@ -603,6 +844,9 @@ interface LoadOneBundleSinks {
   registry: SurfacePluginRegistry;
   externalEnabled: boolean;
   firstPartyRendererRepos: ReadonlySet<string> | undefined;
+  /** cortex#1794 (S9a) — pre-resolved once in {@link loadExternalPlugins},
+   *  never re-read per bundle. */
+  firstPartyAdapterRepos: ReadonlySet<string>;
   loaded: LoadedPluginInfo[];
   skipped: SkippedPluginInfo[];
   failed: FailedPluginInfo[];
@@ -628,18 +872,22 @@ async function loadOneBundle(bundle: DiscoveredBundle, sinks: LoadOneBundleSinks
     return;
   }
 
-  // (b) External-flag / first-party-renderer gate (OQ6/OQ9).
-  const firstParty = isFirstPartyRendererBundle(
-    arcPackage,
-    manifest.kind,
-    sinks.firstPartyRendererRepos,
-  );
+  // (b) External-flag / first-party gate (OQ6/OQ9, extended cortex#1794
+  // S9a). `isFirstPartyBundle` dispatches by `manifest.kind`: a renderer is
+  // checked against the in-tree allowlist EXACTLY as before (regression);
+  // an adapter is checked against the allowlist derived from cortex's own
+  // `arc-manifest.yaml` `dependencies:`, resolved once in
+  // `loadExternalPlugins` and threaded through unchanged for every bundle.
+  const firstParty = isFirstPartyBundle(arcPackage, manifest.kind, {
+    rendererAllowlist: sinks.firstPartyRendererRepos,
+    adapterAllowlist: sinks.firstPartyAdapterRepos,
+  });
   if (!sinks.externalEnabled && !firstParty) {
     sinks.skipped.push({
       bundleName,
       kind: manifest.kind,
       id: manifest.id,
-      reason: "system.plugins.external is off and this bundle is not an exempt first-party renderer",
+      reason: `system.plugins.external is off and this ${manifest.kind} bundle is not an exempt first-party bundle`,
     });
     return;
   }
@@ -839,7 +1087,7 @@ async function loadOneBundle(bundle: DiscoveredBundle, sinks: LoadOneBundleSinks
 
   sinks.loaded.push({ bundleName, kind: manifest.kind, id: manifest.id, firstParty });
   process.stderr.write(
-    `cortex plugin-loader: loaded ${manifest.kind} "${manifest.id}" from bundle "${bundleName}"${firstParty ? " (first-party renderer exemption)" : ""}\n`,
+    `cortex plugin-loader: loaded ${manifest.kind} "${manifest.id}" from bundle "${bundleName}"${firstParty ? ` (first-party ${manifest.kind} exemption)` : ""}\n`,
   );
 }
 
