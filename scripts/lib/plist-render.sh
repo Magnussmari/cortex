@@ -74,7 +74,7 @@ extract_stack_id_slug() {
 # this filename/dirname convention MUST equal it. We deliberately do NOT
 # re-derive the locator from stack.id here: the on-disk files (the sentinel,
 # stacks/<slug>.yaml, the dir itself) are keyed on this name, so reconciling a
-# drifted stack is an operator rename, not an automatic rewrite (high blast
+# drifted stack is a principal rename, not an automatic rewrite (high blast
 # radius on a live pipeline — see cortex#810). cortex#700: centralised so
 # preupgrade/postupgrade/plist-render all agree on the locator.
 config_file_to_slug() {
@@ -230,7 +230,7 @@ discover_stack_slugs() {
 #
 # WARN, do not fail: a hard error would brick `arc upgrade` for a drifted stack
 # (high blast radius on a live review pipeline — #810). The fix is a one-time
-# operator rename of the dir/file to match stack.id; we surface it loudly every
+# principal rename of the dir/file to match stack.id; we surface it loudly every
 # upgrade until reconciled. Emitted to STDERR so it never pollutes the slug list
 # that discover_stack_slugs streams on stdout to its callers.
 #
@@ -326,12 +326,18 @@ render_stack_plist() {
     echo "  ⚠ Template missing: ${src}" >&2
     return 1
   fi
+  # G-30 (cortex#1866, XDG wave 3): render atomically. A bare `sed > dst`
+  # onto a live LaunchAgents path leaves a truncated/partial plist visible if
+  # the render is interrupted — launchd would then load garbage. Render to a
+  # same-dir temp and `mv` (atomic rename within one filesystem) so the
+  # installed plist only ever transitions whole-old → whole-new.
   sed -e "s|__CORTEX_DIR__|${cortex_dir}|g" \
       -e "s|__BUN_PATH__|${bun_path}|g" \
       -e "s|__HOME__|${HOME}|g" \
       -e "s|__STACK_SLUG__|${slug}|g" \
       -e "s|__CONFIG_PATH__|${config_yaml}|g" \
-      "${src}" > "${dst}"
+      "${src}" > "${dst}.tmp"
+  mv -f "${dst}.tmp" "${dst}"
   echo "  ✓ ${slug} plist rendered → ${dst} (config=${config_yaml})"
 }
 
@@ -365,10 +371,12 @@ render_cortex_plists() {
   local relay_src="${cortex_dir}/src/services/ai.meta-factory.cortex.relay.plist"
   local relay_dst="${launch_dir}/ai.meta-factory.cortex.relay.plist"
   if [ -f "${relay_src}" ]; then
+    # G-30: atomic render (same rationale as render_stack_plist).
     sed -e "s|__CORTEX_DIR__|${cortex_dir}|g" \
         -e "s|__BUN_PATH__|${bun_path}|g" \
         -e "s|__HOME__|${HOME}|g" \
-        "${relay_src}" > "${relay_dst}"
+        "${relay_src}" > "${relay_dst}.tmp"
+    mv -f "${relay_dst}.tmp" "${relay_dst}"
     echo "  ✓ Relay plist rendered → ${relay_dst}"
   fi
 
@@ -383,4 +391,314 @@ render_cortex_plists() {
   if [ "${rendered_count}" -eq 0 ]; then
     echo "  ⚠ No stacks discovered in ${config_dir} (no per-stack dirs or cortex*.yaml) — no stack plists rendered" >&2
   fi
+}
+
+# ── Bin cutover helpers (cortex#1866, XDG wave 3) ────────────────────────────
+
+# Leave a legacy ~/bin/<name> in place as a forward-symlink → ~/.local/bin/<name>.
+#
+# The bin cutover moved cortex/cortex-relay/cldyo-live from ~/bin to
+# ~/.local/bin (arc-manifest provides.files + arc#293 host-adapter defaults).
+# Already-installed launchd plists may still exec ~/bin/<name> until they are
+# re-rendered + reloaded. To guarantee ~/bin/<name> keeps resolving through ANY
+# interrupt in that window, the legacy path is converted to a forward-symlink
+# pointing at the new location.
+#
+# INTERRUPT-WINDOW RULE (cortex#1866 T13, non-negotiable): we NEVER delete
+# ~/bin/<name> here — deletion is wave 6 (#1904). Deleting it in the same
+# operation that re-renders plists would, on any interrupt (pull conflict,
+# missing bun, reboot), leave every plist execing a missing binary under
+# KeepAlive:true → throttled respawn forever.
+#
+# Safety:
+#   - Only bridge when the ~/.local/bin target exists — never create a dangling
+#     forward-symlink.
+#   - An existing symlink at ~/bin/<name> is replaced atomically (`ln -sfn`).
+#   - A REAL file/dir at ~/bin/<name> is backed up to <path>.pre-arc rather than
+#     clobbered (mirrors arc's occupied-destination preflight, arc#293).
+#
+# Host-independent: both macOS (launchd) and Linux (systemd) now exec
+# ~/.local/bin, so the bridge is created regardless of platform.
+#
+# Args: $1 binary basename (e.g. cortex, cortex-relay, cldyo-live)
+forward_link_legacy_bin() {
+  local name="$1"
+  local target="${HOME}/.local/bin/${name}"
+  local link="${HOME}/bin/${name}"
+
+  # Nothing to point at → do not create a dangling forward-symlink.
+  [ -e "${target}" ] || return 0
+
+  mkdir -p "${HOME}/bin"
+
+  if [ -L "${link}" ]; then
+    : # existing symlink (possibly stale) — ln -sfn replaces it atomically
+  elif [ -e "${link}" ]; then
+    # A real regular file / directory occupies the legacy path — preserve it.
+    # Never clobber an earlier backup: if `<link>.pre-arc` already holds a prior
+    # preserved file, fall back to a timestamped `<link>.pre-arc.<epoch>[.n]`
+    # sidecar (mirrors arc createSymlink's resolveBackupPath — data-loss nit).
+    local sidecar="${link}.pre-arc"
+    if [ -e "${sidecar}" ]; then
+      local stamp
+      stamp="$(date +%s)"
+      sidecar="${link}.pre-arc.${stamp}"
+      local n=1
+      while [ -e "${sidecar}" ]; do
+        sidecar="${link}.pre-arc.${stamp}.${n}"
+        n=$((n + 1))
+      done
+    fi
+    mv -f "${link}" "${sidecar}"
+    echo "  ↪ backed up existing ${link} → ${sidecar}"
+  fi
+
+  ln -sfn "${target}" "${link}"
+  echo "  ✓ forward-symlink ${link} → ${target}"
+}
+
+# Reload a (freshly re-rendered) installed plist so a CHANGED ProgramArguments
+# actually takes effect — specifically the ~/bin → ~/.local/bin exec-path move.
+#
+# Uses the modern launchctl domain API: `bootout` the plist if currently
+# loaded, then `bootstrap` it back from disk. The legacy `launchctl load`/
+# `unload` pair is unreliable for a repoint — `load` can silently no-op when the
+# label is already registered, leaving the OLD exec path live under launchd.
+# bootout+bootstrap forces launchd to re-read the plist, so the daemon comes
+# back on the new binary path. Also self-healing: if preupgrade's stop somehow
+# left the old service registered, bootout evicts it before bootstrap.
+#
+# Domain: gui/<uid> — the per-user Aqua session that owns ~/Library/LaunchAgents.
+# Both calls are `|| true`: bootout errors when the label isn't loaded (fine),
+# bootstrap errors (code 5) when it somehow already is.
+#
+# ⚠ #1904 PREREQUISITE: the `bootstrap … || true` swallows a code-5 ("service
+# already loaded") failure. That failure would leave the daemon on its OLD
+# ~/bin exec path — harmless TODAY *only* because the forward-symlink bridge
+# (forward_link_legacy_bin) keeps ~/bin/<name> resolving. When wave 6 (#1904)
+# DELETES ~/bin, that masking disappears and a swallowed code-5 becomes a
+# daemon execing a missing binary. Before #1904 prunes ~/bin, this needs a
+# settle-then-verify/retry here (bootout, wait for teardown, bootstrap, assert
+# the new exec path is live) — NOT built now, deliberately, to keep this wave's
+# blast radius minimal. Tracked as a #1904 gate.
+#
+# Args: $1 plist path
+reload_plist() {
+  local plist="$1"
+  [ -f "${plist}" ] || return 0
+  local domain
+  domain="gui/$(id -u)"
+  launchctl bootout "${domain}" "${plist}" 2>/dev/null || true
+  launchctl bootstrap "${domain}" "${plist}" 2>/dev/null || true
+}
+
+# ── Skip-restart: spare a production stack (cortex#1866 principal req.) ──────
+#
+# CORTEX_UPGRADE_SKIP_RESTART is a comma-list of stack slugs whose LIVE daemon
+# must NOT be force-restarted by `arc upgrade cortex` (verified live: the `work`
+# stack serves production). A skipped stack:
+#   - is NOT stopped by preupgrade (its PID is excluded from the pgrep kill and
+#     it is not launchctl-unloaded), so it keeps running on its live process;
+#   - has its binary moved + forward-symlink bridged + plist re-rendered as
+#     normal, but is NOT bootout/bootstrapped by postupgrade;
+#   - migrates to ~/.local/bin on its NEXT bootout+bootstrap (reboot / logout /
+#     manual `launchctl` reload / maintenance window), when the re-rendered plist
+#     takes effect. A KeepAlive relaunch of the SAME job does NOT migrate it — a
+#     relaunched process keeps launchd's in-memory ProgramArguments (the OLD
+#     ~/bin exec path); the forward-symlink (forward_link_legacy_bin) keeps that
+#     ~/bin path valid until the job is bootstrapped from the new plist on disk.
+# Relay is never routed through the skip check — it always reloads.
+#
+# KEY UNIFICATION (advw3b 3a): BOTH sides key on SLUG. preupgrade's kill-filter
+# resolves each running daemon's slug from its argv `--config` (canonicalized
+# via realpath, then the repo's filename→slug map), NOT by path-substring — so a
+# daemon whose argv spells its config differently (relative path, or the
+# cortex#717 monolith-vs-dir-layout coexistence) can't desync the kill side from
+# postupgrade's slug-keyed reload side and get killed-but-never-restarted.
+
+# True if $1 (a slug) is in CORTEX_UPGRADE_SKIP_RESTART. Word-splitting on the
+# comma-normalized list trims incidental whitespace; slugs are [a-zA-Z0-9_-] so
+# there is no quoting hazard.
+stack_restart_skipped() {
+  local slug="$1"
+  local list="${CORTEX_UPGRADE_SKIP_RESTART:-}"
+  [ -n "${list}" ] || return 1
+  local entry
+  for entry in $(printf '%s' "${list}" | tr ',' ' '); do
+    [ "${entry}" = "${slug}" ] && return 0
+  done
+  return 1
+}
+
+# Reload ONE stack's plist unless its slug is skip-listed. Encapsulates the
+# postupgrade reload decision so the recorded-running loop and the discover-all
+# fallback loop stay identical (and both honor the skip list).
+#
+# Args: $1 launch_dir  $2 slug
+reload_stack_unless_skipped() {
+  local launch_dir="$1" slug="$2"
+  local plist="${launch_dir}/ai.meta-factory.cortex.${slug}.plist"
+  if [ ! -f "${plist}" ]; then
+    echo "  ⚠ ${slug} plist not found after render — skipping restart" >&2
+    return 0
+  fi
+  if stack_restart_skipped "${slug}"; then
+    echo "  ⏸ ${slug} left running on its live process (CORTEX_UPGRADE_SKIP_RESTART) — plist re-rendered to ~/.local/bin; migrates on its next bootout+bootstrap (reboot / logout / manual reload)"
+    return 0
+  fi
+  reload_plist "${plist}"
+  echo "  ✓ ${slug} daemon reloaded"
+}
+
+# Extract the `--config` argument value from a process command line. Handles
+# both `--config <path>` (two tokens) and `--config=<path>`. Prints the value,
+# or nothing if there is no --config. Word-splits on whitespace — cortex config
+# paths live under ~/.config/cortex and contain no spaces.
+extract_config_arg() {
+  local cmdline="$1" tok take_next=0
+  for tok in ${cmdline}; do
+    if [ "${take_next}" = "1" ]; then printf '%s' "${tok}"; return 0; fi
+    case "${tok}" in
+      --config=*) printf '%s' "${tok#--config=}"; return 0 ;;
+      --config)   take_next=1 ;;
+    esac
+  done
+  return 0
+}
+
+# Resolve the canonical stack SLUG from a daemon's argv `--config` value.
+#
+# Canonicalizes with realpath (so a relative / non-canonical / symlinked argv
+# path resolves to the same absolute path discover_stack_slugs sees), then maps
+# filename → slug the SAME way discovery does:
+#   - monolith: cortex.yaml → meta-factory, cortex.<slug>.yaml → <slug>
+#     (config_file_to_slug — the repo's canonical filename map);
+#   - dir-layout sentinel <config_dir>/<slug>/<slug>.yaml → <slug>, validated by
+#     requiring the parent-dir basename to equal the file stem (the exact shape
+#     resolve_stack_config_path stamps and discover_stack_slugs derives from).
+# Returns non-zero (prints nothing) when the path is empty or unclassifiable —
+# the caller treats that as a fail-safe abort when a skip-list is set.
+#
+# Known pathological corner (revw3c, non-deployment): a stack literally slugged
+# `cortex` in the dir layout has sentinel <config_dir>/cortex/cortex.yaml, whose
+# basename `cortex.yaml` hits the monolith special-case → meta-factory, while
+# discover_stack_slugs (dir basename) would call it `cortex`. This is a
+# pre-existing repo-wide ambiguity in config_file_to_slug's meta-factory
+# special-case, not introduced here; `cortex` is not a real deployed slug.
+slug_from_config_arg() {
+  local raw="$1" path base slug parent
+  [ -n "${raw}" ] || return 1
+  path="$(realpath "${raw}" 2>/dev/null || printf '%s' "${raw}")"
+  base="$(basename "${path}")"
+  if slug="$(config_file_to_slug "${base}")"; then
+    printf '%s' "${slug}"
+    return 0
+  fi
+  slug="${base%.yaml}"
+  parent="$(basename "$(dirname "${path}")")"
+  if [ -n "${slug}" ] && [ "${base}" != "${slug}" ] && [ "${slug}" = "${parent}" ]; then
+    printf '%s' "${slug}"
+    return 0
+  fi
+  return 1
+}
+
+# Reclassify a kill-list by SLUG and drop skip-listed stacks, so preupgrade's
+# kill never stops a spared production stack. For each PID, the slug is resolved
+# from the LIVE daemon's argv `--config` (slug_from_config_arg) — identical
+# keying to postupgrade's reload side.
+#
+# FAIL-SAFE (advw3b 3a): when CORTEX_UPGRADE_SKIP_RESTART is non-empty and a
+# running daemon's slug cannot be resolved from its argv, this returns 2 (abort)
+# WITHOUT printing survivors — the caller must abort the upgrade before any kill,
+# rather than risk killing an unclassifiable stack that might be the spare.
+#
+# Prints surviving PIDs (space-separated) on stdout on success.
+# Returns: 0 = ok, 2 = abort (reason on stderr).
+#
+# Args: $1 space/newline-separated pid list  $2 config_dir (accepted for symmetry
+#       with the discovery callers; slug resolution is argv-driven).
+filter_out_skipped_pids() {
+  local pids="$1"
+  local list="${CORTEX_UPGRADE_SKIP_RESTART:-}"
+  # No skip-list requested → no reclassification, no abort: pass through so a
+  # normal upgrade is never blocked and behaviour matches the pre-feature path.
+  if [ -z "${list}" ] || [ -z "${pids}" ]; then
+    printf '%s' "${pids}"
+    return 0
+  fi
+  local kept="" pid cmdline cfg slug
+  for pid in ${pids}; do
+    cmdline="$(ps -o command= -p "${pid}" 2>/dev/null || true)"
+    cfg="$(extract_config_arg "${cmdline}")"
+    if ! slug="$(slug_from_config_arg "${cfg}")"; then
+      echo "  ✗ cannot determine slug for running daemon PID ${pid} (config: ${cfg:-${cmdline:-<none>}}); refusing to proceed with a skip-list set, to avoid killing an unclassifiable stack — resolve or unset CORTEX_UPGRADE_SKIP_RESTART" >&2
+      return 2
+    fi
+    stack_restart_skipped "${slug}" && continue   # spare the skip-listed stack
+    kept="${kept}${kept:+ }${pid}"
+  done
+  printf '%s' "${kept}"
+  return 0
+}
+
+# ── Arc-version guard: refuse the cutover on an arc without arc#295 ──────────
+#
+# The bin cutover moves cortex/cortex-relay/cldyo-live to ~/.local/bin, where
+# regular files (`~/.local/bin/{cldyo-live,lucid}`) already live. arc#295's
+# no-throw createSymlink backs those up to a `.pre-arc` sidecar; an OLDER arc's
+# createSymlink THROWS on them and aborts the upgrade — and preupgrade has by
+# then already stopped the fleet, so the box is left DOWN. This guard refuses
+# up-front (BEFORE any daemon is stopped) unless the installed arc is new enough.
+
+# Print the installed arc CLI version (bare semver), or nothing if undetectable.
+detect_arc_version() {
+  command -v arc >/dev/null 2>&1 || return 0
+  arc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+
+# True if semver $1 >= semver $2 (numeric major.minor.patch; any pre-release /
+# build suffix is ignored). Pure bash — no `sort -V` (BSD/macOS sort lacks it).
+arc_version_ge() {
+  local a b i ai bi
+  local -a av=() bv=()
+  # Strip anything after the numeric.dotted core (e.g. "-rc.1", "+build").
+  a="${1%%[!0-9.]*}"
+  b="${2%%[!0-9.]*}"
+  IFS='.' read -ra av <<< "${a}"
+  IFS='.' read -ra bv <<< "${b}"
+  for i in 0 1 2; do
+    ai="${av[i]:-0}"; bi="${bv[i]:-0}"
+    [[ "${ai}" =~ ^[0-9]+$ ]] || ai=0
+    [[ "${bi}" =~ ^[0-9]+$ ]] || bi=0
+    # Force base-10 so a hypothetical zero-padded component (e.g. "08") can't be
+    # read as octal and fail open. Unreachable with today's tags — free hardening.
+    ai=$((10#${ai})); bi=$((10#${bi}))
+    if (( ai > bi )); then return 0; fi
+    if (( ai < bi )); then return 1; fi
+  done
+  return 0  # equal
+}
+
+# Preflight: REFUSE (return non-zero, clear message) unless the installed arc is
+# >= $1. Call at the VERY TOP of preupgrade, BEFORE stopping any daemon.
+# Args: $1 minimum arc semver (e.g. 0.38.0)
+require_min_arc_version() {
+  local min="$1"
+  local ver
+  ver="$(detect_arc_version)"
+  # The mandated refuse line (verbatim; message contract for the deploy gate).
+  local refuse="cortex bin cutover requires arc >= ${min} (no-throw symlink installer, arc#295). Run \`arc self-update\` first, then retry \`arc upgrade cortex\`."
+  if [ -z "${ver}" ]; then
+    echo "  ✗ arc not found or its version was unparseable." >&2
+    echo "${refuse}" >&2
+    return 1
+  fi
+  if ! arc_version_ge "${ver}" "${min}"; then
+    echo "  ✗ installed arc is ${ver}." >&2
+    echo "${refuse}" >&2
+    return 1
+  fi
+  echo "  ✓ arc ${ver} >= ${min} — no-throw symlink installer present (arc#295)"
+  return 0
 }
