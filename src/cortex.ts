@@ -133,6 +133,8 @@ import {
 import { attachLegacyOutboundLog } from "./adapters/discord";
 import { resolveRendererPluginAndConfig, type Renderer } from "./renderers";
 import { createDefaultSurfacePluginRegistry, validateSurfacesAgainstRegistry } from "./adapters/registry";
+import { loadExternalPlugins } from "./adapters/loader";
+import { createSystemPluginLoadFailedEvent, createSystemPluginLoadedEvent } from "./bus/system-events";
 import { deriveStackId, DEFAULT_STREAM_MAX_BYTES } from "./common/types/cortex-config";
 import type {
   Agent,
@@ -3108,6 +3110,81 @@ export async function startCortex(
   // in-tree registrations (ADR-0024 §3.3) — extraction later moves a plugin
   // out, it never rewires this composition.
   const surfacePluginRegistry = createDefaultSurfacePluginRegistry();
+
+  // cortex#1792 (S6, ADR-0024 D1/D3/D4/D5, OQ9/OQ11) — discover, compat-gate,
+  // import, and register out-of-tree plugin bundles into the SAME registry,
+  // BEFORE anything below consumes it (surfaces validation, the per-stack
+  // adapter loop, the renderer boot loop, the gateway). `loadExternalPlugins`
+  // never throws: a bad bundle (bad manifest, incompatible sdkRange, a
+  // throwing import, a duplicate-platform shadow attempt, …) is skipped,
+  // logged, and returned in `.failed` — every other in-tree AND bundle
+  // plugin still loads. `config.plugins.external` (default off) gates every
+  // bundle except an OQ9-exempt first-party renderer, which loads
+  // regardless — a stack's paging sink must not silently vanish behind an
+  // opt-in flag nobody flipped. The runtime-hard-fail half of OQ9 (does
+  // `system.>` coverage still hold two classes after this?) is cortex#1893,
+  // a separate issue; this loop only SURFACES what loaded so that check has
+  // something to read.
+  const pluginLoadResult = await loadExternalPlugins({
+    registry: surfacePluginRegistry,
+    externalEnabled: config.plugins.external,
+  });
+  // cortex#1792 — ONE stderr line per outcome, not two: `loadOneBundle`
+  // (`src/adapters/loader.ts`) already writes a `cortex plugin-loader: …`
+  // stderr line at the exact point each bundle is refused or loaded (and
+  // `loadExternalPlugins` does the same for discovery issues). Boot used to
+  // ALSO `console.error`/`console.log` the same failed/loaded outcomes here,
+  // duplicating every plugin outcome in boot logs. This loop's job is only
+  // the structured bus event (`system.plugin.load_failed`/`.loaded`) —
+  // logging stays the loader's job. `skipped` is the one outcome the loader
+  // never logs (an off-by-default gate skip isn't a failure worth a stderr
+  // line), so its `console.log` here remains the single site for it.
+  for (const failure of pluginLoadResult.failed) {
+    // Per CLAUDE.md "no empty catch blocks" + this file's established
+    // publish-site convention (`publishCapabilitiesFor`/tombstone/exec-brain
+    // above all `await` + `try`/`catch`, never fire-and-forget `void`) — a
+    // rejected bus publish here must not become an unhandled rejection, but
+    // it also must not abort the loop or crash boot (one bad plugin outcome
+    // failing to PUBLISH is not a reason to stop reporting the rest).
+    try {
+      await runtime.publish(
+        createSystemPluginLoadFailedEvent({
+          source: systemEventSource,
+          bundleName: failure.bundleName,
+          kind: failure.kind,
+          pluginId: failure.pluginId,
+          stage: failure.stage,
+          reason: failure.reason,
+        }),
+      );
+    } catch (err) {
+      process.stderr.write(
+        `cortex: failed to publish system.plugin.load_failed for "${failure.bundleName}": ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+  for (const skippedPlugin of pluginLoadResult.skipped) {
+    console.log(
+      `cortex: plugin "${skippedPlugin.bundleName}" (${skippedPlugin.kind}:${skippedPlugin.id}) skipped: ${skippedPlugin.reason}`,
+    );
+  }
+  for (const loadedPlugin of pluginLoadResult.loaded) {
+    try {
+      await runtime.publish(
+        createSystemPluginLoadedEvent({
+          source: systemEventSource,
+          bundleName: loadedPlugin.bundleName,
+          kind: loadedPlugin.kind,
+          pluginId: loadedPlugin.id,
+          firstParty: loadedPlugin.firstParty,
+        }),
+      );
+    } catch (err) {
+      process.stderr.write(
+        `cortex: failed to publish system.plugin.loaded for "${loadedPlugin.bundleName}": ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
 
   // cortex#1789 (S4, ADR-0024 D5) — the REGISTRY pass for `surfaces:`
   // bindings, run here because this is the first point in boot where BOTH
