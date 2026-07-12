@@ -32,11 +32,9 @@
  * activity-centric, not agent-centric.
  */
 
-import type { Envelope } from "../bus/myelin/envelope-validator";
-import type { SurfaceAdapter } from "../bus/surface-router";
+import type { Envelope, RenderTarget, RendererPlugin } from "../surface-sdk";
 import { DashboardRendererSchema, type DashboardRendererConfig } from "../common/types/cortex-config";
 import type { Renderer } from "./types";
-import type { RendererPlugin } from "../adapters/registry";
 
 export interface DashboardRendererOptions {
   /** Max envelopes retained in the ring buffer. Default 1000 — generous
@@ -85,7 +83,7 @@ export class DashboardRenderer implements Renderer {
   }
   /* eslint-enable @typescript-eslint/require-await */
 
-  get surfaceConfig(): SurfaceAdapter {
+  get surfaceConfig(): RenderTarget {
     return {
       id: this.id,
       subjects: this.subjects,
@@ -93,7 +91,7 @@ export class DashboardRenderer implements Renderer {
       // declared one. Leaving it `undefined` on the adapter means the
       // router's evaluateVisibility short-circuits to "no constraint",
       // matching pre-A.4 behaviour exactly. Spreading conditionally keeps
-      // the SurfaceAdapter literal clean.
+      // the RenderTarget literal clean.
       ...(this.visibility !== undefined && { visibility: this.visibility }),
       render: (envelope, signal) => this.render(envelope, signal),
     };

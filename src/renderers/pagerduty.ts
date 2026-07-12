@@ -35,11 +35,9 @@
  * are out-of-band (re-trigger on subsequent envelopes).
  */
 
-import type { Envelope } from "../bus/myelin/envelope-validator";
-import type { SurfaceAdapter } from "../bus/surface-router";
+import type { Envelope, RenderTarget, RendererPlugin } from "../surface-sdk";
 import { PagerDutyRendererSchema, type PagerDutyRendererConfig } from "../common/types/cortex-config";
 import type { Renderer } from "./types";
-import type { RendererPlugin } from "../adapters/registry";
 
 const EVENTS_V2_URL = "https://events.pagerduty.com/v2/enqueue";
 const SUMMARY_MAX_LEN = 1024;
@@ -94,7 +92,7 @@ export class PagerDutyRenderer implements Renderer {
     // in-flight requests; stop() doesn't need to drain them.
   }
 
-  get surfaceConfig(): SurfaceAdapter {
+  get surfaceConfig(): RenderTarget {
     return {
       id: this.id,
       subjects: this.subjects,

@@ -20,12 +20,12 @@ import type {
   ResponseTarget,
   OutboundFile,
   ContextMessage,
-} from "../types";
+  Envelope,
+  RenderTarget,
+} from "../../surface-sdk";
 import type { Agent, SlackPresence } from "../../common/types/cortex-config";
 import type { AgentConfig } from "../../common/types/config";
-import type { Envelope } from "../../bus/myelin/envelope-validator";
 import type { MyelinRuntime } from "../../bus/myelin/runtime";
-import type { SurfaceAdapter } from "../../bus/surface-router";
 import type { PayloadFilter } from "../../bus/payload-filter";
 import {
   type SystemEventSource,
@@ -645,7 +645,7 @@ export class SlackAdapter implements PlatformAdapter {
    * same shape, same render contract, same failure mode (log + drop;
    * JetStream replay handles recovery per architecture §3.3).
    */
-  get surfaceConfig(): SurfaceAdapter {
+  get surfaceConfig(): RenderTarget {
     return {
       id: this.instanceId,
       subjects: this.infra.surfaceSubjects ?? [],
