@@ -24,6 +24,10 @@ import {
   createSystemAdapterRecoveredEvent,
   createSystemDispatchStageEvent,
   createSystemInboundAbortedEvent,
+  createSystemPluginControlRequestEvent,
+  createSystemPluginControlResponseEvent,
+  createSystemPluginReloadFailedEvent,
+  createSystemPluginUnloadedEvent,
   type SystemEventSource,
 } from "../system-events";
 import { emitSystemAccessDenied } from "../emit-system-access-denied";
@@ -917,5 +921,178 @@ describe("emitSystemAccessDenied — drop-site emit helper (cortex#932)", () => 
       }),
     ).not.toThrow();
     expect(published.length).toBe(0);
+  });
+});
+
+describe("createSystemPluginUnloadedEvent (cortex#1793, S8)", () => {
+  const SOURCE: SystemEventSource = {
+    principal: "andreas",
+    agent: "cortex",
+    instance: "local",
+  };
+
+  test("required fields populated; envelope passes schema validation", () => {
+    const env = createSystemPluginUnloadedEvent({
+      source: SOURCE,
+      bundleName: "cli-tail-renderer",
+      kind: "renderer",
+      pluginId: "cli-tail",
+      instanceId: "cli-tail",
+    });
+    expect(env.type).toBe("system.plugin.unloaded");
+    expect(env.source).toBe("andreas.cortex.local");
+    expect(env.payload).toEqual({
+      bundle_name: "cli-tail-renderer",
+      kind: "renderer",
+      plugin_id: "cli-tail",
+      instance_id: "cli-tail",
+    });
+    expect(validateEnvelope(env).ok).toBe(true);
+  });
+
+  test("adapter kind — instance_id distinct from plugin_id", () => {
+    const env = createSystemPluginUnloadedEvent({
+      source: SOURCE,
+      bundleName: "acme-chat-adapter",
+      kind: "adapter",
+      pluginId: "acme-chat",
+      instanceId: "acme-chat:guild-123",
+    });
+    expect((env.payload as { plugin_id: string }).plugin_id).toBe("acme-chat");
+    expect((env.payload as { instance_id: string }).instance_id).toBe("acme-chat:guild-123");
+  });
+});
+
+describe("createSystemPluginReloadFailedEvent (cortex#1793, S8)", () => {
+  const SOURCE: SystemEventSource = {
+    principal: "andreas",
+    agent: "cortex",
+    instance: "local",
+  };
+
+  test("required fields only — optional fields omitted, not undefined-valued", () => {
+    const env = createSystemPluginReloadFailedEvent({
+      source: SOURCE,
+      bundleName: "cli-tail-renderer",
+      stage: "cache_bust_reimport",
+      reason: "import() threw: SyntaxError",
+    });
+    expect(env.type).toBe("system.plugin.reload-failed");
+    expect(env.payload).toEqual({
+      bundle_name: "cli-tail-renderer",
+      stage: "cache_bust_reimport",
+      reason: "import() threw: SyntaxError",
+    });
+    expect(env.payload).not.toHaveProperty("kind");
+    expect(env.payload).not.toHaveProperty("plugin_id");
+    expect(env.payload).not.toHaveProperty("instance_id");
+    // `reload-failed` (hyphen) — NOT `reload_failed`. Confirmed via a live
+    // NATS round trip (S8 completion pass) that a type violating the
+    // vendored `/type` pattern (`^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*){1,4}$`
+    // — no underscores) publishes without error but is SILENTLY DROPPED by
+    // every standard push-mode subscriber (`runtime.subscribe()` +
+    // `onEnvelope`, via `myelin/subscriber.ts`'s schema check). The
+    // already-shipped sibling `system.plugin.load_failed` (S6, on `main`)
+    // and several older `system.*` families (`system.bus.notify_discord`,
+    // `system.bus.reflex_activation_failed`, `system.gateway.routing_decision`,
+    // …) still carry this bug — out of scope to mass-fix here (separate,
+    // coordinated change), but `reload-failed` is spelled correctly since
+    // it ships in THIS slice.
+    expect(validateEnvelope(env).ok).toBe(true);
+  });
+
+  test("all optional fields populated", () => {
+    const env = createSystemPluginReloadFailedEvent({
+      source: SOURCE,
+      bundleName: "cli-tail-renderer",
+      kind: "renderer",
+      pluginId: "cli-tail",
+      instanceId: "cli-tail",
+      stage: "construct",
+      reason: "createRenderer threw",
+    });
+    expect(env.payload).toEqual({
+      bundle_name: "cli-tail-renderer",
+      kind: "renderer",
+      plugin_id: "cli-tail",
+      instance_id: "cli-tail",
+      stage: "construct",
+      reason: "createRenderer threw",
+    });
+    expect(validateEnvelope(env).ok).toBe(true);
+  });
+});
+
+describe("createSystemPluginControlRequestEvent / createSystemPluginControlResponseEvent (cortex#1793, S8)", () => {
+  const SOURCE: SystemEventSource = {
+    principal: "andreas",
+    agent: "cortex",
+    instance: "cli",
+  };
+
+  test("control-request: schema-valid, correlation_id echoes requestId", () => {
+    const requestId = "072670f4-6128-4781-b82b-17a36af6060a";
+    const env = createSystemPluginControlRequestEvent({
+      source: SOURCE,
+      requestId,
+      action: "unload",
+      instanceId: "discord:guild1",
+    });
+    expect(env.type).toBe("system.plugin.control-request");
+    expect(env.correlation_id).toBe(requestId);
+    expect(env.payload).toEqual({
+      request_id: requestId,
+      action: "unload",
+      instance_id: "discord:guild1",
+    });
+    expect(validateEnvelope(env).ok).toBe(true);
+  });
+
+  test("control-request: bundleName-only (load) omits instance_id", () => {
+    const env = createSystemPluginControlRequestEvent({
+      source: SOURCE,
+      requestId: "072670f4-6128-4781-b82b-17a36af6060a",
+      action: "load",
+      bundleName: "acme-bundle",
+    });
+    expect(env.payload).toEqual({
+      request_id: "072670f4-6128-4781-b82b-17a36af6060a",
+      action: "load",
+      bundle_name: "acme-bundle",
+    });
+    expect(env.payload).not.toHaveProperty("instance_id");
+    expect(validateEnvelope(env).ok).toBe(true);
+  });
+
+  test("control-response: success carries rows, schema-valid", () => {
+    const requestId = "072670f4-6128-4781-b82b-17a36af6060a";
+    const env = createSystemPluginControlResponseEvent({
+      source: SOURCE,
+      requestId,
+      ok: true,
+      rows: [{ kind: "renderer", platformOrKind: "pagerduty", instanceId: "pagerduty", bundleName: "in-tree", running: true }],
+    });
+    expect(env.type).toBe("system.plugin.control-response");
+    expect(env.correlation_id).toBe(requestId);
+    expect(env.payload.ok).toBe(true);
+    expect(env.payload.rows).toEqual([
+      { kind: "renderer", platformOrKind: "pagerduty", instanceId: "pagerduty", bundleName: "in-tree", running: true },
+    ]);
+    expect(validateEnvelope(env).ok).toBe(true);
+  });
+
+  test("control-response: failure carries detail, no rows", () => {
+    const env = createSystemPluginControlResponseEvent({
+      source: SOURCE,
+      requestId: "072670f4-6128-4781-b82b-17a36af6060a",
+      ok: false,
+      detail: "no plugin instance \"ghost\" is currently live",
+    });
+    expect(env.payload).toEqual({
+      request_id: "072670f4-6128-4781-b82b-17a36af6060a",
+      ok: false,
+      detail: 'no plugin instance "ghost" is currently live',
+    });
+    expect(validateEnvelope(env).ok).toBe(true);
   });
 });
