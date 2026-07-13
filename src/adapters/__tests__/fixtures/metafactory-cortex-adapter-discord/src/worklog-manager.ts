@@ -7,8 +7,11 @@
  * messages appear at the channel level.
  */
 
-import type { Client, TextChannel, ThreadChannel } from "discord.js";
-import type { PublishedEvent } from "../../taps/cc-events/hooks/lib/event-types";
+// cortex#1797 (S12) — fixture-local stand-in for discord.js; see
+// discordjs-stub.ts's module doc. Only this import line deviates from the
+// real bundle's byte-identical source.
+import type { Client, TextChannel, ThreadChannel } from "./discordjs-stub";
+import type { PublishedEvent } from "./events";
 import {
   formatEventForThread,
   formatThreadName,
@@ -24,7 +27,7 @@ import { detectProject, extractGitHubIssue } from "./event-utils";
 function asString(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
-import type { Envelope, RenderTarget } from "../../surface-sdk";
+import type { Envelope, RenderTarget } from "@the-metafactory/cortex/surface-sdk";
 
 export class WorklogManager {
   private client: Client;

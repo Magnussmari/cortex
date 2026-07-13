@@ -13,20 +13,58 @@
 
 import { existsSync, readdirSync } from "fs";
 import { join } from "path";
-import type { TextChannel } from "discord.js";
-import type { AgentConfig } from "../../common/types/config";
-import {
-  canonicalPublishedEventsDir,
-  legacyPublishedEventsDir,
-  resolvePublishedEventsDir,
-} from "../../common/data-path";
-import type { SurfaceRouter } from "../../bus/surface-router";
-import type { SystemEventSource } from "../../bus/system-events";
-import { JsonlReader } from "../../taps/cc-events/lib/jsonl-reader";
-import { PublishedEventSchema } from "../../taps/cc-events/hooks/lib/event-types";
+// cortex#1797 (S12) — fixture-local stand-in for discord.js; see
+// discordjs-stub.ts's module doc. Only this import line deviates from the
+// real bundle's byte-identical source.
+import type { TextChannel } from "./discordjs-stub";
+import type { RenderTarget } from "@the-metafactory/cortex/surface-sdk";
+import { JsonlReader } from "./jsonl-reader";
+import { PublishedEventSchema } from "./events";
 import type { DiscordAdapter } from "./index";
 import { WorklogManager } from "./worklog-manager";
 import { formatEventForDiscord } from "./event-formatter";
+
+/**
+ * cortex#1797 (S12) — narrow, plugin-owned shape of the `DiscordInstance`
+ * fields this bridge actually reads (`common/types/config.ts`'s
+ * `DiscordInstanceSchema`). A real `DiscordInstance` structurally satisfies
+ * this, so `cortex.ts`'s call site (the only caller) is unaffected.
+ */
+export interface LegacyOutboundLogInstance {
+  logChannelId: string;
+  guildId: string;
+  worklogChannelId?: string;
+  enableAgentLog: boolean;
+}
+
+/**
+ * cortex#1797 (S12) — narrow, plugin-owned shape of the `AgentConfig` fields
+ * this bridge reads (`common/types/config.ts`'s `AgentConfigSchema`).
+ */
+export interface LegacyOutboundLogConfig {
+  paths: { publishedEventsDir: string };
+}
+
+/**
+ * cortex#1797 (S12) — the surface-router's `register` seam, narrowed to
+ * exactly the one call this bridge makes (`bus/surface-router.ts`'s
+ * `SurfaceRouter` is 1500+ lines of cortex-internal bus wiring this bridge
+ * has no other reason to depend on). A real `SurfaceRouter` satisfies this
+ * structurally.
+ */
+export interface LegacyOutboundLogRouter {
+  register(target: RenderTarget): void;
+}
+
+/**
+ * cortex#1797 (S12) — the one field this bridge reads off
+ * `bus/system-events.ts`'s `SystemEventSource` (`.principal`, forwarded to
+ * `worklog.surfaceConfig`). A real `SystemEventSource` satisfies this
+ * structurally.
+ */
+export interface LegacyOutboundLogSource {
+  principal: string;
+}
 
 /**
  * Subscribe a Discord adapter to the published-events JSONL stream so
@@ -38,29 +76,12 @@ import { formatEventForDiscord } from "./event-formatter";
  */
 export function attachLegacyOutboundLog(
   discordAdapter: DiscordAdapter,
-  instance: import("../../common/types/config").DiscordInstance,
-  config: AgentConfig,
-  router: SurfaceRouter,
-  systemEventSource: SystemEventSource,
+  instance: LegacyOutboundLogInstance,
+  config: LegacyOutboundLogConfig,
+  router: LegacyOutboundLogRouter,
+  systemEventSource: LegacyOutboundLogSource,
 ): (() => void) | null {
-  // XDG wave-5 (#1902) — resolve the published-events buffer in LOCKSTEP with the
-  // relay writer (which writes the canonical metafactory data-root dir and carries
-  // the in-flight buffer forward on start). For a DEFAULT-spelled config value
-  // (the legacy `~/.claude/events/published` or the new canonical), resolve
-  // canonical-first / legacy-fallback so writer + consumer always agree — even if
-  // the config value-migrator hasn't rewritten this file yet. A genuinely CUSTOM
-  // pinned path is honored (existence-gated with a legacy fallback), matching the
-  // pre-move behavior.
-  const home = process.env.HOME ?? "~";
-  const configuredDir = config.paths.publishedEventsDir.replace(/^~/, home);
-  const legacyDir = legacyPublishedEventsDir(home);
-  const isDefaultSpelling =
-    configuredDir === legacyDir || configuredDir === canonicalPublishedEventsDir(home);
-  const eventsDir = isDefaultSpelling
-    ? resolvePublishedEventsDir(home)
-    : existsSync(configuredDir) || !existsSync(legacyDir)
-      ? configuredDir
-      : legacyDir;
+  const eventsDir = config.paths.publishedEventsDir.replace(/^~/, process.env.HOME ?? "~");
   const client = discordAdapter.getClient();
   if (!client) {
     console.log("cortex: discord client not available for outbound log");

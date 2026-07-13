@@ -3,7 +3,10 @@
  * Posts responses to Discord, splitting long messages.
  */
 
-import type { TextChannel, ThreadChannel } from "discord.js";
+// cortex#1797 (S12) — fixture-local stand-in for discord.js; see
+// discordjs-stub.ts's module doc. Only this import line deviates from the
+// real bundle's byte-identical source.
+import type { TextChannel, ThreadChannel } from "./discordjs-stub";
 import { retryWithBackoff, type RetryOptions } from "./retry";
 
 export const DISCORD_MAX_LENGTH = 2000;

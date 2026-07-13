@@ -11,11 +11,12 @@
  * tests construct pieces directly; the CLI bottom wires SIGINT/SIGTERM.
  */
 
-// MUST be first: forces @discordjs/ws onto the `ws` package on Bun (overrides
-// globalThis.WebSocket) BEFORE any transitive discord.js import evaluates its
-// module-level WebSocket constructor. Fixes the recurring gateway flapping
-// (cortex#546/#581/#590/#591/#593). See src/bootstrap/ws-transport.ts.
-import "./bootstrap/ws-transport";
+// cortex#1797 (S12 MOVE) — the Bun WebSocket-transport shim that forces
+// @discordjs/ws onto the `ws` package moved OUT of cortex core and INTO the
+// discord bundle (`metafactory-cortex-adapter-discord/src/ws-transport.ts`),
+// alongside the `discord.js` dependency it protects (which left cortex's own
+// package.json this slice). The bundle's `plugin.ts` imports it first, so the
+// override still lands before any Discord client connects.
 
 import { Command } from "commander";
 import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync } from "fs";
@@ -132,7 +133,6 @@ import {
   type Envelope,
 } from "./bus/myelin/envelope-validator";
 
-import { attachLegacyOutboundLog } from "./adapters/discord";
 import { resolveRendererPluginAndConfig, UnimplementedRendererKindError, type Renderer } from "./renderers";
 import { createDefaultSurfacePluginRegistry, validateSurfacesAgainstRegistry } from "./adapters/registry";
 import { loadExternalPlugins } from "./adapters/loader";
@@ -3318,7 +3318,15 @@ export async function startCortex(
     trustResolver,
     inboundWithGateBridge,
     disableOutboundPoller: options.disableOutboundPoller ?? false,
-    setupOutboundLog: attachLegacyOutboundLog,
+    // cortex#1797 (S12 MOVE) — `attachLegacyOutboundLog` moved into the
+    // metafactory-cortex-adapter-discord bundle alongside the rest of
+    // src/adapters/discord/; it's no longer statically importable here
+    // (bundles load dynamically via the plugin loader, not via a
+    // compile-time `import`). `setupOutboundLog` is now optional on
+    // `WireSurfaceAdaptersOpts` and simply omitted — see that field's doc
+    // for the accepted behaviour change (the legacy JSONL-polling
+    // #agent-log/worklog direct-call bridge goes unwired; the bus-driven
+    // `WorklogManager.surfaceConfig` path is unaffected).
     adapters,
     adapterCleanup,
     liveSurfaces,

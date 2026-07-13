@@ -16,6 +16,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { z } from "zod/v4";
+import { createHash } from "node:crypto";
 import {
   buildGatewayAdapters,
   type GatewayAdapterDeps,
@@ -85,6 +86,14 @@ interface FactoryCall {
   runtime: MyelinRuntime | undefined;
   allowedGuildIds?: string[];
   presenceByGuildId?: Record<string, { agentChannelId: string; logChannelId: string }>;
+  /**
+   * cortex#1797 (S12 MOVE) — discord's real `buildGatewayConstructArgs` now
+   * forwards `systemEvents` (not `runtime`) alongside `policy`/`formatEnvelope`
+   * — see `AdapterPlugin.createAdapter`'s doc on the `unknown`-typed forward.
+   * Not part of the legacy `DiscordFactoryArgs` shape, so recorded via an
+   * `as unknown` read rather than a typed field.
+   */
+  systemEvents?: unknown;
 }
 
 function makeFakeAdapter(
@@ -136,6 +145,7 @@ function makeRecordingFactory(): {
         runtime: args.runtime,
         allowedGuildIds: [...args.allowedGuildIds].sort(),
         presenceByGuildId,
+        systemEvents: (args as unknown as { systemEvents?: unknown }).systemEvents,
       });
       return makeFakeAdapter("discord", args.instanceId);
     },
@@ -205,8 +215,81 @@ function stubSlackPlugin(factory: GatewayAdapterFactory): AdapterPlugin {
   };
 }
 
+/**
+ * cortex#1797 (S12 MOVE) — `registryFromFactory` no longer auto-registers a
+ * "discord" entry (no in-tree `discordAdapterPlugin` descriptor left to
+ * spread — the FOURTH and FINAL in-tree adapter extracted; see that
+ * function's doc in `registry.ts`). This suite still needs a real "discord"
+ * entry — its `GatewayAdapterFactory` fakes still carry `.discord`,
+ * unchanged interface — so `makeDeps` registers its own stub `AdapterPlugin`,
+ * same documented workaround as slack/mattermost above. Reproduces the real
+ * (now out-of-tree) plugin's contract closely enough for THESE tests:
+ * `demuxKey`/`groupBindings` byte-identical to the real token-grouping
+ * (`metafactory-cortex-adapter-discord`'s `token-groups.ts`) so the "same
+ * token, two guild bindings → one adapter" fixtures collapse correctly, and
+ * `buildGatewayConstructArgs` builds the `allowedGuildIds`/`presenceByGuildId`
+ * shape `makeRecordingFactory`'s `discord` closure reads (mirrors the real
+ * plugin's `DiscordPresenceSchema.parse` step, permissively — this stub only
+ * needs `guildId`/`agentChannelId`/`logChannelId` present as strings, not
+ * full schema validation).
+ */
+function stubDiscordPlugin(factory: GatewayAdapterFactory): AdapterPlugin {
+  return {
+    kind: "adapter",
+    id: "discord",
+    platform: "discord",
+    bindingSchema: z.unknown(),
+    foldsIntoPresence: true,
+    secretFields: ["token"],
+    demuxKey: (binding) => (typeof binding.guildId === "string" ? binding.guildId : ""),
+    groupBindings: (entries) => {
+      const groups = new Map<string, typeof entries[number][]>();
+      for (const entry of entries) {
+        const key = JSON.stringify({ token: entry.binding.token, stack: entry.stack ?? null });
+        const group = groups.get(key);
+        if (group) group.push(entry);
+        else groups.set(key, [entry]);
+      }
+      return [...groups.values()].map((groupedEntries) => {
+        const guildIds = groupedEntries.map((e) =>
+          typeof e.binding.guildId === "string" ? e.binding.guildId : "",
+        );
+        const firstEntry = groupedEntries[0];
+        const token = typeof firstEntry?.binding.token === "string" ? firstEntry.binding.token : "";
+        const instanceId =
+          guildIds.length === 1
+            ? `discord:${guildIds[0]}`
+            : `discord:token:${createHash("sha256").update(JSON.stringify({ token, stack: firstEntry?.stack ?? null })).digest("hex").slice(0, 12)}`;
+        return { entries: groupedEntries, instanceId };
+      });
+    },
+    buildGatewayConstructArgs: (group, base) => {
+      const presenceByGuildId = new Map(
+        group.entries.map((entry) => [
+          typeof entry.binding.guildId === "string" ? entry.binding.guildId : "",
+          {
+            agentChannelId: typeof entry.binding.agentChannelId === "string" ? entry.binding.agentChannelId : "",
+            logChannelId: typeof entry.binding.logChannelId === "string" ? entry.binding.logChannelId : "",
+          },
+        ]),
+      );
+      return {
+        instanceId: base.instanceId,
+        source: base.source,
+        binding: group.entries[0]?.binding,
+        runtime: base.runtime,
+        allowedGuildIds: new Set(presenceByGuildId.keys()),
+        presenceByGuildId,
+        systemEvents: base.systemEvents,
+      };
+    },
+    createAdapter: (args) => factory.discord(args as never),
+  };
+}
+
 function makeDeps(factory: GatewayAdapterFactory): GatewayAdapterDeps {
   const registry = registryFromFactory(factory);
+  registry.registerAdapter(stubDiscordPlugin(factory));
   registry.registerAdapter(stubSlackPlugin(factory));
   registerMattermostTestPlugin(registry, factory);
   return {
@@ -398,10 +481,24 @@ describe("buildGatewayAdapters", () => {
     expect(calls[0]?.instanceId).toBe("discord:555555555555555555");
   });
 
-  test("runtime is forwarded verbatim to the factory", () => {
+  test("systemEvents port (built from runtime+source) is forwarded to the factory (cortex#1797 S12)", () => {
+    // cortex#1797 (S12 MOVE) — discord's `buildGatewayConstructArgs` no
+    // longer forwards the raw `runtime` (mirrors slack's cortex#1795 S10
+    // inversion): the adapter body only ever calls the host-bound
+    // `AdapterSystemEventPort`, built here from `{runtime, source}` and
+    // threaded through `GatewayConstructBase.systemEvents` instead. This
+    // replaces the old "runtime is forwarded verbatim" assertion, which
+    // pinned a construction shape discord no longer produces.
     const { factory, calls } = makeRecordingFactory();
     buildGatewayAdapters(DISCORD_SURFACES, makeDeps(factory));
-    expect(calls[0]?.runtime).toBe(RUNTIME_STUB);
+    const systemEvents = calls[0]?.systemEvents as
+      | { recovered: unknown; disconnected: unknown; degraded: unknown; untrustedBotDenied: unknown }
+      | undefined;
+    expect(systemEvents).toBeDefined();
+    expect(typeof systemEvents?.recovered).toBe("function");
+    expect(typeof systemEvents?.disconnected).toBe("function");
+    expect(typeof systemEvents?.degraded).toBe("function");
+    expect(typeof systemEvents?.untrustedBotDenied).toBe("function");
   });
 
   test("same Discord token across two guild bindings → one adapter with both guilds allowed", () => {
