@@ -33,22 +33,32 @@ import { createHash } from "node:crypto";
 import { join, basename } from "path";
 import { realpathSync, existsSync, renameSync, readFileSync } from "fs";
 
+import { resolvePidStateDir } from "./state-path";
+
 /**
  * State directory holding every pidfile (and the degraded-state markers derived
- * from them). `CORTEX_STATE_DIR` overrides it — the STATE env seam (cortex#1908
- * CONFIG/EVENTS/STATE trio). This is the SOLE state constructor in the tree, so
- * the STATE read lands here rather than being split across files (which would
- * desync cortex.ts's `mkdirSync(STATE_DIR)` from `PID_FILE`/`pidFileFor`
- * derivation). Like `HOME`, it is read ONCE at import (T1b): the resolved value
- * is a module constant, so processes needing an override must set the env
- * before the module loads — the value does not track later `process.env`
- * mutation. `.trim()` + `||` means a blank/whitespace override falls back to the
- * grove default rather than resolving pidfiles into an empty-string path.
+ * from them). This is the SOLE state constructor in the tree, so the STATE read
+ * lands here rather than being split across files (which would desync cortex.ts's
+ * `mkdirSync(STATE_DIR)` from `PID_FILE`/`pidFileFor` derivation).
+ *
+ * XDG wave-5 (cortex#1903): resolved via {@link resolvePidStateDir} —
+ * COMPLETION-gated, NOT canonical-first. Pre-migration it resolves to the legacy
+ * `~/.config/grove/state` (byte-identical to the pre-XDG default), and it flips
+ * to the canonical `~/.local/state/metafactory/cortex` ONLY once a gated
+ * migration has written its completion marker. `$CORTEX_STATE_DIR` overrides
+ * VERBATIM (cortex#1908 seam, same blank-is-unset semantics). This gating is the
+ * crux of the pidfile-identity contract: a bare/stray canonical dir must never
+ * flip this const, or a live daemon's pidfile path would move out from under it.
+ *
+ * Like `HOME`, it is read ONCE at import (T1b): the resolved value is a module
+ * constant, so processes needing an override must set the env before the module
+ * loads — the value does not track later `process.env` mutation. The physical
+ * state MOVE is GATED (X-09 + directory-occupancy precondition, see
+ * `migrate-state-dir.ts`), so no daemon's pidfile identity flips out from under a
+ * running process: nothing runs during the migration, and after it every process
+ * resolves the canonical dir consistently.
  */
-export const STATE_DIR =
-  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- `||` is intentional: a blank/whitespace CORTEX_STATE_DIR trims to "" (falsy but not null), and MUST fall back to the grove default; `??` would keep the empty string and resolve pidfiles into a rootless path.
-  process.env.CORTEX_STATE_DIR?.trim() ||
-  join(process.env.HOME ?? "~", ".config", "grove", "state");
+export const STATE_DIR = resolvePidStateDir();
 export const PID_FILE = join(STATE_DIR, "cortex.pid");
 export const DEFAULT_CONFIG = join(
   process.env.HOME ?? "~",

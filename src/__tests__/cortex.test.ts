@@ -885,6 +885,13 @@ describe("runDryRun — config validator (cortex#88 item 2)", () => {
 
 describe("pidFileFor — per-config PID file derivation", () => {
   const DEFAULT_CONFIG = join(process.env.HOME ?? "~", ".config", "grove", "bot.yaml");
+  // BACKWARD-COMPAT CONTRACT (cortex#1900 + #1903): pre-migration — no completion
+  // marker, CORTEX_STATE_DIR unset — the default pidfile MUST stay byte-identical
+  // to the legacy grove path so a running daemon's pidfile identity is continuous.
+  // #1903 is COMPLETION-gated (not existence-gated) precisely so this holds even
+  // if a stray canonical dir exists; and STATE_DIR is import-baked, so suite order
+  // cannot flip it. The `state migration flips STATE_DIR to canonical` describe
+  // below asserts the post-migration side hermetically in a child process.
   const LEGACY_PID = join(process.env.HOME ?? "~", ".config", "grove", "state", "cortex.pid");
 
   test("undefined config → legacy cortex.pid (backward compat)", () => {
@@ -898,12 +905,12 @@ describe("pidFileFor — per-config PID file derivation", () => {
   // cortex#1900 — the pidfile name is `cortex-<basename>-<hash8>.pid`: it keeps
   // the human-readable slug (continuity requirement #2) AND appends 8 hex chars
   // of sha256(canonical full path) so two trees can never collide.
-  const STATE_DIR = join(process.env.HOME ?? "~", ".config", "grove", "state");
+  const STATE_DIR_LEGACY = join(process.env.HOME ?? "~", ".config", "grove", "state");
 
   test("custom config → cortex-<basename>-<hash8>.pid (slug preserved + path hash)", () => {
     const result = pidFileFor("/Users/andreas/.config/cortex/cortex.work.yaml");
     expect(basename(result)).toMatch(/^cortex-cortex\.work-[0-9a-f]{8}\.pid$/);
-    expect(result.startsWith(STATE_DIR)).toBe(true);
+    expect(result.startsWith(STATE_DIR_LEGACY)).toBe(true);
   });
 
   test("two distinct custom configs → two distinct PID files", () => {
@@ -1214,10 +1221,14 @@ describe("STATE_DIR — CORTEX_STATE_DIR env seam", () => {
   const modPath = join(import.meta.dir, "..", "common", "pidfile.ts");
   const CFG = "/cortex-1908-state-probe/stack.yaml";
 
-  function probePidFile(override: string | null): string {
+  function probePidFile(override: string | null, homeOverride?: string): string {
     const env = { ...process.env };
     if (override === null) delete env.CORTEX_STATE_DIR;
     else env.CORTEX_STATE_DIR = override;
+    // Optionally pin $HOME to a scratch dir so the module-const STATE_DIR is baked
+    // against a hermetic home (no real legacy tree, no completion marker) — the
+    // only way to exercise the resolver's default with an import-baked const.
+    if (homeOverride !== undefined) env.HOME = homeOverride;
     const src =
       `import { pidFileFor } from ${JSON.stringify(modPath)};` +
       `process.stdout.write(pidFileFor(${JSON.stringify(CFG)}));`;
@@ -1243,18 +1254,28 @@ describe("STATE_DIR — CORTEX_STATE_DIR env seam", () => {
     }
   });
 
-  test("CORTEX_STATE_DIR unset → byte-identical to the grove default STATE_DIR path", () => {
-    const out = probePidFile(null);
-    // basename is STATE_DIR-independent (hash is over the config path), so this
-    // reference default holds even if the test process itself set the override.
-    const expectedDefault = join(
-      process.env.HOME ?? "~",
-      ".config",
-      "grove",
-      "state",
-      basename(pidFileFor(CFG)),
-    );
-    expect(out).toBe(expectedDefault);
+  test("CORTEX_STATE_DIR unset, no completed migration → byte-identical to the LEGACY grove default (#1903 identity contract)", () => {
+    // Hermetic scratch $HOME with NO legacy tree and NO completion marker. The
+    // #1903 resolver is COMPLETION-gated, so pre-migration it MUST return the
+    // legacy grove default byte-identically — a running daemon's pidfile identity
+    // stays continuous until a gated cutover. (Pinning $HOME removes the pre-#1903
+    // dependence on whichever tree happened to exist on the box — the bug that
+    // made this pass on a dev box but fail on a clean CI runner.)
+    const scratchHome = mkdtempSync(join(tmpdir(), "cortex-statedir-unset-"));
+    try {
+      const out = probePidFile(null, scratchHome);
+      // basename is STATE_DIR-independent (hash is over the config path).
+      const expectedDefault = join(
+        scratchHome,
+        ".config",
+        "grove",
+        "state",
+        basename(pidFileFor(CFG)),
+      );
+      expect(out).toBe(expectedDefault);
+    } finally {
+      rmSync(scratchHome, { recursive: true, force: true });
+    }
   });
 
   // Interaction: migrateLegacyPidFile's DEFAULT stateDir is STATE_DIR, which now
@@ -1300,6 +1321,69 @@ describe("STATE_DIR — CORTEX_STATE_DIR env seam", () => {
       expect(r.read).toBe(r.wrote); // PID carried across the rename
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STATE_DIR — COMPLETION-gated canonical flip (#1903 pidfile-identity contract)
+// ---------------------------------------------------------------------------
+// The crux fix: the canonical state root is preferred ONLY after a gated
+// migration writes its completion marker — NEVER because a canonical dir merely
+// exists. A bare/stray canonical dir (e.g. one a network-cache write created)
+// must not flip a live daemon's pidfile identity. Probed in child processes so
+// the import-baked STATE_DIR is evaluated against a hermetic scratch $HOME.
+describe("STATE_DIR — completion-gated canonical flip (#1903)", () => {
+  const modPath = join(import.meta.dir, "..", "common", "pidfile.ts");
+  const MARKER = ".xdg-state-migration.json";
+
+  function probeStateDir(home: string): string {
+    const env = { ...process.env };
+    env.HOME = home;
+    delete env.CORTEX_STATE_DIR;
+    const src =
+      `import { STATE_DIR } from ${JSON.stringify(modPath)};` +
+      `process.stdout.write(STATE_DIR);`;
+    const proc = Bun.spawnSync([process.execPath, "-e", src], { env, stdout: "pipe", stderr: "pipe" });
+    if (proc.exitCode !== 0) {
+      throw new Error(`state-dir probe failed (exit ${proc.exitCode}): ${proc.stderr.toString()}`);
+    }
+    return proc.stdout.toString();
+  }
+
+  const groveOf = (home: string): string => join(home, ".config", "grove", "state");
+  const canonicalOf = (home: string): string => join(home, ".local", "state", "metafactory", "cortex");
+
+  test("no completion marker → STATE_DIR stays legacy grove (identity continuity)", () => {
+    const home = mkdtempSync(join(tmpdir(), "cortex-gate-nomarker-"));
+    try {
+      expect(probeStateDir(home)).toBe(groveOf(home));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("BARE canonical dir WITHOUT marker does NOT flip STATE_DIR (the #1903 hazard)", () => {
+    const home = mkdtempSync(join(tmpdir(), "cortex-gate-baredir-"));
+    try {
+      // Simulate a sibling class (e.g. network-cache) having created the canonical
+      // root/subdir. With bare-existence gating this WOULD flip identity; with
+      // completion gating it must NOT — STATE_DIR stays legacy grove.
+      mkdirSync(join(canonicalOf(home), "network-cache"), { recursive: true });
+      expect(probeStateDir(home)).toBe(groveOf(home));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("completion marker present → STATE_DIR flips to canonical", () => {
+    const home = mkdtempSync(join(tmpdir(), "cortex-gate-marker-"));
+    try {
+      mkdirSync(canonicalOf(home), { recursive: true });
+      writeFileSync(join(canonicalOf(home), MARKER), "{}");
+      expect(probeStateDir(home)).toBe(canonicalOf(home));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });
