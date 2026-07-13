@@ -1,14 +1,23 @@
 /**
- * MIG-7.2d — PagerDuty renderer.
+ * cortex#1894 (S12b, ADR-0024 D5) — PagerDuty renderer.
+ * The renderer-track extraction pilot (leaf-y ~130 LOC, zero npm deps — uses
+ * `fetch` — one config secret `routingKey`, zero in-tree consumers). This file
+ * now lives in the `metafactory-cortex-renderer-pagerduty` bundle repo, not
+ * cortex core. It imports the SDK CONTRACT (type-only) from
+ * `@the-metafactory/cortex/surface-sdk` — resolved by `tsconfig.json`'s `paths`
+ * to the flat `.d.ts` that `bun run sync:sdk` fetches from cortex at the pinned
+ * ref (`.cortex-sdk-ref`), NOT a hand-vendored copy (cortex#1950) — plus its
+ * plugin-owned `./schema`. No cortex runtime module at all: the SDK imports are
+ * `import type`, erased at runtime.
  *
  * Forwards bus envelopes to PagerDuty's events-v2 API
- * (`https://events.pagerduty.com/v2/enqueue`). The G-1111 §4.6 fail-safe
- * rule recommends PagerDuty as one of the two distinct platform classes
- * subscribed to `local.{principal}.system.>` so an operational alert reliably
- * pages even if the dashboard is the thing that broke.
+ * (`https://events.pagerduty.com/v2/enqueue`). The G-1111 §4.6 fail-safe rule
+ * recommends PagerDuty as one of the two distinct platform classes subscribed
+ * to `local.{principal}.system.>` so an operational alert reliably pages even
+ * if the dashboard is the thing that broke.
  *
- * Principal chooses what counts as page-worthy via the `subscribe` patterns
- * on the `PagerDutyRendererConfig`. Typical wiring:
+ * Principal chooses what counts as page-worthy via the `subscribe` patterns on
+ * the `PagerDutyRendererConfig`. Typical wiring:
  *
  *     - kind: pagerduty
  *       routingKey: ${PAGERDUTY_ROUTING_KEY}
@@ -19,25 +28,24 @@
  *
  * Mapping rules (events-v2 §payload):
  *   - `event_action` is always `"trigger"` for now. Future iteration could
- *     map `system.adapter.recovered` to `"resolve"` once the upstream
- *     adapter emits a matching `dedup_key`.
+ *     map `system.adapter.recovered` to `"resolve"` once the upstream adapter
+ *     emits a matching `dedup_key`.
  *   - `dedup_key` defaults to `${envelope.source}:${envelope.type}` so a
  *     flapping shard doesn't open N tickets.
  *   - `severity` is derived: `system.*.crashed` → `critical`,
- *     `system.*.degraded` → `error`, anything else → `warning`. Override
- *     via `payload.severity` on the envelope.
+ *     `system.*.degraded` → `error`, anything else → `warning`. Override via
+ *     `payload.severity` on the envelope.
  *   - `summary` is `${envelope.type}: ${envelope.source}` truncated to 1024
  *     chars per the PagerDuty hard limit.
  *
  * Failure handling (Renderer contract §2): network failures + non-2xx
- * responses log a warning and drop the envelope. Throwing would poison
- * the surface-router's dispatch loop, and PagerDuty's own retry mechanics
- * are out-of-band (re-trigger on subsequent envelopes).
+ * responses log a warning and drop the envelope. Throwing would poison the
+ * surface-router's dispatch loop, and PagerDuty's own retry mechanics are
+ * out-of-band (re-trigger on subsequent envelopes).
  */
 
-import type { Envelope, RenderTarget, RendererPlugin } from "../surface-sdk";
-import { PagerDutyRendererSchema, type PagerDutyRendererConfig } from "../common/types/cortex-config";
-import type { Renderer } from "./types";
+import type { Envelope, RenderTarget, Renderer } from "@the-metafactory/cortex/surface-sdk";
+import type { PagerDutyRendererConfig } from "./schema";
 
 const EVENTS_V2_URL = "https://events.pagerduty.com/v2/enqueue";
 const SUMMARY_MAX_LEN = 1024;
@@ -66,10 +74,9 @@ export class PagerDutyRenderer implements Renderer {
   constructor(config: PagerDutyRendererConfig, options: PagerDutyRendererOptions = {}) {
     // cortex#1788 (S3, ADR-0024 OQ10) — `config.id` defaults to `kind`,
     // preserving the pre-OQ10 single-integration-per-deployment id exactly
-    // when unset. Two `kind: pagerduty` entries (different routing keys)
-    // now need distinct `id:` values in config to avoid colliding in
-    // router metrics and to be independently addressable by a future
-    // `unload` verb.
+    // when unset. Two `kind: pagerduty` entries (different routing keys) now
+    // need distinct `id:` values in config to avoid colliding in router
+    // metrics and to be independently addressable by a future `unload` verb.
     this.id = config.id ?? "pagerduty";
     this.subjects = config.subscribe;
     this.routingKey = config.routingKey;
@@ -183,22 +190,3 @@ export class PagerDutyRenderer implements Renderer {
     return "warning";
   }
 }
-
-/**
- * cortex#1788 (S3, ADR-0024 §8.1) — `pagerduty`'s `RendererPlugin`. The
- * renderer track's extraction pilot (leaf-y, zero npm deps, R10) — it
- * registers through the registry now (dogfooding, ADR-0024 §3.3) and stays
- * in-tree until S12b extracts it (gated on OQ9, the boot-coverage hard-fail).
- */
-export const pagerdutyRendererPlugin: RendererPlugin = {
-  kind: "renderer",
-  id: "pagerduty",
-  rendererKind: "pagerduty",
-  // cortex#1789 (S4) — the real per-kind schema, incl. the REQUIRED
-  // `routingKey` secret field. `createRenderer` parses the raw entry through
-  // this before construction; a Zod validation failure never echoes the
-  // rejected value (only the field path + message), so a malformed
-  // `routingKey` is never leaked into the thrown error.
-  configSchema: PagerDutyRendererSchema,
-  createRenderer: (config) => new PagerDutyRenderer(config as PagerDutyRendererConfig),
-};
