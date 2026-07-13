@@ -80,6 +80,7 @@ import type {
 import type { SystemEventSource } from "../bus/system-events";
 import type { MyelinRuntime } from "../bus/myelin/runtime";
 import type { PolicyEngine, PlatformPrincipalIndex, PrincipalRegistry } from "../common/policy";
+import type { AdapterPolicyPort } from "../surface-sdk";
 import { assertNoUnresolvedPlaceholder } from "../common/config/resolve-env-placeholders";
 import type {
   BindingGroup,
@@ -88,7 +89,6 @@ import type {
 } from "../adapters/registry";
 import { discordAdapterPlugin } from "../adapters/discord/plugin";
 import { slackAdapterPlugin } from "../adapters/slack/plugin";
-import { mattermostAdapterPlugin } from "../adapters/mattermost/plugin";
 import { buildAdapterPolicyPort } from "../adapters/plugin-support";
 // Back-compat re-export for callers that still import the old suppression helper here.
 export { gatewayOwnedSurfaceKeys } from "./surface-ownership-plan";
@@ -145,6 +145,16 @@ interface FactoryArgsBase {
   policyEngine?: PolicyEngine;
   policyLookup?: PlatformPrincipalIndex;
   policyRegistry?: PrincipalRegistry;
+  /**
+   * cortex#1796 (S11, ADR-0024 D5 extraction lane) — the host-bound
+   * `AdapterPolicyPort` (mirrors `GatewayConstructBase.policy`,
+   * cortex#1794 S9b). Only the (now out-of-tree) mattermost plugin reads
+   * this field — discord/slack still call `common/policy` directly via the
+   * triad above; their own dependency-inversion is a later slice. Optional
+   * so discord/slack's existing `baseFactoryArgs` call sites (which never
+   * set it) are unaffected.
+   */
+  policy?: AdapterPolicyPort;
 }
 
 interface DiscordFactoryArgs extends FactoryArgsBase {
@@ -222,16 +232,33 @@ export interface GatewayAdapterDeps {
  * imports (`start-gateway.ts`, `surface-adapter-boot.ts`, and their tests'
  * recording/counting fakes) keep resolving. The actual construction logic
  * moved verbatim into each platform's `AdapterPlugin.createAdapter`
- * (`src/adapters/{discord,slack,mattermost}/plugin.ts` — `web`'s moved
- * out-of-tree entirely, cortex#1794 S9 MOVE) — this object is now a thin
- * delegating shim, not the source of truth. New code should thread a
- * {@link SurfacePluginRegistry} (`createDefaultSurfacePluginRegistry`)
- * instead of this factory.
+ * (`src/adapters/{discord,slack}/plugin.ts` — `web` and `mattermost` moved
+ * out-of-tree entirely, cortex#1794 S9 MOVE / cortex#1796 S11 MOVE) — this
+ * object is now a thin delegating shim, not the source of truth. New code
+ * should thread a {@link SurfacePluginRegistry}
+ * (`createDefaultSurfacePluginRegistry`) instead of this factory.
+ *
+ * cortex#1796 (S11 MOVE) — `mattermost` below throws rather than
+ * constructing: there is no more in-tree `mattermostAdapterPlugin` to
+ * delegate to. This is genuinely unreachable in production —
+ * `wireSurfaceAdapters` (`src/runner/surface-adapter-boot.ts`) always
+ * receives `opts.registry` from `cortex.ts` and resolves mattermost via
+ * {@link registryToLegacyFactory} instead (a pure runtime registry lookup),
+ * never falling through to this default. Only a caller that supplies
+ * NEITHER `factory` NOR `registry` would ever hit this arm — kept as a
+ * loud, actionable error instead of a silent `undefined` crash so that
+ * caller finds out immediately what to fix.
  */
 export const defaultGatewayAdapterFactory: GatewayAdapterFactory = {
   discord: (args) => discordAdapterPlugin.createAdapter(args as unknown as Record<string, unknown>),
   slack: (args) => slackAdapterPlugin.createAdapter(args as unknown as Record<string, unknown>),
-  mattermost: (args) => mattermostAdapterPlugin.createAdapter(args as unknown as Record<string, unknown>),
+  mattermost: () => {
+    throw new Error(
+      "defaultGatewayAdapterFactory.mattermost: mattermost extracted out-of-tree " +
+        "(metafactory-cortex-adapter-mattermost, cortex#1796 S11 MOVE) — pass `registry` " +
+        "(threaded from loadExternalPlugins) instead of the bare factory.",
+    );
+  },
 };
 
 // =============================================================================
