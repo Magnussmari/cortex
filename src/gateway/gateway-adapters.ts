@@ -88,8 +88,8 @@ import type {
   SurfacePluginRegistry,
 } from "../adapters/registry";
 import { discordAdapterPlugin } from "../adapters/discord/plugin";
-import { slackAdapterPlugin } from "../adapters/slack/plugin";
-import { buildAdapterPolicyPort } from "../adapters/plugin-support";
+import { buildAdapterPolicyPort, buildAdapterSystemEventPort } from "../adapters/plugin-support";
+import { formatEnvelopeAsMarkdown } from "../adapters/envelope-renderer";
 // Back-compat re-export for callers that still import the old suppression helper here.
 export { gatewayOwnedSurfaceKeys } from "./surface-ownership-plan";
 
@@ -232,26 +232,53 @@ export interface GatewayAdapterDeps {
  * imports (`start-gateway.ts`, `surface-adapter-boot.ts`, and their tests'
  * recording/counting fakes) keep resolving. The actual construction logic
  * moved verbatim into each platform's `AdapterPlugin.createAdapter`
- * (`src/adapters/{discord,slack}/plugin.ts` — `web` and `mattermost` moved
- * out-of-tree entirely, cortex#1794 S9 MOVE / cortex#1796 S11 MOVE) — this
+ * (`src/adapters/discord/plugin.ts` — `web`, `slack`, and `mattermost` all
+ * moved out-of-tree entirely, cortex#1794 S9 / cortex#1795 S10 / cortex#1796
+ * S11 MOVE) — this
  * object is now a thin delegating shim, not the source of truth. New code
  * should thread a {@link SurfacePluginRegistry}
  * (`createDefaultSurfacePluginRegistry`) instead of this factory.
  *
- * cortex#1796 (S11 MOVE) — `mattermost` below throws rather than
- * constructing: there is no more in-tree `mattermostAdapterPlugin` to
- * delegate to. This is genuinely unreachable in production —
- * `wireSurfaceAdapters` (`src/runner/surface-adapter-boot.ts`) always
- * receives `opts.registry` from `cortex.ts` and resolves mattermost via
- * {@link registryToLegacyFactory} instead (a pure runtime registry lookup),
- * never falling through to this default. Only a caller that supplies
- * NEITHER `factory` NOR `registry` would ever hit this arm — kept as a
- * loud, actionable error instead of a silent `undefined` crash so that
- * caller finds out immediately what to fix.
+ * cortex#1795 (S10 MOVE) — `slack` keeps its method here (unlike `web`,
+ * which dropped out of {@link GatewayAdapterFactory} entirely — see that
+ * interface's doc): `wireSurfaceAdapters`'s per-stack boot lane
+ * (`surface-adapter-boot.ts`) still calls `factory.slack(...)` on whichever
+ * factory a ternary produces, and that ternary's OTHER branch
+ * (`registryToLegacyFactory`, `adapters/registry.ts`) still has a real
+ * `slack` method — removing it here would make the union type-check fail on
+ * that call site for no behavioural gain. Production never actually reaches
+ * THIS implementation, though: `cortex.ts` always threads `registry` (which
+ * routes through `registryToLegacyFactory` instead, itself fully
+ * registry-driven — no in-tree import). This synchronous shim genuinely
+ * cannot construct a real Slack adapter any more (there is no in-tree
+ * `slackAdapterPlugin` to delegate to, and dynamic-import is async) — it
+ * throws a loud, actionable error instead of silently misbehaving. No
+ * production or test call site is known to reach this branch (verified: no
+ * test imports `defaultGatewayAdapterFactory` directly, and every
+ * `wireSurfaceAdapters`/`startGatewayIfEnabled` call site supplies an
+ * explicit `factory` or `registry`).
+ *
+ * cortex#1796 (S11 MOVE) — `mattermost` below throws for the SAME reason:
+ * there is no more in-tree `mattermostAdapterPlugin` to delegate to. This is
+ * genuinely unreachable in production — `wireSurfaceAdapters`
+ * (`src/runner/surface-adapter-boot.ts`) always receives `opts.registry`
+ * from `cortex.ts` and resolves mattermost via {@link registryToLegacyFactory}
+ * instead (a pure runtime registry lookup), never falling through to this
+ * default. Only a caller that supplies NEITHER `factory` NOR `registry`
+ * would ever hit this arm — kept as a loud, actionable error instead of a
+ * silent `undefined` crash so that caller finds out immediately what to fix.
  */
 export const defaultGatewayAdapterFactory: GatewayAdapterFactory = {
   discord: (args) => discordAdapterPlugin.createAdapter(args as unknown as Record<string, unknown>),
-  slack: (args) => slackAdapterPlugin.createAdapter(args as unknown as Record<string, unknown>),
+  slack: () => {
+    throw new Error(
+      "defaultGatewayAdapterFactory.slack: unreachable in production — cortex#1795 (S10 MOVE) " +
+        "extracted the Slack adapter to the metafactory-cortex-adapter-slack bundle; this legacy " +
+        "synchronous factory has no in-tree implementation to delegate to. Pass a `registry` " +
+        "(createDefaultSurfacePluginRegistry(), post-loadExternalPlugins) instead of relying on " +
+        "this factory's default.",
+    );
+  },
   mattermost: () => {
     throw new Error(
       "defaultGatewayAdapterFactory.mattermost: mattermost extracted out-of-tree " +
@@ -348,11 +375,19 @@ export function buildGatewayAdapters(
       }
 
       const source = gatewaySource(principal, group.instanceId);
+      // cortex#1795 (S10) — the shadow gateway's system-event port, built
+      // per-instance (unlike `policy`, invariant across instances) since it
+      // closes over this group's own `source`. Reproduces the pre-S10
+      // `SlackAdapter.canPublishSystemEvent()` gate exactly — see
+      // `buildAdapterSystemEventPort`'s doc.
+      const systemEvents = buildAdapterSystemEventPort({ runtime, source });
       const args = plugin.buildGatewayConstructArgs(group, {
         instanceId: group.instanceId,
         source,
         runtime,
         policy,
+        systemEvents,
+        formatEnvelope: formatEnvelopeAsMarkdown,
       });
       adapters.push(plugin.createAdapter(args));
     }

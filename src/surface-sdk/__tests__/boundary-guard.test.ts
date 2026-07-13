@@ -112,9 +112,12 @@ function listPlatformAdapterFiles(): string[] {
   // cortex#1794 (S9 MOVE) — `web` dropped: it extracted to the
   // `metafactory-cortex-adapter-web` bundle and no longer has a
   // `src/adapters/web/` directory to walk.
+  // cortex#1795 (S10 MOVE) — `slack` dropped the same way: it extracted to
+  // the `metafactory-cortex-adapter-slack` bundle and no longer has a
+  // `src/adapters/slack/` directory to walk.
   // cortex#1796 (S11 MOVE) — `mattermost` dropped for the same reason
   // (`metafactory-cortex-adapter-mattermost`).
-  const platforms = ["discord", "slack"];
+  const platforms = ["discord"];
   const files: string[] = [];
   for (const platform of platforms) {
     const dir = resolve(SRC_ROOT, "adapters", platform);

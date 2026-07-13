@@ -473,30 +473,30 @@ function composeRawConfigWithSurfaces(configPath: string): {
  * fold-platform list: every registered `AdapterPlugin` that opts into
  * `foldsIntoPresence`. Replaces the hardcoded `PLATFORMS` const that used to
  * live in `surfaces.ts` — "which platforms fold" is now a property each
- * plugin declares (discord/slack/mattermost `true`, web `false` — PRESERVED
- * exactly) rather than a second list that could drift from the registry.
- * `surfaces.ts` itself cannot import the registry (would cycle — the
- * registry's in-tree adapter plugins import `surfaces.ts` for their binding
- * schemas), so `loader.ts` — which already imports the registry for the
- * registry-pass validation below — computes this list and passes it down
- * explicitly. Constructing a fresh `SurfacePluginRegistry` per call is cheap
- * (pure in-memory registration, no I/O); this is the same "default registry"
- * every other config-load-time registry check in this file uses.
+ * plugin declares (discord `true`, web `false` — PRESERVED exactly; slack
+ * and mattermost are ALSO `true` but are no longer resolvable from the
+ * in-tree default alone post-extraction — see {@link DEFAULT_FOLD_PLATFORMS},
+ * the registry-free anchor this unions with below) rather than a second list
+ * that could drift from the registry. `surfaces.ts` itself cannot import the
+ * registry (would cycle — the registry's in-tree adapter plugins import
+ * `surfaces.ts` for their binding schemas), so `loader.ts` — which already
+ * imports the registry for the registry-pass validation below — computes
+ * this list.
  */
 function defaultFoldPlatforms(): readonly string[] {
   const fromRegistry = createDefaultSurfacePluginRegistry()
     .listAdapters()
     .filter((p) => p.foldsIntoPresence)
     .map((p) => p.platform);
-  // cortex#1796 (S11 MOVE) — `mattermost` extracted out-of-tree: it no
-  // longer appears in the SYNCHRONOUS in-tree registry this function builds
-  // (config load happens before `loadExternalPlugins`' async bundle
-  // discovery runs, so an out-of-tree plugin's `foldsIntoPresence: true`
-  // flag is invisible here even though it's unchanged). Union with
-  // {@link DEFAULT_FOLD_PLATFORMS} — the registry-free anchor — so
-  // mattermost's legacy `agents[*].presence.mattermost` fold behavior
-  // survives the extraction; extraction moved the plugin CODE, not this
-  // fold contract.
+  // cortex#1795/#1796 (S10/S11 MOVE) — `slack`/`mattermost` extracted
+  // out-of-tree: neither appears in the SYNCHRONOUS in-tree registry this
+  // function builds (config load happens before `loadExternalPlugins`' async
+  // bundle discovery runs, so an out-of-tree plugin's `foldsIntoPresence:
+  // true` flag is invisible here even though it's unchanged). Union with
+  // {@link DEFAULT_FOLD_PLATFORMS} — the registry-free anchor — so both
+  // platforms' legacy `agents[*].presence.{slack,mattermost}` fold behavior
+  // survives extraction; extraction moved the plugin CODE, not this fold
+  // contract.
   return [...new Set([...fromRegistry, ...DEFAULT_FOLD_PLATFORMS])];
 }
 
@@ -507,12 +507,12 @@ function defaultFoldPlatforms(): readonly string[] {
  * `loadExternalPlugins`' async bundle discovery runs) and supplements it
  * with a permissive STUB `AdapterPlugin` for every platform in
  * {@link EXTRACTED_ADAPTER_PLATFORMS} not already registered (`web`,
- * `mattermost`) — otherwise a stack with a legitimately-declared
- * `surfaces.web[]`/`surfaces.mattermost[]` binding would fail to LOAD at
- * all, since those platforms' real plugins aren't visible to this
- * synchronous registry (cortex#1796 review finding — mattermost, unlike
- * `web`, has a live production `foldsIntoPresence: true` fold path, so this
- * one actually broke real config loads, not just a theoretical gap).
+ * `mattermost`, `slack`) — otherwise a stack with a legitimately-declared
+ * `surfaces.web[]`/`surfaces.mattermost[]`/`surfaces.slack[]` binding would
+ * fail to LOAD at all, since those platforms' real plugins aren't visible to
+ * this synchronous registry (cortex#1796 review finding — mattermost/slack,
+ * unlike `web`, have a live production `foldsIntoPresence: true` fold path,
+ * so this one actually broke real config loads, not just a theoretical gap).
  *
  * The stub's `bindingSchema` is fully permissive (`z.record(...)`) — it
  * only proves "this platform key is a KNOWN, first-party-exempt adapter,
@@ -520,7 +520,7 @@ function defaultFoldPlatforms(): readonly string[] {
  * `loadExternalPlugins` has actually loaded the bundle and
  * `cortex.ts` re-runs `validateSurfacesAgainstRegistry` against the
  * fully-loaded registry. A genuinely unknown/misspelled platform key (not
- * discord/slack and not in {@link EXTRACTED_ADAPTER_PLATFORMS}) still fails
+ * discord and not in {@link EXTRACTED_ADAPTER_PLATFORMS}) still fails
  * loudly here, unchanged.
  */
 function surfacesParseRegistry(): SurfacePluginRegistry {

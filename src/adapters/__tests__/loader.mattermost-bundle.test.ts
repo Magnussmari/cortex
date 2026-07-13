@@ -113,10 +113,12 @@ describe("transparent upgrade E2E — the real metafactory-cortex-adapter-matter
     ]);
   });
 
-  test("the loaded plugin registers into the SAME registry discord/slack already live in, alongside them", async () => {
+  test("the loaded plugin registers into the SAME registry discord already lives in, alongside it", async () => {
+    // cortex#1795 (S10 MOVE) — `slack` also extracted out-of-tree since this
+    // suite was written; the in-tree registry is discord-only now.
     const registry = createDefaultSurfacePluginRegistry();
     const beforeIds = registry.listAdapters().map((p) => p.id);
-    expect(beforeIds).toEqual(["discord", "slack"]);
+    expect(beforeIds).toEqual(["discord"]);
 
     await loadExternalPlugins({
       registry,
@@ -125,7 +127,7 @@ describe("transparent upgrade E2E — the real metafactory-cortex-adapter-matter
       runner: runnerFor([mattermostBundlePkg()]),
     });
 
-    expect(registry.listAdapters().map((p) => p.id)).toEqual(["discord", "slack", "mattermost"]);
+    expect(registry.listAdapters().map((p) => p.id)).toEqual(["discord", "mattermost"]);
   });
 
   test("the registered plugin constructs a REAL, working MattermostAdapter — not just a shape-valid stub", async () => {

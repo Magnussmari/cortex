@@ -34,6 +34,18 @@ import { tmpdir } from "os";
 import { stringify } from "yaml";
 import { loadConfigWithAgents } from "../loader";
 
+// cortex#1795/#1796 (S10/S11 MOVE) — this file used to carry a fixture-local
+// `testSlackAdapterPluginStub`/`testRegistryWithSlack()` so
+// `loadConfigWithAgents` could be threaded an explicit registry that knew
+// about the (now out-of-tree) slack plugin. That threading is gone:
+// `loadConfigWithAgents` no longer accepts a `registry` param at all —
+// `parseSurfaces`'s internal `surfacesParseRegistry()` (loader.ts)
+// structurally admits every `EXTRACTED_ADAPTER_PLATFORMS` entry (web,
+// mattermost, slack) at load time, so every test below that exercises
+// `surfacesBlock()` (which carries slack[] and mattermost[] bindings) now
+// calls `loadConfigWithAgents(path)` with no second argument and still
+// passes.
+
 let testDir: string;
 
 beforeEach(() => {

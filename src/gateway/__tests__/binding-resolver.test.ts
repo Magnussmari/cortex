@@ -27,7 +27,11 @@ import {
 } from "../binding-resolver";
 import type { Surfaces } from "../../common/types/surfaces";
 import type { InboundMessage } from "../../adapters/types";
-import { testRegistryWithWeb } from "./test-registry-support";
+import {
+  testRegistryWithWeb,
+  testRegistryWithSlack,
+  testRegistryWithSlackAndMattermost,
+} from "./test-registry-support";
 
 // ─── Shared fixtures ─────────────────────────────────────────────────────────
 
@@ -123,7 +127,7 @@ describe("buildBindingIndex — happy path", () => {
   });
 
   test("slack: indexes by workspaceId", () => {
-    const index = buildBindingIndex(SLACK_SURFACES);
+    const index = buildBindingIndex(SLACK_SURFACES, testRegistryWithSlack());
     expect(index.slack.size).toBe(1);
     expect(index.slack.has("T0123456789")).toBe(true);
   });
@@ -146,7 +150,7 @@ describe("buildBindingIndex — happy path", () => {
       slack: SLACK_SURFACES.slack,
       mattermost: MATTERMOST_SINGLE_SURFACES.mattermost,
     };
-    const index = buildBindingIndex(combined, testRegistryWithWeb());
+    const index = buildBindingIndex(combined, testRegistryWithSlackAndMattermost());
     expect(index.discord.size).toBe(1);
     expect(index.slack.size).toBe(1);
     expect(index.mattermostSingle).not.toBeNull();
@@ -215,7 +219,7 @@ describe("buildBindingIndex — collision throws", () => {
         },
       ],
     };
-    expect(() => buildBindingIndex(ambiguous)).toThrow(/slack.*TSAMESPACE/i);
+    expect(() => buildBindingIndex(ambiguous, testRegistryWithSlack())).toThrow(/slack.*TSAMESPACE/i);
   });
 });
 
@@ -234,7 +238,7 @@ describe("resolveBinding — happy path", () => {
   });
 
   test("slack: resolves by workspaceId", () => {
-    const index = buildBindingIndex(SLACK_SURFACES);
+    const index = buildBindingIndex(SLACK_SURFACES, testRegistryWithSlack());
     const inbound = msg({ platform: "slack", guildId: "T0123456789" });
     const match = resolveBinding(index, inbound);
     expect(match).not.toBeNull();
@@ -258,7 +262,7 @@ describe("resolveBinding — happy path", () => {
 
 describe("resolveBinding — no platform bindings", () => {
   test("discord inbound against slack-only index → null", () => {
-    const index = buildBindingIndex(SLACK_SURFACES);
+    const index = buildBindingIndex(SLACK_SURFACES, testRegistryWithSlack());
     const inbound = msg({ platform: "discord", guildId: "555555555555555555" });
     expect(resolveBinding(index, inbound)).toBeNull();
   });
@@ -280,7 +284,7 @@ describe("resolveBinding — no-match on demux key", () => {
   });
 
   test("slack: workspaceId not in index → null", () => {
-    const index = buildBindingIndex(SLACK_SURFACES);
+    const index = buildBindingIndex(SLACK_SURFACES, testRegistryWithSlack());
     const inbound = msg({ platform: "slack", guildId: "TNOMATCH12" });
     expect(resolveBinding(index, inbound)).toBeNull();
   });
@@ -296,7 +300,7 @@ describe("resolveBinding — DM / no guildId", () => {
   });
 
   test("slack DM (no guildId / workspaceId) → null", () => {
-    const index = buildBindingIndex(SLACK_SURFACES);
+    const index = buildBindingIndex(SLACK_SURFACES, testRegistryWithSlack());
     const inbound = msg({ platform: "slack", guildId: undefined, isDM: true });
     expect(resolveBinding(index, inbound)).toBeNull();
   });

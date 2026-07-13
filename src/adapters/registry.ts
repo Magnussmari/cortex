@@ -104,11 +104,25 @@ export interface GatewayConstructBase {
    * registry module has no compile-time dependency on `surface-sdk` or
    * `common/policy`, so each plugin's `buildGatewayConstructArgs` casts
    * internally (the convention `AdapterPlugin`'s docstring already
-   * establishes for `createAdapter`'s args). Currently only the web plugin
-   * forwards it — see `metafactory-cortex-adapter-web`'s `src/plugin.ts`
-   * (relocated out-of-tree, cortex#1794 S9 MOVE; was `adapters/web/plugin.ts`).
+   * establishes for `createAdapter`'s args). Forwarded by both the `web`
+   * plugin (`metafactory-cortex-adapter-web`'s `src/plugin.ts`, relocated
+   * out-of-tree cortex#1794 S9 MOVE) and the `slack` plugin
+   * (`metafactory-cortex-adapter-slack`'s `src/plugin.ts`, cortex#1795 S10).
    */
   readonly policy?: unknown;
+  /**
+   * cortex#1795 (S10) — a host-bound `AdapterSystemEventPort` (`surface-sdk`),
+   * typed `unknown` for the same reason `policy` is. Currently only the
+   * slack plugin forwards it.
+   */
+  readonly systemEvents?: unknown;
+  /**
+   * cortex#1795 (S10) — the host-bound envelope→markdown renderer (the
+   * shared `adapters/envelope-renderer.ts`'s `formatEnvelopeAsMarkdown`),
+   * typed `unknown` for the same reason `policy` is. Currently only the
+   * slack plugin forwards it.
+   */
+  readonly formatEnvelope?: unknown;
 }
 
 /**
@@ -269,14 +283,13 @@ export class SurfacePluginRegistry {
 // =============================================================================
 
 import { discordAdapterPlugin } from "./discord/plugin";
-import { slackAdapterPlugin } from "./slack/plugin";
 import { dashboardRendererPlugin } from "../renderers/dashboard";
 import { pagerdutyRendererPlugin } from "../renderers/pagerduty";
 
 /**
- * Compose ONE registry carrying every in-tree plugin — discord → slack
- * (adapters, in the pre-registry `buildGatewayAdapters` order) then
- * dashboard → pagerduty (renderers, in the pre-registry `createRenderer`
+ * Compose ONE registry carrying every in-tree plugin — `discord` is the ONLY
+ * in-tree adapter left (in the pre-registry `buildGatewayAdapters` order)
+ * then dashboard → pagerduty (renderers, in the pre-registry `createRenderer`
  * switch order). Boot (`cortex.ts`) calls this ONCE and threads the result to
  * the gateway path (`buildGatewayAdapters`), the per-stack path
  * (`wireSurfaceAdapters`), and the renderer boot loop.
@@ -289,18 +302,22 @@ import { pagerdutyRendererPlugin } from "../renderers/pagerduty";
  * exemption (cortex declares the bundle in `arc-manifest.yaml`
  * `dependencies:`, so it loads even with `system.plugins.external` off).
  *
+ * cortex#1795 (S10 MOVE) — `slack` is no longer registered here either, same
+ * fate as `web`: extracted to the `metafactory-cortex-adapter-slack` bundle,
+ * loaded by `loadExternalPlugins` under the SAME first-party exemption.
+ *
  * cortex#1796 (S11 MOVE) — `mattermost` is no longer registered here
  * either. It extracted to the `metafactory-cortex-adapter-mattermost`
- * bundle, same D2/S9a exemption mechanism as `web`. `registry.listAdapters()`
- * therefore returns `["discord","slack"]` right after this function
- * returns, and `["discord","slack","mattermost","web"]` (bundle-name-sorted)
- * once boot's `loadExternalPlugins` call completes — both are correct, just
- * different points in the boot sequence.
+ * bundle, same D2/S9a exemption mechanism as `web`/`slack`.
+ *
+ * `registry.listAdapters()` therefore returns `["discord"]` right after this
+ * function returns, and `["discord","mattermost","slack","web"]`
+ * (bundle-name-sorted) once boot's `loadExternalPlugins` call completes —
+ * both are correct, just different points in the boot sequence.
  */
 export function createDefaultSurfacePluginRegistry(): SurfacePluginRegistry {
   const registry = new SurfacePluginRegistry();
   registry.registerAdapter(discordAdapterPlugin);
-  registry.registerAdapter(slackAdapterPlugin);
   registry.registerRenderer(dashboardRendererPlugin);
   registry.registerRenderer(pagerdutyRendererPlugin);
   return registry;
@@ -417,8 +434,15 @@ export function validateSurfacesAgainstRegistry(
  * factory to a `Record<string, unknown>`-param shape. `any` is the standard
  * escape for "adapt an external, more specifically-typed callback shape."
  *
- * cortex#1796 (S11 MOVE) — `mattermost` stays a member here (unlike `web`,
- * which was never part of this interface) because `wireSurfaceAdapters`
+ * `slack` STAYS on this interface post-cortex#1795 (S10 MOVE) — unlike
+ * `web`, `wireSurfaceAdapters` (`surface-adapter-boot.ts`) still calls
+ * `factory.slack(...)` on the production path via
+ * {@link registryToLegacyFactory} below, which is fully registry-driven (no
+ * in-tree import). Only {@link registryFromFactory}'s auto-registration of a
+ * "slack" entry lost its descriptor-field source — see that function's doc.
+ *
+ * cortex#1796 (S11 MOVE) — `mattermost` stays a member here too (unlike
+ * `web`, which was never part of this interface) because `wireSurfaceAdapters`
  * (`src/runner/surface-adapter-boot.ts`) still has a real per-stack
  * construction call site that calls `factory.mattermost(...)` unconditionally
  * — see {@link registryToLegacyFactory}'s doc for why that stays safe to
@@ -445,7 +469,19 @@ interface LegacyGatewayAdapterFactory {
  *
  * cortex#1794 (S9 MOVE) — `web` dropped from both the registration loop and
  * {@link LegacyGatewayAdapterFactory} (no in-tree `webAdapterPlugin` to
- * borrow descriptor fields from any more).
+ * borrow descriptor fields from any more). A test that needs a "web-shaped"
+ * fourth platform registers its own stub `AdapterPlugin` directly via
+ * `registry.registerAdapter(...)` after calling this function.
+ *
+ * cortex#1795 (S10 MOVE) — `slack` drops from the REGISTRATION LOOP too
+ * (it stays on {@link LegacyGatewayAdapterFactory} itself — see that
+ * interface's doc): there is no more in-tree `slackAdapterPlugin` to borrow
+ * `bindingSchema`/`demuxKey`/`groupBindings`/`buildGatewayConstructArgs`
+ * from. A test that needs a "slack" registry entry (e.g. to exercise
+ * `validateSurfacesAgainstRegistry`/demux against `surfaces.slack[]`)
+ * registers its own stub `AdapterPlugin` directly via
+ * `registry.registerAdapter(...)` after calling this function, same as the
+ * `web` workaround above — see `__tests__/registry.test.ts` for an example.
  *
  * cortex#1796 (S11 MOVE) — `mattermost` dropped from the registration loop
  * too, same reason (no in-tree `mattermostAdapterPlugin` descriptor to
@@ -459,7 +495,6 @@ interface LegacyGatewayAdapterFactory {
 export function registryFromFactory(factory: LegacyGatewayAdapterFactory): SurfacePluginRegistry {
   const registry = new SurfacePluginRegistry();
   registry.registerAdapter({ ...discordAdapterPlugin, createAdapter: (args) => factory.discord(args) });
-  registry.registerAdapter({ ...slackAdapterPlugin, createAdapter: (args) => factory.slack(args) });
   registry.registerRenderer(dashboardRendererPlugin);
   registry.registerRenderer(pagerdutyRendererPlugin);
   return registry;
