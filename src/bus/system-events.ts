@@ -479,7 +479,7 @@ export function createSystemAccessFilteredEvent(
 }
 
 // ---------------------------------------------------------------------------
-// system.bus.peer_dispatch_received — IAW Phase B.2a visibility event
+// system.bus.peer-dispatch-received — IAW Phase B.2a visibility event
 // ---------------------------------------------------------------------------
 
 export interface SystemBusPeerDispatchReceivedOpts {
@@ -490,7 +490,7 @@ export interface SystemBusPeerDispatchReceivedOpts {
    * Multi-agent stacks may run one listener per agent (the JSDoc on
    * `BusDispatchListener.receivingAgentId` explicitly contemplates
    * `peer-router` agents and per-agent listeners). Without this
-   * field, a dashboard subscribed to `system.bus.peer_dispatch_received`
+   * field, a dashboard subscribed to `system.bus.peer-dispatch-received`
    * can't answer "who in our stack received this" (Echo cortex#203
    * round 1).
    */
@@ -539,7 +539,7 @@ export function createSystemBusPeerDispatchReceivedEvent(
   opts: SystemBusPeerDispatchReceivedOpts,
 ): Envelope {
   return buildBaseEnvelope({
-    type: "system.bus.peer_dispatch_received",
+    type: "system.bus.peer-dispatch-received",
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
@@ -555,7 +555,7 @@ export function createSystemBusPeerDispatchReceivedEvent(
 }
 
 // ---------------------------------------------------------------------------
-// system.bus.reflex_activation_dispatched / _failed — F-6 visibility events
+// system.bus.reflex-activation-dispatched / -failed — F-6 visibility events
 // ---------------------------------------------------------------------------
 
 interface SystemBusReflexActivationDispatchedBase {
@@ -601,7 +601,7 @@ export type SystemBusReflexActivationDispatchedOpts =
  * F-6 — visibility event emitted when `ReflexActivationListener` resolves a
  * reflex `reflex.activation.fired` event and re-emits it as a `tasks.*`
  * dispatch the existing executor runs. Parity with
- * `system.bus.peer_dispatch_received`: bookkeeping about our own stack,
+ * `system.bus.peer-dispatch-received`: bookkeeping about our own stack,
  * sovereignty defaults to local even when the underlying activation carries
  * a different classification (which is preserved on the dispatch itself).
  */
@@ -609,7 +609,7 @@ export function createSystemBusReflexActivationDispatchedEvent(
   opts: SystemBusReflexActivationDispatchedOpts,
 ): Envelope {
   return buildBaseEnvelope({
-    type: "system.bus.reflex_activation_dispatched",
+    type: "system.bus.reflex-activation-dispatched",
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
@@ -663,7 +663,7 @@ export function createSystemBusReflexActivationFailedEvent(
   opts: SystemBusReflexActivationFailedOpts,
 ): Envelope {
   return buildBaseEnvelope({
-    type: "system.bus.reflex_activation_failed",
+    type: "system.bus.reflex-activation-failed",
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
@@ -708,7 +708,7 @@ export interface SystemBusReflexActivationSkippedOpts {
  * DROPS a fired activation because its author is trusted (in the target's
  * configurable `skip_authors`). This is an honest policy SKIP, not a failure:
  * no dispatch, no error, the Decision id is marked (a redelivery re-skips
- * silently). Distinct from `_failed` (which means the bridge could not
+ * silently). Distinct from `-failed` (which means the bridge could not
  * dispatch) so the audit trail distinguishes "we chose not to" from "we
  * could not".
  */
@@ -716,7 +716,7 @@ export function createSystemBusReflexActivationSkippedEvent(
   opts: SystemBusReflexActivationSkippedOpts,
 ): Envelope {
   return buildBaseEnvelope({
-    type: "system.bus.reflex_activation_skipped",
+    type: "system.bus.reflex-activation-skipped",
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
@@ -734,7 +734,7 @@ export function createSystemBusReflexActivationSkippedEvent(
 }
 
 // ---------------------------------------------------------------------------
-// system.bus.notify_discord — F-6 downstream code-capability visibility
+// system.bus.notify-discord — F-6 downstream code-capability visibility
 // ---------------------------------------------------------------------------
 
 export interface SystemBusNotifyDiscordOpts {
@@ -763,7 +763,7 @@ export function createSystemBusNotifyDiscordEvent(
   opts: SystemBusNotifyDiscordOpts,
 ): Envelope {
   return buildBaseEnvelope({
-    type: "system.bus.notify_discord",
+    type: "system.bus.notify-discord",
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
@@ -1599,7 +1599,7 @@ export function createSystemDispatchStageEvent(
 }
 
 // ---------------------------------------------------------------------------
-// system.gateway.routing_decision — cortex#596 gateway inbound observability
+// system.gateway.routing-decision — cortex#596 gateway inbound observability
 // ---------------------------------------------------------------------------
 
 /**
@@ -1624,7 +1624,7 @@ export function createSystemDispatchStageEvent(
  *
  * Two outcomes of ONE decision, so they share a single envelope type
  * discriminated on `outcome` — the same shape the sibling
- * `system.bus.notify_discord` (`posted`/`failed`/`skipped`) and
+ * `system.bus.notify-discord` (`posted`/`failed`/`skipped`) and
  * `system.bus.process` (`started`/`completed`/`failed`) visibility events use,
  * rather than two near-identical `.routed` / `.unroutable` types.
  */
@@ -1666,7 +1666,7 @@ export interface SystemGatewayRoutingDecisionOpts {
 }
 
 /**
- * Construct a `system.gateway.routing_decision` envelope (cortex#596).
+ * Construct a `system.gateway.routing-decision` envelope (cortex#596).
  *
  * The SurfaceGateway is a thin demux in front of the per-stack runners; it
  * carries its own source identity `{principal}.gateway.{instance}` (see
@@ -1684,14 +1684,14 @@ export interface SystemGatewayRoutingDecisionOpts {
  * takes its own `gateway` leaf. `git grep system.gateway` was empty before this
  * event: an unclaimed, natural namespace.
  *
- * Subject convention: `local.{principal}.system.gateway.routing_decision` —
+ * Subject convention: `local.{principal}.system.gateway.routing-decision` —
  * surfaces subscribe to `system.gateway.>` (or the broader `system.>`).
  */
 export function createSystemGatewayRoutingDecisionEvent(
   opts: SystemGatewayRoutingDecisionOpts,
 ): Envelope {
   return buildBaseEnvelope({
-    type: "system.gateway.routing_decision",
+    type: "system.gateway.routing-decision",
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
@@ -1708,7 +1708,7 @@ export function createSystemGatewayRoutingDecisionEvent(
 }
 
 // ---------------------------------------------------------------------------
-// system.plugin.load_failed / system.plugin.loaded — cortex#1792 (S6,
+// system.plugin.load-failed / system.plugin.loaded — cortex#1792 (S6,
 // ADR-0024 D1/D3/D5)
 // ---------------------------------------------------------------------------
 
@@ -1756,15 +1756,15 @@ export interface SystemPluginLoadFailedOpts {
 }
 
 /**
- * Construct a `system.plugin.load_failed` envelope. Subject convention:
- * `local.{principal}.system.plugin.load_failed` — surfaces subscribe to
+ * Construct a `system.plugin.load-failed` envelope. Subject convention:
+ * `local.{principal}.system.plugin.load-failed` — surfaces subscribe to
  * `system.plugin.>` (or the broader `system.>`).
  */
 export function createSystemPluginLoadFailedEvent(
   opts: SystemPluginLoadFailedOpts,
 ): Envelope {
   return buildBaseEnvelope({
-    type: "system.plugin.load_failed",
+    type: "system.plugin.load-failed",
     source: buildSource(opts.source),
     sovereignty: defaultSystemSovereignty(opts.source, opts.classification),
     payload: {
@@ -1816,7 +1816,7 @@ export function createSystemPluginLoadedEvent(
 
 /**
  * S8's runtime-lifecycle twins of the S6 boot-time `system.plugin.loaded` /
- * `system.plugin.load_failed` pair, above. Same `system.plugin.*` family
+ * `system.plugin.load-failed` pair, above. Same `system.plugin.*` family
  * (never a separate `system.adapter.*`/`system.renderer.*` namespace — the
  * SCOPE AMENDED comment on cortex#1793 is explicit that S8 stays consistent
  * with S6's naming rather than forking one), same secret-free reason-string
@@ -1826,23 +1826,25 @@ export function createSystemPluginLoadedEvent(
  * **Leaf segment is `reload-failed` (hyphen), NOT `reload_failed`.** The
  * vendored envelope schema's `/type` pattern
  * (`^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*){1,4}$`, `envelope.schema.json`)
- * forbids underscores in a type segment. `system.plugin.load_failed` (S6,
- * already on `main`) and several older `system.*` families
- * (`system.bus.notify_discord`, `system.bus.reflex_activation_failed`,
- * `system.gateway.routing_decision`, …) violate this pattern — the schema
- * check only runs on the SUBSCRIBER side (`myelin/subscriber.ts`), so a
- * violating envelope publishes without error and is then **silently
- * dropped by every standard push-mode subscriber** (`runtime.subscribe()` +
- * `onEnvelope`) — confirmed via a live NATS round-trip while building S8's
- * `system.plugin.control-request`/`-response` pair (the exact bug this
- * comment documents: the first draft used `control_request`/`control_response`
- * and every response silently vanished). `unloaded` has no segment needing
- * a separator fix; `reload-failed` is spelled correctly here rather than
- * inheriting the sibling's already-broken convention. `load_failed` is left
- * as-is — it already shipped on `main` via S6/#1927, and renaming a shipped
- * wire type is a separate, coordinated fix (flagged, not bundled into this
- * unrelated slice); every OTHER pre-existing underscore violation across
- * `system.*` is the same systemic gap and is out of scope here too.
+ * forbids underscores in a type segment. The schema check only runs on the
+ * SUBSCRIBER side (`myelin/subscriber.ts`), so an underscore-typed envelope
+ * publishes without error and is then **silently dropped by every standard
+ * push-mode subscriber** (`runtime.subscribe()` + `onEnvelope`) — confirmed via
+ * a live NATS round-trip while building S8's
+ * `system.plugin.control-request`/`-response` pair (the exact bug: the first
+ * draft used `control_request`/`control_response` and every response silently
+ * vanished). `unloaded` has no segment needing a separator fix; `reload-failed`
+ * is spelled correctly here.
+ *
+ * A cohort of earlier `system.*` families shipped with the underscore bug —
+ * `system.plugin.load_failed` (S6/#1927), `system.bus.notify_discord`,
+ * `system.bus.peer_dispatch_received`, `system.bus.reflex_activation_*`,
+ * `system.gateway.routing_decision`, `system.verifier.self_check`. cortex#1935
+ * was the coordinated fix that renamed every one of those leaves to hyphens
+ * (this file now emits `system.plugin.load-failed`, `system.bus.notify-discord`,
+ * …), and added the `envelope-type-no-underscore` regression gate +
+ * `renamed-envelope-types-roundtrip` real-schema test so the class cannot
+ * silently recur. Any new `system.*` leaf MUST use hyphens.
  *
  * `createSystemPluginUnloadedEvent` fires on a SUCCESSFUL runtime detach
  * (`cortex plugin unload`, or a reconcile-driven detach of a bundle removed
