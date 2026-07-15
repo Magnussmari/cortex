@@ -12,7 +12,10 @@
  *   --machine  live inventory: dangling symlinks, plist exec paths,
  *              settings.json hooks, packages.db rows, WAL sidecars,
  *              occupied cutover destinations, grove-vs-cortex divergence,
- *              pidfile liveness
+ *              pidfile liveness, and positive-layout checks (cortex#2033):
+ *              state-class dirs misplaced under the canonical CONFIG root, and
+ *              STATE-tree coherence (stray canonical without marker / split
+ *              identity). Testable against a scratch $HOME via `--home <dir>`.
  *
  * ── THE REPO GATE ──────────────────────────────────────────────────────────
  * `bun xdg-audit.ts --repos` is a DETERMINISTIC gate. Exit code = number of
@@ -57,10 +60,26 @@ import { homedir } from "os";
 import { Database } from "bun:sqlite";
 import { parse as parseYaml } from "yaml";
 
-const HOME = homedir();
+import {
+  canonicalPidStateDir,
+  cortexStateDir,
+  cortexStateDirOverride,
+  legacyPidStateDir,
+  stateMigrationCompleted,
+  STATE_MIGRATION_JOURNAL_NAME,
+} from "../src/common/state-path";
+import { readDirEnv } from "../src/common/xdg";
+
 const args = process.argv.slice(2);
 const flag = (f: string) => args.includes(f);
 const opt = (f: string) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
+// HOME is the machine-scan root. `--home <dir>` overrides it so the machine
+// domain is testable against a scratch $HOME with ZERO real-home access (the
+// same escape hatch the repo scan gets from positional roots). The state/config
+// coherence checks below thread this HOME into the state-path resolvers, which
+// still honor `$XDG_*` / `$CORTEX_*` verbatim — env wins over the injected home,
+// exactly as the resolvers behave in production.
+const HOME = opt("--home") ?? homedir();
 const JSON_OUT = flag("--json");
 const VERBOSE = flag("--verbose");
 const WAVE = opt("--wave");
@@ -427,16 +446,165 @@ function scanTreeDivergence() {
 }
 
 function scanPidfiles() {
-  for (const dir of [join(HOME, ".config", "grove", "state"), join(HOME, ".local", "share", "cortex")]) {
+  // Post-migration, the legacy pid state dir keeps DEAD copies by design (the
+  // migration is copy-keep-source; the legacy prune is #1904). So once the marker
+  // is set, a STALE pidfile in the LEGACY dir is expected cruft — an info, not a
+  // gate. LIVE ones still gate (a daemon that must be booted out first), and the
+  // genuinely-split case (live legacy pid ≠ canonical) is caught by
+  // scanStateTreeCoherence. Pre-migration behavior is unchanged (byte-identical).
+  const legacyPidDir = legacyPidStateDir(HOME);
+  const migrated = stateMigrationCompleted(HOME);
+  for (const dir of [legacyPidDir, join(HOME, ".local", "share", "cortex")]) {
     if (!existsSync(dir)) continue;
     for (const name of readdirSync(dir)) {
       if (!name.endsWith(".pid")) continue;
       const p = join(dir, name);
       let pid = 0; try { pid = parseInt(readFileSync(p, "utf8").trim(), 10); } catch { continue; }
       let alive = false; try { process.kill(pid, 0); alive = true; } catch {}
+      if (!alive && migrated && dir === legacyPidDir) {
+        infos.push(`kept legacy pid source (post-migration, #1904 prunes): ${p.replace(HOME, "~")} — pid ${pid} stale`);
+        continue;
+      }
       pushMachine({ domain: "machine", pattern: alive ? "live-pidfile" : "stale-pidfile", clazz: "state", wave: 5, issue: "cortex#1903",
         location: p.replace(HOME, "~"), excerpt: `pid ${pid} ${alive ? "ALIVE (gate must bootout first)" : "stale"}` });
     }
+  }
+}
+
+// ─────────────────────────────────── positive-layout checks (cortex#2033)
+// The legacy scans above only fire on KNOWN-BAD legacy paths, so a box that is
+// wrong-by-CLASS — state-class content living under the canonical CONFIG root,
+// or a half-migrated canonical STATE tree — passes with all-zeros (Vincent's
+// blind spot, #2033). These assert the layout POSITIVELY. All GATE.
+
+/** The canonical config home, honoring `$XDG_CONFIG_HOME` (blank ⇒ unset) the
+ *  same way the resolvers do; default `$HOME/.config`. */
+function xdgConfigHomeDir(): string {
+  return readDirEnv("XDG_CONFIG_HOME") ?? join(HOME, ".config");
+}
+
+/** EPERM-as-alive / ESRCH-as-dead liveness probe — the SAME semantics as
+ *  `migrate-state-dir.ts`'s `defaultProcAlive`, so this gate and the migrator's
+ *  occupancy precondition classify a pidfile identically. */
+function procAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return (err as { code?: string }).code !== "ESRCH"; }
+}
+
+/** The set of pid VALUES written in the `*.pid` files of `dir` (unreadable /
+ *  unparseable entries are skipped — membership is by value, liveness-agnostic).
+ *  Used to decide whether a live LEGACY pid is the SAME daemon the box already
+ *  tracks canonically (coherent) or a DIFFERENT one (split identity). */
+function readPidSet(dir: string): Set<number> {
+  const out = new Set<number>();
+  if (!existsSync(dir)) return out;
+  let names: string[]; try { names = readdirSync(dir); } catch { return out; }
+  for (const name of names) {
+    if (!name.endsWith(".pid")) continue;
+    let text: string; try { text = readFileSync(join(dir, name), "utf8"); } catch { continue; }
+    const pid = parseInt(text.trim(), 10);
+    if (Number.isInteger(pid) && pid > 0) out.add(pid);
+  }
+  return out;
+}
+
+/**
+ * (1) Class-misplacement: state-class dirs living under the canonical CONFIG
+ * root (`…/metafactory/cortex/{logs,state,relay,network-cache}`) — the #2030
+ * postinstall bug shape. These four are STATE classes (they belong under
+ * `~/.local/state/metafactory/cortex`); their presence under the CONFIG root is
+ * a layout error the legacy-path scan can't see (it's a canonical path, not a
+ * legacy one). Catches already-scaffolded-wrong boxes + any future regression.
+ *
+ * NOTE: this is an unconditional class assertion — a deliberate operator that
+ * pins `paths.logDir` under the config root (e.g. `~/.config/metafactory/cortex/
+ * logs`) is UNSUPPORTED and will flag here; state classes belong under the state
+ * root, and the gate does not carve out a hand-pinned exception.
+ */
+function scanConfigRootMisplacement() {
+  const cortexConfig = join(xdgConfigHomeDir(), "metafactory", "cortex");
+  for (const name of ["logs", "state", "relay", "network-cache"]) {
+    const p = join(cortexConfig, name);
+    if (!existsSync(p)) continue;
+    pushMachine({
+      domain: "machine", pattern: "config-root-state-misplacement", clazz: "state", wave: 5, issue: "cortex#2030/#2033",
+      location: p.replace(HOME, "~"),
+      excerpt: `state-class '${name}' under CONFIG root — belongs in ~/.local/state/metafactory/cortex (#2030 bug shape)`,
+    });
+  }
+}
+
+/**
+ * (2) State-tree coherence of the canonical STATE root:
+ *
+ *   • canonical root EXISTS but the completion marker does NOT → partial/stray
+ *     canonical (the "wedge" class): a bare/half-migrated canonical dir that the
+ *     resolvers must NOT prefer, and which shouldn't exist without a completed,
+ *     marker-writing migration. SKIPPED under an explicit `$CORTEX_STATE_DIR`:
+ *     an override box resolves canonical by rule 1 (the override IS the root,
+ *     VERBATIM), never runs the gated migration, and so never writes the marker
+ *     — "canonical without marker" is the NORMAL steady state there, not a wedge.
+ *
+ *   • split identity: the state migration is COPY-KEEP-SOURCE (the legacy prune
+ *     is the separate #1904 job), so a healthy migrated box legitimately keeps
+ *     DEAD `*.pid` copies at the legacy dir alongside the marker. Gate ONLY a
+ *     genuinely split identity — a LEGACY pidfile whose pid is ALIVE and is NOT
+ *     the pid the box tracks canonically — OR one we cannot prove dead
+ *     (unreadable / unparseable → fail-safe PRESENT, mirroring
+ *     `migrate-state-dir.ts`'s `stateDirOccupancyCheck`). A dead legacy copy is
+ *     the kept migration source (#1904 cleanup), never a finding.
+ *
+ * Both honor `$CORTEX_STATE_DIR` / `$XDG_STATE_HOME` via the state-path seam.
+ */
+function scanStateTreeCoherence() {
+  const migrated = stateMigrationCompleted(HOME);
+
+  // (2a) stray/partial canonical — genuine only for a NON-override box (an
+  // override box legitimately has no marker; see doc above).
+  if (cortexStateDirOverride() === undefined) {
+    const canonical = cortexStateDir(HOME);
+    if (existsSync(canonical) && !migrated) {
+      pushMachine({
+        domain: "machine", pattern: "canonical-state-without-marker", clazz: "state", wave: 5, issue: "cortex#1903/#2033",
+        location: canonical.replace(HOME, "~"),
+        excerpt: `canonical state root exists WITHOUT completion marker ${STATE_MIGRATION_JOURNAL_NAME} (partial/stray — wedge class)`,
+      });
+    }
+  }
+
+  // (2b) split identity — liveness-aware. Only fires post-migration (marker set).
+  if (!migrated) return;
+  const legacy = legacyPidStateDir(HOME);
+  if (!existsSync(legacy)) return;
+  const flagSplit = (where: string, why: string) => pushMachine({
+    domain: "machine", pattern: "split-identity-legacy-pidfile", clazz: "state", wave: 5, issue: "cortex#1903/#2033",
+    location: where.replace(HOME, "~"), excerpt: why,
+  });
+
+  let names: string[];
+  try { names = readdirSync(legacy); }
+  catch {
+    // present-but-unreadable legacy dir hides an unknown pidfile set — fail-safe
+    // gate (cannot prove there is no live split identity).
+    flagSplit(join(legacy, "*.pid"), "legacy state dir unreadable — cannot prove no live split identity");
+    return;
+  }
+  const canonicalPids = readPidSet(canonicalPidStateDir(HOME));
+  for (const name of names) {
+    if (!name.endsWith(".pid")) continue;
+    const p = join(legacy, name);
+    let text: string;
+    try { text = readFileSync(p, "utf8"); }
+    catch { flagSplit(p, "legacy pidfile unreadable — cannot prove dead (fail-safe gate)"); continue; }
+    const pid = parseInt(text.trim(), 10);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      flagSplit(p, `unparseable pid "${text.trim().slice(0, 24)}" — cannot prove dead (fail-safe gate)`);
+      continue;
+    }
+    if (!procAlive(pid)) continue;              // dead copy = the kept migration source (#1904 prunes it)
+    if (canonicalPids.has(pid)) continue;       // same live daemon also tracked canonically → coherent
+    flagSplit(p, `pid ${pid} ALIVE and ≠ canonical pid (split identity)`);
   }
 }
 
@@ -458,6 +626,7 @@ if (DO_MACHINE) {
   for (const d of ["skills", "bin", "agents", "commands", "hooks"]) scanSymlinks(join(HOME, ".claude", d), 5, "arc#287");
   scanPlists(); scanSettingsHooks(); scanPackagesDb(); scanWalSidecars();
   scanOccupiedDestinations(); scanTreeDivergence(); scanPidfiles();
+  scanConfigRootMisplacement(); scanStateTreeCoherence();
 }
 
 // ------------------------------------------------------------------ report
