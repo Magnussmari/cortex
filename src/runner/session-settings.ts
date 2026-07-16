@@ -95,9 +95,21 @@
  * See {@link scopeSessionEnv}.
  */
 
-import { mkdtempSync, writeFileSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  cpSync,
+  chmodSync,
+  lstatSync,
+  readdirSync,
+  existsSync,
+  readFileSync,
+  rmSync,
+} from "fs";
+import { tmpdir, homedir } from "os";
+import { join, basename } from "path";
+import { parse as parseYaml } from "yaml";
 
 /**
  * The setting sources cortex bot sessions load: NONE. Deliberately empty.
@@ -179,6 +191,201 @@ export const CORTEX_SKILL_GRANTS_ENV = "CORTEX_SKILL_GRANTS";
  * — exactly the {@link CORTEX_SKILL_GRANTS_ENV} pattern.
  */
 export const CORTEX_MCP_GRANTS_ENV = "CORTEX_MCP_GRANTS";
+
+/**
+ * Name of the Claude Code plugin cortex materialises to carry a session's
+ * granted skills (cortex#990 A1). Fixed string — the plugin is per-session
+ * and single-purpose, so its name never varies. The `/`-prefixed skill
+ * invocation the model sees is namespaced under it (`/cortex-granted:<skill>`).
+ */
+export const CORTEX_GRANTED_PLUGIN_NAME = "cortex-granted";
+
+/**
+ * Default source dir for granted skills: `~/.claude/skills`. Used when the
+ * deployment declared no `configHome` for the claude-code substrate (#2132).
+ * The caller (cc-session.ts) overrides this with `<configHome>/skills` when a
+ * config home IS declared, so grants resolve against the SAME home the child
+ * session authenticates and loads config from.
+ */
+export const DEFAULT_SKILL_SOURCE_DIR = join(homedir(), ".claude", "skills");
+
+/**
+ * Cortex's version string for the materialised plugin's `plugin.json`, read
+ * from the repo-root `arc-manifest.yaml` (the same source `getVersion` in
+ * cortex.ts uses) with a `"0.0.0"` fallback. Cosmetic for `claude plugin
+ * validate` — any non-empty string validates — but we carry the real version
+ * so a materialised plugin is self-describing. Computed lazily and cached so
+ * module load stays free of filesystem work.
+ */
+let cachedCortexVersion: string | undefined;
+function cortexPluginVersion(): string {
+  if (cachedCortexVersion !== undefined) return cachedCortexVersion;
+  try {
+    const manifestPath = join(import.meta.dir, "..", "..", "arc-manifest.yaml");
+    const manifest = parseYaml(readFileSync(manifestPath, "utf-8")) as { version?: string };
+    cachedCortexVersion = manifest.version ?? "0.0.0";
+  } catch {
+    cachedCortexVersion = "0.0.0";
+  }
+  return cachedCortexVersion;
+}
+
+/**
+ * Materialise the granted skills as a Claude Code **plugin** inside `dir`
+ * (cortex#990 A1). Layout, matching the validated spike:
+ *
+ *   plugin/
+ *   ├── .claude-plugin/plugin.json   ← {name, version, description}
+ *   └── skills/<grant>/              ← a read-only COPY per granted skill
+ *
+ * Each grant is COPIED (not symlinked) from `<skillSourceDir>/<grant>`. The
+ * copy is the fix for the review's MAJOR 1: a symlinked source dir let a
+ * Bash-holding session write THROUGH the link and poison the shared skill
+ * source; copying severs that link. All grants land in ONE `skills/` dir, so a
+ * skill's sibling-relative reference (e.g. `../gws-shared/SKILL.md`) still
+ * resolves. Files are set 0444 / dirs 0555 as defence-in-depth (a same-uid
+ * session can chmod its own throwaway copy back — accepted residual; the
+ * shared source is already out of reach because the link is gone).
+ *
+ * Grant names are validated BEFORE any path use (review MAJOR 2): anything
+ * that isn't a bare basename (`../secrets`, `..`, `.`, empty) is logged and
+ * skipped — a crafted grant can neither escape `skills/` nor abort session
+ * construction. Each copy is wrapped in try/catch for the same reason: any
+ * failure (e.g. a pre-existing name) is logged and skipped, never thrown.
+ *
+ * Returns the plugin dir only when ≥1 skill actually materialised; when every
+ * grant was invalid/missing/failed it removes the empty plugin dir and returns
+ * `undefined` (review MINOR — no `--plugin-dir` for a zero-skill plugin). The
+ * caller appends `--plugin-dir <pluginDir>` to the session args; `cleanup()`
+ * removes the whole temp tree (the copies, never the sources).
+ */
+function materialiseGrantedPlugin(
+  dir: string,
+  skillGrants: readonly string[],
+  skillSourceDir: string,
+): string | undefined {
+  if (skillGrants.length === 0) return undefined;
+
+  const pluginDir = join(dir, "plugin");
+  const skillsDir = join(pluginDir, "skills");
+  mkdirSync(join(pluginDir, ".claude-plugin"), { recursive: true });
+  mkdirSync(skillsDir, { recursive: true });
+  writeFileSync(
+    join(pluginDir, ".claude-plugin", "plugin.json"),
+    JSON.stringify(
+      {
+        name: CORTEX_GRANTED_PLUGIN_NAME,
+        version: cortexPluginVersion(),
+        description: "cortex per-session granted skills",
+      },
+      null,
+      2,
+    ),
+  );
+
+  let materialised = 0;
+  for (const grant of skillGrants) {
+    // Reject unsafe grant names BEFORE building any path (review MAJOR 2). A
+    // bare character class like /^[\w.-]+$/ is NOT enough — `..` matches it —
+    // so require the name to equal its own basename AND exclude the dot names
+    // and the empty string explicitly.
+    if (
+      grant.length === 0 ||
+      grant === "." ||
+      grant === ".." ||
+      basename(grant) !== grant
+    ) {
+      process.stderr.write(`cortex: skill grant '${grant}' invalid — skipped\n`);
+      continue;
+    }
+
+    const target = join(skillSourceDir, grant);
+    if (!existsSync(target)) {
+      process.stderr.write(
+        `cortex: skill grant '${grant}' not found under ${skillSourceDir} — skipped\n`,
+      );
+      continue;
+    }
+
+    try {
+      const dest = join(skillsDir, grant);
+      // Recursive COPY (not symlink) severs the write path back to the shared
+      // source. `dereference: true` is LOAD-BEARING, not cosmetic: an installed
+      // skill dir is itself typically a symlink (e.g. ~/.claude/skills/gws-drive
+      // → ~/.soma/skills/gws-drive), and a non-dereferencing copy would just
+      // recreate that symlink — leaving the write-through-to-source hole open.
+      // Dereferencing materialises real files, fully severing the link. Then
+      // lock it down read-only as defence-in-depth.
+      //
+      // Trust note: dereference also copies a skill's OWN inner symlink targets
+      // into the plugin — transitive trust of the granted skill's content. Safe
+      // at same-uid (the session could already read those targets directly);
+      // REVISIT if cortex ever runs sessions at lower fs privilege than the
+      // daemon, where a skill's symlink could pull in bytes the session may not
+      // otherwise read.
+      cpSync(target, dest, { recursive: true, dereference: true });
+      chmodTreeReadOnly(dest);
+      materialised++;
+    } catch (err) {
+      // Never let a crafted/racy grant abort session construction.
+      process.stderr.write(
+        `cortex: skill grant '${grant}' — materialise failed, skipped: ${
+          err instanceof Error ? err.message : String(err)
+        }\n`,
+      );
+    }
+  }
+
+  if (materialised === 0) {
+    // Every grant was invalid/missing/failed — don't advertise an empty plugin.
+    rmSync(pluginDir, { recursive: true, force: true });
+    return undefined;
+  }
+  return pluginDir;
+}
+
+/**
+ * Recursively set a materialised skill tree read-only: files 0444, dirs 0555.
+ * Defence-in-depth over the copy (cortex#990 A1, review MAJOR 1). Symlinks
+ * inside a skill are left untouched (chmod would follow to a target outside the
+ * copy); they are removed with the tree at cleanup regardless. 0555 keeps dirs
+ * traversable/readable, so this and a later read both still work.
+ */
+function chmodTreeReadOnly(path: string): void {
+  const st = lstatSync(path);
+  if (st.isSymbolicLink()) return;
+  if (st.isDirectory()) {
+    for (const entry of readdirSync(path)) chmodTreeReadOnly(join(path, entry));
+    chmodSync(path, 0o555);
+  } else {
+    chmodSync(path, 0o444);
+  }
+}
+
+/**
+ * Restore writable permissions across a tree so `rmSync` can remove it. The
+ * read-only skill copies (0444 files under 0555 dirs) block removal — a
+ * read-only DIRECTORY can't have its entries unlinked. Chmod each dir writable
+ * BEFORE descending (0700 keeps it traversable), same-uid so always permitted.
+ * Best-effort per node; the caller still force-removes afterwards.
+ */
+function restoreWritableTree(path: string): void {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink()) return;
+  if (st.isDirectory()) {
+    try {
+      chmodSync(path, 0o700);
+    } catch {
+      /* best-effort */
+    }
+    for (const entry of readdirSync(path)) restoreWritableTree(join(path, entry));
+  }
+}
 
 /**
  * Build the curated settings object cortex spawns bot sessions under.
@@ -281,11 +488,21 @@ export interface IsolatedSettings {
   settingsPath: string;
   /**
    * CLI args to append: `--setting-sources "" --settings <path>` (empty
-   * source list ⇒ load no ambient source; only the curated file). Order
-   * matters only in that both must precede `-p <prompt>` (handled by
-   * buildClaudeArgs putting the prompt last).
+   * source list ⇒ load no ambient source; only the curated file). When the
+   * session is granted skills, ALSO carries `--plugin-dir <pluginDir>` (the
+   * materialised granted-skills plugin, cortex#990 A1). Order matters only in
+   * that all must precede `-p <prompt>` (handled by buildClaudeArgs putting
+   * the prompt last).
    */
   args: string[];
+  /**
+   * Absolute path to the materialised granted-skills plugin dir, or
+   * `undefined` when the session was granted no skills (or every grant was
+   * invalid/missing/failed). Exposed so callers/tests can locate it (e.g. to
+   * run `claude plugin validate`); it lives INSIDE the temp dir, so `cleanup()`
+   * removes it.
+   */
+  pluginDir?: string;
   /** Remove the temp dir. Safe to call multiple times. */
   cleanup: () => void;
 }
@@ -306,11 +523,17 @@ export interface IsolatedSettings {
  *   `[]`) → the curated file registers the MCP Guard PreToolUse hook and the
  *   caller must set the {@link CORTEX_MCP_GRANTS_ENV} env var. Undefined →
  *   no MCP hook (non-policy path, behaviour unchanged).
+ * @param skillSourceDir Dir the granted skills are symlinked FROM (cortex#990
+ *   A1). Defaults to {@link DEFAULT_SKILL_SOURCE_DIR} (`~/.claude/skills`); the
+ *   caller passes `<configHome>/skills` when the deployment relocated the
+ *   claude-code config home (#2132). Only consulted when `skillGrants` is
+ *   non-empty.
  */
 export function createIsolatedSettings(
   claudeDir: string,
   skillGrants?: readonly string[],
   mcpGrants?: readonly string[],
+  skillSourceDir: string = DEFAULT_SKILL_SOURCE_DIR,
 ): IsolatedSettings {
   const dir = mkdtempSync(join(tmpdir(), "cortex-session-"));
   const settingsPath = join(dir, "settings.json");
@@ -322,27 +545,51 @@ export function createIsolatedSettings(
     },
   );
 
+  const args = [
+    "--setting-sources",
+    CORTEX_SETTING_SOURCES.join(","),
+    "--settings",
+    settingsPath,
+  ];
+
+  // cortex#990 A1 — when the session is granted skills, materialise them as a
+  // --plugin-dir plugin ALONGSIDE the curated settings (the isolation posture,
+  // empty --setting-sources included, is untouched). Empty/undefined grants →
+  // no plugin, no extra arg → byte-identical to the pre-#990 behaviour.
+  const pluginDir =
+    skillGrants !== undefined && skillGrants.length > 0
+      ? materialiseGrantedPlugin(dir, skillGrants, skillSourceDir)
+      : undefined;
+  if (pluginDir !== undefined) {
+    args.push("--plugin-dir", pluginDir);
+  }
+
   return {
     settingsPath,
-    args: [
-      "--setting-sources",
-      CORTEX_SETTING_SOURCES.join(","),
-      "--settings",
-      settingsPath,
-    ],
+    args,
+    pluginDir,
     cleanup: () => {
       try {
         rmSync(dir, { recursive: true, force: true });
-      } catch (err) {
-        // Best-effort cleanup of an OS temp dir. A leftover dir is inert
-        // (mode 0600, no secrets — only hook paths) and the OS reclaims
-        // tmp eventually; log rather than throw so session teardown can't
-        // fail on a transient fs error.
-        process.stderr.write(
-          `session-settings: temp cleanup failed for ${dir}: ${
-            err instanceof Error ? err.message : String(err)
-          }\n`,
-        );
+      } catch {
+        // The granted-skills copies are materialised read-only (0444 files
+        // under 0555 dirs), and a read-only DIRECTORY blocks removal of its
+        // entries. Restore writable perms (same-uid, always permitted) and
+        // retry once before giving up.
+        try {
+          restoreWritableTree(dir);
+          rmSync(dir, { recursive: true, force: true });
+        } catch (err) {
+          // Best-effort cleanup of an OS temp dir. A leftover dir is inert
+          // (no secrets — only hook paths + read-only skill copies) and the OS
+          // reclaims tmp eventually; log rather than throw so session teardown
+          // can't fail on a transient fs error.
+          process.stderr.write(
+            `session-settings: temp cleanup failed for ${dir}: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          );
+        }
       }
     },
   };
