@@ -110,6 +110,13 @@ import {
 import { tmpdir, homedir } from "os";
 import { join, basename } from "path";
 import { parse as parseYaml } from "yaml";
+import {
+  isAllowedAgentEnvKey,
+  isReservedRefSource,
+  ALLOWED_AGENT_ENV_KEYS,
+  AGENT_ENV_KEY_PATTERN,
+} from "../common/config/agent-env";
+import { SECRET_REF_PATTERN } from "../common/inference/secret-ref";
 
 /**
  * The setting sources cortex bot sessions load: NONE. Deliberately empty.
@@ -620,4 +627,123 @@ export function scopeSessionEnv(
     scoped[key] = value;
   }
   return scoped;
+}
+
+/**
+ * cortex#2133 (epic #2164, TRUST-PATH) — resolve an agent's declarative `env:`
+ * passthrough map ({@link AgentEnvSchema}) into the concrete `NAME → value`
+ * pairs to layer onto a CC session's child env.
+ *
+ * The caller (`cc-session.ts`) merges the result onto the scoped base env
+ * BEFORE `buildSessionEnv` layers cortex's own `CORTEX_*`/config-home/grant
+ * vars — so a declared var can never shadow cortex's pipeline vars, and (with
+ * the deny below) can never touch the `CLAUDE_*` namespace `scopeSessionEnv`
+ * guards.
+ *
+ * Four responsibilities, all security-relevant:
+ *
+ *   1. **Re-assert the ALLOWLIST on the DESTINATION KEY (defence-in-depth).**
+ *      The config schema already rejects any non-allowlisted key at load
+ *      ({@link isAllowedAgentEnvKey} in `common/config/agent-env.ts`, the SHARED
+ *      predicate — deny-by-default; only {@link ALLOWED_AGENT_ENV_KEYS} pass),
+ *      but we DROP anything not allowed here too so NO path — a test, a future
+ *      direct caller, a schema regression — can layer an unblessed var onto a
+ *      child session. Dropping (not throwing) is the fail-closed choice: the var
+ *      simply never gets set, isolation holds regardless of how the map arrived,
+ *      and a crafted map cannot DoS the session. Each drop is logged. This is
+ *      the destination side of the two-shape design (see agent-env.ts module
+ *      doc): allowlist what we SET.
+ *
+ *   2. **Prefix-deny the `env:` REF SOURCE NAME (MINOR-3).** A benign,
+ *      allowlisted destination key whose value is `env:GUARDED_NAME` would
+ *      otherwise re-surface a guarded daemon var's VALUE under a clean name —
+ *      e.g. `GDRIVE_TOKEN: "env:CLAUDE_CODE_OAUTH_TOKEN"` exfiltrates the OAuth
+ *      token. The ref source is a READ FROM the daemon env (not a set), so its
+ *      guard is a PREFIX DENY on the cortex/substrate control namespaces
+ *      ({@link isReservedRefSource} — CLAUDE_/ANTHROPIC_/CORTEX_/GROVE_), NOT the
+ *      destination allowlist: we are protecting a bounded set of guarded daemon
+ *      vars from re-surfacing, not deciding which arbitrary daemon var is a
+ *      legitimate credential source. Two sides, two shapes — deliberate. The
+ *      stderr line names the key and the ref NAME only — NEVER the resolved value
+ *      — preserving the module's no-value-logging property.
+ *
+ *   3. **Re-assert the KEY GRAMMAR at runtime (MINOR-4).** We re-check the
+ *      destination key against {@link AGENT_ENV_KEY_PATTERN} (the ASCII-anchored
+ *      POSIX-identifier grammar the schema enforces at load) so a non-schema
+ *      caller (a future direct caller, a test) cannot slip a whitespace/`=`/dash-
+ *      mangled key like `" CLAUDE_X"` — whose leading space would dodge the
+ *      prefix check — past the runtime layer. A key that fails the pattern is
+ *      dropped and logged.
+ *
+ *   4. **Resolve secret references at call time.** A value of the form
+ *      `env:NAME` ({@link SECRET_REF_PATTERN}) is a SECRET REFERENCE, read from
+ *      `parentEnv` here (the daemon env) and never stored in config; anything
+ *      else is a literal (e.g. a credential PATH) and passes through verbatim.
+ *      An unresolved reference (unset/empty daemon var) is SKIPPED with a loud
+ *      stderr line rather than throwing — the session still runs and the
+ *      dependent skill surfaces its own "credential missing" error, instead of
+ *      one bad ref taking down the whole dispatch.
+ *
+ * @param agentEnv The agent's declared passthrough map, or `undefined`/absent
+ *   (⇒ `{}`, byte-identical to the pre-#2133 session env).
+ * @param parentEnv The daemon env to resolve `env:NAME` references against.
+ *   Injectable for testing; defaults to `process.env`.
+ */
+export function resolveAgentEnv(
+  agentEnv: Record<string, string> | undefined,
+  parentEnv: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const resolved: Record<string, string> = {};
+  if (agentEnv === undefined) return resolved;
+  for (const [key, rawValue] of Object.entries(agentEnv)) {
+    // Responsibility (3): re-assert the ASCII key grammar at runtime, so a
+    // non-schema caller can't slip a mangled key (e.g. `" CLAUDE_X"` whose
+    // leading space would dodge the prefix check below) past this layer.
+    if (!AGENT_ENV_KEY_PATTERN.test(key)) {
+      process.stderr.write(
+        `session-settings: agent env key '${key}' dropped — not a POSIX identifier (cortex#2133 runtime key-grammar re-check)\n`,
+      );
+      continue;
+    }
+    if (!isAllowedAgentEnvKey(key)) {
+      // Responsibility (1). Deny-by-default: only exact, case-sensitive
+      // ALLOWED_AGENT_ENV_KEYS names may be set from this map. Anything else —
+      // the open-ended session-hijack classes a denylist could never fully
+      // enumerate — is dropped (cortex#2133 / epic #2164 allowlist inversion).
+      process.stderr.write(
+        `session-settings: agent env key '${key}' dropped — per-agent env is deny-by-default (allowlist); only [${ALLOWED_AGENT_ENV_KEYS.join(", ")}] are permitted (cortex#2133/#2164)\n`,
+      );
+      continue;
+    }
+    const refMatch = SECRET_REF_PATTERN.exec(rawValue);
+    if (refMatch?.[1] !== undefined) {
+      const refEnvVar = refMatch[1];
+      // Responsibility (2): deny the REF SOURCE name too. A benign key must not
+      // re-surface a denied daemon var's VALUE under a clean name
+      // (e.g. `GDRIVE_TOKEN: "env:CLAUDE_CODE_OAUTH_TOKEN"`). Log the key + ref
+      // NAME only — never the value (preserve the no-value-logging property).
+      if (isReservedRefSource(refEnvVar)) {
+        process.stderr.write(
+          `session-settings: agent env '${key}' → secret reference env:${refEnvVar} dropped — ` +
+            `the referenced var is in a reserved prefix (CLAUDE_/ANTHROPIC_/CORTEX_/GROVE_); ` +
+            `a passthrough may not re-surface a guarded daemon var's value (cortex#2133)\n`,
+        );
+        continue;
+      }
+      const secretVal = parentEnv[refEnvVar];
+      if (secretVal === undefined || secretVal.trim() === "") {
+        // See responsibility (2): skip an unresolved ref, don't throw.
+        process.stderr.write(
+          `session-settings: agent env '${key}' → secret reference env:${refEnvVar} ` +
+            `could not be resolved (unset/empty) — variable not set for this session\n`,
+        );
+        continue;
+      }
+      resolved[key] = secretVal;
+    } else {
+      // A literal (e.g. a credential path). Passes through verbatim.
+      resolved[key] = rawValue;
+    }
+  }
+  return resolved;
 }
