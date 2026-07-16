@@ -7,6 +7,7 @@
 
 import type { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
+import { configHomeSpawnEnv } from "../../../common/substrates/config-home";
 import type { SessionEndpoint, ManagedProcess } from "./types";
 import type { StreamJsonContentBlock } from "./stream-json";
 import { NotControllable, SessionConflict, SessionClosed } from "./types";
@@ -48,12 +49,24 @@ export function resolveSessionEndpoint(
  */
 export type SpawnFn = (args: string[]) => Subprocess;
 
-const defaultSpawn: SpawnFn = (args) =>
-  Bun.spawn(args, {
+const defaultSpawn: SpawnFn = (args) => {
+  // One of the two places cortex spawns `claude` (the other is
+  // runner/cc-session.ts). Both must export the deployment's configured config
+  // home, or the child authenticates against the vendor-default credential,
+  // which refreshes independently of the principal's and expires. `env` is
+  // omitted when nothing is declared → plain inherit (the pre-existing
+  // behaviour). The decision itself lives in — and is unit-tested at —
+  // common/substrates/config-home.ts, because THIS wrapper is an injection-seam
+  // default that every test replaces, so logic placed here would never run
+  // under CI.
+  const env = configHomeSpawnEnv("claude-code");
+  return Bun.spawn(args, {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
+    ...(env && { env }),
   });
+};
 
 /**
  * Spawn a new controlled CC session for an assignment.

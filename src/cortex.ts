@@ -105,6 +105,7 @@ import { GateReplyRouter } from "./bus/gate-reply-router";
 import { DaemonBrainHost } from "./brain/daemon-brain-host";
 import { wireDevConsumers } from "./runner/dev-consumer-boot";
 import { wireReviewConsumers } from "./runner/review-consumer-boot";
+import { setActiveSubstrates, activeConfigHomeEnv } from "./common/substrates/config-home";
 import { wireBrainConsumers } from "./runner/brain-consumer-boot";
 import { wireReleaseConsumers } from "./runner/release-consumer-boot";
 import { wireSurfaceAdapters } from "./runner/surface-adapter-boot";
@@ -904,11 +905,25 @@ export async function startCortex(
     : DEFAULT_CONFIG;
 
   const configDir = dirname(expandedConfigPath);
+  // Publish the deployment `substrates:` block process-wide so EVERY claude-code
+  // session this daemon spawns (dispatch, dev-loop, review, agent-team) resolves
+  // against the declared config home (cc-session reads it at spawn). Set-once at
+  // boot; refreshed on config reload below. See common/substrates/config-home.ts.
+  setActiveSubstrates(config.substrates);
   const securityPreamble = buildSecurityPreamble(config, expandedConfigPath);
   console.log("cortex: starting...");
   console.log(`  Agent: ${config.agent.displayName}`);
   console.log(`  Config: ${options.configPath ?? "(in-memory)"}`);
   console.log(`  PID: ${process.pid}`);
+  // Make the config home VISIBLE at boot. Sessions fall back to the vendor
+  // default silently when no `substrates.claude-code.configHome` is declared —
+  // which is a legitimate default, but indistinguishable at runtime from a
+  // misconfiguration. Logging it once turns a silent fallback into an
+  // observable fact the principal can check against intent.
+  const bootConfigHome = activeConfigHomeEnv("claude-code");
+  console.log(
+    `  Claude config home: ${bootConfigHome?.value ?? "(vendor default — no substrates.claude-code.configHome)"}`,
+  );
 
   // cortex#427 — resolve the canonical principal id ONCE at boot. Every
   // subsequent `{principal}` segment (NATS subjects, `signed_by` chains,
@@ -4037,6 +4052,21 @@ export async function startCortex(
     && existsSync(expandedConfigPath)
   ) {
     configWatcher = new ConfigWatcher(expandedConfigPath, config, (event) => {
+      // Keep the process-wide config-home current on hot reload (a `substrates:`
+      // edit takes effect for subsequently-spawned sessions without a restart),
+      // and re-log on CHANGE. Without the re-log the boot line goes stale-but-
+      // confident: deleting `substrates:` and reloading silently reverts every
+      // later session to the vendor default while the one line the principal can
+      // check still reports the old home. A confidently wrong log is worse than
+      // no log.
+      const homeBeforeReload = activeConfigHomeEnv("claude-code")?.value;
+      setActiveSubstrates(event.config.substrates);
+      const homeAfterReload = activeConfigHomeEnv("claude-code")?.value;
+      if (homeBeforeReload !== homeAfterReload) {
+        console.log(
+          `cortex: Claude config home changed on reload → ${homeAfterReload ?? "(vendor default — no substrates.claude-code.configHome)"}`,
+        );
+      }
       dispatchHandler.updateConfig(event.config, expandedConfigPath);
       for (const adapter of adapters) adapter.updateConfig?.(event.config);
       if (cloudPublisher) {

@@ -16,6 +16,7 @@ import {
   CORTEX_MCP_GRANTS_ENV,
   type IsolatedSettings,
 } from "./session-settings";
+import { activeConfigHomeEnv } from "../common/substrates/config-home";
 
 // Re-export for convenience
 export type { UsageStats, StreamEvent };
@@ -110,6 +111,16 @@ export interface CCSessionOpts {
    * settings; that principal holds the implicit full grant anyway.
    */
   mcpGrants?: string[];
+  /**
+   * The substrate's config-home env var to export on the child, resolved by the
+   * dispatch layer from the deployment `substrates:` block (claude-code →
+   * `{ name: "CLAUDE_CONFIG_DIR", value: <home> }`). Set on the child env AFTER
+   * `scopeSessionEnv`, so isolation stays strict default-deny while the config
+   * home is still an intentional, named export (not an inherited passthrough).
+   * Undefined = use the substrate's default home. See
+   * common/substrates/config-home.ts.
+   */
+  configHomeEnv?: { name: string; value: string };
 }
 
 export interface CCSessionResult {
@@ -158,7 +169,11 @@ export interface CCSessionResult {
  * `principal-env.ts`) so external setters still on `GROVE_*` keep resolving
  * during the transition.
  *
- * Pure function: does not mutate `baseEnv`. Extracted from `start()` so the
+ * Does not mutate `baseEnv` — but NOT referentially transparent: it reads the
+ * process-wide config home (`activeConfigHomeEnv`) published at daemon boot, so
+ * the same inputs yield a different `CLAUDE_CONFIG_DIR` across deployments.
+ * Tests that care must set it explicitly (`setActiveSubstrates`) or pass
+ * `opts.configHomeEnv`. Extracted from `start()` so the
  * spawned env is unit-testable without invoking the `claude` binary.
  */
 export function buildSessionEnv(
@@ -173,8 +188,22 @@ export function buildSessionEnv(
     | "entity"
     | "principal"
     | "parentSessionId"
+    | "configHomeEnv"
   >,
 ): Record<string, string> {
+  // The substrate's config-home var (claude-code → CLAUDE_CONFIG_DIR): explicit
+  // `opts.configHomeEnv` override, else the process-wide `substrates:` block
+  // published at daemon boot. Applied HERE — `baseEnv` is post-`scopeSessionEnv`
+  // — so it survives isolation's CLAUDE_* strip WITHOUT widening the env
+  // allowlist, while staying a pure/testable transform rather than a mutation
+  // buried in `start()`. Without it a child authenticates on the vendor-default
+  // credential, which refreshes independently of the principal's and expires.
+  //
+  // Honest boundary: relocating a config HOME also relocates its `.claude.json`
+  // MCP servers — isolation is strict at the ENV-allowlist layer, but
+  // `--setting-sources ""` does not gate config-dir MCP config. That is inherent
+  // to any config home (default or otherwise), not introduced here.
+  const configHomeEnv = opts.configHomeEnv ?? activeConfigHomeEnv("claude-code");
   return {
     ...baseEnv,
     ...(opts.channel && { CORTEX_CHANNEL: opts.channel }),
@@ -187,6 +216,7 @@ export function buildSessionEnv(
     // ST-P1 (cortex#964) — child-session linkage. The spawned child's
     // EventLogger reads CORTEX_PARENT_SESSION_ID to parent its events.
     ...(opts.parentSessionId && { CORTEX_PARENT_SESSION_ID: opts.parentSessionId }),
+    ...(configHomeEnv && { [configHomeEnv.name]: configHomeEnv.value }),
   };
 }
 
