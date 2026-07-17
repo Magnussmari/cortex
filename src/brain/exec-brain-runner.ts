@@ -28,6 +28,9 @@
  *        - `post`          → `hooks.onPost`
  *        - `ask_principal` → `hooks.onAskPrincipal` → answer `gate_verdict`
  *        - `dispatch`      → `hooks.onDispatch`; may reject → `effect_rejected`
+ *        - `create_private_thread` → ALWAYS refused `effect_rejected` (this
+ *          lifecycle has no live surface-adapter binding; cortex#2206 is
+ *          daemon-lifecycle only — see `daemon-brain-host.ts`)
  *        - `log`           → `hooks.onLog`
  *        - `result`        → terminal; resolve.
  *   5. task_id correlation: any effect whose `task_id` ≠ the spawned task's id
@@ -572,6 +575,19 @@ export function makeExecBrainRunner(
               }),
             );
           }
+          return;
+        }
+        case "create_private_thread": {
+          // cortex#2206 — this capability is DAEMON-lifecycle only: it needs
+          // a live surface-adapter binding + a supervising host's rate
+          // limiter/timeout-pause machinery, none of which the per-task
+          // (B-1) runner has (this is a fresh spawn-per-task process with no
+          // standing adapter connection). Refuse rather than silently no-op.
+          await rejectEffect(
+            "create_private_thread",
+            "create_private_thread is not supported by the per-task (lifecycle: per-task) " +
+              "exec-brain runner — only daemon-lifecycle brains may open private threads (cortex#2206)",
+          );
           return;
         }
         case "result":

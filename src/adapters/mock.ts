@@ -12,6 +12,7 @@ import type {
   ResponseTarget,
   OutboundFile,
   ContextMessage,
+  CreatePrivateThreadResult,
 } from "./types";
 import type { Envelope } from "../bus/myelin/envelope-validator";
 import type { SurfaceAdapter } from "../bus/surface-router";
@@ -35,6 +36,15 @@ export class MockAdapter implements PlatformAdapter {
   progressCleared: ResponseTarget[] = [];
   /** Recorded createThread calls */
   threadsCreated: { msg: InboundMessage; name: string }[] = [];
+  /** cortex#2206 — recorded createPrivateThread calls */
+  privateThreadsCreated: { channelId: string; name: string; memberIds: string[] }[] = [];
+  /**
+   * cortex#2206 — configurable return for `createPrivateThread`. Defaults to
+   * `undefined` ⇒ synthesize a deterministic `mock-private-thread-N` success,
+   * mirroring `createThread`'s counter. Tests that need to exercise the
+   * `{ ok: false }` (adapter-failure → `not_now`) path set this explicitly.
+   */
+  createPrivateThreadResult: CreatePrivateThreadResult | undefined = undefined;
   /** cortex#502 — recorded resolveLogicalTarget calls */
   logicalTargetsResolved: { surface: string; channel: string; thread?: string }[] = [];
   /**
@@ -141,6 +151,20 @@ export class MockAdapter implements PlatformAdapter {
       channelId: msg.channelId,
       threadId: `mock-thread-${this.threadCounter}`,
     };
+  }
+
+  /** cortex#2206 — see {@link createPrivateThreadResult} for the configurable-failure seam. */
+  async createPrivateThread(opts: {
+    channelId: string;
+    name: string;
+    memberIds: string[];
+  }): Promise<CreatePrivateThreadResult> {
+    this.privateThreadsCreated.push(opts);
+    if (this.createPrivateThreadResult !== undefined) {
+      return this.createPrivateThreadResult;
+    }
+    this.threadCounter++;
+    return { ok: true, threadId: `mock-private-thread-${this.threadCounter}` };
   }
 
   async notifyPrincipal(text: string): Promise<void> {

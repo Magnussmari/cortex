@@ -21,8 +21,10 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   DaemonBrainHost,
+  CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR,
   type DaemonTransport,
   type DaemonBrainProcess,
+  type CreatePrivateThreadFn,
 } from "../daemon-brain-host";
 import { MAX_TASK_ATTACHMENT_BYTES } from "../attachment-budget";
 import { type TaskEvent, type GateVerdictValue } from "../protocol";
@@ -87,6 +89,27 @@ function makeHooks(over: Partial<BrainTaskHooks> = {}): BrainTaskHooks & {
     onDispatch: over.onDispatch ?? ((d) => void dispatches.push(d)),
     onLog: over.onLog ?? (() => {}),
   };
+}
+
+/**
+ * cortex#2206 — a fake `create_private_thread` I/O seam. Records every call
+ * and, by default, succeeds with a deterministic incrementing thread id.
+ * Tests that need the adapter-failure path override via `result`.
+ */
+function makeThreadFn(
+  result?: (opts: { channelId: string; name: string; memberIds: string[] }) =>
+    | { ok: true; threadId: string }
+    | { ok: false; detail: string },
+): CreatePrivateThreadFn & {
+  calls: { channelId: string; name: string; memberIds: string[] }[];
+} {
+  const calls: { channelId: string; name: string; memberIds: string[] }[] = [];
+  const fn = async (opts: { channelId: string; name: string; memberIds: string[] }) => {
+    calls.push(opts);
+    if (result) return result(opts);
+    return { ok: true as const, threadId: `thread-${calls.length}` };
+  };
+  return Object.assign(fn, { calls });
 }
 
 /** Wait until `cond()` is true (poll), or throw after `timeoutMs`. */
@@ -528,6 +551,419 @@ describe("DaemonBrainHost — attachment budget (§12.5)", () => {
       JSON.stringify({ v: 1, type: "result", task_id: "big", status: "complete" }),
     );
     await runP;
+    await host.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create_private_thread (cortex#2206)
+// ---------------------------------------------------------------------------
+
+describe("DaemonBrainHost — create_private_thread (cortex#2206)", () => {
+  test("members: \"source\" creates a thread on the agent's OWN channel binding, resolves the source user server-side, and answers thread_created", async () => {
+    const brain = new FakeBrain();
+    const { transport } = makeFakeTransport([brain]);
+    const threadFn = makeThreadFn();
+    const host = new DaemonBrainHost({
+      agentId: "escort",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "agent-own-channel",
+      createPrivateThread: threadFn,
+      anonReachable: true,
+    });
+    await host.start();
+
+    const runP = host.runTask(
+      makeTask({
+        task_id: "th1",
+        source: { surface: "discord", channel: "arrivals", thread: "", user: "newcomer-42" },
+      }),
+      makeHooks(),
+    );
+    await until(() => brain.lastTask()?.task_id === "th1");
+
+    brain.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "th1",
+        name: "welcome newcomer-42",
+        members: "source",
+      }),
+    );
+    await until(() => brain.hasEvent("thread_created"));
+
+    // Exactly the intended host call: the agent's OWN channel binding, never
+    // anything the brain could have named, and the member list resolved
+    // server-side from the task's own recorded source user.
+    expect(threadFn.calls).toEqual([
+      { channelId: "agent-own-channel", name: "welcome newcomer-42", memberIds: ["newcomer-42"] },
+    ]);
+
+    const created = brain.received.find((e) => e.type === "thread_created");
+    expect(created).toMatchObject({ type: "thread_created", task_id: "th1", thread_id: "thread-1" });
+
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: "th1", status: "complete" }));
+    await runP;
+    await host.stop();
+  });
+
+  test("an anon-reachable agent requesting an explicit member list is refused effect_rejected/policy_denied — the adapter is NEVER called", async () => {
+    const brain = new FakeBrain();
+    const { transport } = makeFakeTransport([brain]);
+    const threadFn = makeThreadFn();
+    const host = new DaemonBrainHost({
+      agentId: "escort",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "agent-own-channel",
+      createPrivateThread: threadFn,
+      anonReachable: true, // e.g. AgentSchema.openOnboarding: true
+    });
+    await host.start();
+
+    const runP = host.runTask(makeTask({ task_id: "evil" }), makeHooks());
+    await until(() => brain.lastTask()?.task_id === "evil");
+
+    brain.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "evil",
+        name: "definitely not a welcome thread",
+        members: ["some-arbitrary-platform-user-id"],
+      }),
+    );
+    await until(() => brain.hasEvent("effect_rejected"));
+
+    const rej = brain.received.find((e) => e.type === "effect_rejected");
+    expect(rej).toMatchObject({ type: "effect_rejected", effect: "create_private_thread" });
+    if (rej?.type === "effect_rejected") {
+      expect(rej.reason.kind).toBe("policy_denied");
+    }
+    // The load-bearing assertion: the anon-reachable agent's explicit member
+    // list NEVER reached the adapter — the effect was refused before any I/O.
+    expect(threadFn.calls.length).toBe(0);
+    expect(brain.hasEvent("thread_created")).toBe(false);
+
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: "evil", status: "complete" }));
+    await runP;
+    await host.stop();
+  });
+
+  test("a non-anon-reachable (trusted) agent MAY request an explicit member list", async () => {
+    const brain = new FakeBrain();
+    const { transport } = makeFakeTransport([brain]);
+    const threadFn = makeThreadFn();
+    const host = new DaemonBrainHost({
+      agentId: "quest-master",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "quest-board-channel",
+      createPrivateThread: threadFn,
+      anonReachable: false, // explicit opt-out — this agent has no anon path
+    });
+    await host.start();
+
+    const runP = host.runTask(makeTask({ task_id: "quest1" }), makeHooks());
+    await until(() => brain.lastTask()?.task_id === "quest1");
+
+    brain.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "quest1",
+        name: "quest party",
+        members: ["party-member-1", "party-member-2"],
+      }),
+    );
+    await until(() => brain.hasEvent("thread_created"));
+
+    expect(threadFn.calls).toEqual([
+      {
+        channelId: "quest-board-channel",
+        name: "quest party",
+        memberIds: ["party-member-1", "party-member-2"],
+      },
+    ]);
+
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: "quest1", status: "complete" }));
+    await runP;
+    await host.stop();
+  });
+
+  test("the wire effect has no channel field — a brain-supplied `channel` is structurally ignored; the agent's own binding is always used", async () => {
+    const brain = new FakeBrain();
+    const { transport } = makeFakeTransport([brain]);
+    const threadFn = makeThreadFn();
+    const host = new DaemonBrainHost({
+      agentId: "escort",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "the-real-agent-channel",
+      createPrivateThread: threadFn,
+    });
+    await host.start();
+
+    const runP = host.runTask(makeTask({ task_id: "spoof" }), makeHooks());
+    await until(() => brain.lastTask()?.task_id === "spoof");
+
+    // Raw wire line carrying an extra `channel` field — not a schema field at
+    // all (protocol.ts's CreatePrivateThreadEffectSchema has no such key), so
+    // the tolerant-ingest codec strips it before the effect ever reaches the
+    // host's switch. This is the "structurally impossible", not merely
+    // "refused", guarantee the issue calls for.
+    brain.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "spoof",
+        name: "spoofed thread",
+        members: "source",
+        channel: "attacker-chosen-channel",
+      }),
+    );
+    await until(() => brain.hasEvent("thread_created"));
+
+    expect(threadFn.calls.length).toBe(1);
+    expect(threadFn.calls[0]?.channelId).toBe("the-real-agent-channel");
+
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: "spoof", status: "complete" }));
+    await runP;
+    await host.stop();
+  });
+
+  test("no channel binding / no adapter capability configured → effect_rejected cant_do (structural, not policy)", async () => {
+    const brain = new FakeBrain();
+    const { transport } = makeFakeTransport([brain]);
+    const host = new DaemonBrainHost({
+      agentId: "no-thread-capability",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport,
+      makeScratchDir: scratchFactory,
+      // agentChannelId / createPrivateThread both omitted.
+    });
+    await host.start();
+
+    const runP = host.runTask(makeTask({ task_id: "nocap" }), makeHooks());
+    await until(() => brain.lastTask()?.task_id === "nocap");
+
+    brain.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "nocap",
+        name: "will never exist",
+        members: "source",
+      }),
+    );
+    await until(() => brain.hasEvent("effect_rejected"));
+    const rej = brain.received.find((e) => e.type === "effect_rejected");
+    if (rej?.type === "effect_rejected") {
+      expect(rej.reason.kind).toBe("cant_do");
+    }
+
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: "nocap", status: "complete" }));
+    await runP;
+    await host.stop();
+  });
+
+  test("an adapter failure maps to effect_rejected not_now (transient, not the brain's fault)", async () => {
+    const brain = new FakeBrain();
+    const { transport } = makeFakeTransport([brain]);
+    const threadFn = makeThreadFn(() => ({ ok: false, detail: "discord API 503" }));
+    const host = new DaemonBrainHost({
+      agentId: "escort",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "agent-own-channel",
+      createPrivateThread: threadFn,
+    });
+    await host.start();
+
+    const runP = host.runTask(makeTask({ task_id: "fail1" }), makeHooks());
+    await until(() => brain.lastTask()?.task_id === "fail1");
+
+    brain.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "fail1",
+        name: "will fail",
+        members: "source",
+      }),
+    );
+    await until(() => brain.hasEvent("effect_rejected"));
+    const rej = brain.received.find((e) => e.type === "effect_rejected");
+    expect(rej).toMatchObject({ type: "effect_rejected", effect: "create_private_thread" });
+    if (rej?.type === "effect_rejected") {
+      expect(rej.reason.kind).toBe("not_now");
+      expect(rej.reason.detail).toContain("discord API 503");
+    }
+
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: "fail1", status: "complete" }));
+    await runP;
+    await host.stop();
+  });
+
+  test(`rate limit trips at exactly ${CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR}/hour for one agent — the next is refused, a DIFFERENT agent still succeeds`, async () => {
+    let nowMs = 1_000_000;
+    const clock = () => nowMs;
+
+    const brainA = new FakeBrain();
+    const { transport: transportA } = makeFakeTransport([brainA]);
+    const threadFnA = makeThreadFn();
+    const hostA = new DaemonBrainHost({
+      agentId: "agent-a",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport: transportA,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "channel-a",
+      createPrivateThread: threadFnA,
+      now: clock,
+    });
+    await hostA.start();
+
+    const runA = hostA.runTask(makeTask({ task_id: "rl" }), makeHooks());
+    await until(() => brainA.lastTask()?.task_id === "rl");
+
+    // Drive CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR (10) successful calls,
+    // all well within the hour window.
+    for (let i = 0; i < CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR; i++) {
+      nowMs += 1_000; // a few seconds apart — still the same window
+      brainA.emit(
+        JSON.stringify({
+          v: 1,
+          type: "create_private_thread",
+          task_id: "rl",
+          name: `thread-${i}`,
+          members: "source",
+        }),
+      );
+      await until(
+        () => brainA.received.filter((e) => e.type === "thread_created").length === i + 1,
+      );
+    }
+    expect(threadFnA.calls.length).toBe(CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR);
+
+    // The 11th within the SAME window is refused — the budget, not a fluke.
+    nowMs += 1_000;
+    brainA.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "rl",
+        name: "eleventh",
+        members: "source",
+      }),
+    );
+    await until(() => brainA.hasEvent("effect_rejected"));
+    const rej = brainA.received.find((e) => e.type === "effect_rejected");
+    expect(rej).toMatchObject({ type: "effect_rejected", effect: "create_private_thread" });
+    if (rej?.type === "effect_rejected") {
+      expect(rej.reason.kind).toBe("policy_denied");
+      expect(rej.reason.detail).toMatch(/rate|exceeded|limit/i);
+    }
+    // The 11th never reached the adapter.
+    expect(threadFnA.calls.length).toBe(CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR);
+
+    brainA.emit(JSON.stringify({ v: 1, type: "result", task_id: "rl", status: "complete" }));
+    await runA;
+    await hostA.stop();
+
+    // A DIFFERENT agent (its own DaemonBrainHost instance, its own counter)
+    // in the exact same window still succeeds — the budget is per-agent, not
+    // a global ceiling one agent's traffic can exhaust for everyone.
+    const brainB = new FakeBrain();
+    const { transport: transportB } = makeFakeTransport([brainB]);
+    const threadFnB = makeThreadFn();
+    const hostB = new DaemonBrainHost({
+      agentId: "agent-b",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport: transportB,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "channel-b",
+      createPrivateThread: threadFnB,
+      now: clock,
+    });
+    await hostB.start();
+    const runB = hostB.runTask(makeTask({ task_id: "rlb" }), makeHooks());
+    await until(() => brainB.lastTask()?.task_id === "rlb");
+
+    brainB.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "rlb",
+        name: "agent-b's first thread this hour",
+        members: "source",
+      }),
+    );
+    await until(() => brainB.hasEvent("thread_created"));
+    expect(threadFnB.calls.length).toBe(1);
+
+    brainB.emit(JSON.stringify({ v: 1, type: "result", task_id: "rlb", status: "complete" }));
+    await runB;
+    await hostB.stop();
+  });
+
+  test("an open create_private_thread call PAUSES the per-task timeout — no orphan (mirrors the ask_principal gate-pause, cortex#1073)", async () => {
+    const brain = new FakeBrain();
+    const { transport } = makeFakeTransport([brain]);
+    let resolveThread!: (v: { ok: true; threadId: string }) => void;
+    const slowThreadFn: CreatePrivateThreadFn = () =>
+      new Promise((resolve) => {
+        resolveThread = resolve;
+      });
+    const host = new DaemonBrainHost({
+      agentId: "escort",
+      run: "bun b.ts",
+      packDir: "/p",
+      transport,
+      makeScratchDir: scratchFactory,
+      agentChannelId: "agent-own-channel",
+      createPrivateThread: slowThreadFn,
+      taskTimeoutMs: 150, // deliberately shorter than the in-flight wait below
+    });
+    await host.start();
+
+    const runP = host.runTask(makeTask({ task_id: "slow" }), makeHooks());
+    await until(() => brain.lastTask()?.task_id === "slow");
+
+    brain.emit(
+      JSON.stringify({
+        v: 1,
+        type: "create_private_thread",
+        task_id: "slow",
+        name: "slow platform round-trip",
+        members: "source",
+      }),
+    );
+
+    // The adapter call is deliberately held open far longer than
+    // taskTimeoutMs — the host must NOT fail the task while it's in flight.
+    await new Promise((r) => setTimeout(r, 300));
+    resolveThread({ ok: true, threadId: "thread-slow" });
+
+    await until(() => brain.hasEvent("thread_created"));
+    brain.emit(JSON.stringify({ v: 1, type: "result", task_id: "slow", status: "complete" }));
+
+    const result = await runP;
+    expect(result.result.status).toBe("complete"); // NOT "failed"/timeout
     await host.stop();
   });
 });
