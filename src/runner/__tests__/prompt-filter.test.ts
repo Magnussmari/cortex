@@ -10,8 +10,14 @@
  * prompt injection scanner is silently fail-open — exactly the bug grove#173
  * was filed to fix.
  */
-import { describe, test, expect } from "bun:test";
-import { scanPrompt, deriveReasonCategory } from "../prompt-filter";
+import { describe, test, expect, afterEach } from "bun:test";
+import {
+  scanPrompt,
+  deriveReasonCategory,
+  assertPromptFilterReady,
+  validateLoadedFilter,
+  __setPromptFilterLoadErrorForTests,
+} from "../prompt-filter";
 
 describe("scanPrompt (grove#173 acceptance)", () => {
   test("allows clean conversational text", () => {
@@ -197,5 +203,110 @@ describe("scanPrompt trust gate (cortex#741)", () => {
   test("trusted score is still surfaced for the audit record", () => {
     const result = scanPrompt(EX004_FP, "discord", { trusted: true });
     expect(typeof result.score).toBe("number");
+  });
+});
+
+describe("assertPromptFilterReady (cortex#2184 boot gate)", () => {
+  const ENV_VAR = "CORTEX_ALLOW_UNSCANNED_PROMPTS";
+  const originalEnv = process.env[ENV_VAR];
+
+  // Real content-filter loads cleanly in this environment (the whole point of
+  // grove#173 Phase B — see the file-level doc comment above), so
+  // `promptFilterLoadError` is `null` at module init. We simulate a load
+  // failure via the test seam rather than uninstalling the dependency — reset
+  // it after every test so we never leak the simulated failure into the
+  // scanPrompt tests above/below.
+  afterEach(() => {
+    __setPromptFilterLoadErrorForTests(null);
+    if (originalEnv === undefined) {
+      delete process.env.CORTEX_ALLOW_UNSCANNED_PROMPTS;
+    } else {
+      process.env[ENV_VAR] = originalEnv;
+    }
+  });
+
+  test("loaded (no simulated failure) → no-op, never throws", () => {
+    __setPromptFilterLoadErrorForTests(null);
+    delete process.env.CORTEX_ALLOW_UNSCANNED_PROMPTS;
+    expect(() => assertPromptFilterReady("cortex start")).not.toThrow();
+  });
+
+  test("not loaded + opt-out unset → throws an actionable error", () => {
+    __setPromptFilterLoadErrorForTests("Cannot find package '@metafactory/content-filter'");
+    delete process.env.CORTEX_ALLOW_UNSCANNED_PROMPTS;
+
+    let thrown: unknown;
+    try {
+      assertPromptFilterReady("cortex start");
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    // Names the module, states scanning would be OFF, gives the fix, echoes
+    // the underlying error, and mentions the opt-out — per cortex#2184.
+    expect(message).toContain("@metafactory/content-filter");
+    expect(message).toContain("scanning would be OFF");
+    expect(message).toContain("bun install");
+    expect(message).toContain("Cannot find package '@metafactory/content-filter'");
+    expect(message).toContain(ENV_VAR);
+    expect(message).toContain("cortex start");
+  });
+
+  test("not loaded + opt-out set → proceeds with exactly one loud SECURITY warning", () => {
+    __setPromptFilterLoadErrorForTests("simulated load failure");
+    process.env[ENV_VAR] = "1";
+
+    const logged: string[] = [];
+    const orig = console.error;
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    try {
+      expect(() => assertPromptFilterReady("cortex stack create")).not.toThrow();
+    } finally {
+      console.error = orig;
+    }
+
+    const warnings = logged.filter((l) => l.includes("SECURITY") && l.includes(ENV_VAR));
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("DISABLED");
+  });
+});
+
+describe("validateLoadedFilter (cortex#2184 round 2 — resolved-but-degraded import)", () => {
+  // A RESOLVED import promise is not proof of a working filter: a partial
+  // fetch, an ESM/CJS interop quirk landing the export on `.default`, or a
+  // renamed/missing export all resolve without throwing — so the module-init
+  // `catch` never fires, yet `scanPrompt`'s fail-open check
+  // (`if (!filterContentString)`) would still trip. These tests pin that
+  // `validateLoadedFilter` uses the SAME predicate scanPrompt does, on a few
+  // plausible degraded-module shapes, without needing a real broken import.
+
+  test("mod exports a real callable filterContentString → null (ready)", () => {
+    const mod = { filterContentString: () => ({}) as unknown };
+    expect(validateLoadedFilter(mod)).toBeNull();
+  });
+
+  test("mod.filterContentString is undefined (missing export) → error string", () => {
+    const mod = { filterContentString: undefined };
+    const result = validateLoadedFilter(mod);
+    expect(result).not.toBeNull();
+    expect(result).toContain("@metafactory/content-filter");
+    expect(result).toContain("did not export a callable");
+  });
+
+  test("mod.filterContentString present but not a function (e.g. landed on .default, wrong shape) → error string", () => {
+    const mod = { filterContentString: { default: () => {} } };
+    const result = validateLoadedFilter(mod);
+    expect(result).not.toBeNull();
+    expect(result).toContain("did not export a callable");
+  });
+
+  test("mod with no filterContentString key at all → error string", () => {
+    const mod = {};
+    const result = validateLoadedFilter(mod);
+    expect(result).not.toBeNull();
   });
 });
