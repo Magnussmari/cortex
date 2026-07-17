@@ -12,10 +12,13 @@
  *   - **Cortex → brain (events).** Things the host tells the brain about:
  *     a `task` to run, a follow-up `message`, a host-resolved `gate_verdict`,
  *     a `cancel`, a `shutdown` drain signal, an `effect_rejected` (cortex
- *     refused one of the brain's effects), and the daemon `hello` handshake.
+ *     refused one of the brain's effects), a `thread_created` (the answer to
+ *     a `create_private_thread` effect), and the daemon `hello` handshake.
  *   - **Brain → cortex (effects).** Things the brain asks the host to do:
  *     `post` to a surface, `ask_principal` (render a gate), `dispatch` fleet
- *     work, `result` (close the task), and `log`.
+ *     work, `create_private_thread` (open a private thread off the agent's
+ *     own channel binding — cortex#2206), `result` (close the task), and
+ *     `log`.
  *
  * The brain never sees a platform token, a NATS credential, or another
  * agent's identity (§5 property 1). It *asks* for effects; cortex *performs*
@@ -203,6 +206,7 @@ export const BRAIN_EVENT_CANCEL = "cancel" as const;
 export const BRAIN_EVENT_SHUTDOWN = "shutdown" as const;
 export const BRAIN_EVENT_EFFECT_REJECTED = "effect_rejected" as const;
 export const BRAIN_EVENT_HELLO = "hello" as const;
+export const BRAIN_EVENT_THREAD_CREATED = "thread_created" as const;
 
 /**
  * `task` — start a unit of work. Per-task brains receive `persona` here (§5
@@ -250,6 +254,28 @@ export const GateVerdictEventSchema = z.object({
   principal: z.string().min(1),
 });
 export type GateVerdictEvent = z.infer<typeof GateVerdictEventSchema>;
+
+/**
+ * `thread_created` — the answer to a `create_private_thread` effect
+ * (cortex#2206), modeled directly on {@link GateVerdictEventSchema}'s shape:
+ * the brain asks for an async host effect, the host performs it, and this
+ * event carries the result back correlated by `task_id`. `thread_id` is the
+ * HOST-RESOLVED platform thread id — the brain never chose it, exactly as
+ * `gate_verdict.principal` is host-resolved, never brain-supplied.
+ *
+ * There is no failure variant of this event — a refused or failed
+ * `create_private_thread` reuses the EXISTING `effect_rejected` event
+ * verbatim (rate-limit trip and an anon-reachable agent naming its own
+ * members both map to `policy_denied`; a genuine adapter/platform failure
+ * maps to `not_now`, transient/retryable). No new failure shape was needed.
+ */
+export const ThreadCreatedEventSchema = z.object({
+  v: z.literal(BRAIN_PROTOCOL_VERSION),
+  type: z.literal(BRAIN_EVENT_THREAD_CREATED),
+  task_id: z.string().min(1),
+  thread_id: z.string().min(1),
+});
+export type ThreadCreatedEvent = z.infer<typeof ThreadCreatedEventSchema>;
 
 /** `cancel` — abandon an in-flight task. */
 export const CancelEventSchema = z.object({
@@ -327,6 +353,7 @@ export const BrainEventSchema = z.discriminatedUnion("type", [
   ShutdownEventSchema,
   EffectRejectedEventSchema,
   HelloEventSchema,
+  ThreadCreatedEventSchema,
 ]);
 export type BrainEvent = z.infer<typeof BrainEventSchema>;
 
@@ -337,6 +364,7 @@ export type BrainEvent = z.infer<typeof BrainEventSchema>;
 export const BRAIN_EFFECT_POST = "post" as const;
 export const BRAIN_EFFECT_ASK_PRINCIPAL = "ask_principal" as const;
 export const BRAIN_EFFECT_DISPATCH = "dispatch" as const;
+export const BRAIN_EFFECT_CREATE_PRIVATE_THREAD = "create_private_thread" as const;
 export const BRAIN_EFFECT_RESULT = "result" as const;
 export const BRAIN_EFFECT_LOG = "log" as const;
 
@@ -425,6 +453,49 @@ export const DispatchEffectSchema = z.object({
 export type DispatchEffect = z.infer<typeof DispatchEffectSchema>;
 
 /**
+ * `members` on a `create_private_thread` effect (cortex#2206): either the
+ * literal `"source"` — resolve to the task's own recorded source user,
+ * SERVER-SIDE, never from anything the brain sent — or an explicit list of
+ * platform user ids the brain is requesting.
+ *
+ * The wire type stays OPEN (not narrowed to `"source"`-only) because a
+ * future trusted, principal-mapped agent (e.g. quest spaces, guildhall idea
+ * 0026) needs multi-member threads. Enforcement of WHO may use the open form
+ * is host-side policy, not a type-level restriction (ADR cortex#2206 #1): an
+ * anon-reachable agent (`AgentSchema.openOnboarding`) requesting anything
+ * other than `"source"` is refused `effect_rejected` (`policy_denied`) by
+ * the host — see `daemon-brain-host.ts`'s `create_private_thread` case.
+ */
+export const CreatePrivateThreadMembersSchema = z.union([
+  z.literal("source"),
+  z.array(z.string().min(1)),
+]);
+export type CreatePrivateThreadMembers = z.infer<
+  typeof CreatePrivateThreadMembersSchema
+>;
+
+/**
+ * `create_private_thread` — open a private thread and put specific people in
+ * it (cortex#2206; guildhall's escort onboarding seat, guildhall idea 0026's
+ * quest spaces). Deliberately carries NO channel field — that absence is
+ * intentional, not an oversight: the brain must never be able to name an
+ * arbitrary channel. The host derives the parent channel from the AGENT'S
+ * OWN binding (`presence.discord.agentChannelId` today) — see
+ * `daemon-brain-host.ts`. The answer comes back as a {@link
+ * ThreadCreatedEvent}; a refusal reuses {@link EffectRejectedEventSchema}.
+ */
+export const CreatePrivateThreadEffectSchema = z.object({
+  v: z.literal(BRAIN_PROTOCOL_VERSION),
+  type: z.literal(BRAIN_EFFECT_CREATE_PRIVATE_THREAD),
+  task_id: z.string().min(1),
+  name: z.string().min(1),
+  members: CreatePrivateThreadMembersSchema,
+});
+export type CreatePrivateThreadEffect = z.infer<
+  typeof CreatePrivateThreadEffectSchema
+>;
+
+/**
  * `result` — closes the task. `complete` carries an optional `summary`;
  * `failed` carries the typed `reason` (cant_do | not_now | wont_do — §5
  * property 5). Modeled as a `status`-discriminated union so a `failed` result
@@ -469,6 +540,7 @@ export const BrainEffectSchema = z.discriminatedUnion("type", [
   PostEffectSchema,
   AskPrincipalEffectSchema,
   DispatchEffectSchema,
+  CreatePrivateThreadEffectSchema,
   ResultEffectSchema,
   LogEffectSchema,
 ]);
@@ -499,6 +571,7 @@ const KNOWN_EFFECT_TYPES: ReadonlySet<string> = new Set([
   BRAIN_EFFECT_POST,
   BRAIN_EFFECT_ASK_PRINCIPAL,
   BRAIN_EFFECT_DISPATCH,
+  BRAIN_EFFECT_CREATE_PRIVATE_THREAD,
   BRAIN_EFFECT_RESULT,
   BRAIN_EFFECT_LOG,
 ]);
@@ -608,6 +681,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set([
   BRAIN_EVENT_SHUTDOWN,
   BRAIN_EVENT_EFFECT_REJECTED,
   BRAIN_EVENT_HELLO,
+  BRAIN_EVENT_THREAD_CREATED,
 ]);
 
 export function parseBrainEvent(line: string): ParseBrainEventResult {

@@ -54,6 +54,12 @@ const events: BrainEvent[] = [
   { v: 1, type: "shutdown", deadline_ms: 5000 },
   {
     v: 1,
+    type: "thread_created",
+    task_id: "t1",
+    thread_id: "thread-abc123",
+  },
+  {
+    v: 1,
     type: "effect_rejected",
     task_id: "t1",
     effect: "dispatch",
@@ -105,6 +111,20 @@ const effects: BrainEffect[] = [
     task_id: "t1",
     capability: "soc.triage.email",
     payload: {},
+  },
+  {
+    v: 1,
+    type: "create_private_thread",
+    task_id: "t1",
+    name: "welcome newcomer",
+    members: "source",
+  },
+  {
+    v: 1,
+    type: "create_private_thread",
+    task_id: "t1",
+    name: "quest party",
+    members: ["u1", "u2"],
   },
   { v: 1, type: "result", task_id: "t1", status: "complete", summary: "done" },
   { v: 1, type: "result", task_id: "t1", status: "complete" },
@@ -512,6 +532,111 @@ describe("gate_verdict vocabulary", () => {
       verdict: "pass",
     });
     expect(parseBrainEvent(line).kind).toBe("invalid");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create_private_thread / thread_created (cortex#2206)
+// ---------------------------------------------------------------------------
+
+describe("create_private_thread schema", () => {
+  test("members accepts the literal \"source\"", () => {
+    const line = JSON.stringify({
+      v: 1,
+      type: "create_private_thread",
+      task_id: "t1",
+      name: "welcome",
+      members: "source",
+    });
+    expect(parseBrainEffect(line).kind).toBe("ok");
+  });
+
+  test("members accepts an explicit string array", () => {
+    const line = JSON.stringify({
+      v: 1,
+      type: "create_private_thread",
+      task_id: "t1",
+      name: "quest party",
+      members: ["u1", "u2"],
+    });
+    expect(parseBrainEffect(line).kind).toBe("ok");
+  });
+
+  test("members rejects any other string literal (only \"source\" or an array is valid)", () => {
+    const line = JSON.stringify({
+      v: 1,
+      type: "create_private_thread",
+      task_id: "t1",
+      name: "welcome",
+      members: "everyone",
+    });
+    expect(parseBrainEffect(line).kind).toBe("invalid");
+  });
+
+  test("members is required", () => {
+    const line = JSON.stringify({
+      v: 1,
+      type: "create_private_thread",
+      task_id: "t1",
+      name: "welcome",
+    });
+    expect(parseBrainEffect(line).kind).toBe("invalid");
+  });
+
+  test("name is required (non-empty)", () => {
+    const line = JSON.stringify({
+      v: 1,
+      type: "create_private_thread",
+      task_id: "t1",
+      name: "",
+      members: "source",
+    });
+    expect(parseBrainEffect(line).kind).toBe("invalid");
+  });
+
+  // The load-bearing structural guarantee (issue cortex#2206): the wire
+  // schema has NO channel field at all. A brain that includes one is not
+  // "refused" — the field is silently stripped by the tolerant-ingest codec
+  // before the effect ever reaches host policy, so there is no code path by
+  // which a brain-named channel could influence anything downstream.
+  test("a brain-supplied `channel` field is stripped — there is no such field on the wire", () => {
+    const line = JSON.stringify({
+      v: 1,
+      type: "create_private_thread",
+      task_id: "t1",
+      name: "welcome",
+      members: "source",
+      channel: "attacker-chosen-channel-id",
+    });
+    const parsed = parseBrainEffect(line);
+    expect(parsed.kind).toBe("ok");
+    if (parsed.kind === "ok") {
+      expect(parsed.effect).not.toHaveProperty("channel");
+    }
+  });
+
+  test("thread_created requires a non-empty thread_id", () => {
+    const line = JSON.stringify({
+      v: 1,
+      type: "thread_created",
+      task_id: "t1",
+      thread_id: "",
+    });
+    expect(parseBrainEvent(line).kind).toBe("invalid");
+  });
+
+  test("thread_created round-trips with a real thread id", () => {
+    const ev = {
+      v: 1,
+      type: "thread_created",
+      task_id: "t1",
+      thread_id: "912345678901234567",
+    } as const;
+    const parsed = parseBrainEvent(encodeBrainEvent(ev));
+    expect(parsed.kind).toBe("ok");
+    if (parsed.kind === "ok") {
+      expect(parsed.event).toEqual(ev);
+    }
   });
 });
 

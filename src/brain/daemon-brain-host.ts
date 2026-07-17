@@ -22,7 +22,12 @@
  *      delivery"; identity is HOST-AUTHORITATIVE);
  *   3. accepts `runTask(task, hooks)` calls — writes the `task` event, routes
  *      the brain's effects (post / ask_principal / dispatch / log / result) to
- *      the per-task hooks, and resolves when that task's `result` arrives;
+ *      the per-task hooks, and resolves when that task's `result` arrives.
+ *      `create_private_thread` (cortex#2206) is the one effect NOT routed
+ *      through the per-task hooks: it is host-POLICY (channel binding,
+ *      anon-reachable membership gate, rate limit), so this file enforces it
+ *      directly and calls an injected {@link CreatePrivateThreadFn} only for
+ *      the mechanical create-thread-and-add-members I/O;
  *   4. enforces, PER TASK (not per process): task_id correlation, scratch
  *      confinement, and the 4 MiB attachment budget (§12.5). Scratch dirs are
  *      created per TASK and removed when the task closes — confinement stays
@@ -68,6 +73,7 @@ import {
   JsonlDecoder,
   type TaskEvent,
   type ResultEffect,
+  type HostReasonKind,
 } from "./protocol";
 import {
   buildArgv,
@@ -152,6 +158,55 @@ export type DaemonTransport = (opts: {
 export const SOCKET_AUTH_TIMEOUT_MS = 2_000;
 
 // ---------------------------------------------------------------------------
+// `create_private_thread` I/O seam (cortex#2206)
+// ---------------------------------------------------------------------------
+
+/**
+ * The result of a `create_private_thread` I/O attempt. NEVER throws — a
+ * platform/API failure resolves `{ ok: false, detail }` so the host maps it
+ * to a retryable `effect_rejected` (`not_now`) instead of an unhandled
+ * rejection (mirrors every other injected seam in this file).
+ */
+export type CreatePrivateThreadOutcome =
+  | { ok: true; threadId: string }
+  | { ok: false; detail: string };
+
+/**
+ * The actual create-thread-and-add-members I/O for a `create_private_thread`
+ * effect (cortex#2206). Every POLICY decision — which channel, who gets
+ * added, whether the rate limit allows it — is made by
+ * {@link DaemonBrainHost} itself, BEFORE this function is ever called; this
+ * seam performs only the mechanical platform call under parameters the host
+ * already decided. Mirrors the `transport` seam: production wires the real
+ * Discord adapter (`src/adapters/discord/index.ts`'s `createPrivateThread`);
+ * tests inject a fake.
+ */
+export type CreatePrivateThreadFn = (opts: {
+  /** The parent channel — ALWAYS the agent's own binding, never brain input. */
+  channelId: string;
+  name: string;
+  /** Host-resolved member ids — `"source"` has already been expanded server-side. */
+  memberIds: string[];
+}) => Promise<CreatePrivateThreadOutcome>;
+
+/**
+ * Rate limit for `create_private_thread`: 10/hour, PER AGENT (ADR
+ * cortex#2206 #2). Each {@link DaemonBrainHost} instance already serves
+ * exactly one agent (`agentId` is fixed at construction), so the limiter
+ * state below is naturally per-agent without needing to key it — a second
+ * agent gets its own `DaemonBrainHost` instance and its own counter.
+ *
+ * Open follow-up (explicitly NOT required for v1, per the ADR): this budget
+ * is shared across every triggering user of an anon-reachable agent, so one
+ * bad actor can exhaust the hour's capacity for every legitimate newcomer.
+ * Per-triggering-user budgets are a fast-follow if abuse is observed.
+ */
+export const CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR = 10;
+
+/** The sliding window `CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR` is measured over. */
+const CREATE_PRIVATE_THREAD_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
@@ -212,6 +267,39 @@ export interface DaemonBrainHostOpts {
   onDegraded?: (agentId: string) => void;
   /** Test seam — clock for uptime accounting. Defaults to `() => Date.now()`. */
   now?: () => number;
+  /**
+   * cortex#2206 — the parent channel a `create_private_thread` effect opens
+   * its thread on. ALWAYS the agent's OWN presence binding
+   * (`presence.discord.agentChannelId` today), resolved by the CALLER at
+   * construction — never supplied by the brain (the wire effect carries no
+   * channel field at all; that absence is intentional, see `protocol.ts`'s
+   * `CreatePrivateThreadEffectSchema`). Undefined ⇒ this agent has no
+   * thread-capable surface bound; every `create_private_thread` effect is
+   * refused `effect_rejected` (`not_now`).
+   */
+  agentChannelId?: string;
+  /**
+   * cortex#2206 — the injected create-thread-and-add-members I/O
+   * ({@link CreatePrivateThreadFn}). Undefined ⇒ same `not_now` refusal as a
+   * missing `agentChannelId` (no capability configured for this agent).
+   */
+  createPrivateThread?: CreatePrivateThreadFn;
+  /**
+   * cortex#2206 — true when this agent is reachable by an unmapped,
+   * zero-authority anon principal (`AgentSchema.openOnboarding`,
+   * cortex#1165). Gates `create_private_thread`'s `members` field: while
+   * `true`, a brain requesting anything other than the literal `"source"` is
+   * refused `effect_rejected` (`policy_denied`) — an anon-reachable brain
+   * may never name its own thread membership.
+   *
+   * **Defaults to `true` — the SAFE default.** A brand-new capability like
+   * this must fail toward the MORE restrictive behaviour when the caller
+   * doesn't say otherwise; an agent must be EXPLICITLY constructed with
+   * `anonReachable: false` before its brain may request an explicit member
+   * list. (ADR cortex#2206 #1: "which future agents get [the wider path] is
+   * each of their own onboarding, not a blanket switch.")
+   */
+  anonReachable?: boolean;
 }
 
 /** Per-task tracking record (one per multiplexed task_id). */
@@ -257,6 +345,23 @@ export class DaemonBrainHost {
   private readonly makeSocketPath: (agentId: string) => string;
   private readonly onDegraded: ((agentId: string) => void) | undefined;
   private readonly now: () => number;
+  /** cortex#2206 — see {@link DaemonBrainHostOpts.agentChannelId}. */
+  private readonly agentChannelId: string | undefined;
+  /** cortex#2206 — see {@link DaemonBrainHostOpts.createPrivateThread}. */
+  private readonly createPrivateThreadFn: CreatePrivateThreadFn | undefined;
+  /** cortex#2206 — see {@link DaemonBrainHostOpts.anonReachable}. Fail-safe default: `true`. */
+  private readonly anonReachable: boolean;
+  /**
+   * cortex#2206 — sliding-window timestamps (ms) of accepted
+   * `create_private_thread` ATTEMPTS (recorded before the adapter call, not
+   * only on success — an attempt that fails at the platform still cost a
+   * real API call and must still count against the budget). Pruned lazily
+   * on each check/record; never grows past
+   * {@link CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR} entries. In-memory
+   * only — does NOT survive a daemon restart (see file header discussion in
+   * the PR/issue for why that's an accepted v1 tradeoff).
+   */
+  private threadCreateAttempts: number[] = [];
 
   /** Live process + connection for the CURRENT generation. */
   private proc: DaemonBrainProcess | null = null;
@@ -303,6 +408,9 @@ export class DaemonBrainHost {
     this.makeSocketPath = opts.makeSocketPath ?? defaultMakeSocketPath;
     this.onDegraded = opts.onDegraded;
     this.now = opts.now ?? (() => Date.now());
+    this.agentChannelId = opts.agentChannelId;
+    this.createPrivateThreadFn = opts.createPrivateThread;
+    this.anonReachable = opts.anonReachable ?? true;
   }
 
   /** True once the restart budget is exhausted — the consumer stops dispatching. */
@@ -892,6 +1000,138 @@ export class DaemonBrainHost {
         }
         return;
       }
+      case "create_private_thread": {
+        // cortex#2206 — open a private thread off THIS agent's own channel
+        // binding. Every parameter that matters (channel, membership, rate
+        // budget) is decided HERE, host-side — the effect payload carries no
+        // channel at all (intentional), and `members` is enforced, not
+        // trusted, before it ever reaches the adapter.
+        //
+        // PAUSE the per-task liveness timeout while the thread-create call
+        // is in flight — identical reasoning to `ask_principal`
+        // (cortex#1073): this is async I/O (a platform REST round-trip), not
+        // brain liveness, so a slow (but honest) platform response must
+        // never race the timeout and fail a task that isn't hung. Re-arm
+        // once every open gate (ask_principal OR create_private_thread)
+        // closes.
+        if (record.openGates === 0 && record.timeoutTimer !== undefined) {
+          clearTimeout(record.timeoutTimer);
+          record.timeoutTimer = undefined;
+        }
+        record.openGates += 1;
+        try {
+          // 1. Structural: no channel binding / no adapter capability wired
+          // for this agent ⇒ this agent simply cannot do this, full stop.
+          // cant_do (not not_now): this will never resolve on retry without
+          // a redeploy/config change, unlike the genuinely transient states
+          // (degraded, draining, adapter I/O failure) that use not_now
+          // elsewhere in this file — a brain must not burn rate-limit budget
+          // retrying a capability that can never appear (code review, PR #2214).
+          if (this.agentChannelId === undefined || this.createPrivateThreadFn === undefined) {
+            await this.rejectEffect(
+              e.task_id,
+              "create_private_thread",
+              "cant_do",
+              `agent "${this.agentId}" has no thread-capable surface binding configured`,
+            );
+            return;
+          }
+
+          // 2. Anon-reachable gate (ADR cortex#2206 #1). An agent an
+          // unmapped, zero-authority stranger can reach may NEVER have its
+          // brain name arbitrary thread members — only "source" (the
+          // triggering event's own author, resolved below in step 3) is
+          // permitted. Checked BEFORE resolving members so a violating
+          // request never even gets as far as touching the rate budget.
+          if (this.anonReachable && e.members !== "source") {
+            await this.rejectEffect(
+              e.task_id,
+              "create_private_thread",
+              "policy_denied",
+              `agent "${this.agentId}" is anon-reachable (openOnboarding); ` +
+                `members must be "source" — an explicit member list is refused`,
+            );
+            return;
+          }
+
+          // 3. Resolve membership SERVER-SIDE. "source" is ALWAYS the
+          // task's own recorded source user (record.task.source.user, set
+          // by the host when the task was created from the inbound event) —
+          // never anything the brain put on the wire. An explicit list
+          // (only reachable for a non-anon-reachable agent, per step 2) is
+          // the brain's own request, passed through as-is; per-recipient
+          // authorization for that path is future work owned by whichever
+          // trusted agent uses it, not this effect's job to second-guess
+          // (ADR cortex#2206 #1).
+          const memberIds =
+            e.members === "source" ? [record.task.source.user] : e.members;
+
+          // 4. Rate limit — 10/hour/agent (named constant), a real sliding
+          // window. Checked (and reserved) AFTER the structural/policy
+          // gates above so a request that was going to be refused anyway
+          // never burns budget.
+          if (this.isThreadCreateRateLimited()) {
+            await this.rejectEffect(
+              e.task_id,
+              "create_private_thread",
+              "policy_denied",
+              `agent "${this.agentId}" exceeded ${CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR} ` +
+                `create_private_thread calls in the past hour`,
+            );
+            return;
+          }
+          // Reserve the slot BEFORE the (possibly slow) adapter call — an
+          // attempt costs real platform-API budget whether or not it
+          // ultimately succeeds; counting only successes would let a brain
+          // that keeps hitting a failing/slow path dodge the limit entirely.
+          this.recordThreadCreateAttempt();
+
+          // 5. Perform the actual I/O. Never throws by contract
+          // (CreatePrivateThreadFn) — a platform failure comes back as
+          // `{ ok: false, detail }`, not a rejection.
+          const outcome = await this.createPrivateThreadFn({
+            channelId: this.agentChannelId,
+            name: e.name,
+            memberIds,
+          });
+
+          // The task may have been drained/cancelled while the call was in
+          // flight — never forward a result to a closed/replaced task
+          // (§7.5, same rule `ask_principal` follows for `gate_verdict`).
+          if (record.settled) return;
+
+          if (!outcome.ok) {
+            // A genuine adapter/platform failure is transient/retryable —
+            // NOT the brain's fault and NOT a policy refusal.
+            await this.rejectEffect(
+              e.task_id,
+              "create_private_thread",
+              "not_now",
+              outcome.detail,
+            );
+            return;
+          }
+
+          await this.sendToConn(
+            encodeBrainEvent({
+              v: 1,
+              type: "thread_created",
+              task_id: e.task_id,
+              thread_id: outcome.threadId,
+            }) + "\n",
+          );
+        } finally {
+          record.openGates = Math.max(0, record.openGates - 1);
+          // Last gate closed and the task is still live → re-arm the
+          // liveness timeout for the remaining (deterministic) steps.
+          if (record.openGates === 0 && !record.settled && record.timeoutTimer === undefined) {
+            record.timeoutTimer = setTimeout(() => {
+              void this.failTask(record, "timeout");
+            }, this.taskTimeoutMs);
+          }
+        }
+        return;
+      }
       case "result":
         this.settleTask(record, e);
         return;
@@ -971,11 +1211,20 @@ export class DaemonBrainHost {
     }
   }
 
-  /** Send an `effect_rejected` for a refused effect. Best-effort. */
+  /**
+   * Send an `effect_rejected` for a refused effect. Best-effort.
+   *
+   * `kind` accepts the FULL host taxonomy ({@link HostReasonKind}) — not
+   * just the 3-kind brain subset — because `create_private_thread`'s policy
+   * refusals (anon-reachable agent naming its own members; rate limit trip)
+   * are `policy_denied`, a host-only kind (cortex#2206). Every pre-existing
+   * call site keeps passing one of the original 3 kinds, so this widening is
+   * purely additive.
+   */
   private async rejectEffect(
     taskId: string,
     effect: string,
-    kind: "cant_do" | "not_now" | "wont_do",
+    kind: HostReasonKind,
     detail: string,
   ): Promise<void> {
     await this.sendToConn(
@@ -987,6 +1236,25 @@ export class DaemonBrainHost {
         reason: { kind, detail },
       }) + "\n",
     );
+  }
+
+  /**
+   * cortex#2206 — true when this agent has already made
+   * {@link CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR} `create_private_thread`
+   * ATTEMPTS within the trailing hour. Prunes expired entries first (a real
+   * sliding window, not a fixed bucket that resets on the hour boundary).
+   * Read-only — pair with {@link recordThreadCreateAttempt} to reserve a
+   * slot once the caller has decided to proceed.
+   */
+  private isThreadCreateRateLimited(): boolean {
+    const cutoff = this.now() - CREATE_PRIVATE_THREAD_RATE_LIMIT_WINDOW_MS;
+    this.threadCreateAttempts = this.threadCreateAttempts.filter((t) => t > cutoff);
+    return this.threadCreateAttempts.length >= CREATE_PRIVATE_THREAD_RATE_LIMIT_PER_HOUR;
+  }
+
+  /** Record one `create_private_thread` attempt against this agent's sliding window. */
+  private recordThreadCreateAttempt(): void {
+    this.threadCreateAttempts.push(this.now());
   }
 
   /** Write a line to the live connection, swallowing a closed-socket error. */
