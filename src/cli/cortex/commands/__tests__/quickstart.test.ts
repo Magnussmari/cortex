@@ -38,6 +38,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 import { dispatchQuickstart } from "../quickstart";
+import { daemonErrorLogPath } from "../quickstart-lib";
 import type {
   CommandResult,
   GatePort,
@@ -181,8 +182,14 @@ interface FakeOverrides {
   unitFileExists?: (unit: string) => boolean;
   daemonReload?: () => CommandResult;
   enableNow?: (units: string[]) => CommandResult;
+  // cortex#2264 — records the error-log truncation step 7 performs before the
+  // (re)start (so a test can assert it ran, with what path, and in what order).
+  truncateErrorLog?: (errorLogPath: string) => void;
   provisionSeed?: () => CommandResult;
-  readLog?: () => string | undefined;
+  // cortex#2264 — takes the polled path so a test can return DIFFERENT content
+  // for the main `.log` vs the `.error.log` sibling. Existing zero-arg lambdas
+  // stay assignable (a `() => T` satisfies `(p: string) => T`).
+  readLog?: (logPath: string) => string | undefined;
   fetchHealthz?: () => Promise<boolean>;
 }
 
@@ -196,6 +203,7 @@ function fakePorts(overrides: FakeOverrides = {}): QuickstartPorts {
   const service: ServicePort = {
     unitFileExists: overrides.unitFileExists ?? (() => true),
     daemonReload: overrides.daemonReload ?? (() => ({ exitCode: 0, stdout: "", stderr: "" })),
+    truncateErrorLog: overrides.truncateErrorLog ?? (() => {}),
     enableNow: overrides.enableNow ?? (() => ({ exitCode: 0, stdout: "", stderr: "" })),
   };
   const provision: ProvisionPort = {
@@ -494,6 +502,123 @@ describe("dispatchQuickstart — step 8 gate", () => {
     expect(res.stdout).toContain("timed out after 5000ms");
     expect(res.stdout).toContain("✗ Stack:");
     expect(res.stdout).toContain("✗ nats /healthz");
+  });
+
+  // cortex#2264 — a bus-connect failure lands in the .error.log SIBLING, not
+  // the polled .log. The gate must FAIL FAST surfacing the real error, never
+  // silently burn the whole timeout window.
+  test("cortex#2264: a bus-connect failure in the .error.log fast-fails and surfaces the real error", async () => {
+    const configDir = freshDir();
+    const natsDir = freshDir();
+    const FAILURE_LINE =
+      "myelin-runtime: failed to connect — continuing without NATS: ENOENT: no such file or directory, open '~/.config/nats/work-bot.creds'";
+    let sleepCalls = 0;
+    const res = await withEnv(validCtxEnv(), () =>
+      dispatchQuickstart(
+        // A LONG timeout: a pre-fix silent-wait would burn the full window.
+        ["--config-dir", configDir, "--nats-dir", natsDir, "--gate-timeout-ms", "600000"],
+        () => {
+          const ports = fakePorts({
+            // Main .log carries a PARTIAL boot (no "connected to nats" — the
+            // connect failed), so the success gate never passes; the .error.log
+            // sibling carries the real failure. nats-server itself is up →
+            // healthz true (exactly the bench repro: bus dark, nats alive).
+            readLog: (p: string) => (p.endsWith(".error.log") ? FAILURE_LINE : "Stack: andreas/work\npolicy-engine active\n"),
+            fetchHealthz: () => Promise.resolve(true),
+          });
+          // Count sleeps to prove we did NOT poll the full window.
+          const origSleep = ports.gate.sleep;
+          ports.gate.sleep = (ms: number) => {
+            sleepCalls++;
+            return origSleep(ms);
+          };
+          return ports;
+        },
+      ),
+    );
+    expect(res.exitCode).toBe(1);
+    // FAST-FAIL: not the silent timeout message.
+    expect(res.stdout).not.toContain("timed out after");
+    // The ACTUAL error is surfaced, with its root cause.
+    expect(res.stdout).toContain("bus connect FAILED");
+    expect(res.stdout).toContain(FAILURE_LINE);
+    expect(res.stdout).toContain(".error.log");
+    // It fast-failed on the FIRST poll — no wait-window burn.
+    expect(sleepCalls).toBe(0);
+  });
+
+  // cortex#2264 STALENESS (the realistic window the adversarial review caught):
+  // a fresh boot the gate actually WAITS on — main log partial on poll 1, healthy
+  // on poll 2 — with a STALE prior-boot failure line in the append-mode
+  // .error.log. Step 7 truncates that .error.log before the (re)start, so the gate
+  // must PASS on poll 2 and NEVER fast-fail on the stale line at poll 1.
+  test("cortex#2264: a fresh boot with a partial→healthy log PASSES despite a stale .error.log failure (step 7 truncated it)", async () => {
+    const configDir = freshDir();
+    const natsDir = freshDir();
+    const STALE_FAILURE = "myelin-runtime: failed to connect — continuing without NATS: (a PRIOR boot's failure)";
+    // Append-mode error log: starts with the stale prior-boot failure. Step 7's
+    // truncate clears it before the daemon (re)starts.
+    let errorLogContent = STALE_FAILURE;
+    let mainPolls = 0;
+    const res = await withPlatform("linux", () =>
+      withEnv(validCtxEnv(), () =>
+        dispatchQuickstart(
+          ["--config-dir", configDir, "--nats-dir", natsDir, "--gate-timeout-ms", "600000"],
+          () =>
+            fakePorts({
+              // Step 7 (Linux) truncates the append-mode error log before restart.
+              truncateErrorLog: () => {
+                errorLogContent = "";
+              },
+              readLog: (p: string) => {
+                if (p.endsWith(".error.log")) return errorLogContent;
+                mainPolls++;
+                // Poll 1: fresh daemon not yet connected (partial). Poll 2+: healthy.
+                return mainPolls >= 2 ? FULL_HEALTHY_LOG : "Stack: andreas/work\npolicy-engine active\n";
+              },
+              // nats-server up throughout (bench repro shape).
+              fetchHealthz: () => Promise.resolve(true),
+            }),
+        ),
+      ),
+    );
+    // Truncation cleared the stale line before the gate ran → no false fast-fail;
+    // the gate waits one poll and PASSES on the now-healthy boot.
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).not.toContain("bus connect FAILED");
+    expect(res.stdout).toContain("Healthy-boot gate ✓");
+  });
+
+  // cortex#2264 — step 7 truncates the daemon's append-mode .error.log at the
+  // EXACT daemonErrorLogPath, BEFORE it (re)starts the daemon (enable --now).
+  test("cortex#2264: step 7 truncates the .error.log (correct path) before enable --now", async () => {
+    const configDir = freshDir();
+    const natsDir = freshDir();
+    const calls: string[] = [];
+    const res = await withPlatform("linux", () =>
+      withEnv(validCtxEnv(), () =>
+        dispatchQuickstart(
+          ["--config-dir", configDir, "--nats-dir", natsDir],
+          () =>
+            fakePorts({
+              truncateErrorLog: (p: string) => calls.push(`truncate:${p}`),
+              enableNow: (u: string[]) => {
+                calls.push(`enable:${u.join(",")}`);
+                return { exitCode: 0, stdout: "", stderr: "" };
+              },
+            }),
+        ),
+      ),
+    );
+    expect(res.exitCode).toBe(0);
+    const expectedPath = daemonErrorLogPath(process.env.HOME ?? "", "work");
+    // Truncation happened, targeting the exact daemonErrorLogPath…
+    expect(calls).toContain(`truncate:${expectedPath}`);
+    // …and it happened BEFORE the (re)start.
+    const truncIdx = calls.findIndex((c) => c.startsWith("truncate:"));
+    const enableIdx = calls.findIndex((c) => c.startsWith("enable:"));
+    expect(truncIdx).toBeGreaterThanOrEqual(0);
+    expect(enableIdx).toBeGreaterThan(truncIdx);
   });
 });
 

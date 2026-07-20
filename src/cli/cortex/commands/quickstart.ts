@@ -71,7 +71,9 @@ import { expandTilde } from "../../../common/config/loader";
 import { buildQuickstartPorts } from "./quickstart-adapters";
 import type { QuickstartPorts } from "./quickstart-ports";
 import {
+  daemonErrorLogPath,
   daemonLogPath,
+  detectBusConnectFailure,
   evaluateHealthyBootGate,
   gatePassed,
   natsConfPath,
@@ -676,6 +678,17 @@ function runServices(ports: QuickstartPorts, opts: { slug: string; skip: boolean
   }
   lines.push("  ✓ systemctl --user daemon-reload");
 
+  // cortex#2264 — clear the daemon's append-mode `.error.log` IMMEDIATELY before
+  // the (re)start, so step 8's gate only ever sees CURRENT-boot content. Without
+  // this, a bus-connect failure line from a PRIOR boot would linger (systemd
+  // StandardError=append never truncates) and make the gate fast-fail on stale
+  // content before the fresh daemon connects — breaking the "fix creds and
+  // re-run" recovery. Best-effort (the port swallows fs errors); done here,
+  // gated on this Linux branch actually (re)starting the daemon.
+  const errorLogPath = daemonErrorLogPath(process.env.HOME ?? "", opts.slug);
+  ports.service.truncateErrorLog(errorLogPath);
+  lines.push(`  ✓ cleared prior-boot error log (${errorLogPath})`);
+
   const enable = ports.service.enableNow([`nats@${opts.slug}`, `cortex@${opts.slug}`]);
   if (enable.exitCode !== 0) {
     lines.push(`  ✗ systemctl --user enable --now nats@${opts.slug} cortex@${opts.slug} failed: ${enable.stderr.trim()}`);
@@ -706,7 +719,13 @@ async function runGate(
       "  ○ --container passed — skipping healthy-boot gate (container health is compose restart: + nats healthcheck)",
     ]);
   }
-  const logPath = daemonLogPath(process.env.HOME ?? "", opts.slug);
+  const home = process.env.HOME ?? "";
+  const logPath = daemonLogPath(home, opts.slug);
+  // cortex#2264 — the bus-connect failure the daemon logs on a dead bus is a
+  // `console.error`, so it lands in the `.error.log` SIBLING, NEVER the `.log`
+  // the healthy-boot gate greps. Poll it too and FAIL FAST (surfacing the real
+  // error) instead of silently waiting out the whole timeout window.
+  const errorLogPath = daemonErrorLogPath(home, opts.slug);
   const healthzUrl = `http://127.0.0.1:${opts.monitorPort}/healthz`;
   const deadline = ports.gate.now() + opts.timeoutMs;
 
@@ -716,6 +735,22 @@ async function runGate(
     const healthzOk = await ports.gate.fetchHealthz(healthzUrl, 3_000);
     if (gatePassed(gateLines, healthzOk)) {
       return step("8. Healthy-boot gate", true, [renderGateTable(gateLines, healthzOk)]);
+    }
+    // cortex#2264 — a surfaced bus-connect failure is TERMINAL for this boot:
+    // fail fast with the actual error line rather than burning the full
+    // timeout. This is safe on the FIRST poll (before success is logged) because
+    // step 7 TRUNCATED this append-mode `.error.log` right before the daemon
+    // (re)started — so any line here is from THIS boot, never a stale prior-boot
+    // failure. SCOPE: surface + fast-fail only — the daemon still degrades and
+    // continues (its fail-closed-abort posture is a separate, deferred call).
+    const busFailure = detectBusConnectFailure(ports.gate.readLog(errorLogPath));
+    if (busFailure !== undefined) {
+      return step("8. Healthy-boot gate", false, [
+        renderGateTable(gateLines, healthzOk),
+        `  ✗ bus connect FAILED — the daemon could not reach NATS (surfaced from ${errorLogPath}):`,
+        `    ${busFailure}`,
+        `  (failing fast — not waiting out the ${String(opts.timeoutMs)}ms gate; fix the bus/creds and re-run)`,
+      ]);
     }
     if (ports.gate.now() >= deadline) {
       return step("8. Healthy-boot gate", false, [
