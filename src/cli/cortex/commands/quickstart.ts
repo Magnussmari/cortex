@@ -661,6 +661,27 @@ function runSeedProvisioning(ports: QuickstartPorts, opts: { slug: string; confi
 // Step 7 — services (Linux only)
 // =============================================================================
 
+/**
+ * cortex#2264 / cortex#2282 — clear the daemon's append-mode `.error.log` so
+ * step 8's gate only ever sees CURRENT-boot content. Without this, a
+ * bus-connect failure line from a PRIOR boot would linger (both systemd
+ * `StandardError=append:` and launchd `StandardErrorPath` append, never
+ * truncate) and make the gate fast-fail on stale content before the fresh
+ * daemon connects — breaking the "fix creds and re-run" recovery. Best-effort
+ * (the port swallows fs errors). Extracted (cortex#2282) so it is callable
+ * host-independently, but a truncate is ONLY safe paired atomically with a
+ * (re)start — truncate → restart → gate — otherwise it destroys the
+ * current-boot failure evidence the gate's fast-fail depends on. So today
+ * ONLY the Linux branch calls it, immediately before its `enable --now`;
+ * the darwin call arrives with A2 (cortex#2283), paired with the
+ * restart-on-re-run it needs. Returns the human-readable step line.
+ */
+function clearPriorBootErrorLog(ports: QuickstartPorts, slug: string): string {
+  const errorLogPath = daemonErrorLogPath(process.env.HOME ?? "", slug);
+  ports.service.truncateErrorLog(errorLogPath);
+  return `  ✓ cleared prior-boot error log (${errorLogPath})`;
+}
+
 function runServices(ports: QuickstartPorts, opts: { slug: string; skip: boolean }): StepReport {
   if (opts.skip) {
     return step("7. Services", true, ["  ○ --skip-services passed — skipping"]);
@@ -695,16 +716,10 @@ function runServices(ports: QuickstartPorts, opts: { slug: string; skip: boolean
   }
   lines.push("  ✓ systemctl --user daemon-reload");
 
-  // cortex#2264 — clear the daemon's append-mode `.error.log` IMMEDIATELY before
-  // the (re)start, so step 8's gate only ever sees CURRENT-boot content. Without
-  // this, a bus-connect failure line from a PRIOR boot would linger (systemd
-  // StandardError=append never truncates) and make the gate fast-fail on stale
-  // content before the fresh daemon connects — breaking the "fix creds and
-  // re-run" recovery. Best-effort (the port swallows fs errors); done here,
-  // gated on this Linux branch actually (re)starting the daemon.
-  const errorLogPath = daemonErrorLogPath(process.env.HOME ?? "", opts.slug);
-  ports.service.truncateErrorLog(errorLogPath);
-  lines.push(`  ✓ cleared prior-boot error log (${errorLogPath})`);
+  // cortex#2264 — clear the daemon's append-mode `.error.log` IMMEDIATELY
+  // before the (re)start (see clearPriorBootErrorLog above), so step 8's gate
+  // only ever sees CURRENT-boot content.
+  lines.push(clearPriorBootErrorLog(ports, opts.slug));
 
   const enable = ports.service.enableNow([`nats@${opts.slug}`, `cortex@${opts.slug}`]);
   if (enable.exitCode !== 0) {
@@ -771,11 +786,16 @@ async function runGate(
     }
     // cortex#2264 — a surfaced bus-connect failure is TERMINAL for this boot:
     // fail fast with the actual error line rather than burning the full
-    // timeout. This is safe on the FIRST poll (before success is logged) because
-    // step 7 TRUNCATED this append-mode `.error.log` right before the daemon
-    // (re)started — so any line here is from THIS boot, never a stale prior-boot
-    // failure. SCOPE: surface + fast-fail only — the daemon still degrades and
-    // continues (its fail-closed-abort posture is a separate, deferred call).
+    // timeout. On LINUX this is safe on the FIRST poll (before success is
+    // logged) because step 7 truncated this append-mode `.error.log` AND
+    // (re)started the daemon right before the gate — so any line here is from
+    // THIS boot, never a stale prior-boot failure. On darwin neither happens
+    // yet: quickstart does not restart the daemon, so a stale prior-boot line
+    // can fast-fail a re-run here — the paired truncate → restart → gate
+    // arrives with A2 (cortex#2283; a lone truncate would instead destroy
+    // current-boot failure evidence and false-GREEN the gate). SCOPE: surface
+    // + fast-fail only — the daemon still degrades and continues (its
+    // fail-closed-abort posture is a separate, deferred call).
     const busFailure = detectBusConnectFailure(ports.gate.readLog(errorLogPath));
     if (busFailure !== undefined) {
       return step("8. Healthy-boot gate", false, [

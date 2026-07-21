@@ -58,10 +58,12 @@ export interface PreflightPorts {
 
 /**
  * The injectable systemd seam. NEVER exercised on macOS in production
- * (quickstart's orchestrator skips the whole step off `process.platform`) —
- * this interface exists so a test can inject a fake systemctl and assert the
- * exact invocations quickstart makes, without a real systemd on the test
- * host (arc's L2 pattern, referenced in cortex#2094's acceptance criteria).
+ * (quickstart's orchestrator skips the whole step off `process.platform`;
+ * `truncateErrorLog` — pure fs — joins the darwin path only with A2 /
+ * cortex#2283, paired with the restart it needs). This interface exists so a
+ * test can inject a fake systemctl and assert the exact invocations
+ * quickstart makes, without a real systemd on the test host (arc's L2
+ * pattern, referenced in cortex#2094's acceptance criteria).
  */
 export interface ServicePort {
   /** Absolute path a systemd user unit named `unit` would be rendered at —
@@ -78,8 +80,12 @@ export interface ServicePort {
    * CURRENT-boot content. The `cortex@.service` unit routes `StandardError` with
    * `append:` (never truncates), so a failure line from a PRIOR boot would
    * otherwise persist and make the gate fast-fail on a stale line before the
-   * fresh boot has even connected. Called ONLY in the Linux branch that actually
-   * (re)starts the daemon (never on macOS, where arc/launchd owns the restart).
+   * fresh boot has even connected. Called ONLY in the Linux branch that
+   * actually (re)starts the daemon — a truncate is only safe paired with a
+   * restart (truncate → restart → gate), else it destroys current-boot
+   * failure evidence. launchd's `StandardErrorPath` appends too (cortex#2282
+   * unified the paths), so the darwin call arrives with A2 (cortex#2283)
+   * alongside restart-on-re-run.
    * Best-effort: never throws — a failure here degrades the gate to its honest
    * timeout path, never a false-fail. `errorLogPath` is the exact path
    * `daemonErrorLogPath()` computes.
