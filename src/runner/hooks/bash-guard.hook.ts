@@ -100,7 +100,17 @@ interface GuardConfig {
 
 const DEFAULT_CONFIG: GuardConfig = {
   rules: [
-    { pattern: "^gh\\s+(pr|issue|repo|api|run)\\s" },
+    // gh: the read/write PORCELAIN verbs only. `api` and `run` are DELIBERATELY
+    // absent from the floor (cortex#2335). `gh api` is a raw REST client — on the
+    // floor (repos: []) the repo-pin block never engages, so it can reach ANY
+    // endpoint the host's gh login has (`-X PUT repos/<o>/<r>/pulls/<n>/merge`,
+    // `-X DELETE`, releases, deploy keys, `gh api graphql`, `gh api user`),
+    // sidestepping every verb-level distinction drawn elsewhere. `gh run` can
+    // dispatch/cancel/rerun workflows. This mirrors the code capability's
+    // allowlist (stack-lib.ts: "we deliberately DO NOT add gh api / gh repo /
+    // gh run"). A stack that genuinely needs them declares an explicit
+    // bashAllowlist rule (ideally repos-pinned) — never the floor.
+    { pattern: "^gh\\s+(pr|issue|repo)\\s" },
     { pattern: "^git\\s+(log|diff|show|status|branch|fetch|remote|rev-parse)\\b" },
     { pattern: "^ls\\b" },
     { pattern: "^pwd$" },
