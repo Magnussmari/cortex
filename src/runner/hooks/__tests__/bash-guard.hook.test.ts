@@ -696,6 +696,52 @@ describe("bash-guard.hook — floor drops gh api/run (cortex#2335)", () => {
     expectGrantDecision(r.stdout);
   });
 
+  // --- cortex#2335 review (mellanon): porcelain SUBCOMMAND restriction. The
+  // verb-open floor allowed destructive porcelain — mutating ops the code
+  // capability forbids. The floor must be <= the code capability. These assert
+  // the mutating porcelain is DENIED (this is what "went unnoticed"). ---
+  test("`gh pr merge` is DENIED on the floor (floor must not out-power the code agent)", () => {
+    const r = runFloor("gh pr merge 1 --repo the-metafactory/cortex");
+    expect(r.status).toBe(0);
+    expectFloorDeny(r.stdout);
+  });
+
+  test("`gh pr merge --admin` (branch-protection bypass) is DENIED on the floor", () => {
+    const r = runFloor("gh pr merge 1 --admin");
+    expect(r.status).toBe(0);
+    expectFloorDeny(r.stdout);
+  });
+
+  test("`gh pr review --approve` (self-approve) is DENIED on the floor", () => {
+    const r = runFloor("gh pr review 1 --approve");
+    expect(r.status).toBe(0);
+    expectFloorDeny(r.stdout);
+  });
+
+  test("`gh pr close` is DENIED on the floor", () => {
+    const r = runFloor("gh pr close 1");
+    expect(r.status).toBe(0);
+    expectFloorDeny(r.stdout);
+  });
+
+  test("`gh issue delete` is DENIED on the floor", () => {
+    const r = runFloor("gh issue delete 1 --yes");
+    expect(r.status).toBe(0);
+    expectFloorDeny(r.stdout);
+  });
+
+  test("`gh repo delete` is DENIED on the floor (prompt-injection blast radius)", () => {
+    const r = runFloor("gh repo " + "delete the-metafactory/cortex --yes");
+    expect(r.status).toBe(0);
+    expectFloorDeny(r.stdout);
+  });
+
+  test("`gh pr comment` (non-mutating collab) is still GRANTED on the floor", () => {
+    const r = runFloor("gh pr comment 1 --body hi");
+    expect(r.status).toBe(0);
+    expectGrantDecision(r.stdout);
+  });
+
   test("a stack that EXPLICITLY grants `gh api` (own rule) still works — floor removal is not a global ban", () => {
     // The escape hatch Andreas's proposal preserves: an agent genuinely needing
     // gh api declares its own rule. Proves we closed the FLOOR, not gh api itself.

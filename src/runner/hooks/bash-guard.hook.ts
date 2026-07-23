@@ -100,17 +100,25 @@ interface GuardConfig {
 
 const DEFAULT_CONFIG: GuardConfig = {
   rules: [
-    // gh: the read/write PORCELAIN verbs only. `api` and `run` are DELIBERATELY
-    // absent from the floor (cortex#2335). `gh api` is a raw REST client — on the
-    // floor (repos: []) the repo-pin block never engages, so it can reach ANY
-    // endpoint the host's gh login has (`-X PUT repos/<o>/<r>/pulls/<n>/merge`,
-    // `-X DELETE`, releases, deploy keys, `gh api graphql`, `gh api user`),
-    // sidestepping every verb-level distinction drawn elsewhere. `gh run` can
-    // dispatch/cancel/rerun workflows. This mirrors the code capability's
-    // allowlist (stack-lib.ts: "we deliberately DO NOT add gh api / gh repo /
-    // gh run"). A stack that genuinely needs them declares an explicit
-    // bashAllowlist rule (ideally repos-pinned) — never the floor.
-    { pattern: "^gh\\s+(pr|issue|repo)\\s" },
+    // gh: READ-ONLY porcelain SUBCOMMANDS only (cortex#2335). Two vectors are
+    // closed here:
+    //   1. `api`/`run` are absent — `gh api` is a raw REST client; on the floor
+    //      (repos: []) the repo-pin block never engages, so it could reach ANY
+    //      endpoint (`-X PUT repos/<o>/<r>/pulls/<n>/merge`, `-X DELETE`, deploy
+    //      keys, `gh api graphql`), and `gh run` can dispatch/cancel workflows.
+    //   2. Porcelain is subcommand-restricted, NOT verb-open. A bare
+    //      `^gh\s+(pr|issue|repo)\s` still allowed `gh pr merge --admin`,
+    //      `gh pr review --approve`, `gh issue delete`, `gh repo delete` — so a
+    //      floor agent on untrusted Discord input (prompt injection) could merge
+    //      or delete, i.e. the chat floor stayed STRONGER than the deliberately
+    //      narrowed code capability (stack-lib.ts pins `gh pr` to
+    //      create|view|list|diff|checks, "NEVER merge", no `gh repo` at all).
+    // The floor now allows only non-mutating subcommands, mirroring/under the
+    // code capability. A stack needing more declares an explicit (ideally
+    // repos-pinned) bashAllowlist rule — never the floor.
+    { pattern: "^gh\\s+pr\\s+(view|list|diff|checks|status|comment)\\b" },
+    { pattern: "^gh\\s+issue\\s+(view|list|status|comment)\\b" },
+    { pattern: "^gh\\s+repo\\s+view\\b" },
     { pattern: "^git\\s+(log|diff|show|status|branch|fetch|remote|rev-parse)\\b" },
     { pattern: "^ls\\b" },
     { pattern: "^pwd$" },
